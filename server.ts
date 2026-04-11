@@ -2,6 +2,7 @@ import express from 'express';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import fs from 'fs/promises';
+import fsSync from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
@@ -18,7 +19,15 @@ app.use((req, res, next) => {
   next();
 });
 
-const BACKEND_DIR = path.join(__dirname, 'backend');
+function resolveBackendDir() {
+  const bundledBackend = path.join(process.resourcesPath || '', 'backend');
+  if (bundledBackend && fsSync.existsSync(bundledBackend)) {
+    return bundledBackend;
+  }
+  return path.join(__dirname, 'backend');
+}
+
+const BACKEND_DIR = resolveBackendDir();
 
 type RelayType = 'claude' | 'codex';
 type ProfileRecord = {

@@ -3,6 +3,7 @@ const { execFile } = require('child_process');
 const { promisify } = require('util');
 const fs = require('fs/promises');
 const path = require('path');
+const fsSync = require('fs');
 
 const execFileAsync = promisify(execFile);
 const app = express();
@@ -15,7 +16,15 @@ app.use((req, res, next) => {
   next();
 });
 
-const BACKEND_DIR = path.join(__dirname, 'backend');
+function resolveBackendDir() {
+  const bundledBackend = path.join(process.resourcesPath || '', 'backend');
+  if (bundledBackend && fsSync.existsSync(bundledBackend)) {
+    return bundledBackend;
+  }
+  return path.join(__dirname, 'backend');
+}
+
+const BACKEND_DIR = resolveBackendDir();
 
 async function runPython(args, cwd = BACKEND_DIR) {
   const launchers = process.platform === 'win32' ? ['py', 'python'] : ['python3', 'python'];
