@@ -1,12 +1,9 @@
-import express from 'express';
-import { execFile } from 'child_process';
-import { promisify } from 'util';
-import fs from 'fs/promises';
-import path from 'path';
-import { fileURLToPath } from 'url';
+const express = require('express');
+const { execFile } = require('child_process');
+const { promisify } = require('util');
+const fs = require('fs/promises');
+const path = require('path');
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
 const execFileAsync = promisify(execFile);
 const app = express();
 
@@ -20,25 +17,7 @@ app.use((req, res, next) => {
 
 const BACKEND_DIR = path.join(__dirname, 'backend');
 
-type RelayType = 'claude' | 'codex';
-type ProfileRecord = {
-  id: string;
-  name: string;
-  type: 'Claude' | 'Codex';
-  relayType: RelayType;
-  workspace: string;
-  status: 'Running' | 'Stopped';
-  running: boolean;
-  ready: boolean;
-  provider: string;
-  model: string;
-  triggerMode: string;
-  discordChannel: string;
-  state: 'idle' | 'working';
-  logPath: string;
-};
-
-async function runPython(args: string[], cwd = BACKEND_DIR): Promise<{ stdout: string; stderr: string; code: number }> {
+async function runPython(args, cwd = BACKEND_DIR) {
   const launchers = process.platform === 'win32' ? ['py', 'python'] : ['python3', 'python'];
   let lastError = '';
 
@@ -46,8 +25,8 @@ async function runPython(args: string[], cwd = BACKEND_DIR): Promise<{ stdout: s
     try {
       const result = await execFileAsync(launcher, args, { cwd, windowsHide: true });
       return { stdout: result.stdout ?? '', stderr: result.stderr ?? '', code: 0 };
-    } catch (err: any) {
-      if (err?.code === 'ENOENT') {
+    } catch (err) {
+      if (err && err.code === 'ENOENT') {
         lastError = `${launcher} not found`;
         continue;
       }
@@ -62,7 +41,7 @@ async function runPython(args: string[], cwd = BACKEND_DIR): Promise<{ stdout: s
   return { stdout: '', stderr: lastError || 'No Python launcher found', code: 1 };
 }
 
-async function getProfiles(): Promise<ProfileRecord[]> {
+async function getProfiles() {
   const result = await runPython(['cladex.py', 'list', '--json']);
   if (result.code !== 0) {
     throw new Error(result.stderr || 'Failed to list profiles');
@@ -70,7 +49,7 @@ async function getProfiles(): Promise<ProfileRecord[]> {
   return JSON.parse(result.stdout || '[]');
 }
 
-async function findProfile(id: string, relayType?: string): Promise<ProfileRecord | undefined> {
+async function findProfile(id, relayType) {
   const profiles = await getProfiles();
   return profiles.find((profile) => profile.id === id && (!relayType || profile.relayType === relayType));
 }
@@ -78,7 +57,7 @@ async function findProfile(id: string, relayType?: string): Promise<ProfileRecor
 app.get('/api/profiles', async (_req, res) => {
   try {
     res.json(await getProfiles());
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message ?? 'Failed to load profiles' });
   }
 });
@@ -90,7 +69,7 @@ app.get('/api/status', async (_req, res) => {
       throw new Error(result.stderr || 'Failed to load status');
     }
     res.json(JSON.parse(result.stdout || '{"running":[],"profiles":[]}'));
-  } catch (err: any) {
+  } catch (err) {
     res.status(500).json({ error: err?.message ?? 'Failed to load status' });
   }
 });
@@ -102,13 +81,11 @@ app.post('/api/profiles/:id/start', async (req, res) => {
     res.status(400).json({ success: false, error: 'type must be claude or codex' });
     return;
   }
-
   const result = await runPython(['cladex.py', 'start', id, '--type', relayType]);
   if (result.code !== 0) {
     res.status(500).json({ success: false, error: result.stderr || result.stdout || 'Failed to start relay' });
     return;
   }
-
   res.json({ success: true });
 });
 
@@ -119,13 +96,11 @@ app.post('/api/profiles/:id/stop', async (req, res) => {
     res.status(400).json({ success: false, error: 'type must be claude or codex' });
     return;
   }
-
   const result = await runPython(['cladex.py', 'stop', id, '--type', relayType]);
   if (result.code !== 0) {
     res.status(500).json({ success: false, error: result.stderr || result.stdout || 'Failed to stop relay' });
     return;
   }
-
   res.json({ success: true });
 });
 
@@ -136,13 +111,11 @@ app.delete('/api/profiles/:id', async (req, res) => {
     res.status(400).json({ success: false, error: 'type must be claude or codex' });
     return;
   }
-
   const result = await runPython(['cladex.py', 'remove', id, '--type', relayType]);
   if (result.code !== 0) {
     res.status(500).json({ success: false, error: result.stderr || result.stdout || 'Failed to remove profile' });
     return;
   }
-
   res.json({ success: true });
 });
 
@@ -161,7 +134,7 @@ app.get('/api/profiles/:id/logs', async (req, res) => {
   }
 
   try {
-    const profile = await findProfile(id, relayType as RelayType);
+    const profile = await findProfile(id, relayType);
     if (!profile?.logPath) {
       throw new Error('No log path found');
     }
@@ -189,7 +162,6 @@ app.post('/api/profiles', async (req, res) => {
   }
 
   const absoluteWorkspace = path.resolve(workspace);
-
   let result;
   if (relayType === 'codex') {
     result = await runPython([
@@ -224,7 +196,6 @@ app.post('/api/profiles', async (req, res) => {
     res.status(500).json({ success: false, error: result.stderr || result.stdout || 'Failed to create profile' });
     return;
   }
-
   res.json({ success: true });
 });
 

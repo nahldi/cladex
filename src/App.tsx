@@ -42,7 +42,6 @@ async function fetchProfiles(): Promise<Profile[]> {
     if (!res.ok) throw new Error('Failed to fetch');
     return await res.json();
   } catch {
-    // Return empty array if API not available
     return [];
   }
 }
@@ -150,15 +149,7 @@ export default function App() {
   const loadProfiles = useCallback(async () => {
     setLoading(true);
     const data = await fetchProfiles();
-    if (data.length > 0) {
-      setProfiles(data);
-    } else {
-      // Demo profiles when API not available
-      setProfiles([
-        { id: '1', name: 'Claude-Architect', type: 'Claude', workspace: '~/dev/core', status: 'Stopped', discordChannel: 'core-arch', state: 'idle' },
-        { id: '2', name: 'Codex-API', type: 'Codex', workspace: '~/dev/api', status: 'Stopped', discordChannel: 'api-v2', state: 'idle' },
-      ]);
-    }
+    setProfiles(data);
     setLoading(false);
   }, []);
 
@@ -222,22 +213,24 @@ export default function App() {
       <main className="relative z-10 h-screen flex flex-col pb-24">
         <AnimatePresence mode="wait">
           {view === 'dashboard' ? (
-            <DashboardView
-              key="dashboard"
-              profiles={profiles}
-              loading={loading}
-              actionLoading={actionLoading}
-              onToggle={toggleStatus}
-              onDelete={handleDelete}
-              onRefresh={loadProfiles}
-              onOpenLogs={(id) => { setSelectedProfileId(id); setActiveModal('logs'); }}
-            />
+            <motion.div key="dashboard">
+              <DashboardView
+                profiles={profiles}
+                loading={loading}
+                actionLoading={actionLoading}
+                onToggle={toggleStatus}
+                onDelete={handleDelete}
+                onRefresh={loadProfiles}
+                onOpenLogs={(id) => { setSelectedProfileId(id); setActiveModal('logs'); }}
+              />
+            </motion.div>
           ) : (
-            <ChatView
-              key="chat"
-              profiles={profiles}
-              messages={messages}
-            />
+            <motion.div key="chat">
+              <ChatView
+                profiles={profiles}
+                messages={messages}
+              />
+            </motion.div>
           )}
         </AnimatePresence>
       </main>
@@ -328,15 +321,16 @@ function DashboardView({ profiles, loading, actionLoading, onToggle, onDelete, o
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
           {profiles.map((profile, i) => (
-            <InteractiveCard
-              key={profile.id}
-              profile={profile}
-              index={i}
-              loading={actionLoading === profile.id}
-              onToggle={() => onToggle(profile.id)}
-              onDelete={() => onDelete(profile.id)}
-              onOpenLogs={() => onOpenLogs(profile.id)}
-            />
+            <React.Fragment key={profile.id}>
+              <InteractiveCard
+                profile={profile}
+                index={i}
+                loading={actionLoading === profile.id}
+                onToggle={() => onToggle(profile.id)}
+                onDelete={() => onDelete(profile.id)}
+                onOpenLogs={() => onOpenLogs(profile.id)}
+              />
+            </React.Fragment>
           ))}
         </div>
       )}
@@ -545,7 +539,11 @@ function ChatView({ profiles, messages }: { profiles: Profile[]; messages: Messa
         {activeAgents.length === 0 ? (
           <span className="text-sm text-gray-500 italic">No agents running in this workspace.</span>
         ) : (
-          activeAgents.map(agent => <GlowingNameplate key={agent.id} agent={agent} />)
+          activeAgents.map(agent => (
+            <React.Fragment key={agent.id}>
+              <GlowingNameplate agent={agent} />
+            </React.Fragment>
+          ))
         )}
       </div>
 

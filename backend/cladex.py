@@ -224,6 +224,32 @@ def _filter_profiles(name: str | None = None, relay_type: str | None = None) -> 
     return profiles
 
 
+def _profile_json_record(profile: dict[str, Any]) -> dict[str, Any]:
+    relay_type = str(profile.get("_relay_type", "")).strip().lower()
+    attach_channel = (
+        profile.get("attach_channel_id")
+        or profile.get("discord_channel")
+        or profile.get("channel")
+        or ""
+    )
+    return {
+        "id": profile.get("name", ""),
+        "name": profile.get("name", ""),
+        "type": "Claude" if relay_type == "claude" else "Codex",
+        "relayType": relay_type,
+        "workspace": profile.get("workspace", ""),
+        "status": "Running" if profile.get("_running") else "Stopped",
+        "running": bool(profile.get("_running")),
+        "ready": bool(profile.get("_ready")),
+        "provider": profile.get("_provider", ""),
+        "model": profile.get("_model", ""),
+        "triggerMode": profile.get("_trigger_mode", ""),
+        "discordChannel": attach_channel,
+        "state": "working" if profile.get("_running") else "idle",
+        "logPath": profile.get("_log_path", ""),
+    }
+
+
 def _print_table(profiles: list[dict[str, Any]]) -> None:
     if not profiles:
         print("No profiles found.")
@@ -244,19 +270,7 @@ def _print_table(profiles: list[dict[str, Any]]) -> None:
 def cmd_list(args: argparse.Namespace) -> int:
     profiles = _filter_profiles(relay_type=args.type)
     if getattr(args, 'json', False):
-        # JSON output for API
-        output = []
-        for p in profiles:
-            output.append({
-                "id": p.get("name", ""),
-                "name": p.get("name", ""),
-                "type": "Claude" if p.get("_relay_type") == "claude" else "Codex",
-                "workspace": p.get("workspace", ""),
-                "status": "Running" if p.get("_running") else "Stopped",
-                "discordChannel": p.get("channel_id", ""),
-                "state": "working" if p.get("_running") else "idle",
-            })
-        print(json.dumps(output))
+        print(json.dumps([_profile_json_record(profile) for profile in profiles]))
         return 0
     _print_table(profiles)
     return 0
@@ -265,8 +279,14 @@ def cmd_list(args: argparse.Namespace) -> int:
 def cmd_status(args: argparse.Namespace) -> int:
     profiles = _filter_profiles(name=args.name, relay_type=args.type)
     if getattr(args, 'json', False):
-        running = [p.get("name", "") for p in profiles if p.get("_running")]
-        print(json.dumps({"running": running}))
+        print(
+            json.dumps(
+                {
+                    "running": [p.get("name", "") for p in profiles if p.get("_running")],
+                    "profiles": [_profile_json_record(profile) for profile in profiles],
+                }
+            )
+        )
         return 0
     if not profiles:
         print("No matching profiles found.")
@@ -313,6 +333,73 @@ def cmd_restart(args: argparse.Namespace) -> int:
     for profile in profiles:
         restart_profile(profile)
         print(f"Restarted {profile['name']} [{profile['_relay_type']}].")
+    return 0
+
+
+def _remove_codex_profile(profile: dict[str, Any]) -> None:
+    relayctl._stop_profile(profile)
+    env_file = Path(str(profile.get("env_file", "")).strip())
+    registry = relayctl._load_registry()
+    registry["profiles"] = [item for item in registry.get("profiles", []) if item.get("name") != profile.get("name")]
+    for project in registry.get("projects", []):
+        members = [member for member in project.get("profiles", []) if member != profile.get("name")]
+        project["profiles"] = members
+    relayctl._save_registry(registry)
+    if env_file.exists():
+        env_file.unlink(missing_ok=True)
+
+
+def _remove_claude_profile(profile: dict[str, Any]) -> None:
+    stop_profile({**profile, "_relay_type": "claude"})
+    env_file = Path(str(profile.get("env_file", "")).strip())
+    registry = _load_claude_registry()
+    registry["profiles"] = [item for item in registry.get("profiles", []) if item.get("name") != profile.get("name")]
+    _claude_registry_path = CLAUDE_REGISTRY_PATH
+    _claude_registry_path.parent.mkdir(parents=True, exist_ok=True)
+    _claude_registry_path.write_text(json.dumps(registry, indent=2) + "\n", encoding="utf-8")
+    if env_file.exists():
+        env_file.unlink(missing_ok=True)
+
+
+def cmd_remove(args: argparse.Namespace) -> int:
+    if not args.name:
+        print("Provide a profile name to remove.")
+        return 1
+    profiles = _filter_profiles(name=args.name, relay_type=args.type)
+    if not profiles:
+        print("No matching profiles found.")
+        return 1
+    profile = profiles[0]
+    relay_type = profile.get("_relay_type")
+    if relay_type == "codex":
+        _remove_codex_profile(profile)
+    elif relay_type == "claude":
+        _remove_claude_profile(profile)
+    else:
+        raise RuntimeError(f"Unknown relay type: {relay_type}")
+    print(f"Removed {profile['name']} [{relay_type}].")
+    return 0
+
+
+def cmd_logs(args: argparse.Namespace) -> int:
+    profiles = _filter_profiles(name=args.name, relay_type=args.type)
+    if not profiles:
+        print("No matching profiles found.")
+        return 1
+    profile = profiles[0]
+    log_path = Path(str(profile.get("_log_path", "")).strip())
+    lines = max(int(getattr(args, "lines", 80) or 80), 1)
+    if not log_path.exists():
+        if getattr(args, "json", False):
+            print(json.dumps({"logs": []}))
+            return 0
+        print(f"No log file found for {profile['name']}.")
+        return 1
+    text = relayctl.tail_lines(log_path, lines)
+    if getattr(args, "json", False):
+        print(json.dumps({"logs": [line for line in text.splitlines() if line.strip()]}))
+        return 0
+    print(text, end="")
     return 0
 
 
@@ -485,6 +572,18 @@ def build_parser() -> argparse.ArgumentParser:
     restart_parser.add_argument("name", nargs="?")
     restart_parser.add_argument("--type", choices=("codex", "claude"), default=None)
     restart_parser.set_defaults(func=cmd_restart)
+
+    logs_parser = subparsers.add_parser("logs", help="Show recent logs for one profile.")
+    logs_parser.add_argument("name")
+    logs_parser.add_argument("--type", choices=("codex", "claude"), default=None)
+    logs_parser.add_argument("--lines", type=int, default=80)
+    logs_parser.add_argument("--json", action="store_true", help="Output logs as JSON")
+    logs_parser.set_defaults(func=cmd_logs)
+
+    remove_parser = subparsers.add_parser("remove", help="Remove a profile from the unified registry.")
+    remove_parser.add_argument("name")
+    remove_parser.add_argument("--type", choices=("codex", "claude"), default=None)
+    remove_parser.set_defaults(func=cmd_remove)
 
     gui_parser = subparsers.add_parser("gui", help="Open the CLADEX GUI.")
     gui_parser.set_defaults(func=cmd_gui)

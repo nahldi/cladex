@@ -1,5 +1,5 @@
 const { app, BrowserWindow, shell } = require('electron');
-const { spawn } = require('child_process');
+const { fork } = require('child_process');
 const path = require('path');
 
 let mainWindow = null;
@@ -8,12 +8,11 @@ let apiServer = null;
 const isDev = !app.isPackaged;
 
 function startApiServer() {
-  const serverPath = path.join(__dirname, '..', 'server.ts');
+  const serverPath = path.join(__dirname, '..', 'server.cjs');
 
-  apiServer = spawn('npx', ['tsx', serverPath], {
+  apiServer = fork(serverPath, [], {
     cwd: path.join(__dirname, '..'),
-    stdio: 'pipe',
-    shell: true,
+    silent: true,
   });
 
   apiServer.stdout?.on('data', (data) => {

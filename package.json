@@ -6,7 +6,7 @@
   "main": "electron/main.cjs",
   "scripts": {
     "dev": "vite --port=3000 --host=0.0.0.0",
-    "server": "tsx server.ts",
+    "server": "node server.cjs",
     "start": "concurrently \"npm run server\" \"npm run dev\"",
     "build": "vite build",
     "preview": "vite preview",
@@ -37,7 +37,6 @@
     "electron": "^41.2.0",
     "electron-builder": "^26.8.1",
     "tailwindcss": "^4.1.14",
-    "tsx": "^4.21.0",
     "typescript": "~5.8.2",
     "vite": "^6.2.0"
   },
@@ -51,7 +50,7 @@
       "dist/**/*",
       "electron/**/*",
       "backend/**/*",
-      "server.js"
+      "server.cjs"
     ],
     "extraResources": [
       {
