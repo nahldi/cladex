@@ -4,6 +4,10 @@
 
 A desktop app and CLI for managing Discord relays to both Claude Code and Codex CLI.
 
+The shipped product is local-first:
+- the desktop app talks to a local API server on loopback only
+- readable bot labels are surfaced ahead of technical profile ids
+
 ## Features
 
 - **Unified Manager**: Control both Claude and Codex relays from one interface
@@ -14,6 +18,25 @@ A desktop app and CLI for managing Discord relays to both Claude Code and Codex 
 - **Workspace-Scoped**: Each workspace can have multiple relay profiles
 
 ## Quick Start
+
+### Fastest Path For Most People
+
+1. Install Node.js 18+ and Python 3.10+.
+2. Install the AI CLIs you want to use:
+   - `codex`
+   - `claude`
+3. From this repo root, run:
+
+```bash
+npm install
+py -m pip install -e backend
+CLADEX.cmd
+```
+
+That gives you the desktop manager plus the Python relay commands:
+- `cladex`
+- `codex-discord`
+- `claude-discord`
 
 ### Desktop App
 
@@ -36,6 +59,7 @@ npm start  # Runs API server + Vite dev server
 
 Optional desktop UI environment variables live in `.env.example`.
 They are local settings for the Electron app and local API server only.
+By default the local API binds to `127.0.0.1:3001`.
 
 ### Build Installer
 
@@ -44,8 +68,8 @@ npm run electron:build  # Creates installer in release/
 ```
 
 Packaged launchers produced by the build:
-- `release\CLADEX Setup 2.0.1.exe`
-- `release\CLADEX 2.0.1.exe`
+- `release\CLADEX Setup 2.0.2.exe`
+- `release\CLADEX 2.0.2.exe`
 - `release\win-unpacked\CLADEX.exe`
 
 ### Backend CLI
@@ -72,6 +96,7 @@ cladex/
     relayctl.py         # Codex relay
     bot.py              # Codex Discord bot
     relay_runtime.py    # Shared durable runtime
+  CLADEX.cmd       # Easy local launcher
 ```
 
 ## CLI Commands
@@ -123,6 +148,13 @@ codex-discord stop
 - Claude Code CLI (`claude`)
 - Codex CLI (`codex`)
 - Discord bot token
+
+## Distribution Notes
+
+- Local generated runtime files at the repo root are ignored and not meant for git.
+- Release builds are written to `release/`.
+- The Python backend package name stays `discord-codex-relay` for command/package compatibility.
+- The desktop product name remains `CLADEX`.
 
 ## License
 

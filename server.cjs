@@ -7,6 +7,8 @@ const fsSync = require('fs');
 
 const execFileAsync = promisify(execFile);
 const app = express();
+const API_HOST = process.env.API_HOST || '127.0.0.1';
+const API_PORT = Number(process.env.API_PORT || 3001);
 
 app.use(express.json());
 app.use((req, res, next) => {
@@ -73,10 +75,10 @@ async function runJson(args, cwd = BACKEND_DIR) {
 
 app.get('/api/runtime-info', async (_req, res) => {
   res.json({
-    apiBase: `http://localhost:${Number(process.env.API_PORT || 3001)}`,
+    apiBase: `http://${API_HOST}:${API_PORT}`,
     backendDir: BACKEND_DIR,
     packaged: process.env.NODE_ENV === 'production' || !!process.resourcesPath,
-    appVersion: process.env.npm_package_version || '2.0.1',
+    appVersion: process.env.npm_package_version || '2.0.2',
   });
 });
 
@@ -360,7 +362,6 @@ app.delete('/api/projects/:name', async (req, res) => {
   res.json({ success: true });
 });
 
-const PORT = Number(process.env.API_PORT || 3001);
-app.listen(PORT, () => {
-  console.log(`CLADEX API server running on http://localhost:${PORT}`);
+app.listen(API_PORT, API_HOST, () => {
+  console.log(`CLADEX API server running on http://${API_HOST}:${API_PORT}`);
 });

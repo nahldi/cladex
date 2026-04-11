@@ -1,9 +1,12 @@
 const { app, BrowserWindow, shell } = require('electron');
 const { fork } = require('child_process');
+const http = require('http');
 const path = require('path');
 
 let mainWindow = null;
 let apiServer = null;
+const API_PORT = Number(process.env.API_PORT || 3001);
+const API_HOST = process.env.API_HOST || '127.0.0.1';
 
 const isDev = !app.isPackaged;
 
@@ -31,6 +34,45 @@ function startApiServer() {
 
   apiServer.on('close', (code) => {
     console.log(`API server exited with code ${code}`);
+  });
+}
+
+function waitForApi(timeoutMs = 10000) {
+  const startedAt = Date.now();
+  return new Promise((resolve, reject) => {
+    const attempt = () => {
+      const request = http.get(
+        {
+          host: API_HOST,
+          port: API_PORT,
+          path: '/api/runtime-info',
+          timeout: 1200,
+        },
+        (response) => {
+          response.resume();
+          if (response.statusCode && response.statusCode >= 200 && response.statusCode < 500) {
+            resolve();
+            return;
+          }
+          retry();
+        },
+      );
+      request.on('error', retry);
+      request.on('timeout', () => {
+        request.destroy();
+        retry();
+      });
+    };
+
+    const retry = () => {
+      if (Date.now() - startedAt > timeoutMs) {
+        reject(new Error(`CLADEX API server did not become ready on ${API_HOST}:${API_PORT}`));
+        return;
+      }
+      setTimeout(attempt, 250);
+    };
+
+    attempt();
   });
 }
 
@@ -78,11 +120,14 @@ function createWindow() {
   });
 }
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
   startApiServer();
-
-  // Give API server a moment to start
-  setTimeout(createWindow, 1500);
+  try {
+    await waitForApi();
+  } catch (error) {
+    console.error(error);
+  }
+  createWindow();
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {

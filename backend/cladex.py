@@ -789,7 +789,7 @@ def cmd_project_save(args: argparse.Namespace) -> int:
     members: list[dict[str, str]] = []
     for raw_member in args.member:
         if ":" not in raw_member:
-            raise SystemExit("Members must use relayType:name format, for example `codex:tyson-1234`.")
+            raise SystemExit("Members must use relayType:name format, for example `codex:Tyson`.")
         relay_type, member_name = raw_member.split(":", 1)
         matches = _filter_profiles(name=member_name, relay_type=relay_type.strip().lower())
         if not matches:
