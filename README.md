@@ -2,39 +2,39 @@
 
 **CL**aude + Co**DEX** - Unified Discord Relay Manager
 
-A beautiful GUI and CLI for managing Discord relays to both Claude Code and Codex CLI.
+A desktop app and CLI for managing Discord relays to both Claude Code and Codex CLI.
 
 ## Features
 
 - **Unified Manager**: Control both Claude and Codex relays from one interface
-- **Modern GUI**: React + Vite frontend with 3D interactive cards and animations
+- **Desktop App**: Native Electron app with animated UI
+- **Durable Runtime**: Both relays use per-channel session binding and persistent memory
 - **CLI Tools**: `cladex`, `claude-discord`, `codex-discord` commands
 - **Session Persistence**: Automatic session management with resume capability
 - **Workspace-Scoped**: Each workspace can have multiple relay profiles
 
-## Structure
-
-```
-cladex/
-  src/           # React frontend (Vite + Tailwind + Framer Motion)
-  backend/       # Python relay backend
-    cladex.py         # Unified manager
-    claude_relay.py   # Claude Code relay
-    relayctl.py       # Codex relay
-    bot.py            # Discord bot
-    ...
-```
-
 ## Quick Start
 
-### Frontend (GUI)
+### Desktop App
 
 ```bash
 npm install
-npm run dev
+npm run app
 ```
 
-### Backend (CLI)
+### Development Mode
+
+```bash
+npm start  # Runs API server + Vite dev server
+```
+
+### Build Installer
+
+```bash
+npm run electron:build  # Creates installer in release/
+```
+
+### Backend CLI
 
 ```bash
 cd backend
@@ -42,6 +42,22 @@ pip install -e .
 cladex list
 cladex start --type claude
 cladex start --type codex
+```
+
+## Structure
+
+```
+cladex/
+  src/              # React frontend (Vite + Tailwind + Framer Motion)
+  electron/         # Electron main process
+  server.cjs        # API server
+  backend/          # Python relay backend
+    cladex.py           # Unified manager
+    claude_relay.py     # Claude Code relay
+    claude_backend.py   # Claude durable runtime
+    relayctl.py         # Codex relay
+    bot.py              # Codex Discord bot
+    relay_runtime.py    # Shared durable runtime
 ```
 
 ## CLI Commands
@@ -52,7 +68,7 @@ cladex list              # List all profiles
 cladex status            # Show running relays
 cladex start --type X    # Start relay (claude/codex)
 cladex stop --type X     # Stop relay
-cladex gui               # Open GUI
+cladex gui               # Open tkinter GUI
 
 # Claude relay
 claude-discord setup
@@ -69,21 +85,25 @@ codex-discord status
 codex-discord stop
 ```
 
-## Session Lifecycle
+## Runtime Details
 
 ### Claude
-- First turn: `claude -p --output-format stream-json --session-id <uuid>`
-- Later turns: `claude -p --output-format stream-json --resume <session_id>`
+- Uses `DurableRuntime` for per-channel session binding
+- CLI: `claude -p --output-format stream-json --model claude-opus-4-5-20251101`
+- First turn: `--session-id <uuid>`
+- Later turns: `--resume <session_id>`
+- Turn artifacts recorded to STATUS.md, HANDOFF.md, TASKS.json
 - Auto-recovery on stale sessions
 
 ### Codex
 - App-server primary backend with CLI fallback
 - Adaptive reasoning effort (medium/high/xhigh)
 - Durable memory in SQLite + repo memory files
+- Per-channel worktree binding
 
 ## Requirements
 
-- Node.js 18+ (frontend)
+- Node.js 18+ (frontend/Electron)
 - Python 3.10+ (backend)
 - Claude Code CLI (`claude`)
 - Codex CLI (`codex`)
