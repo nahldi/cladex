@@ -272,7 +272,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
     print("\n[OK] Setup complete!")
     print("\nNext steps:")
     print("  1. Run 'claude-discord' in your workspace to register a bot")
-    print("  2. Or run 'cladex gui' from discord-codex-relay to open the canonical manager")
+    print("  2. Or run 'cladex gui' to open the canonical desktop manager")
 
     return 0
 
@@ -411,10 +411,10 @@ def cmd_list(args: argparse.Namespace) -> int:
 
 
 def cmd_gui(args: argparse.Namespace) -> int:
-    """Open the canonical GUI manager from discord-codex-relay."""
+    """Open the canonical CLADEX desktop manager."""
     cladex_bin = shutil.which("cladex")
     if not cladex_bin:
-        print("cladex is not installed. Install or update discord-codex-relay first.")
+        print("cladex is not installed. Install or update the CLADEX package first.")
         return 1
 
     kwargs = {"close_fds": True}

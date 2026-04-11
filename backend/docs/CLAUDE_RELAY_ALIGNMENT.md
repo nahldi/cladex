@@ -37,9 +37,11 @@ Claude now inherits the same durable memory lifecycle as Codex:
 ## Remaining Differences from Codex
 
 - Claude uses CLI print-mode (`-p`), not app-server
-- No adaptive reasoning effort (Codex has medium/high/xhigh)
 - No SQLite state (uses file-based durable memory only)
 - Still needs longer-run soak testing under restart/recovery scenarios
+
+Claude does have relay-side adaptive effort selection now.
+The remaining gap is backend depth and long-run validation, not the absence of an effort policy.
 
 ## Practical Rule
 

@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-Common utilities for the Discord Claude Relay.
-Mirrors the structure of relay_common.py from discord-codex-relay.
+Common utilities for the Claude relay inside the unified CLADEX package.
 """
 from __future__ import annotations
 

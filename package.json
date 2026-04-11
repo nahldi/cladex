@@ -1,7 +1,7 @@
 {
   "name": "cladex",
   "private": true,
-  "version": "2.0.0",
+  "version": "2.0.1",
   "author": "CLADEX Contributors",
   "description": "Unified desktop and CLI manager for Codex and Claude Discord relays.",
   "type": "module",
@@ -20,7 +20,6 @@
     "app": "npm run build && electron ."
   },
   "dependencies": {
-    "@google/genai": "^1.29.0",
     "@tailwindcss/vite": "^4.1.14",
     "@vitejs/plugin-react": "^5.0.4",
     "dotenv": "^17.2.3",
@@ -71,20 +70,29 @@
       {
         "from": "assets",
         "to": "assets",
-        "filter": ["**/*"]
+        "filter": [
+          "**/*"
+        ]
       }
     ],
     "win": {
-      "target": ["nsis", "portable"],
+      "target": [
+        "nsis",
+        "portable"
+      ],
       "signAndEditExecutable": false,
       "icon": "assets/icon.png"
     },
     "mac": {
-      "target": ["dmg"],
+      "target": [
+        "dmg"
+      ],
       "icon": "assets/icon.png"
     },
     "linux": {
-      "target": ["AppImage"],
+      "target": [
+        "AppImage"
+      ],
       "icon": "assets/icon.png"
     },
     "icon": "assets/icon.png"

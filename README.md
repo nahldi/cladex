@@ -28,6 +28,9 @@ npm run app
 npm start  # Runs API server + Vite dev server
 ```
 
+Optional desktop UI environment variables live in `.env.example`.
+They are local settings only. CLADEX does not require Gemini, Google, AI Studio, or Cloud Run configuration.
+
 ### Build Installer
 
 ```bash
@@ -68,7 +71,7 @@ cladex list              # List all profiles
 cladex status            # Show running relays
 cladex start --type X    # Start relay (claude/codex)
 cladex stop --type X     # Stop relay
-cladex gui               # Open tkinter GUI
+cladex gui               # Open the desktop relay manager
 
 # Claude relay
 claude-discord setup
@@ -92,6 +95,7 @@ codex-discord stop
 - CLI: `claude -p --output-format stream-json --model claude-opus-4-5-20251101`
 - First turn: `--session-id <uuid>`
 - Later turns: `--resume <session_id>`
+- Adaptive effort policy through the relay: quick turns use `medium`, implementation and repair use `high`, and `xhigh` can be enabled explicitly
 - Turn artifacts recorded to STATUS.md, HANDOFF.md, TASKS.json
 - Auto-recovery on stale sessions
 

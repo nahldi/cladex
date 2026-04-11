@@ -706,7 +706,7 @@ class RelayBackend:
     High-level relay backend for Discord.
 
     GUI chat is intentionally out of scope for this repo; the canonical manager
-    lives in discord-codex-relay.
+    lives in CLADEX.
     """
 
     def __init__(

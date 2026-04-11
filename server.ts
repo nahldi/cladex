@@ -116,7 +116,7 @@ app.get('/api/runtime-info', async (_req, res) => {
     apiBase: `http://localhost:${Number(process.env.API_PORT || 3001)}`,
     backendDir: BACKEND_DIR,
     packaged: app.get('env') === 'production' || !!process.resourcesPath,
-    appVersion: process.env.npm_package_version || '2.0.0',
+    appVersion: process.env.npm_package_version || '2.0.1',
   };
   res.json(payload);
 });
