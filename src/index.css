@@ -1,8 +1,10 @@
 @import "tailwindcss";
 
+@custom-variant dark (&:where(.dark, .dark *));
+
 @theme {
-  --color-claude: #f97316;
-  --color-codex: #10b981;
+  --color-claude: #d4735e;
+  --color-codex: #7db5a5;
 }
 
 @layer utilities {
@@ -20,6 +22,21 @@
     0% { transform: translateY(0) scale(1); opacity: 1; }
     100% { transform: translateY(-50px) scale(1.5); opacity: 0; }
   }
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  background: #f2efe7;
+}
+
+.dark body {
+  background: #050505;
 }
 
 /* Custom Scrollbar for a sleeker look */

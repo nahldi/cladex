@@ -8,11 +8,17 @@ let apiServer = null;
 const isDev = !app.isPackaged;
 
 function startApiServer() {
-  const serverPath = path.join(__dirname, '..', 'server.cjs');
+  const serverPath = app.isPackaged
+    ? path.join(process.resourcesPath, 'app.asar.unpacked', 'server.cjs')
+    : path.join(__dirname, '..', 'server.cjs');
+  const serverCwd = app.isPackaged
+    ? process.resourcesPath
+    : path.join(__dirname, '..');
 
   apiServer = fork(serverPath, [], {
-    cwd: path.join(__dirname, '..'),
+    cwd: serverCwd,
     silent: true,
+    windowsHide: true,
   });
 
   apiServer.stdout?.on('data', (data) => {

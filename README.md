@@ -22,6 +22,12 @@ npm install
 npm run app
 ```
 
+Fastest local launcher from this repo:
+
+```bat
+CLADEX.cmd
+```
+
 ### Development Mode
 
 ```bash
@@ -36,6 +42,11 @@ They are local settings for the Electron app and local API server only.
 ```bash
 npm run electron:build  # Creates installer in release/
 ```
+
+Packaged launchers produced by the build:
+- `release\CLADEX Setup 2.0.1.exe`
+- `release\CLADEX 2.0.1.exe`
+- `release\win-unpacked\CLADEX.exe`
 
 ### Backend CLI
 

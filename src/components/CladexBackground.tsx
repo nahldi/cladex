@@ -10,9 +10,9 @@ type Particle = {
   color: string;
 };
 
-const COLORS = ['#f97316', '#10b981', '#6366f1', '#64748b'];
+const COLORS = ['#d4735e', '#7db5a5', '#6366f1', '#64748b'];
 
-export default function CladexBackground() {
+export default function CladexBackground({ isDark }: { isDark: boolean }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
   useEffect(() => {
@@ -57,7 +57,7 @@ export default function CladexBackground() {
 
     const animate = () => {
       frame += 0.004;
-      ctx.fillStyle = '#050505';
+      ctx.fillStyle = isDark ? '#050505' : '#f2efe7';
       ctx.fillRect(0, 0, canvas.width, canvas.height);
 
       for (const particle of particles) {
@@ -102,22 +102,29 @@ export default function CladexBackground() {
       window.removeEventListener('mousemove', onMouseMove);
       window.removeEventListener('mouseleave', onMouseLeave);
     };
-  }, []);
+  }, [isDark]);
 
   return (
     <div className="pointer-events-none fixed inset-0 z-0 overflow-hidden">
       <canvas ref={canvasRef} className="absolute inset-0 h-full w-full" />
       <motion.div
-        className="absolute -left-[12%] top-[-18%] h-[48rem] w-[48rem] rounded-full bg-orange-500/10 blur-[130px]"
+        className={`absolute -left-[12%] top-[-18%] h-[48rem] w-[48rem] rounded-full blur-[130px] transition-colors duration-500 ${isDark ? 'bg-[#d4735e]/12' : 'bg-[#d4735e]/20 mix-blend-multiply'}`}
         animate={{ x: [0, 36, 0], y: [0, 18, 0], scale: [1, 1.04, 1] }}
         transition={{ duration: 24, repeat: Infinity, ease: 'easeInOut' }}
       />
       <motion.div
-        className="absolute bottom-[-22%] right-[-8%] h-[50rem] w-[50rem] rounded-full bg-emerald-500/10 blur-[160px]"
+        className={`absolute bottom-[-22%] right-[-8%] h-[50rem] w-[50rem] rounded-full blur-[160px] transition-colors duration-500 ${isDark ? 'bg-[#7db5a5]/12' : 'bg-[#7db5a5]/18 mix-blend-multiply'}`}
         animate={{ x: [0, -44, 0], y: [0, -28, 0], scale: [1, 1.08, 1] }}
         transition={{ duration: 28, repeat: Infinity, ease: 'easeInOut', delay: 1.5 }}
       />
-      <div className="absolute inset-0 bg-[radial-gradient(circle_at_center,transparent_0,rgba(5,5,5,0.1)_55%,rgba(5,5,5,0.45)_100%)]" />
+      <div className={`absolute inset-0 ${isDark ? 'bg-[radial-gradient(circle_at_center,transparent_0,rgba(5,5,5,0.1)_55%,rgba(5,5,5,0.45)_100%)]' : 'bg-[radial-gradient(circle_at_center,transparent_0,rgba(242,239,231,0.16)_55%,rgba(242,239,231,0.76)_100%)]'}`} />
+      <div
+        className={`absolute inset-0 opacity-[0.08] ${isDark ? 'mix-blend-overlay' : 'mix-blend-multiply'}`}
+        style={{
+          backgroundImage:
+            'radial-gradient(circle at 20% 20%, rgba(255,255,255,0.7) 0, transparent 22%), radial-gradient(circle at 80% 30%, rgba(255,255,255,0.65) 0, transparent 20%), radial-gradient(circle at 50% 80%, rgba(255,255,255,0.55) 0, transparent 18%)',
+        }}
+      />
     </div>
   );
 }

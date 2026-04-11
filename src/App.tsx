@@ -1,12 +1,14 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { AnimatePresence, motion } from 'motion/react';
+import { AnimatePresence, motion, useMotionTemplate, useMotionValue, useSpring, useTransform } from 'motion/react';
 import {
   Activity,
   Bot,
+  ChevronRight,
   FileText,
   FolderKanban,
   LayoutGrid,
   Loader2,
+  MessageSquare,
   PauseCircle,
   Pencil,
   Play,
@@ -49,6 +51,8 @@ interface Profile {
   statusText?: string;
   activeWorktree?: string;
   activeChannel?: string;
+  sessionId?: string;
+  stateNamespace?: string;
 }
 
 interface RuntimeInfo {
@@ -89,6 +93,7 @@ interface ProfileSettingsData {
 }
 
 const API_BASE = 'http://localhost:3001/api';
+const CLADEX_LOGO = new URL('../assets/icon.png', import.meta.url).href;
 
 function labelFor(profile: Profile): string {
   return profile.displayName || profile.botName || profile.workspaceLabel || humanize(profile.technicalName || profile.name || 'Relay');
@@ -151,6 +156,11 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [busyKey, setBusyKey] = useState<string | null>(null);
   const [errorText, setErrorText] = useState('');
+  const isDark = true;
+
+  useEffect(() => {
+    document.documentElement.classList.add('dark');
+  }, [isDark]);
 
   const loadAll = useCallback(async (silent = false) => {
     if (!silent) {
@@ -203,28 +213,28 @@ export default function App() {
   }
 
   return (
-    <div className="relative min-h-screen overflow-hidden bg-[#050505] font-sans text-gray-100 selection:bg-indigo-500/30">
-      <CladexBackground />
-      <div className="pointer-events-none absolute inset-0 z-0 bg-[radial-gradient(circle_at_top,rgba(249,115,22,0.12),transparent_28%),radial-gradient(circle_at_bottom_right,rgba(16,185,129,0.12),transparent_32%)]" />
+    <div className={`relative min-h-screen overflow-hidden font-sans transition-colors duration-500 selection:bg-indigo-500/30 ${isDark ? 'bg-[#050505] text-gray-100' : 'bg-[#f2efe7] text-slate-900'}`}>
+      <CladexBackground isDark={isDark} />
+      <div className={`pointer-events-none absolute inset-0 z-0 transition-opacity duration-500 ${isDark ? 'bg-[radial-gradient(circle_at_top,rgba(249,115,22,0.12),transparent_28%),radial-gradient(circle_at_bottom_right,rgba(16,185,129,0.12),transparent_32%)] opacity-100' : 'bg-[radial-gradient(circle_at_top,rgba(212,115,94,0.16),transparent_30%),radial-gradient(circle_at_bottom_right,rgba(125,181,165,0.18),transparent_34%)] opacity-80'}`} />
       <main className="relative z-10 flex h-screen flex-col pb-24">
         <header className="mx-auto flex w-full max-w-7xl items-center justify-between px-8 pt-8">
           <div className="flex items-center gap-4">
-            <div className="relative h-14 w-14 overflow-hidden rounded-2xl border border-white/10 bg-white/5 shadow-[0_0_30px_rgba(99,102,241,0.18)]">
-              <img src="/cladex.png" alt="CLADEX" className="h-full w-full object-cover" />
+            <div className={`relative h-16 w-16 overflow-hidden rounded-[22px] border shadow-[0_0_35px_rgba(99,102,241,0.18)] ${isDark ? 'border-white/10 bg-white/5' : 'border-black/10 bg-white/70 shadow-[0_0_35px_rgba(212,115,94,0.12)]'}`}>
+              <img src={CLADEX_LOGO} alt="CLADEX" className="h-full w-full object-cover" />
             </div>
             <div>
-              <h1 className="text-3xl font-black tracking-tight text-white">CLADEX</h1>
-              <p className="font-mono text-xs uppercase tracking-[0.28em] text-orange-300/90">Unified Relay Control</p>
-              <p className="mt-2 max-w-2xl text-sm text-gray-400">Readable Claude and Codex relay control with the real runtime behind it. No placeholder state. No ugly profile slugs as the main labels.</p>
+              <h1 className={`text-4xl font-black tracking-tight ${isDark ? 'text-white' : 'text-slate-900'}`}>CLADEX</h1>
+              <p className={`font-mono text-xs uppercase tracking-[0.28em] ${isDark ? 'text-orange-300/90' : 'text-[#b15f4e]'}`}>Unified Relay Control</p>
+              <p className={`mt-2 max-w-2xl text-sm ${isDark ? 'text-gray-400' : 'text-slate-600'}`}>Readable Claude and Codex relay control with the real runtime behind it. Real labels. Real settings. Real logs. No placeholder state.</p>
             </div>
           </div>
           <div className="hidden gap-3 md:flex">
             <ActionButton label="Refresh" icon={<RefreshCw size={16} />} busy={loading} onClick={() => void loadAll()} />
-            <ActionButton label="Stop All" icon={<PauseCircle size={16} />} busy={busyKey === 'stop-all'} tone="danger" onClick={() => void runAction('stop-all', api.stopAll)} />
+            <ActionButton label="Stop All" icon={<PauseCircle size={16} />} busy={busyKey === 'stop-all'} tone="danger" light={!isDark} onClick={() => void runAction('stop-all', api.stopAll)} />
           </div>
         </header>
 
-        {errorText ? <div className="mx-auto mt-4 w-full max-w-7xl rounded-2xl border border-amber-500/20 bg-amber-500/10 px-4 py-3 text-sm text-amber-100">{errorText}</div> : null}
+        {errorText ? <div className={`mx-auto mt-4 w-full max-w-7xl rounded-2xl border px-4 py-3 text-sm ${isDark ? 'border-amber-500/20 bg-amber-500/10 text-amber-100' : 'border-amber-300 bg-amber-50 text-amber-950'}`}>{errorText}</div> : null}
 
         <AnimatePresence mode="wait">
           {view === 'relays' ? (
@@ -268,13 +278,13 @@ export default function App() {
       </main>
 
       <div className="fixed bottom-6 left-1/2 z-50 -translate-x-1/2">
-        <div className="flex items-center gap-2 rounded-2xl border border-white/10 bg-white/5 p-2 backdrop-blur-xl shadow-2xl shadow-black/50">
-          <DockButton icon={<LayoutGrid />} label="Relays" active={view === 'relays'} onClick={() => setView('relays')} />
-          <DockButton icon={<FolderKanban />} label="Workgroups" active={view === 'workgroups'} onClick={() => setView('workgroups')} />
-          <DockButton icon={<FileText />} label="Live Feed" active={view === 'live'} onClick={() => setView('live')} />
-          <div className="mx-2 h-8 w-px bg-white/10" />
-          <DockButton icon={<Plus />} label="Add Relay" onClick={() => setActiveModal('add')} />
-          <DockButton icon={<Settings />} label="Settings" onClick={() => setActiveModal('settings')} />
+        <div className={`flex items-center gap-2 rounded-2xl border p-2 backdrop-blur-xl shadow-2xl transition-colors duration-500 ${isDark ? 'border-white/10 bg-white/5 shadow-black/50' : 'border-slate-300/70 bg-white/80 shadow-slate-300/50'}`}>
+          <DockButton icon={<LayoutGrid />} label="Relays" active={view === 'relays'} onClick={() => setView('relays')} light={!isDark} />
+          <DockButton icon={<FolderKanban />} label="Workgroups" active={view === 'workgroups'} onClick={() => setView('workgroups')} light={!isDark} />
+          <DockButton icon={<MessageSquare />} label="Live Console" active={view === 'live'} onClick={() => setView('live')} light={!isDark} />
+          <div className={`mx-2 h-8 w-px ${isDark ? 'bg-white/10' : 'bg-slate-300/80'}`} />
+          <DockButton icon={<Plus />} label="Add Relay" onClick={() => setActiveModal('add')} light={!isDark} />
+          <DockButton icon={<Settings />} label="Runtime" onClick={() => setActiveModal('settings')} light={!isDark} />
         </div>
       </div>
 
@@ -367,17 +377,49 @@ function RelayCard({
 }) {
   const isClaude = profile.type === 'Claude';
   const running = profile.running;
-  const tone = isClaude ? 'border-orange-500/25 bg-orange-500/8 text-orange-200' : 'border-emerald-500/25 bg-emerald-500/8 text-emerald-200';
+  const accent = isClaude ? '#d4735e' : '#7db5a5';
+  const tiltX = useMotionValue(0);
+  const tiltY = useMotionValue(0);
+  const pointerX = useMotionValue(0);
+  const pointerY = useMotionValue(0);
+  const springX = useSpring(tiltX, { stiffness: 280, damping: 26, mass: 0.4 });
+  const springY = useSpring(tiltY, { stiffness: 280, damping: 26, mass: 0.4 });
+  const rotateX = useTransform(springY, [-0.5, 0.5], ['10deg', '-10deg']);
+  const rotateY = useTransform(springX, [-0.5, 0.5], ['-10deg', '10deg']);
+  const spotlight = useMotionTemplate`radial-gradient(320px circle at ${pointerX}px ${pointerY}px, ${isClaude ? 'rgba(212,115,94,0.16)' : 'rgba(125,181,165,0.18)'}, transparent 50%)`;
+
+  function handlePointerMove(event: React.MouseEvent<HTMLDivElement>) {
+    const bounds = event.currentTarget.getBoundingClientRect();
+    pointerX.set(event.clientX - bounds.left);
+    pointerY.set(event.clientY - bounds.top);
+    tiltX.set((event.clientX - (bounds.left + bounds.width / 2)) / bounds.width);
+    tiltY.set((event.clientY - (bounds.top + bounds.height / 2)) / bounds.height);
+  }
+
+  function resetPointer() {
+    tiltX.set(0);
+    tiltY.set(0);
+  }
 
   return (
-    <div className="relative overflow-hidden rounded-[30px] border border-white/10 bg-[#0a0a0c] p-6 shadow-2xl">
-      <div className="absolute inset-0 bg-[linear-gradient(to_right,#ffffff05_1px,transparent_1px),linear-gradient(to_bottom,#ffffff05_1px,transparent_1px)] bg-[size:24px_24px] opacity-50" />
-      <div className="relative z-10 flex h-full flex-col">
+    <motion.div
+      onMouseMove={handlePointerMove}
+      onMouseLeave={resetPointer}
+      style={{ rotateX, rotateY, transformStyle: 'preserve-3d' }}
+      whileHover={{ scale: 1.015 }}
+      className="relative [perspective:1200px]"
+    >
+      <div className="absolute inset-0 rounded-[32px] bg-black/20 blur-2xl dark:bg-black/30" />
+      <div className="relative overflow-hidden rounded-[30px] border border-slate-200/80 bg-white/80 p-6 shadow-[0_22px_60px_rgba(15,23,42,0.12)] backdrop-blur-xl transition-colors duration-500 dark:border-white/10 dark:bg-[#0a0a0c]/92 dark:shadow-2xl">
+        <div className="absolute inset-0 bg-[linear-gradient(to_right,#0f172a08_1px,transparent_1px),linear-gradient(to_bottom,#0f172a08_1px,transparent_1px)] bg-[size:24px_24px] opacity-60 dark:bg-[linear-gradient(to_right,#ffffff05_1px,transparent_1px),linear-gradient(to_bottom,#ffffff05_1px,transparent_1px)]" />
+        <motion.div className="pointer-events-none absolute inset-0 rounded-[30px] opacity-0 transition-opacity duration-300 group-hover:opacity-100" style={{ background: spotlight }} />
+        <div className="pointer-events-none absolute -right-14 top-10 h-28 w-28 rounded-full blur-3xl" style={{ background: `${accent}25` }} />
+        <div className="relative z-10 flex h-full flex-col">
         <div className="flex items-start justify-between gap-4">
           <div>
-            <div className={`inline-flex rounded-full border px-2 py-1 text-[10px] font-bold uppercase tracking-[0.22em] ${tone}`}>{profile.type}</div>
-            <h3 className="mt-3 text-2xl font-bold tracking-tight text-white">{labelFor(profile)}</h3>
-            <p className="mt-1 text-sm text-gray-400">{workspaceFor(profile)}</p>
+            <div className={`inline-flex rounded-full border px-2 py-1 text-[10px] font-bold uppercase tracking-[0.22em] ${isClaude ? 'border-orange-500/30 bg-orange-500/10 text-orange-700 dark:text-orange-200' : 'border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-200'}`}>{profile.type}</div>
+            <h3 className="mt-3 text-2xl font-bold tracking-tight text-slate-900 dark:text-white">{labelFor(profile)}</h3>
+            <p className="mt-1 text-sm text-slate-500 dark:text-gray-400">{workspaceFor(profile)}</p>
           </div>
           <div className="flex gap-2">
             <MiniIconButton label="Logs" icon={<FileText size={14} />} onClick={onLogs} />
@@ -387,7 +429,28 @@ function RelayCard({
           </div>
         </div>
 
-        <div className="mt-6 rounded-2xl border border-white/10 bg-white/[0.03] p-4">
+        <div className="mt-5 flex items-center justify-center py-3">
+          <div className="flex w-full max-w-[220px] items-center justify-between">
+            <div className="flex h-11 w-11 items-center justify-center rounded-2xl border-2 bg-white shadow-lg dark:bg-[#09090b]" style={{ borderColor: running ? accent : 'rgba(148,163,184,0.35)', color: running ? accent : undefined }}>
+              {isClaude ? <Bot size={18} /> : <Terminal size={18} />}
+            </div>
+            <div className="relative mx-4 h-[2px] flex-1 overflow-hidden rounded-full bg-slate-200 dark:bg-white/10">
+              {running ? (
+                <motion.div
+                  className="absolute inset-y-0 left-[-35%] w-1/2"
+                  style={{ background: `linear-gradient(to right, transparent, ${accent}, transparent)` }}
+                  animate={{ x: ['-10%', '220%'] }}
+                  transition={{ duration: 1.2, repeat: Infinity, ease: 'linear' }}
+                />
+              ) : null}
+            </div>
+            <div className={`flex h-11 w-11 items-center justify-center rounded-2xl border-2 ${running ? 'border-[#5865f2] bg-[#5865f2]/10 text-[#5865f2]' : 'border-slate-300 bg-slate-100 text-slate-400 dark:border-white/10 dark:bg-white/5 dark:text-gray-500'}`}>
+              <MessageSquare size={18} />
+            </div>
+          </div>
+        </div>
+
+        <div className="mt-2 rounded-2xl border border-slate-200/80 bg-white/70 p-4 text-sm leading-relaxed text-slate-700 dark:border-white/10 dark:bg-white/[0.03] dark:text-gray-300">
           <InfoRow label="Backend" value={profile.provider || 'Relay runtime'} mono />
           <InfoRow label="Model" value={profile.model || (profile.type === 'Codex' ? 'gpt-5.4' : 'Claude default')} mono />
           <InfoRow label="Trigger" value={profile.triggerMode || 'Mention or direct message'} />
@@ -395,13 +458,13 @@ function RelayCard({
           <InfoRow label="Channel" value={channelFor(profile)} />
         </div>
 
-        <div className="mt-4 rounded-2xl border border-white/5 bg-black/30 p-4 text-sm leading-relaxed text-gray-300">
+        <div className="mt-4 rounded-2xl border border-slate-200/80 bg-slate-50/80 p-4 text-sm leading-relaxed text-slate-700 dark:border-white/5 dark:bg-black/30 dark:text-gray-300">
           {profile.statusText || 'Ready for the next Discord turn.'}
         </div>
 
         <div className="mt-auto flex items-center justify-between pt-5">
-          <div className="flex items-center gap-2 text-sm text-gray-400">
-            <span className={`h-2.5 w-2.5 rounded-full ${running ? (isClaude ? 'bg-orange-400' : 'bg-emerald-400') : 'bg-gray-600'} ${running ? 'animate-pulse' : ''}`} />
+          <div className="flex items-center gap-2 text-sm text-slate-500 dark:text-gray-400">
+            <span className={`h-2.5 w-2.5 rounded-full ${running ? (isClaude ? 'bg-orange-400' : 'bg-emerald-400') : 'bg-slate-400 dark:bg-gray-600'} ${running ? 'animate-pulse' : ''}`} />
             {running ? (profile.state === 'working' ? 'Working' : 'Listening') : 'Stopped'}
           </div>
           <button
@@ -411,8 +474,8 @@ function RelayCard({
               running
                 ? 'border-red-500/30 bg-red-500/10 text-red-200 hover:bg-red-500/20'
                 : isClaude
-                  ? 'border-orange-500/30 bg-orange-500/10 text-orange-200 hover:bg-orange-500/20'
-                  : 'border-emerald-500/30 bg-emerald-500/10 text-emerald-200 hover:bg-emerald-500/20'
+                  ? 'border-orange-500/30 bg-orange-500/10 text-orange-700 hover:bg-orange-500/20 dark:text-orange-200'
+                  : 'border-emerald-500/30 bg-emerald-500/10 text-emerald-700 hover:bg-emerald-500/20 dark:text-emerald-200'
             }`}
           >
             {busy ? <Loader2 size={14} className="animate-spin" /> : running ? <Square size={14} fill="currentColor" /> : <Play size={14} fill="currentColor" />}
@@ -420,7 +483,8 @@ function RelayCard({
           </button>
         </div>
       </div>
-    </div>
+      </div>
+    </motion.div>
   );
 }
 
@@ -445,9 +509,9 @@ function WorkgroupsView({
     <div className="mx-auto flex w-full max-w-7xl flex-1 flex-col px-8 pb-8 pt-8">
       <div className="mb-8 flex items-end justify-between gap-4">
         <div>
-          <div className="text-[10px] font-bold uppercase tracking-[0.24em] text-gray-500">Saved workgroups</div>
-          <h2 className="mt-2 text-3xl font-black tracking-tight text-white">Start or stop related relays together.</h2>
-          <p className="mt-2 max-w-2xl text-sm text-gray-400">This replaces the old project strip with a real workgroup surface in the desktop app.</p>
+          <div className="text-[10px] font-bold uppercase tracking-[0.24em] text-slate-500 dark:text-gray-500">Saved workgroups</div>
+          <h2 className="mt-2 text-3xl font-black tracking-tight text-slate-900 dark:text-white">Start or stop related relays together.</h2>
+          <p className="mt-2 max-w-2xl text-sm text-slate-600 dark:text-gray-400">This replaces the old project strip with a real workgroup surface in the desktop app.</p>
         </div>
         <ActionButton label="New Workgroup" icon={<Plus size={16} />} onClick={onCreate} />
       </div>
@@ -457,12 +521,12 @@ function WorkgroupsView({
       ) : (
         <div className="grid gap-5 lg:grid-cols-2">
           {projects.map((project) => (
-            <div key={project.name} className="rounded-[30px] border border-white/10 bg-white/[0.03] p-6 shadow-2xl">
+            <div key={project.name} className="rounded-[30px] border border-slate-200/80 bg-white/80 p-6 shadow-[0_18px_45px_rgba(15,23,42,0.08)] dark:border-white/10 dark:bg-white/[0.03] dark:shadow-2xl">
               <div className="flex items-start justify-between gap-4">
                 <div>
-                  <div className="text-[10px] font-bold uppercase tracking-[0.22em] text-gray-500">Workgroup</div>
-                  <div className="mt-2 text-2xl font-bold tracking-tight text-white">{project.name}</div>
-                  <div className="mt-2 text-sm text-gray-400">{project.memberCount} relay{project.memberCount === 1 ? '' : 's'}</div>
+                  <div className="text-[10px] font-bold uppercase tracking-[0.22em] text-slate-500 dark:text-gray-500">Workgroup</div>
+                  <div className="mt-2 text-2xl font-bold tracking-tight text-slate-900 dark:text-white">{project.name}</div>
+                  <div className="mt-2 text-sm text-slate-600 dark:text-gray-400">{project.memberCount} relay{project.memberCount === 1 ? '' : 's'}</div>
                 </div>
                 <div className="flex gap-2">
                   <ActionButton label="Start" icon={<Play size={14} />} busy={busyKey === `project-start-${project.name}`} onClick={() => onStart(project.name)} />
@@ -474,12 +538,12 @@ function WorkgroupsView({
                 {project.members.map((member) => {
                   const profile = profiles.find((row) => row.id === member.id && row.relayType === member.relayType);
                   return (
-                    <div key={`${member.relayType}:${member.id}`} className="flex items-center justify-between rounded-2xl border border-white/5 bg-black/30 px-4 py-3">
+                    <div key={`${member.relayType}:${member.id}`} className="flex items-center justify-between rounded-2xl border border-slate-200/80 bg-slate-50/80 px-4 py-3 dark:border-white/5 dark:bg-black/30">
                       <div>
-                        <div className="text-sm font-semibold text-white">{member.displayName}</div>
-                        <div className="text-xs text-gray-500">{profile ? workspaceFor(profile) : member.workspace}</div>
+                        <div className="text-sm font-semibold text-slate-900 dark:text-white">{member.displayName}</div>
+                        <div className="text-xs text-slate-500 dark:text-gray-500">{profile ? workspaceFor(profile) : member.workspace}</div>
                       </div>
-                      <div className={`rounded-full px-2 py-1 text-[10px] font-bold uppercase tracking-[0.22em] ${member.relayType === 'claude' ? 'bg-orange-500/10 text-orange-200' : 'bg-emerald-500/10 text-emerald-200'}`}>
+                      <div className={`rounded-full px-2 py-1 text-[10px] font-bold uppercase tracking-[0.22em] ${member.relayType === 'claude' ? 'bg-orange-500/10 text-orange-700 dark:text-orange-200' : 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-200'}`}>
                         {member.relayType}
                       </div>
                     </div>
@@ -556,55 +620,55 @@ function LiveFeed({
 
   return (
     <div className="mx-auto flex w-full max-w-6xl flex-1 flex-col px-8 pb-8 pt-8">
-      <div className="overflow-hidden rounded-[32px] border border-white/10 bg-[#0a0a0c] shadow-2xl">
-        <div className="flex flex-wrap items-center gap-2 border-b border-white/5 bg-white/[0.03] px-5 py-4">
+      <div className="overflow-hidden rounded-[32px] border border-slate-200/80 bg-[#fbfaf6] shadow-[0_22px_60px_rgba(15,23,42,0.12)] dark:border-white/10 dark:bg-[#0a0a0c] dark:shadow-2xl">
+        <div className="flex flex-wrap items-center gap-2 border-b border-slate-200 bg-white/60 px-5 py-4 dark:border-white/5 dark:bg-white/[0.03]">
           {workspaces.map((workspace) => (
-            <button key={workspace} onClick={() => setActiveWorkspace(workspace)} className={`rounded-2xl px-4 py-2 text-sm font-medium transition-colors ${activeWorkspace === workspace ? 'border border-indigo-500/30 bg-indigo-500/15 text-indigo-200' : 'text-gray-500 hover:bg-white/5 hover:text-gray-200'}`}>
+            <button key={workspace} onClick={() => setActiveWorkspace(workspace)} className={`rounded-2xl px-4 py-2 text-sm font-medium transition-colors ${activeWorkspace === workspace ? 'border border-indigo-500/30 bg-indigo-500/15 text-indigo-700 dark:text-indigo-200' : 'text-slate-500 hover:bg-black/5 hover:text-slate-900 dark:text-gray-500 dark:hover:bg-white/5 dark:hover:text-gray-200'}`}>
               {workspace.split(/[\\/]/).filter(Boolean).pop() || workspace}
             </button>
           ))}
         </div>
         <div className="grid min-h-[640px] grid-cols-1 xl:grid-cols-[260px_minmax(0,1fr)_320px]">
-          <div className="border-r border-white/5 bg-black/20 p-5">
-            <div className="text-[10px] font-bold uppercase tracking-[0.22em] text-gray-500">Relays in this workspace</div>
+          <div className="border-r border-slate-200 bg-white/30 p-5 dark:border-white/5 dark:bg-black/20">
+            <div className="text-[10px] font-bold uppercase tracking-[0.22em] text-slate-500 dark:text-gray-500">Relays in this workspace</div>
             <div className="mt-4 space-y-3">
               {workspaceProfiles.map((profile) => (
-                <button key={profile.id} onClick={() => onSelectProfile(profile.id)} className={`w-full rounded-2xl border px-4 py-3 text-left transition-colors ${activeProfile?.id === profile.id ? 'border-indigo-500/30 bg-indigo-500/10' : 'border-white/5 bg-white/[0.02] hover:bg-white/[0.06]'}`}>
+                <button key={profile.id} onClick={() => onSelectProfile(profile.id)} className={`w-full rounded-2xl border px-4 py-3 text-left transition-colors ${activeProfile?.id === profile.id ? 'border-indigo-500/30 bg-indigo-500/10' : 'border-slate-200 bg-white/70 hover:bg-slate-50 dark:border-white/5 dark:bg-white/[0.02] dark:hover:bg-white/[0.06]'}`}>
                   <div className="flex items-center justify-between gap-3">
                     <div>
-                      <div className="text-sm font-semibold text-white">{labelFor(profile)}</div>
-                      <div className="text-xs text-gray-500">{profile.type}</div>
+                      <div className="text-sm font-semibold text-slate-900 dark:text-white">{labelFor(profile)}</div>
+                      <div className="text-xs text-slate-500 dark:text-gray-500">{profile.type}</div>
                     </div>
-                    <span className={`h-2.5 w-2.5 rounded-full ${profile.running ? (profile.type === 'Claude' ? 'bg-orange-400' : 'bg-emerald-400') : 'bg-gray-600'}`} />
+                    <span className={`h-2.5 w-2.5 rounded-full ${profile.running ? (profile.type === 'Claude' ? 'bg-orange-400' : 'bg-emerald-400') : 'bg-slate-400 dark:bg-gray-600'}`} />
                   </div>
                 </button>
               ))}
             </div>
           </div>
 
-          <div className="border-r border-white/5">
-            <div className="border-b border-white/5 bg-white/[0.03] px-6 py-5">
+          <div className="border-r border-slate-200 dark:border-white/5">
+            <div className="border-b border-slate-200 bg-white/60 px-6 py-5 dark:border-white/5 dark:bg-white/[0.03]">
               {activeProfile ? (
                 <>
-                  <div className="text-[10px] font-bold uppercase tracking-[0.22em] text-gray-500">Live relay feed</div>
-                  <div className="mt-2 text-2xl font-bold tracking-tight text-white">{labelFor(activeProfile)}</div>
-                  <div className="mt-2 text-sm text-gray-400">{activeProfile.statusText || 'Watching the actual relay log stream for this bot.'}</div>
+                  <div className="text-[10px] font-bold uppercase tracking-[0.22em] text-slate-500 dark:text-gray-500">Live relay feed</div>
+                  <div className="mt-2 text-2xl font-bold tracking-tight text-slate-900 dark:text-white">{labelFor(activeProfile)}</div>
+                  <div className="mt-2 text-sm text-slate-600 dark:text-gray-400">{activeProfile.statusText || 'Watching the actual relay log stream for this bot.'}</div>
                 </>
               ) : (
-                <div className="text-gray-500">Select a relay to inspect it.</div>
+                <div className="text-slate-500 dark:text-gray-500">Select a relay to inspect it.</div>
               )}
             </div>
-            <div className="h-[560px] overflow-y-auto bg-black/30 p-6 font-mono text-xs text-gray-300">
+            <div className="h-[560px] overflow-y-auto bg-[#f7f3ea]/70 p-6 font-mono text-xs text-slate-700 dark:bg-black/30 dark:text-gray-300">
               {!activeProfile ? (
                 <EmptyState title="No relay selected." detail="Pick a relay on the left to inspect its feed." compact />
               ) : loading && !logs.length ? (
-                <div className="flex items-center gap-2 text-indigo-300"><Loader2 size={16} className="animate-spin" /> Loading relay feed...</div>
+                <div className="flex items-center gap-2 text-indigo-500 dark:text-indigo-300"><Loader2 size={16} className="animate-spin" /> Loading relay feed...</div>
               ) : logs.length ? (
                 <div className="space-y-2">
                   {logs.map((line, index) => (
-                    <div key={`${activeProfile.id}-${index}-${line.slice(0, 12)}`} className="rounded-2xl border border-white/5 bg-white/[0.03] px-4 py-3 leading-relaxed">
-                      <span className="mr-3 text-gray-500">{String(index + 1).padStart(2, '0')}</span>
-                      <span className={line.toLowerCase().includes('error') ? 'text-red-200' : line.toLowerCase().includes('working') ? 'text-indigo-200' : 'text-gray-200'}>{line}</span>
+                    <div key={`${activeProfile.id}-${index}-${line.slice(0, 12)}`} className="rounded-2xl border border-slate-200 bg-white/80 px-4 py-3 leading-relaxed dark:border-white/5 dark:bg-white/[0.03]">
+                      <span className="mr-3 text-slate-400 dark:text-gray-500">{String(index + 1).padStart(2, '0')}</span>
+                      <span className={line.toLowerCase().includes('error') ? 'text-red-600 dark:text-red-200' : line.toLowerCase().includes('working') ? 'text-indigo-600 dark:text-indigo-200' : 'text-slate-800 dark:text-gray-200'}>{line}</span>
                     </div>
                   ))}
                 </div>
@@ -614,8 +678,8 @@ function LiveFeed({
             </div>
           </div>
 
-          <div className="bg-white/[0.03] p-6">
-            <div className="text-[10px] font-bold uppercase tracking-[0.22em] text-gray-500">Relay details</div>
+          <div className="bg-white/40 p-6 dark:bg-white/[0.03]">
+            <div className="text-[10px] font-bold uppercase tracking-[0.22em] text-slate-500 dark:text-gray-500">Relay details</div>
             {activeProfile ? (
               <div className="mt-4 space-y-4">
                 <InspectorRow label="Relay" value={labelFor(activeProfile)} />
@@ -630,7 +694,7 @@ function LiveFeed({
                 <InspectorRow label="Current detail" value={activeProfile.statusText || 'No detailed runtime note yet.'} />
               </div>
             ) : (
-              <div className="mt-4 text-sm text-gray-500">No relay selected.</div>
+              <div className="mt-4 text-sm text-slate-500 dark:text-gray-500">No relay selected.</div>
             )}
           </div>
         </div>
@@ -778,13 +842,13 @@ function SettingsModal({ runtimeInfo, onClose, onStopAll }: { runtimeInfo: Runti
   return (
     <ModalShell title="CLADEX Runtime" onClose={onClose} wide>
       <div className="space-y-6">
-        <p className="text-sm leading-relaxed text-gray-400">This panel shows the real desktop runtime. Profile behavior lives with each relay, not in fake global settings.</p>
+        <p className="text-sm leading-relaxed text-slate-600 dark:text-gray-400">This panel shows the real desktop runtime. Profile behavior lives with each relay, not in fake global settings.</p>
         <InspectorRow label="API base" value={runtimeInfo?.apiBase || 'Loading...'} mono />
         <InspectorRow label="Backend path" value={runtimeInfo?.backendDir || 'Loading...'} mono />
         <InspectorRow label="App version" value={runtimeInfo?.appVersion || 'Loading...'} />
         <InspectorRow label="Packaging" value={runtimeInfo?.packaged ? 'Packaged desktop build' : 'Source build'} />
-        <div className="rounded-2xl border border-white/10 bg-black/30 p-4 text-sm text-gray-400">
-          <div className="mb-2 text-[10px] font-bold uppercase tracking-[0.22em] text-gray-500">Runtime notes</div>
+        <div className="rounded-2xl border border-slate-200/80 bg-white/70 p-4 text-sm text-slate-600 dark:border-white/10 dark:bg-black/30 dark:text-gray-400">
+          <div className="mb-2 text-[10px] font-bold uppercase tracking-[0.22em] text-slate-500 dark:text-gray-500">Runtime notes</div>
           <ul className="space-y-2">
             <li>Codex stays the deeper runtime because it is app-server based.</li>
             <li>Claude now shares the same durable memory, worktree, status, and handoff path instead of a thin side path.</li>
@@ -836,31 +900,31 @@ function LogsModal({ profile, onClose }: { profile: Profile; onClose: () => void
 }
 
 function SummaryPanel({ label, value, detail }: { label: string; value: string; detail: string }) {
-  return <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-5 shadow-2xl"><div className="text-[10px] font-bold uppercase tracking-[0.22em] text-gray-500">{label}</div><div className="mt-2 text-3xl font-black text-white">{value}</div><div className="mt-2 text-sm text-gray-400">{detail}</div></div>;
+  return <div className="rounded-2xl border border-slate-200/80 bg-white/80 p-5 shadow-[0_18px_45px_rgba(15,23,42,0.08)] backdrop-blur-xl dark:border-white/10 dark:bg-white/[0.03] dark:shadow-2xl"><div className="text-[10px] font-bold uppercase tracking-[0.22em] text-slate-500 dark:text-gray-500">{label}</div><div className="mt-2 text-3xl font-black text-slate-900 dark:text-white">{value}</div><div className="mt-2 text-sm text-slate-600 dark:text-gray-400">{detail}</div></div>;
 }
 
 function EmptyState({ title, detail, compact = false }: { title: string; detail: string; compact?: boolean }) {
-  return <div className={`flex flex-col items-center justify-center rounded-2xl border border-white/10 bg-white/[0.03] px-6 text-center ${compact ? 'h-48 py-8' : 'h-64 py-12'}`}><Activity size={compact ? 28 : 40} className="mb-4 text-gray-600" /><div className="text-lg font-semibold text-white">{title}</div><div className="mt-2 max-w-xl text-sm text-gray-500">{detail}</div></div>;
+  return <div className={`flex flex-col items-center justify-center rounded-2xl border border-slate-200/80 bg-white/70 px-6 text-center dark:border-white/10 dark:bg-white/[0.03] ${compact ? 'h-48 py-8' : 'h-64 py-12'}`}><Activity size={compact ? 28 : 40} className="mb-4 text-slate-400 dark:text-gray-600" /><div className="text-lg font-semibold text-slate-900 dark:text-white">{title}</div><div className="mt-2 max-w-xl text-sm text-slate-500 dark:text-gray-500">{detail}</div></div>;
 }
 
 function InfoRow({ label, value, mono = false }: { label: string; value: string; mono?: boolean }) {
-  return <div className="grid grid-cols-[92px_minmax(0,1fr)] gap-3 py-1"><div className="text-[10px] font-bold uppercase tracking-[0.22em] text-gray-500">{label}</div><div className={`text-sm text-gray-300 ${mono ? 'font-mono' : ''}`}>{value}</div></div>;
+  return <div className="grid grid-cols-[92px_minmax(0,1fr)] gap-3 py-1"><div className="text-[10px] font-bold uppercase tracking-[0.22em] text-slate-500 dark:text-gray-500">{label}</div><div className={`text-sm text-slate-700 dark:text-gray-300 ${mono ? 'font-mono' : ''}`}>{value}</div></div>;
 }
 
 function InspectorRow({ label, value, mono = false }: { label: string; value: string; mono?: boolean }) {
-  return <div className="grid grid-cols-[110px_minmax(0,1fr)] gap-3"><div className="pt-1 text-[10px] font-bold uppercase tracking-[0.22em] text-gray-500">{label}</div><div className={`rounded-2xl border border-white/5 bg-black/30 px-3 py-2 text-sm text-gray-200 ${mono ? 'break-all font-mono' : ''}`}>{value}</div></div>;
+  return <div className="grid grid-cols-[110px_minmax(0,1fr)] gap-3"><div className="pt-1 text-[10px] font-bold uppercase tracking-[0.22em] text-slate-500 dark:text-gray-500">{label}</div><div className={`rounded-2xl border border-slate-200/80 bg-white/80 px-3 py-2 text-sm text-slate-800 dark:border-white/5 dark:bg-black/30 dark:text-gray-200 ${mono ? 'break-all font-mono' : ''}`}>{value}</div></div>;
 }
 
 function FormInput({ label, value, onChange, placeholder, mono = false, type = 'text' }: { label: string; value: string; onChange: (value: string) => void; placeholder: string; mono?: boolean; type?: string }) {
-  return <label className="block"><div className="mb-2 text-[10px] font-bold uppercase tracking-[0.22em] text-gray-500">{label}</div><input type={type} value={value} onChange={(event) => onChange(event.target.value)} placeholder={placeholder} className={`w-full rounded-2xl border border-white/10 bg-black/40 px-4 py-3 text-white outline-none focus:border-indigo-500 ${mono ? 'font-mono text-sm' : 'text-sm'}`} /></label>;
+  return <label className="block"><div className="mb-2 text-[10px] font-bold uppercase tracking-[0.22em] text-slate-500 dark:text-gray-500">{label}</div><input type={type} value={value} onChange={(event) => onChange(event.target.value)} placeholder={placeholder} className={`w-full rounded-2xl border border-slate-200 bg-white/80 px-4 py-3 text-slate-900 outline-none focus:border-indigo-500 dark:border-white/10 dark:bg-black/40 dark:text-white ${mono ? 'font-mono text-sm' : 'text-sm'}`} /></label>;
 }
 
 function FormSelect({ label, value, onChange, options }: { label: string; value: string; onChange: (value: string) => void; options: Array<{ value: string; label: string }> }) {
-  return <label className="block"><div className="mb-2 text-[10px] font-bold uppercase tracking-[0.22em] text-gray-500">{label}</div><select value={value} onChange={(event) => onChange(event.target.value)} className="w-full rounded-2xl border border-white/10 bg-black/40 px-4 py-3 text-sm text-white outline-none focus:border-indigo-500">{options.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>;
+  return <label className="block"><div className="mb-2 text-[10px] font-bold uppercase tracking-[0.22em] text-slate-500 dark:text-gray-500">{label}</div><select value={value} onChange={(event) => onChange(event.target.value)} className="w-full rounded-2xl border border-slate-200 bg-white/80 px-4 py-3 text-sm text-slate-900 outline-none focus:border-indigo-500 dark:border-white/10 dark:bg-black/40 dark:text-white">{options.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>;
 }
 
 function ToggleRow({ checked, onChange, label }: { checked: boolean; onChange: (checked: boolean) => void; label: string }) {
-  return <label className="flex items-center gap-3 rounded-2xl border border-white/10 bg-black/30 px-4 py-3 text-sm text-gray-300"><input type="checkbox" checked={checked} onChange={(event) => onChange(event.target.checked)} className="h-4 w-4 accent-indigo-500" />{label}</label>;
+  return <label className="flex items-center gap-3 rounded-2xl border border-slate-200/80 bg-white/80 px-4 py-3 text-sm text-slate-700 dark:border-white/10 dark:bg-black/30 dark:text-gray-300"><input type="checkbox" checked={checked} onChange={(event) => onChange(event.target.checked)} className="h-4 w-4 accent-indigo-500" />{label}</label>;
 }
 
 function TypeButton({ active, label, icon, onClick, tone }: { active: boolean; label: string; icon: React.ReactNode; onClick: () => void; tone: 'orange' | 'emerald' }) {
@@ -869,17 +933,17 @@ function TypeButton({ active, label, icon, onClick, tone }: { active: boolean; l
 }
 
 function ModalShell({ title, children, onClose, wide = false }: { title: string; children: React.ReactNode; onClose: () => void; wide?: boolean }) {
-  return <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="fixed inset-0 z-[100] flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm" onClick={onClose}><motion.div initial={{ scale: 0.94, y: 18 }} animate={{ scale: 1, y: 0 }} exit={{ scale: 0.94, y: 18 }} onClick={(event) => event.stopPropagation()} className={`w-full overflow-hidden rounded-[32px] border border-white/10 bg-[#0a0a0c] shadow-2xl ${wide ? 'max-w-3xl' : 'max-w-xl'}`}><div className="flex items-center justify-between border-b border-white/5 bg-white/[0.03] px-6 py-5"><div><div className="text-[10px] font-bold uppercase tracking-[0.22em] text-gray-500">CLADEX</div><div className="mt-1 text-xl font-semibold text-white">{title}</div></div><button onClick={onClose} className="rounded-full bg-white/5 p-2 text-gray-400 transition-colors hover:bg-white/10 hover:text-white"><X size={16} /></button></div><div className="p-6">{children}</div></motion.div></motion.div>;
+  return <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="fixed inset-0 z-[100] flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm" onClick={onClose}><motion.div initial={{ scale: 0.94, y: 18 }} animate={{ scale: 1, y: 0 }} exit={{ scale: 0.94, y: 18 }} onClick={(event) => event.stopPropagation()} className={`w-full overflow-hidden rounded-[32px] border border-slate-200/80 bg-[#f8f6f0] shadow-[0_28px_80px_rgba(15,23,42,0.22)] dark:border-white/10 dark:bg-[#0a0a0c] dark:shadow-2xl ${wide ? 'max-w-3xl' : 'max-w-xl'}`}><div className="flex items-center justify-between border-b border-slate-200 bg-white/50 px-6 py-5 dark:border-white/5 dark:bg-white/[0.03]"><div><div className="text-[10px] font-bold uppercase tracking-[0.22em] text-slate-500 dark:text-gray-500">CLADEX</div><div className="mt-1 text-xl font-semibold text-slate-900 dark:text-white">{title}</div></div><button onClick={onClose} className="rounded-full bg-slate-200/70 p-2 text-slate-500 transition-colors hover:bg-slate-300 hover:text-slate-900 dark:bg-white/5 dark:text-gray-400 dark:hover:bg-white/10 dark:hover:text-white"><X size={16} /></button></div><div className="p-6">{children}</div></motion.div></motion.div>;
 }
 
-function DockButton({ icon, label, active, onClick }: { icon: React.ReactNode; label: string; active?: boolean; onClick: () => void }) {
+function DockButton({ icon, label, active, onClick, light = false }: { icon: React.ReactNode; label: string; active?: boolean; onClick: () => void; light?: boolean }) {
   const ref = useRef<HTMLButtonElement>(null);
   const [position, setPosition] = useState({ x: 0, y: 0 });
-  return <div className="group relative"><motion.button ref={ref} onMouseMove={(event) => { if (!ref.current) return; const bounds = ref.current.getBoundingClientRect(); setPosition({ x: (event.clientX - (bounds.left + bounds.width / 2)) * 0.3, y: (event.clientY - (bounds.top + bounds.height / 2)) * 0.3 }); }} onMouseLeave={() => setPosition({ x: 0, y: 0 })} animate={{ x: position.x, y: position.y }} transition={{ type: 'spring', stiffness: 150, damping: 15, mass: 0.1 }} whileHover={{ scale: 1.08 }} whileTap={{ scale: 0.96 }} onClick={onClick} className={`rounded-xl p-3 transition-colors ${active ? 'bg-indigo-500 text-white shadow-[0_0_20px_rgba(99,102,241,0.5)]' : 'text-gray-400 hover:bg-white/10 hover:text-white'}`}>{icon}</motion.button><div className="pointer-events-none absolute bottom-full left-1/2 mb-3 -translate-x-1/2 whitespace-nowrap rounded-lg border border-white/10 bg-black/80 px-3 py-1.5 text-xs font-bold text-white opacity-0 transition-opacity group-hover:opacity-100">{label}</div></div>;
+  return <div className="group relative"><motion.button ref={ref} onMouseMove={(event) => { if (!ref.current) return; const bounds = ref.current.getBoundingClientRect(); setPosition({ x: (event.clientX - (bounds.left + bounds.width / 2)) * 0.3, y: (event.clientY - (bounds.top + bounds.height / 2)) * 0.3 }); }} onMouseLeave={() => setPosition({ x: 0, y: 0 })} animate={{ x: position.x, y: position.y }} transition={{ type: 'spring', stiffness: 150, damping: 15, mass: 0.1 }} whileHover={{ scale: 1.08 }} whileTap={{ scale: 0.96 }} onClick={onClick} className={`rounded-xl p-3 transition-colors ${active ? 'bg-indigo-500 text-white shadow-[0_0_20px_rgba(99,102,241,0.5)]' : light ? 'text-slate-600 hover:bg-black/5 hover:text-slate-900' : 'text-gray-400 hover:bg-white/10 hover:text-white'}`}>{icon}</motion.button><div className={`pointer-events-none absolute bottom-full left-1/2 mb-3 -translate-x-1/2 whitespace-nowrap rounded-lg border px-3 py-1.5 text-xs font-bold opacity-0 transition-opacity group-hover:opacity-100 ${light ? 'border-slate-200 bg-white text-slate-800 shadow-xl' : 'border-white/10 bg-black/80 text-white'}`}>{label}</div></div>;
 }
 
-function ActionButton({ label, icon, onClick, busy = false, tone = 'default' }: { label: string; icon: React.ReactNode; onClick: () => void; busy?: boolean; tone?: 'default' | 'danger' }) {
-  return <button onClick={onClick} disabled={busy} className={`inline-flex items-center gap-2 rounded-2xl border px-4 py-2 text-sm font-semibold transition-colors disabled:opacity-50 ${tone === 'danger' ? 'border-red-500/25 bg-red-500/10 text-red-200 hover:bg-red-500/20' : 'border-white/10 bg-white/[0.04] text-white hover:bg-white/[0.08]'}`}>{busy ? <Loader2 size={16} className="animate-spin" /> : icon}{label}</button>;
+function ActionButton({ label, icon, onClick, busy = false, tone = 'default', light = false }: { label: string; icon: React.ReactNode; onClick: () => void; busy?: boolean; tone?: 'default' | 'danger'; light?: boolean }) {
+  return <button onClick={onClick} disabled={busy} className={`inline-flex items-center gap-2 rounded-2xl border px-4 py-2 text-sm font-semibold transition-colors disabled:opacity-50 ${tone === 'danger' ? 'border-red-500/25 bg-red-500/10 text-red-700 hover:bg-red-500/20 dark:text-red-200' : light ? 'border-slate-300 bg-white text-slate-800 hover:bg-slate-100' : 'border-white/10 bg-white/[0.04] text-white hover:bg-white/[0.08]'}`}>{busy ? <Loader2 size={16} className="animate-spin" /> : icon}{label}</button>;
 }
 
 function PrimaryButton({ label, icon, onClick }: { label: string; icon: React.ReactNode; onClick: () => void }) {
@@ -887,9 +951,9 @@ function PrimaryButton({ label, icon, onClick }: { label: string; icon: React.Re
 }
 
 function SecondaryButton({ label, onClick }: { label: string; onClick: () => void }) {
-  return <button onClick={onClick} className="rounded-2xl border border-white/10 bg-white/[0.03] px-4 py-2 text-sm font-semibold text-gray-300 transition-colors hover:bg-white/[0.08]">{label}</button>;
+  return <button onClick={onClick} className="rounded-2xl border border-slate-200 bg-white/70 px-4 py-2 text-sm font-semibold text-slate-700 transition-colors hover:bg-slate-100 dark:border-white/10 dark:bg-white/[0.03] dark:text-gray-300 dark:hover:bg-white/[0.08]">{label}</button>;
 }
 
 function MiniIconButton({ label, icon, onClick, tone = 'default' }: { label: string; icon: React.ReactNode; onClick: () => void; tone?: 'default' | 'danger' }) {
-  return <button title={label} onClick={onClick} className={`rounded-full p-2 transition-colors ${tone === 'danger' ? 'bg-red-500/10 text-red-200 hover:bg-red-500/20' : 'bg-white/5 text-gray-400 hover:bg-white/10 hover:text-white'}`}>{icon}</button>;
+  return <button title={label} onClick={onClick} className={`rounded-full p-2 transition-colors ${tone === 'danger' ? 'bg-red-500/10 text-red-700 hover:bg-red-500/20 dark:text-red-200' : 'bg-slate-100 text-slate-500 hover:bg-slate-200 hover:text-slate-900 dark:bg-white/5 dark:text-gray-400 dark:hover:bg-white/10 dark:hover:text-white'}`}>{icon}</button>;
 }

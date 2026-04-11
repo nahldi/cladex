@@ -52,6 +52,9 @@
       "electron/**/*",
       "server.cjs"
     ],
+    "asarUnpack": [
+      "server.cjs"
+    ],
     "extraResources": [
       {
         "from": "backend",
