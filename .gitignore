@@ -3,6 +3,8 @@ build/
 dist/
 release/
 coverage/
+/AGENTS.md
+/memory/
 .DS_Store
 *.log
 .env*

@@ -29,6 +29,13 @@ from claude_common import claude_code_bin, claude_code_version, atomic_write_tex
 
 logger = logging.getLogger(__name__)
 
+PROMPT_CONTEXT_FILES: tuple[tuple[str, int], ...] = (
+    ("AGENTS.md", 3000),
+    ("memory/STATUS.md", 2500),
+    ("memory/HANDOFF.md", 2000),
+    ("memory/DECISIONS.md", 2000),
+)
+
 
 class ChannelType(Enum):
     DISCORD = "discord"
@@ -194,6 +201,7 @@ class ClaudeBackend:
             return False
 
         prompt = self._format_prompt(msg)
+        self.on_status(f"Claude working on {msg.channel_type.value} message from {msg.sender_name}.")
         result = self._run_turn(prompt, use_resume=self.session.initialized)
 
         if self._should_retry_fresh_session(result):
@@ -223,13 +231,57 @@ class ClaudeBackend:
                 is_final=True,
             )
         )
+        self.on_status("Claude turn complete.")
         return True
 
     def _format_prompt(self, msg: InboundMessage) -> str:
-        parts = [msg.content.strip()]
+        parts = [
+            (
+                "You are Claude running inside CLADEX as a durable coding relay.\n"
+                "Rules:\n"
+                "- Discord is transport, not memory.\n"
+                "- Repo files, AGENTS.md, memory/*, code, tests, and git state are the source of truth.\n"
+                "- Verify claims from other agents before repeating them as fact.\n"
+                "- In shared team channels, default to caveman mode: facts, decisions, blockers, results.\n"
+                "- No filler, no agreement-only replies, no loop chatter, no fake completion claims.\n"
+                "- Use the lightest path that solves the task. Do not burn tools or context without reason.\n"
+                "- Keep replies compact and operationally useful."
+            )
+        ]
+        durable_context = self._durable_context()
+        if durable_context:
+            parts.append(f"Durable repo context:\n{durable_context}")
+        parts.append(
+            "\n".join(
+                [
+                    "Inbound message context:",
+                    f"- channel_type: {msg.channel_type.value}",
+                    f"- sender: {msg.sender_name} ({msg.sender_id})",
+                    f"- workspace: {self.workspace}",
+                ]
+            )
+        )
         if msg.attachments:
-            parts.append(f"(Attachments: {len(msg.attachments)} files)")
+            parts.append(f"Attachments: {len(msg.attachments)} files")
+        parts.append(f"User message:\n{msg.content.strip()}")
         return "\n\n".join(part for part in parts if part)
+
+    def _durable_context(self) -> str:
+        sections: list[str] = []
+        for relative_path, limit in PROMPT_CONTEXT_FILES:
+            path = self.workspace / relative_path
+            if not path.exists() or not path.is_file():
+                continue
+            try:
+                content = path.read_text(encoding="utf-8", errors="replace").strip()
+            except OSError:
+                continue
+            if not content:
+                continue
+            if len(content) > limit:
+                content = content[:limit].rstrip() + "\n...[truncated]"
+            sections.append(f"[{relative_path}]\n{content}")
+        return "\n\n".join(sections)
 
     def _build_command(self, prompt: str, *, use_resume: bool) -> list[str]:
         cmd = [

@@ -2199,7 +2199,7 @@ def cmd_gui(_args: argparse.Namespace) -> int:
         raise SystemExit(f"Native GUI is unavailable in this Python runtime: {exc}")
 
     root = tk.Tk()
-    root.title("Codex Discord Relay Manager")
+    root.title("CLADEX Relay Manager")
     root.geometry("1420x880")
     root.minsize(1220, 720)
 

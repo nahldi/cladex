@@ -86,3 +86,32 @@ def test_process_message_retries_with_fresh_session_on_resume_failure(tmp_path: 
     assert calls == [True, False]
     assert responses == ["done"]
     assert any("stale" in status.lower() for status in statuses)
+
+
+def test_format_prompt_includes_durable_context_and_caveman_rules(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    (workspace / "memory").mkdir(parents=True)
+    (workspace / "AGENTS.md").write_text("Durable rules here", encoding="utf-8")
+    (workspace / "memory" / "STATUS.md").write_text("Current objective: ship it", encoding="utf-8")
+
+    backend = ClaudeBackend(
+        workspace=workspace,
+        state_dir=tmp_path / "state",
+        on_response=lambda msg: None,
+    )
+
+    prompt = backend._format_prompt(
+        InboundMessage(
+            channel_type=ChannelType.DISCORD,
+            channel_id="123",
+            sender_id="u1",
+            sender_name="Finn",
+            content="fix the relay",
+        )
+    )
+
+    assert "caveman mode" in prompt
+    assert "Discord is transport, not memory." in prompt
+    assert "[AGENTS.md]" in prompt
+    assert "[memory/STATUS.md]" in prompt
+    assert "User message:\nfix the relay" in prompt

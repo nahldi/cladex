@@ -89,6 +89,8 @@ class ClaudeRelayBot(commands.Bot):
         self.state_dir.mkdir(parents=True, exist_ok=True)
 
         self._backend: RelayBackend | None = None
+        self._status = "starting"
+        self._status_detail = ""
 
     async def setup_hook(self) -> None:
         """Called when bot is ready to start."""
@@ -136,6 +138,15 @@ class ClaudeRelayBot(commands.Bot):
     def _on_status(self, status: str) -> None:
         """Handle status updates from backend."""
         logger.info(f"[STATUS] {status}")
+        normalized = "ready"
+        lowered = status.lower()
+        if lowered.startswith("error"):
+            normalized = "error"
+        elif "working" in lowered:
+            normalized = "working"
+        elif "stopped" in lowered:
+            normalized = "stopped"
+        self._write_status(normalized, status)
 
     def _split_message(self, content: str, max_length: int = 1900) -> list[str]:
         """Split message into chunks for Discord's character limit."""
@@ -229,6 +240,7 @@ class ClaudeRelayBot(commands.Bot):
             return
 
         logger.info(f"[RECV] {message.author}: {content[:100]}...")
+        self._write_status("working", f"Handling message from {message.author.display_name}")
 
         async with message.channel.typing():
             await self._backend.send_discord_message(
@@ -239,11 +251,14 @@ class ClaudeRelayBot(commands.Bot):
                 message_id=str(message.id),
             )
 
-    def _write_status(self, status: str) -> None:
+    def _write_status(self, status: str, detail: str | None = None) -> None:
         """Write status to state file."""
+        self._status = status
+        self._status_detail = detail or ""
         status_file = self.state_dir / "status.json"
         data = {
             "status": status,
+            "detail": self._status_detail,
             "workspace": str(self.config.workspace),
             "bot_user": str(self.user) if self.user else None,
             "session_id": self._backend.session_id if self._backend else None,

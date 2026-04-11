@@ -1,9 +1,9 @@
 {
-  "name": "discord-codex-relay",
+  "name": "cladex-codex-relay",
   "version": "2.0.0",
-  "description": "Launch a live Codex Discord relay from the current workspace.",
+  "description": "Launch the CLADEX Codex relay from the current workspace.",
   "author": {
-    "name": "Discord Codex Relay Contributors"
+    "name": "CLADEX Contributors"
   },
   "license": "MIT",
   "keywords": [
@@ -14,10 +14,10 @@
   ],
   "skills": "./skills/",
   "interface": {
-    "displayName": "Discord Codex Relay",
-    "shortDescription": "Run a workspace-local Codex relay through Discord.",
-    "longDescription": "Adds a workspace-local `codex-discord` launcher so a live Codex CLI session can be controlled through Discord while staying isolated to the current workspace and bot profile.",
-    "developerName": "discord-codex-relay",
+    "displayName": "CLADEX Codex Relay",
+    "shortDescription": "Run a workspace-local Codex relay through Discord with CLADEX.",
+    "longDescription": "Adds a workspace-local `codex-discord` launcher so a live Codex CLI session can be controlled through Discord while staying isolated to the current workspace and bot profile inside CLADEX.",
+    "developerName": "cladex",
     "category": "Productivity",
     "capabilities": [
       "Interactive",

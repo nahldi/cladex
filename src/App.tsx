@@ -16,20 +16,18 @@ interface Profile {
   id: string;
   name: string;
   type: ProfileType;
+  relayType?: 'claude' | 'codex';
   workspace: string;
   status: ProfileStatus;
   discordChannel: string;
   state: AgentState;
-}
-
-interface Message {
-  id: number;
-  thread: string;
-  author: string;
-  isBot: boolean;
-  type?: ProfileType;
-  text: string;
-  time: string;
+  ready?: boolean;
+  provider?: string;
+  model?: string;
+  triggerMode?: string;
+  statusText?: string;
+  sessionId?: string;
+  logPath?: string;
 }
 
 const API_BASE = 'http://localhost:3001/api';
@@ -138,29 +136,31 @@ export default function App() {
   // Mouse tracking for global effects
   const [mousePos, setMousePos] = useState({ x: 0, y: 0 });
 
-  // Mock messages for chat view
-  const [messages] = useState<Message[]>([
-    { id: 1, thread: '~/dev/api', author: 'User', isBot: false, text: 'Can we optimize the auth middleware?', time: '10:42 AM' },
-    { id: 2, thread: '~/dev/api', author: 'Codex-API', isBot: true, type: 'Codex', text: 'Analyzing `auth.ts`... Found synchronous crypto calls. Rewriting to use async `crypto.subtle`.', time: '10:43 AM' },
-    { id: 3, thread: '~/dev/core', author: 'User', isBot: false, text: 'Design the new database schema for users.', time: '11:00 AM' },
-    { id: 4, thread: '~/dev/core', author: 'Claude-Architect', isBot: true, type: 'Claude', text: 'I am drafting the Prisma schema now. Thinking about the relation between Users and Workspaces...', time: '11:01 AM' },
-  ]);
-
-  const loadProfiles = useCallback(async () => {
-    setLoading(true);
+  const loadProfiles = useCallback(async (options?: { silent?: boolean }) => {
+    if (!options?.silent) {
+      setLoading(true);
+    }
     const data = await fetchProfiles();
     setProfiles(data);
-    setLoading(false);
+    if (!options?.silent) {
+      setLoading(false);
+    }
   }, []);
 
   useEffect(() => {
-    loadProfiles();
+    void loadProfiles();
+    const refreshInterval = window.setInterval(() => {
+      void loadProfiles({ silent: true });
+    }, 5000);
 
     const handleMouseMove = (e: MouseEvent) => {
       setMousePos({ x: e.clientX, y: e.clientY });
     };
     window.addEventListener('mousemove', handleMouseMove);
-    return () => window.removeEventListener('mousemove', handleMouseMove);
+    return () => {
+      window.clearInterval(refreshInterval);
+      window.removeEventListener('mousemove', handleMouseMove);
+    };
   }, [loadProfiles]);
 
   const toggleStatus = async (id: string) => {
@@ -228,7 +228,7 @@ export default function App() {
             <motion.div key="chat">
               <ChatView
                 profiles={profiles}
-                messages={messages}
+                onRefresh={() => { void loadProfiles({ silent: true }); }}
               />
             </motion.div>
           )}
@@ -238,8 +238,8 @@ export default function App() {
       {/* Floating Dock */}
       <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50">
         <div className="flex items-center gap-2 p-2 rounded-2xl bg-white/5 border border-white/10 backdrop-blur-xl shadow-2xl shadow-black/50">
-          <DockButton icon={<LayoutGrid />} label="Nexus" active={view === 'dashboard'} onClick={() => setView('dashboard')} />
-          <DockButton icon={<MessageSquare />} label="Chatroom" active={view === 'chat'} onClick={() => setView('chat')} />
+          <DockButton icon={<LayoutGrid />} label="ClaDex" active={view === 'dashboard'} onClick={() => setView('dashboard')} />
+          <DockButton icon={<MessageSquare />} label="Live Feed" active={view === 'chat'} onClick={() => setView('chat')} />
           <div className="w-px h-8 bg-white/10 mx-2" />
           <DockButton icon={<Plus />} label="Add Relay" onClick={() => setActiveModal('add')} />
           <DockButton icon={<Settings />} label="Settings" onClick={() => setActiveModal('settings')} />
@@ -292,11 +292,11 @@ function DashboardView({ profiles, loading, actionLoading, onToggle, onDelete, o
           </div>
           <div>
             <h1 className="text-3xl font-black tracking-tighter bg-clip-text text-transparent bg-gradient-to-r from-white to-gray-500 relative group cursor-default">
-              RELAY NEXUS
-              <span className="absolute inset-0 bg-clip-text text-transparent bg-gradient-to-r from-indigo-500 to-purple-500 opacity-0 group-hover:opacity-100 group-hover:animate-pulse transition-opacity duration-300 -translate-x-[1px] translate-y-[1px]">RELAY NEXUS</span>
-              <span className="absolute inset-0 bg-clip-text text-transparent bg-gradient-to-r from-red-500 to-orange-500 opacity-0 group-hover:opacity-100 group-hover:animate-pulse transition-opacity duration-300 translate-x-[1px] -translate-y-[1px]" style={{ animationDelay: '50ms' }}>RELAY NEXUS</span>
+              CLADEX
+              <span className="absolute inset-0 bg-clip-text text-transparent bg-gradient-to-r from-indigo-500 to-purple-500 opacity-0 group-hover:opacity-100 group-hover:animate-pulse transition-opacity duration-300 -translate-x-[1px] translate-y-[1px]">CLADEX</span>
+              <span className="absolute inset-0 bg-clip-text text-transparent bg-gradient-to-r from-red-500 to-orange-500 opacity-0 group-hover:opacity-100 group-hover:animate-pulse transition-opacity duration-300 translate-x-[1px] -translate-y-[1px]" style={{ animationDelay: '50ms' }}>CLADEX</span>
             </h1>
-            <p className="text-indigo-400 font-mono text-xs tracking-widest uppercase">System Overview</p>
+            <p className="text-indigo-400 font-mono text-xs tracking-widest uppercase">Unified Relay Control</p>
           </div>
         </div>
         <button
@@ -315,8 +315,8 @@ function DashboardView({ profiles, loading, actionLoading, onToggle, onDelete, o
       ) : profiles.length === 0 ? (
         <div className="flex flex-col items-center justify-center h-64 text-gray-500">
           <Bot size={48} className="mb-4 opacity-50" />
-          <p>No relay profiles configured</p>
-          <p className="text-sm">Click "Add Relay" to create one</p>
+          <p>No relay profiles configured yet.</p>
+          <p className="text-sm">Choose Add Relay and register a Claude or Codex workspace.</p>
         </div>
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
@@ -502,99 +502,194 @@ function InteractiveCard({ profile, index, loading, onToggle, onDelete, onOpenLo
 
 // --- Chatroom View ---
 
-function ChatView({ profiles, messages }: { profiles: Profile[]; messages: Message[] }) {
-  const workspaces = Array.from(new Set(profiles.map(p => p.workspace)));
-  const [activeWorkspace, setActiveWorkspace] = useState(workspaces[0] || '~/dev/core');
+function ChatView({ profiles, onRefresh }: { profiles: Profile[]; onRefresh: () => void }) {
+  const workspaces = Array.from(new Set(profiles.map(p => p.workspace))).sort();
+  const [activeWorkspace, setActiveWorkspace] = useState(workspaces[0] || '');
+  const workspaceProfiles = profiles.filter(p => p.workspace === activeWorkspace);
+  const runningProfiles = workspaceProfiles.filter(p => p.status === 'Running');
+  const [activeProfileId, setActiveProfileId] = useState<string | null>(runningProfiles[0]?.id || workspaceProfiles[0]?.id || null);
+  const activeProfile = workspaceProfiles.find(p => p.id === activeProfileId) || runningProfiles[0] || workspaceProfiles[0] || null;
+  const [logs, setLogs] = useState<string[]>([]);
+  const [logsLoading, setLogsLoading] = useState(false);
 
-  const activeAgents = profiles.filter(p => p.workspace === activeWorkspace && p.status === 'Running');
-  const threadMessages = messages.filter(m => m.thread === activeWorkspace);
+  useEffect(() => {
+    if (!workspaces.length) {
+      setActiveWorkspace('');
+      return;
+    }
+    if (!activeWorkspace || !workspaces.includes(activeWorkspace)) {
+      setActiveWorkspace(workspaces[0]);
+    }
+  }, [activeWorkspace, workspaces]);
+
+  useEffect(() => {
+    if (!workspaceProfiles.length) {
+      setActiveProfileId(null);
+      return;
+    }
+    if (!activeProfileId || !workspaceProfiles.some(profile => profile.id === activeProfileId)) {
+      setActiveProfileId((runningProfiles[0] || workspaceProfiles[0]).id);
+    }
+  }, [activeProfileId, runningProfiles, workspaceProfiles]);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function loadLogs() {
+      if (!activeProfile) {
+        if (!cancelled) {
+          setLogs([]);
+          setLogsLoading(false);
+        }
+        return;
+      }
+      if (!cancelled) {
+        setLogsLoading(true);
+      }
+      const data = await fetchLogs(activeProfile.id, activeProfile.type);
+      if (!cancelled) {
+        setLogs(data);
+        setLogsLoading(false);
+      }
+    }
+    void loadLogs();
+    const interval = window.setInterval(() => {
+      void loadLogs();
+    }, 3000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, [activeProfile]);
 
   return (
     <motion.div
       initial={{ opacity: 0, scale: 0.95 }}
       animate={{ opacity: 1, scale: 1 }}
       exit={{ opacity: 0, scale: 1.05, filter: 'blur(10px)' }}
-      className="flex-1 flex flex-col max-w-5xl mx-auto w-full mt-8 mb-24 bg-[#0a0a0c] border border-white/10 rounded-[2rem] shadow-2xl overflow-hidden"
+      className="flex-1 flex flex-col max-w-6xl mx-auto w-full mt-8 mb-24 bg-[#0a0a0c] border border-white/10 rounded-[2rem] shadow-2xl overflow-hidden"
     >
-      {/* Top Bar: Workspace Tabs */}
-      <div className="flex items-center gap-2 p-4 border-b border-white/5 bg-white/[0.02]">
-        {workspaces.map(ws => (
-          <button
-            key={ws}
-            onClick={() => setActiveWorkspace(ws)}
-            className={`px-4 py-2 rounded-xl text-sm font-medium font-mono transition-all ${
-              activeWorkspace === ws
-                ? 'bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 shadow-[0_0_15px_rgba(99,102,241,0.2)]'
-                : 'text-gray-500 hover:bg-white/5 hover:text-gray-300 border border-transparent'
-            }`}
-          >
-            {ws}
-          </button>
-        ))}
+      <div className="flex items-center justify-between gap-4 p-4 border-b border-white/5 bg-white/[0.02]">
+        <div className="flex items-center gap-2 overflow-x-auto">
+          {workspaces.map(ws => (
+            <button
+              key={ws}
+              onClick={() => setActiveWorkspace(ws)}
+              className={`px-4 py-2 rounded-xl text-sm font-medium font-mono transition-all whitespace-nowrap ${
+                activeWorkspace === ws
+                  ? 'bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 shadow-[0_0_15px_rgba(99,102,241,0.2)]'
+                  : 'text-gray-500 hover:bg-white/5 hover:text-gray-300 border border-transparent'
+              }`}
+            >
+              {ws}
+            </button>
+          ))}
+        </div>
+        <button
+          onClick={onRefresh}
+          className="p-3 rounded-xl bg-white/5 hover:bg-white/10 text-gray-400 hover:text-white transition-colors shrink-0"
+          title="Refresh relay state"
+        >
+          <RefreshCw size={18} />
+        </button>
       </div>
 
-      {/* Nameplates Area */}
-      <div className="px-6 py-4 border-b border-white/5 bg-black/20 flex flex-wrap gap-4 items-center min-h-[72px]">
-        <span className="text-xs font-bold text-gray-600 uppercase tracking-widest mr-2">Active Relays:</span>
-        {activeAgents.length === 0 ? (
-          <span className="text-sm text-gray-500 italic">No agents running in this workspace.</span>
+      <div className="px-6 py-4 border-b border-white/5 bg-black/20 flex flex-wrap gap-3 items-center min-h-[72px]">
+        <span className="text-xs font-bold text-gray-600 uppercase tracking-widest mr-2">Workspace Relays</span>
+        {workspaceProfiles.length === 0 ? (
+          <span className="text-sm text-gray-500 italic">No relay profiles in this workspace.</span>
         ) : (
-          activeAgents.map(agent => (
-            <React.Fragment key={agent.id}>
+          workspaceProfiles.map(agent => (
+            <button key={agent.id} onClick={() => setActiveProfileId(agent.id)} className="text-left">
               <GlowingNameplate agent={agent} />
-            </React.Fragment>
+            </button>
           ))
         )}
       </div>
 
-      {/* Chat Messages */}
-      <div className="flex-1 overflow-y-auto p-6 space-y-6">
-        {threadMessages.map((msg, i) => (
-          <motion.div
-            initial={{ opacity: 0, y: 10 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ delay: i * 0.1 }}
-            key={msg.id}
-            className={`flex gap-4 ${msg.isBot ? '' : 'flex-row-reverse'}`}
-          >
-            <div className={`w-10 h-10 rounded-2xl flex items-center justify-center shrink-0 border shadow-lg ${
-              !msg.isBot ? 'bg-indigo-500/20 border-indigo-500/30 text-indigo-400' :
-              msg.type === 'Claude' ? 'bg-orange-500/20 border-orange-500/30 text-orange-400' : 'bg-emerald-500/20 border-emerald-500/30 text-emerald-400'
-            }`}>
-              {!msg.isBot ? 'U' : msg.type === 'Claude' ? <Bot size={20} /> : <Terminal size={20} />}
-            </div>
-
-            <div className={`flex flex-col max-w-[80%] ${!msg.isBot ? 'items-end' : 'items-start'}`}>
-              <div className="flex items-baseline gap-2 mb-1">
-                <span className="font-bold text-gray-300 text-sm">{msg.author}</span>
-                <span className="text-xs text-gray-600">{msg.time}</span>
+      <div className="grid grid-cols-1 xl:grid-cols-[minmax(0,1fr)_320px] min-h-0 flex-1">
+        <div className="min-h-0 border-r border-white/5">
+          <div className="flex items-center justify-between px-6 py-4 border-b border-white/5 bg-white/[0.02]">
+            <div>
+              <div className="text-[10px] uppercase tracking-[0.22em] text-gray-500 font-bold">Live Relay Feed</div>
+              <div className="mt-1 flex items-center gap-2">
+                <span className="text-lg font-semibold text-white">{activeProfile?.name || 'No profile selected'}</span>
+                {activeProfile ? (
+                  <span className={`px-2 py-1 rounded-full text-[10px] font-bold uppercase tracking-wider ${
+                    activeProfile.type === 'Claude'
+                      ? 'bg-orange-500/10 text-orange-400 border border-orange-500/20'
+                      : 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20'
+                  }`}>
+                    {activeProfile.type}
+                  </span>
+                ) : null}
               </div>
-              <div className={`px-5 py-3 rounded-2xl text-[15px] leading-relaxed ${
-                !msg.isBot
-                  ? 'bg-indigo-600 text-white rounded-tr-sm shadow-[0_4px_20px_rgba(79,70,229,0.2)]'
-                  : 'bg-white/5 text-gray-200 rounded-tl-sm border border-white/10'
-              }`}>
-                {msg.text}
+              {activeProfile?.statusText ? (
+                <div className="mt-2 text-sm text-gray-400 max-w-2xl">{activeProfile.statusText}</div>
+              ) : null}
+            </div>
+            {activeProfile ? (
+              <div className="text-right">
+                <div className={`text-sm font-medium ${activeProfile.status === 'Running' ? 'text-white' : 'text-gray-500'}`}>
+                  {activeProfile.status === 'Running' ? (activeProfile.state === 'working' ? 'Working' : 'Listening') : 'Stopped'}
+                </div>
+                <div className="text-xs text-gray-500 font-mono">{activeProfile.provider || 'runtime'}</div>
+              </div>
+            ) : null}
+          </div>
+
+          <div className="h-[520px] overflow-y-auto p-6 bg-black/30 font-mono text-xs text-gray-300 space-y-2">
+            {!activeProfile ? (
+              <div className="flex flex-col items-center justify-center h-full text-gray-500">
+                <Activity size={36} className="mb-3 opacity-50" />
+                <p>Select a relay to inspect its live feed.</p>
+              </div>
+            ) : logsLoading && logs.length === 0 ? (
+              <div className="flex items-center gap-2 text-indigo-400">
+                <Loader2 size={16} className="animate-spin" />
+                Loading live feed...
+              </div>
+            ) : logs.length === 0 ? (
+              <div className="flex flex-col items-center justify-center h-full text-gray-500">
+                <FileText size={36} className="mb-3 opacity-50" />
+                <p>No log lines yet.</p>
+                <p className="text-gray-600 mt-2">Discord is still the command surface. This pane is operator visibility only.</p>
+              </div>
+            ) : (
+              logs.map((line, i) => (
+                <div key={`${activeProfile.id}-${i}-${line.slice(0, 32)}`} className="rounded-xl border border-white/5 bg-white/[0.02] px-4 py-3 leading-relaxed">
+                  <span className="text-gray-500 mr-3">{String(i + 1).padStart(2, '0')}</span>
+                  <span className={`${line.toLowerCase().includes('error') ? 'text-red-300' : line.toLowerCase().includes('working') ? 'text-indigo-300' : 'text-gray-200'}`}>
+                    {line}
+                  </span>
+                </div>
+              ))
+            )}
+          </div>
+        </div>
+
+        <div className="p-6 bg-white/[0.02] border-t xl:border-t-0 border-white/5">
+          <div className="text-[10px] uppercase tracking-[0.22em] text-gray-500 font-bold mb-4">Relay Inspector</div>
+          {activeProfile ? (
+            <div className="space-y-4">
+              <InspectorRow label="Profile" value={activeProfile.name} />
+              <InspectorRow label="Workspace" value={activeProfile.workspace} mono />
+              <InspectorRow label="Status" value={`${activeProfile.status}${activeProfile.ready ? ' / ready' : ''}`} />
+              <InspectorRow label="Relay Type" value={activeProfile.type} />
+              <InspectorRow label="Backend" value={activeProfile.provider || '-'} mono />
+              <InspectorRow label="Model" value={activeProfile.model || (activeProfile.type === 'Claude' ? 'CLI default' : 'gpt-5.4')} mono />
+              <InspectorRow label="Trigger" value={activeProfile.triggerMode || '-'} mono />
+              <InspectorRow label="Channel" value={activeProfile.discordChannel || '-'} mono />
+              <InspectorRow label="Session" value={activeProfile.sessionId || '-'} mono />
+              <div className="pt-3 border-t border-white/5">
+                <div className="text-[10px] uppercase tracking-[0.22em] text-gray-500 font-bold mb-2">Current Detail</div>
+                <div className="rounded-2xl border border-white/5 bg-black/30 p-4 text-sm text-gray-300 leading-relaxed min-h-[96px]">
+                  {activeProfile.statusText || 'No detailed relay status yet.'}
+                </div>
               </div>
             </div>
-          </motion.div>
-        ))}
-      </div>
-
-      {/* Input Area */}
-      <div className="p-4 bg-white/[0.02] border-t border-white/5">
-        <div className="relative flex items-center bg-black/50 border border-white/10 rounded-2xl p-2 focus-within:border-indigo-500/50 focus-within:shadow-[0_0_20px_rgba(99,102,241,0.2)] transition-all">
-          <button className="p-3 text-gray-500 hover:text-indigo-400 transition-colors rounded-xl hover:bg-white/5">
-            <Plus size={20} />
-          </button>
-          <input
-            type="text"
-            placeholder={`Send command to ${activeWorkspace}...`}
-            className="flex-1 bg-transparent border-none focus:ring-0 text-gray-200 placeholder-gray-600 px-2 outline-none"
-          />
-          <button className="p-3 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl transition-colors shadow-lg shadow-indigo-600/20">
-            <Send size={18} />
-          </button>
+          ) : (
+            <div className="text-sm text-gray-500">No relay selected.</div>
+          )}
         </div>
       </div>
     </motion.div>
@@ -626,6 +721,17 @@ function GlowingNameplate({ agent }: { agent: Profile }) {
   );
 }
 
+function InspectorRow({ label, value, mono = false }: { label: string; value: string; mono?: boolean }) {
+  return (
+    <div className="grid grid-cols-[92px_minmax(0,1fr)] gap-3 items-start">
+      <div className="text-[10px] uppercase tracking-[0.22em] text-gray-500 font-bold pt-1">{label}</div>
+      <div className={`rounded-xl border border-white/5 bg-black/30 px-3 py-2 text-sm text-gray-200 break-all ${mono ? 'font-mono' : ''}`}>
+        {value}
+      </div>
+    </div>
+  );
+}
+
 // --- Modals ---
 
 function AddProfileModal({ onClose, onAdd }: {
@@ -647,7 +753,7 @@ function AddProfileModal({ onClose, onAdd }: {
   };
 
   return (
-    <ModalWrapper onClose={onClose} title="Initialize New Relay">
+    <ModalWrapper onClose={onClose} title="Add Relay Profile">
       <div className="space-y-4">
         <div className="grid grid-cols-2 gap-4">
           <button
@@ -673,28 +779,28 @@ function AddProfileModal({ onClose, onAdd }: {
         </div>
         <input
           type="text"
-          placeholder="Profile Name"
+          placeholder="Profile display name"
           value={name}
           onChange={(e) => setName(e.target.value)}
           className="w-full bg-black/50 border border-white/10 rounded-xl p-3 text-white focus:border-indigo-500 outline-none"
         />
         <input
           type="text"
-          placeholder="Workspace Path (e.g. ~/dev/project)"
+          placeholder="Workspace folder path"
           value={workspace}
           onChange={(e) => setWorkspace(e.target.value)}
           className="w-full bg-black/50 border border-white/10 rounded-xl p-3 text-white focus:border-indigo-500 outline-none font-mono text-sm"
         />
         <input
           type="password"
-          placeholder="Discord Bot Token"
+          placeholder="Discord bot token"
           value={discordToken}
           onChange={(e) => setDiscordToken(e.target.value)}
           className="w-full bg-black/50 border border-white/10 rounded-xl p-3 text-white focus:border-indigo-500 outline-none"
         />
         <input
           type="text"
-          placeholder="Discord Channel ID"
+          placeholder="Allowed Discord channel ID"
           value={channelId}
           onChange={(e) => setChannelId(e.target.value)}
           className="w-full bg-black/50 border border-white/10 rounded-xl p-3 text-white focus:border-indigo-500 outline-none"
@@ -705,7 +811,7 @@ function AddProfileModal({ onClose, onAdd }: {
           className="w-full py-3 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-bold shadow-[0_0_20px_rgba(99,102,241,0.4)] transition-all disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
         >
           {loading ? <Loader2 size={18} className="animate-spin" /> : null}
-          Deploy Relay
+          Save Profile
         </button>
       </div>
     </ModalWrapper>
@@ -714,7 +820,7 @@ function AddProfileModal({ onClose, onAdd }: {
 
 function SettingsModal({ onClose }: { onClose: () => void }) {
   return (
-    <ModalWrapper onClose={onClose} title="System Settings">
+    <ModalWrapper onClose={onClose} title="CLADEX Settings">
       <div className="space-y-6">
         <div>
           <label className="text-xs font-bold text-gray-500 uppercase tracking-widest mb-2 block">API Server</label>
@@ -746,25 +852,33 @@ function LogsModal({ profile, onClose }: { profile: Profile; onClose: () => void
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
+    let cancelled = false;
     const load = async () => {
       const data = await fetchLogs(profile.id, profile.type);
-      setLogs(data.length > 0 ? data : [
-        `> [SYSTEM] Initializing relay daemon for ${profile.workspace}...`,
-        `> [DISCORD] Authenticated as bot. Listening on #${profile.discordChannel}.`,
-        '> [READY] Awaiting commands.'
-      ]);
-      setLoading(false);
+      if (!cancelled) {
+        setLogs(data);
+        setLoading(false);
+      }
     };
-    load();
+    void load();
+    const interval = window.setInterval(() => {
+      void load();
+    }, 3000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
   }, [profile]);
 
   return (
-    <ModalWrapper onClose={onClose} title={`Terminal: ${profile.name}`} wide>
+    <ModalWrapper onClose={onClose} title={`Live Logs · ${profile.name}`} wide>
       <div className="bg-black rounded-xl p-4 font-mono text-xs text-gray-400 h-64 overflow-y-auto space-y-1 border border-white/5 shadow-inner">
         {loading ? (
           <div className="flex items-center gap-2 text-indigo-400">
             <Loader2 size={14} className="animate-spin" /> Loading logs...
           </div>
+        ) : logs.length === 0 ? (
+          <div className="text-gray-500">No log lines recorded yet for this relay.</div>
         ) : (
           logs.map((line, i) => <div key={i}>{line}</div>)
         )}

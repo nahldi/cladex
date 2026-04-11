@@ -67,20 +67,45 @@ def _claude_profile_runtime_state(profile: dict[str, Any]) -> dict[str, Any]:
     state_dir = _claude_state_dir(profile)
     pid_file = state_dir / "relay.pid"
     log_path = state_dir / "relay.log"
+    status_file = state_dir / "status.json"
     pid: int | None = None
     running = False
+    ready = False
+    state = "idle"
+    status_message = ""
+    session_id = ""
     if pid_file.exists():
         try:
             pid = int(pid_file.read_text(encoding="utf-8").strip())
         except Exception:
             pid = None
         running = pid is not None and psutil.pid_exists(pid)
+    if status_file.exists():
+        try:
+            status_payload = json.loads(status_file.read_text(encoding="utf-8"))
+        except Exception:
+            status_payload = {}
+        raw_status = str(status_payload.get("status", "")).strip().lower()
+        status_message = str(status_payload.get("detail", "")).strip()
+        session_id = str(status_payload.get("session_id", "")).strip()
+        if raw_status == "working":
+            state = "working"
+        elif raw_status in {"error", "stopped"}:
+            state = "idle"
+        elif raw_status:
+            state = "idle"
+        ready = running and raw_status not in {"error", "stopped", ""}
+    else:
+        ready = running
     return {
         "running": running,
-        "ready": running,
+        "ready": ready,
         "pid": pid,
         "log_path": log_path,
         "state_dir": state_dir,
+        "state": state,
+        "status_message": status_message,
+        "session_id": session_id,
     }
 
 
@@ -122,6 +147,9 @@ def _claude_profiles() -> list[dict[str, Any]]:
                 "_model": env.get("CLAUDE_MODEL", ""),
                 "_trigger_mode": env.get("BOT_TRIGGER_MODE", "mention_or_dm"),
                 "_log_path": str(runtime["log_path"]),
+                "_state": runtime.get("state", "idle"),
+                "_status_message": runtime.get("status_message", ""),
+                "_session_id": runtime.get("session_id", ""),
             }
         )
         records.append(record)
@@ -245,7 +273,9 @@ def _profile_json_record(profile: dict[str, Any]) -> dict[str, Any]:
         "model": profile.get("_model", ""),
         "triggerMode": profile.get("_trigger_mode", ""),
         "discordChannel": attach_channel,
-        "state": "working" if profile.get("_running") else "idle",
+        "state": profile.get("_state", "working" if profile.get("_running") else "idle"),
+        "statusText": profile.get("_status_message", ""),
+        "sessionId": profile.get("_session_id", ""),
         "logPath": profile.get("_log_path", ""),
     }
 

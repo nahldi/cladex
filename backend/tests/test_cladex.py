@@ -67,6 +67,27 @@ def test_claude_running_state_uses_relay_pid(tmp_path: Path, monkeypatch) -> Non
     assert state["pid"] == 1234
 
 
+def test_claude_runtime_state_reads_status_json(tmp_path: Path, monkeypatch) -> None:
+    data_root = tmp_path / "data"
+    state_dir = data_root / "state" / "ns-two"
+    state_dir.mkdir(parents=True)
+    (state_dir / "relay.pid").write_text("555", encoding="utf-8")
+    (state_dir / "status.json").write_text(
+        json.dumps({"status": "working", "detail": "Claude working on discord message", "session_id": "sess-123"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cladex, "CLAUDE_DATA_ROOT", data_root)
+    monkeypatch.setattr(cladex.psutil, "pid_exists", lambda pid: pid == 555)
+
+    state = cladex._claude_profile_runtime_state({"state_namespace": "ns-two"})
+
+    assert state["running"] is True
+    assert state["ready"] is True
+    assert state["state"] == "working"
+    assert state["status_message"] == "Claude working on discord message"
+    assert state["session_id"] == "sess-123"
+
+
 def test_start_claude_profile_uses_windowless_launch(monkeypatch) -> None:
     calls: list[tuple[list[str], str]] = []
     monkeypatch.setattr(cladex, "_claude_discord_bin", lambda: "claude-discord.cmd")

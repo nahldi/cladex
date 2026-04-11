@@ -3273,7 +3273,7 @@ class CodexSession:
                     {
                         "clientInfo": {
                             "name": "discord-codex-relay",
-                            "title": "Discord Codex Relay",
+                            "title": "CLADEX Codex Relay",
                             "version": "1.0",
                         },
                         "capabilities": {

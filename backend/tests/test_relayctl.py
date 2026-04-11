@@ -1414,7 +1414,7 @@ def test_summarize_relay_log_text_returns_human_readable_events() -> None:
     summary = relayctl._summarize_relay_log_text(
         "\n".join(
             [
-                "Supervisor starting relay worker for C:\\work\\ghostlink\\tyson",
+                "Supervisor starting relay worker for C:\\work\\sampleproject\\tyson",
                 "Native Codex login: ok",
                 "Logged in using ChatGPT",
                 "Codex startup healthcheck: ok",
@@ -1463,7 +1463,7 @@ def test_summarize_app_log_text_prefers_latest_session_and_redacts_user_paths() 
                 "=== app-server[channel-new] pid=2 transport=stdio started_at=2 ===",
                 "Name  : PATH",
                 "Value : C:\\Users\\exampleuser\\AppData\\Local\\Programs\\Python\\Python310",
-                "+ cmd /c type C:\\Users\\exampleuser\\OneDrive\\Desktop\\projects\\ghostlink\\backend\\app.py",
+                "+ cmd /c type C:\\Users\\exampleuser\\OneDrive\\Desktop\\projects\\sampleproject\\backend\\app.py",
             ]
         )
     )
