@@ -242,12 +242,32 @@ def _print_table(profiles: list[dict[str, Any]]) -> None:
 
 
 def cmd_list(args: argparse.Namespace) -> int:
-    _print_table(_filter_profiles(relay_type=args.type))
+    profiles = _filter_profiles(relay_type=args.type)
+    if getattr(args, 'json', False):
+        # JSON output for API
+        output = []
+        for p in profiles:
+            output.append({
+                "id": p.get("name", ""),
+                "name": p.get("name", ""),
+                "type": "Claude" if p.get("_relay_type") == "claude" else "Codex",
+                "workspace": p.get("workspace", ""),
+                "status": "Running" if p.get("_running") else "Stopped",
+                "discordChannel": p.get("channel_id", ""),
+                "state": "working" if p.get("_running") else "idle",
+            })
+        print(json.dumps(output))
+        return 0
+    _print_table(profiles)
     return 0
 
 
 def cmd_status(args: argparse.Namespace) -> int:
     profiles = _filter_profiles(name=args.name, relay_type=args.type)
+    if getattr(args, 'json', False):
+        running = [p.get("name", "") for p in profiles if p.get("_running")]
+        print(json.dumps({"running": running}))
+        return 0
     if not profiles:
         print("No matching profiles found.")
         return 1
@@ -442,11 +462,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     list_parser = subparsers.add_parser("list", help="List all profiles.")
     list_parser.add_argument("--type", choices=("codex", "claude"), default=None)
+    list_parser.add_argument("--json", action="store_true", help="Output as JSON for API")
     list_parser.set_defaults(func=cmd_list)
 
     status_parser = subparsers.add_parser("status", help="Show profile status.")
     status_parser.add_argument("name", nargs="?")
     status_parser.add_argument("--type", choices=("codex", "claude"), default=None)
+    status_parser.add_argument("--json", action="store_true", help="Output as JSON for API")
     status_parser.set_defaults(func=cmd_status)
 
     start_parser = subparsers.add_parser("start", help="Start a profile or all profiles of a type.")
