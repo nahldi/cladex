@@ -67,17 +67,26 @@
           "!**/*.pyc",
           "!**/*.pyo"
         ]
+      },
+      {
+        "from": "assets",
+        "to": "assets",
+        "filter": ["**/*"]
       }
     ],
     "win": {
       "target": ["nsis", "portable"],
-      "signAndEditExecutable": false
+      "signAndEditExecutable": false,
+      "icon": "assets/icon.png"
     },
     "mac": {
-      "target": ["dmg"]
+      "target": ["dmg"],
+      "icon": "assets/icon.png"
     },
     "linux": {
-      "target": ["AppImage"]
-    }
+      "target": ["AppImage"],
+      "icon": "assets/icon.png"
+    },
+    "icon": "assets/icon.png"
   }
 }

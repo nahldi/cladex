@@ -29,12 +29,17 @@ function startApiServer() {
 }
 
 function createWindow() {
+  const iconPath = app.isPackaged
+    ? path.join(process.resourcesPath, 'assets', 'icon.png')
+    : path.join(__dirname, '..', 'assets', 'icon.png');
+
   mainWindow = new BrowserWindow({
     width: 1400,
     height: 900,
     minWidth: 1000,
     minHeight: 700,
     title: 'CLADEX',
+    icon: iconPath,
     backgroundColor: '#050505',
     titleBarStyle: 'hiddenInset',
     trafficLightPosition: { x: 15, y: 15 },

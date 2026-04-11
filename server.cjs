@@ -12,7 +12,7 @@ app.use(express.json());
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Headers', 'Content-Type');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, DELETE');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE');
   next();
 });
 
@@ -63,6 +63,14 @@ async function findProfile(id, relayType) {
   return profiles.find((profile) => profile.id === id && (!relayType || profile.relayType === relayType));
 }
 
+async function runJson(args, cwd = BACKEND_DIR) {
+  const result = await runPython(args, cwd);
+  if (result.code !== 0) {
+    throw new Error(result.stderr || result.stdout || 'Backend command failed');
+  }
+  return JSON.parse(result.stdout || '{}');
+}
+
 app.get('/api/runtime-info', async (_req, res) => {
   res.json({
     apiBase: `http://localhost:${Number(process.env.API_PORT || 3001)}`,
@@ -77,6 +85,19 @@ app.get('/api/profiles', async (_req, res) => {
     res.json(await getProfiles());
   } catch (err) {
     res.status(500).json({ error: err?.message ?? 'Failed to load profiles' });
+  }
+});
+
+app.get('/api/profiles/:id', async (req, res) => {
+  const relayType = String(req.query.type || '').trim().toLowerCase();
+  if (relayType !== 'claude' && relayType !== 'codex') {
+    res.status(400).json({ error: 'type must be claude or codex' });
+    return;
+  }
+  try {
+    res.json(await runJson(['cladex.py', 'show', req.params.id, '--type', relayType, '--json']));
+  } catch (err) {
+    res.status(500).json({ error: err?.message ?? 'Failed to load profile' });
   }
 });
 
@@ -122,6 +143,43 @@ app.post('/api/profiles/:id/stop', async (req, res) => {
   res.json({ success: true });
 });
 
+app.post('/api/profiles/:id/restart', async (req, res) => {
+  const { id } = req.params;
+  const relayType = String(req.body?.type || '').trim().toLowerCase();
+  if (relayType !== 'claude' && relayType !== 'codex') {
+    res.status(400).json({ success: false, error: 'type must be claude or codex' });
+    return;
+  }
+  const result = await runPython(['cladex.py', 'restart', id, '--type', relayType]);
+  if (result.code !== 0) {
+    res.status(500).json({ success: false, error: result.stderr || result.stdout || 'Failed to restart relay' });
+    return;
+  }
+  res.json({ success: true });
+});
+
+app.patch('/api/profiles/:id', async (req, res) => {
+  const { id } = req.params;
+  const relayType = String(req.body?.type || '').trim().toLowerCase();
+  if (relayType !== 'claude' && relayType !== 'codex') {
+    res.status(400).json({ success: false, error: 'type must be claude or codex' });
+    return;
+  }
+  const args = ['cladex.py', 'update-profile', id, '--type', relayType, '--json'];
+  if (Object.prototype.hasOwnProperty.call(req.body, 'botName')) args.push('--bot-name', String(req.body?.botName || '').trim());
+  if (Object.prototype.hasOwnProperty.call(req.body, 'model')) args.push('--model', String(req.body?.model || '').trim());
+  if (Object.prototype.hasOwnProperty.call(req.body, 'triggerMode')) args.push('--trigger-mode', String(req.body?.triggerMode || '').trim() || 'mention_or_dm');
+  if (req.body?.allowDms === true) args.push('--allow-dms');
+  if (req.body?.allowDms === false) args.push('--deny-dms');
+  if (Object.prototype.hasOwnProperty.call(req.body, 'allowedUserIds')) args.push('--allowed-user-ids', String(req.body?.allowedUserIds || '').trim());
+  if (Object.prototype.hasOwnProperty.call(req.body, 'channelId')) args.push('--allowed-channel-id', String(req.body?.channelId || '').trim());
+  try {
+    res.json(await runJson(args));
+  } catch (err) {
+    res.status(500).json({ success: false, error: err?.message ?? 'Failed to update profile' });
+  }
+});
+
 app.delete('/api/profiles/:id', async (req, res) => {
   const { id } = req.params;
   const relayType = String(req.query.type || '').trim().toLowerCase();
@@ -160,6 +218,19 @@ app.get('/api/profiles/:id/logs', async (req, res) => {
     res.json({ logs: content.split(/\r?\n/).filter(Boolean).slice(-100) });
   } catch {
     res.status(500).json({ logs: [], error: result.stderr || result.stdout || 'Failed to read logs' });
+  }
+});
+
+app.post('/api/actions/stop-all', async (req, res) => {
+  const relayType = String(req.body?.type || '').trim().toLowerCase();
+  const args = ['cladex.py', 'stop-all', '--json'];
+  if (relayType === 'claude' || relayType === 'codex') {
+    args.push('--type', relayType);
+  }
+  try {
+    res.json(await runJson(args));
+  } catch (err) {
+    res.status(500).json({ success: false, error: err?.message ?? 'Failed to stop relays' });
   }
 });
 
@@ -228,6 +299,62 @@ app.post('/api/profiles', async (req, res) => {
 
   if (result.code !== 0) {
     res.status(500).json({ success: false, error: result.stderr || result.stdout || 'Failed to create profile' });
+    return;
+  }
+  res.json({ success: true });
+});
+
+app.get('/api/projects', async (_req, res) => {
+  try {
+    res.json(await runJson(['cladex.py', 'project', 'list', '--json']));
+  } catch (err) {
+    res.status(500).json({ error: err?.message ?? 'Failed to load workgroups' });
+  }
+});
+
+app.post('/api/projects', async (req, res) => {
+  const name = String(req.body?.name || '').trim();
+  const members = Array.isArray(req.body?.members) ? req.body.members : [];
+  if (!name || !members.length) {
+    res.status(400).json({ success: false, error: 'name and members are required' });
+    return;
+  }
+  const args = ['cladex.py', 'project', 'save', name];
+  for (const member of members) {
+    const relayType = String(member?.relayType || '').trim().toLowerCase();
+    const id = String(member?.id || '').trim();
+    if (relayType && id) {
+      args.push('--member', `${relayType}:${id}`);
+    }
+  }
+  const result = await runPython(args);
+  if (result.code !== 0) {
+    res.status(500).json({ success: false, error: result.stderr || result.stdout || 'Failed to save workgroup' });
+    return;
+  }
+  res.json({ success: true });
+});
+
+app.post('/api/projects/:name/start', async (req, res) => {
+  try {
+    res.json(await runJson(['cladex.py', 'project', 'start', req.params.name, '--json']));
+  } catch (err) {
+    res.status(500).json({ success: false, error: err?.message ?? 'Failed to start workgroup' });
+  }
+});
+
+app.post('/api/projects/:name/stop', async (req, res) => {
+  try {
+    res.json(await runJson(['cladex.py', 'project', 'stop', req.params.name, '--json']));
+  } catch (err) {
+    res.status(500).json({ success: false, error: err?.message ?? 'Failed to stop workgroup' });
+  }
+});
+
+app.delete('/api/projects/:name', async (req, res) => {
+  const result = await runPython(['cladex.py', 'project', 'remove', req.params.name]);
+  if (result.code !== 0) {
+    res.status(500).json({ success: false, error: result.stderr || result.stdout || 'Failed to remove workgroup' });
     return;
   }
   res.json({ success: true });

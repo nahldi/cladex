@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -12,6 +13,7 @@ from typing import Any
 import psutil
 from platformdirs import user_config_dir, user_data_dir
 
+import claude_relay
 import relayctl
 
 
@@ -19,6 +21,9 @@ CLAUDE_APP_NAME = "discord-claude-relay"
 CLAUDE_CONFIG_ROOT = Path(user_config_dir(CLAUDE_APP_NAME, False))
 CLAUDE_DATA_ROOT = Path(user_data_dir(CLAUDE_APP_NAME, False))
 CLAUDE_REGISTRY_PATH = CLAUDE_CONFIG_ROOT / "workspaces.json"
+CLADEX_APP_NAME = "cladex"
+CLADEX_CONFIG_ROOT = Path(user_config_dir(CLADEX_APP_NAME, False))
+CLADEX_PROJECTS_PATH = CLADEX_CONFIG_ROOT / "projects.json"
 GUI_CHILD_ENV = "CLADEX_GUI_CHILD"
 
 
@@ -38,6 +43,15 @@ def _load_json_file(path: Path, *, default: dict[str, Any]) -> dict[str, Any]:
 
 def _load_claude_registry() -> dict[str, Any]:
     return _load_json_file(CLAUDE_REGISTRY_PATH, default={"profiles": [], "projects": []})
+
+
+def _load_cladex_projects() -> dict[str, Any]:
+    return _load_json_file(CLADEX_PROJECTS_PATH, default={"projects": []})
+
+
+def _save_cladex_projects(payload: dict[str, Any]) -> None:
+    CLADEX_CONFIG_ROOT.mkdir(parents=True, exist_ok=True)
+    CLADEX_PROJECTS_PATH.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
 def _load_claude_env(profile: dict[str, Any]) -> dict[str, str]:
@@ -61,6 +75,48 @@ def _load_claude_env(profile: dict[str, Any]) -> dict[str, str]:
 def _claude_state_dir(profile: dict[str, Any]) -> Path:
     namespace = str(profile.get("state_namespace", "")).strip()
     return CLAUDE_DATA_ROOT / "state" / namespace
+
+
+def _workspace_label(workspace: str) -> str:
+    text = str(workspace or "").strip()
+    if not text:
+        return "Workspace"
+    return Path(text).name or text
+
+
+def _humanize_name(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    candidate = text.replace("_", " ").replace("-", " ").strip()
+    parts = [part for part in candidate.split() if part]
+    if not parts:
+        return text
+    return " ".join(part.capitalize() for part in parts[:4])
+
+
+def _display_name(profile: dict[str, Any]) -> str:
+    bot_name = str(profile.get("_bot_name") or profile.get("bot_name") or "").strip()
+    if bot_name:
+        return bot_name if re.search(r"[A-Z\s]", bot_name) else _humanize_name(bot_name)
+    workspace_name = _workspace_label(str(profile.get("workspace", "")))
+    if workspace_name and workspace_name.lower() not in {"workspace", "repo"}:
+        return _humanize_name(workspace_name)
+    return _humanize_name(str(profile.get("name", ""))) or "Relay"
+
+
+def _channel_label(raw_value: Any) -> str:
+    text = str(raw_value or "").strip()
+    if not text:
+        return ""
+    return f"Channel {text}"
+
+
+def _profile_lookup_key(profile: dict[str, Any]) -> tuple[str, str]:
+    return (
+        str(profile.get("_relay_type", "")).strip().lower(),
+        str(profile.get("name", "")).strip().lower(),
+    )
 
 
 def _claude_profile_runtime_state(profile: dict[str, Any]) -> dict[str, Any]:
@@ -270,7 +326,16 @@ def _filter_profiles(name: str | None = None, relay_type: str | None = None) -> 
         profiles = [item for item in profiles if item.get("_relay_type") == relay_type]
     if name:
         target = name.strip().lower()
-        profiles = [item for item in profiles if str(item.get("name", "")).lower() == target]
+        profiles = [
+            item
+            for item in profiles
+            if target
+            in {
+                str(item.get("name", "")).lower(),
+                str(item.get("_bot_name", "")).strip().lower(),
+                _display_name(item).lower(),
+            }
+        ]
     return profiles
 
 
@@ -282,9 +347,13 @@ def _profile_json_record(profile: dict[str, Any]) -> dict[str, Any]:
         or profile.get("channel")
         or ""
     )
+    display_name = _display_name(profile)
     return {
         "id": profile.get("name", ""),
         "name": profile.get("name", ""),
+        "displayName": display_name,
+        "technicalName": profile.get("name", ""),
+        "workspaceLabel": _workspace_label(profile.get("workspace", "")),
         "type": "Claude" if relay_type == "claude" else "Codex",
         "relayType": relay_type,
         "workspace": profile.get("workspace", ""),
@@ -299,12 +368,195 @@ def _profile_json_record(profile: dict[str, Any]) -> dict[str, Any]:
         "stateNamespace": profile.get("_state_namespace", profile.get("state_namespace", "")),
         "effort": profile.get("_effort", ""),
         "discordChannel": attach_channel,
+        "channelLabel": _channel_label(profile.get("_active_channel") or attach_channel),
         "state": profile.get("_state", "working" if profile.get("_running") else "idle"),
         "statusText": profile.get("_status_message", ""),
         "sessionId": profile.get("_session_id", ""),
         "activeWorktree": profile.get("_active_worktree", ""),
         "activeChannel": profile.get("_active_channel", ""),
         "logPath": profile.get("_log_path", ""),
+    }
+
+
+def _update_profile_registry(registry: dict[str, Any], *, name: str, changes: dict[str, Any]) -> None:
+    for item in registry.get("profiles", []):
+        if item.get("name") == name:
+            item.update(changes)
+            return
+
+
+def _update_codex_profile(
+    profile: dict[str, Any],
+    *,
+    bot_name: str | None = None,
+    model: str | None = None,
+    trigger_mode: str | None = None,
+    allow_dms: bool | None = None,
+    allowed_user_ids: str | None = None,
+    allowed_channel_id: str | None = None,
+) -> None:
+    env_path = Path(str(profile.get("env_file", "")).strip())
+    env = relayctl._normalized_profile_env(relayctl._load_env_file(env_path))
+    if bot_name is not None:
+        env["RELAY_BOT_NAME"] = bot_name.strip()
+    if model is not None:
+        normalized_model = model.strip()
+        env["RELAY_MODEL"] = normalized_model or relayctl.DEFAULT_CODEX_MODEL
+        env["CODEX_MODEL"] = env["RELAY_MODEL"]
+    if trigger_mode is not None:
+        env["BOT_TRIGGER_MODE"] = trigger_mode.strip() or env.get("BOT_TRIGGER_MODE", "mention_or_dm")
+    if allow_dms is not None:
+        env["ALLOW_DMS"] = "true" if allow_dms else "false"
+    if allowed_user_ids is not None:
+        env["ALLOWED_USER_IDS"] = relayctl._parse_csv_ids(allowed_user_ids)
+    if allowed_channel_id is not None:
+        channel_ids = relayctl._parse_csv_ids(allowed_channel_id)
+        env["ALLOWED_CHANNEL_IDS"] = channel_ids
+        env["RELAY_ATTACH_CHANNEL_ID"] = channel_ids.split(",", 1)[0] if channel_ids else ""
+    env = relayctl._normalized_profile_env(env)
+    relayctl._write_env_file(env_path, env)
+
+    registry = relayctl._load_registry()
+    _update_profile_registry(
+        registry,
+        name=str(profile.get("name", "")),
+        changes={
+            "bot_name": env.get("RELAY_BOT_NAME", ""),
+            "attach_channel_id": env.get("RELAY_ATTACH_CHANNEL_ID", ""),
+        },
+    )
+    relayctl._save_registry(registry)
+
+
+def _update_claude_profile(
+    profile: dict[str, Any],
+    *,
+    bot_name: str | None = None,
+    model: str | None = None,
+    trigger_mode: str | None = None,
+    allow_dms: bool | None = None,
+    allowed_user_ids: str | None = None,
+    allowed_channel_id: str | None = None,
+) -> None:
+    env_path = Path(str(profile.get("env_file", "")).strip())
+    env = claude_relay._load_env_file(env_path)
+    if bot_name is not None:
+        env["RELAY_BOT_NAME"] = bot_name.strip()
+    if model is not None:
+        env["CLAUDE_MODEL"] = model.strip()
+    if trigger_mode is not None:
+        env["BOT_TRIGGER_MODE"] = trigger_mode.strip() or env.get("BOT_TRIGGER_MODE", "mention_or_dm")
+    if allow_dms is not None:
+        env["ALLOW_DMS"] = "true" if allow_dms else "false"
+    if allowed_user_ids is not None:
+        env["ALLOWED_USER_IDS"] = claude_relay._parse_csv_ids(allowed_user_ids)
+    if allowed_channel_id is not None:
+        env["ALLOWED_CHANNEL_IDS"] = claude_relay._parse_csv_ids(allowed_channel_id)
+    env["ALLOW_DMS"] = "true" if env.get("ALLOW_DMS", "false").lower() in {"1", "true", "yes"} else "false"
+    env["BOT_TRIGGER_MODE"] = env.get("BOT_TRIGGER_MODE", "mention_or_dm") or "mention_or_dm"
+    env["OPERATOR_IDS"] = claude_relay._parse_csv_ids(env.get("OPERATOR_IDS", ""))
+    env["ALLOWED_USER_IDS"] = claude_relay._parse_csv_ids(env.get("ALLOWED_USER_IDS", ""))
+    env["ALLOWED_CHANNEL_IDS"] = claude_relay._parse_csv_ids(env.get("ALLOWED_CHANNEL_IDS", ""))
+    env["CLAUDE_MODEL"] = (env.get("CLAUDE_MODEL", "") or "").strip()
+    claude_relay._write_env_file(env_path, env)
+
+    registry = _load_claude_registry()
+    _update_profile_registry(
+        registry,
+        name=str(profile.get("name", "")),
+        changes={
+            "bot_name": env.get("RELAY_BOT_NAME", ""),
+        },
+    )
+    _save_claude_projects = CLAUDE_REGISTRY_PATH
+    _save_claude_projects.parent.mkdir(parents=True, exist_ok=True)
+    _save_claude_projects.write_text(json.dumps(registry, indent=2) + "\n", encoding="utf-8")
+
+
+def update_profile(
+    profile: dict[str, Any],
+    *,
+    bot_name: str | None = None,
+    model: str | None = None,
+    trigger_mode: str | None = None,
+    allow_dms: bool | None = None,
+    allowed_user_ids: str | None = None,
+    allowed_channel_id: str | None = None,
+) -> None:
+    relay_type = str(profile.get("_relay_type", "")).strip().lower()
+    if relay_type == "codex":
+        _update_codex_profile(
+            profile,
+            bot_name=bot_name,
+            model=model,
+            trigger_mode=trigger_mode,
+            allow_dms=allow_dms,
+            allowed_user_ids=allowed_user_ids,
+            allowed_channel_id=allowed_channel_id,
+        )
+        return
+    if relay_type == "claude":
+        _update_claude_profile(
+            profile,
+            bot_name=bot_name,
+            model=model,
+            trigger_mode=trigger_mode,
+            allow_dms=allow_dms,
+            allowed_user_ids=allowed_user_ids,
+            allowed_channel_id=allowed_channel_id,
+        )
+        return
+    raise RuntimeError(f"Unknown relay type: {relay_type}")
+
+
+def stop_all_profiles(*, relay_type: str | None = None) -> list[dict[str, Any]]:
+    profiles = _filter_profiles(relay_type=relay_type)
+    for profile in profiles:
+        stop_profile(profile)
+    return profiles
+
+
+def _project_record(name: str, members: list[dict[str, str]]) -> dict[str, Any]:
+    return {"name": name, "members": members}
+
+
+def _member_ref(profile: dict[str, Any]) -> dict[str, str]:
+    return {
+        "name": str(profile.get("name", "")),
+        "relayType": str(profile.get("_relay_type", "")),
+    }
+
+
+def _resolve_project_members(project: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+    all_profiles = {_profile_lookup_key(profile): profile for profile in get_all_profiles()}
+    resolved: list[dict[str, Any]] = []
+    missing: list[dict[str, str]] = []
+    for member in project.get("members", []):
+        relay_type = str(member.get("relayType", "")).strip().lower()
+        name = str(member.get("name", "")).strip()
+        profile = all_profiles.get((relay_type, name.lower()))
+        if profile is None:
+            missing.append({"name": name, "relayType": relay_type})
+        else:
+            resolved.append(profile)
+    return resolved, missing
+
+
+def _project_json_record(project: dict[str, Any]) -> dict[str, Any]:
+    resolved, missing = _resolve_project_members(project)
+    return {
+        "name": str(project.get("name", "")),
+        "memberCount": len(project.get("members", [])),
+        "members": [
+            {
+                "id": profile.get("name", ""),
+                "displayName": _display_name(profile),
+                "relayType": profile.get("_relay_type", ""),
+                "workspace": profile.get("workspace", ""),
+            }
+            for profile in resolved
+        ],
+        "missingMembers": missing,
     }
 
 
@@ -394,6 +646,59 @@ def cmd_restart(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_stop_all(args: argparse.Namespace) -> int:
+    profiles = stop_all_profiles(relay_type=args.type)
+    if not profiles:
+        print("No matching profiles found.")
+        return 1
+    if getattr(args, "json", False):
+        print(json.dumps({"stopped": [profile.get("name", "") for profile in profiles]}))
+        return 0
+    print(f"Stopped {len(profiles)} relay(s).")
+    return 0
+
+
+def cmd_show(args: argparse.Namespace) -> int:
+    profiles = _filter_profiles(name=args.name, relay_type=args.type)
+    if not profiles:
+        print("No matching profiles found.")
+        return 1
+    record = _profile_json_record(profiles[0])
+    if getattr(args, "json", False):
+        print(json.dumps(record))
+        return 0
+    print(json.dumps(record, indent=2))
+    return 0
+
+
+def cmd_update(args: argparse.Namespace) -> int:
+    profiles = _filter_profiles(name=args.name, relay_type=args.type)
+    if not profiles:
+        print("No matching profiles found.")
+        return 1
+    allow_dms: bool | None = None
+    if getattr(args, "allow_dms", False):
+        allow_dms = True
+    elif getattr(args, "deny_dms", False):
+        allow_dms = False
+    update_profile(
+        profiles[0],
+        bot_name=args.bot_name,
+        model=args.model,
+        trigger_mode=args.trigger_mode,
+        allow_dms=allow_dms,
+        allowed_user_ids=args.allowed_user_ids,
+        allowed_channel_id=args.allowed_channel_id,
+    )
+    refreshed = _filter_profiles(name=args.name, relay_type=args.type)
+    record = _profile_json_record(refreshed[0]) if refreshed else {}
+    if getattr(args, "json", False):
+        print(json.dumps(record))
+        return 0
+    print(f"Updated {profiles[0]['name']} [{profiles[0]['_relay_type']}].")
+    return 0
+
+
 def _remove_codex_profile(profile: dict[str, Any]) -> None:
     relayctl._stop_profile(profile)
     env_file = Path(str(profile.get("env_file", "")).strip())
@@ -458,6 +763,93 @@ def cmd_logs(args: argparse.Namespace) -> int:
         print(json.dumps({"logs": [line for line in text.splitlines() if line.strip()]}))
         return 0
     print(text, end="")
+    return 0
+
+
+def cmd_project_list(args: argparse.Namespace) -> int:
+    payload = _load_cladex_projects()
+    records = [_project_json_record(project) for project in payload.get("projects", [])]
+    if getattr(args, "json", False):
+        print(json.dumps(records))
+        return 0
+    if not records:
+        print("No saved workgroups.")
+        return 0
+    for record in records:
+        members = ", ".join(member["displayName"] for member in record["members"]) or "none"
+        print(f"{record['name']}\t{record['memberCount']}\t{members}")
+    return 0
+
+
+def cmd_project_save(args: argparse.Namespace) -> int:
+    name = str(args.name or "").strip()
+    if not name:
+        print("Provide a workgroup name.")
+        return 1
+    members: list[dict[str, str]] = []
+    for raw_member in args.member:
+        if ":" not in raw_member:
+            raise SystemExit("Members must use relayType:name format, for example `codex:tyson-1234`.")
+        relay_type, member_name = raw_member.split(":", 1)
+        matches = _filter_profiles(name=member_name, relay_type=relay_type.strip().lower())
+        if not matches:
+            raise SystemExit(f"No matching profile found for `{raw_member}`.")
+        members.append(_member_ref(matches[0]))
+    if not members:
+        raise SystemExit("Select at least one relay for the workgroup.")
+    payload = _load_cladex_projects()
+    projects = [project for project in payload.get("projects", []) if str(project.get("name", "")).strip().lower() != name.lower()]
+    projects.append(_project_record(name, members))
+    projects.sort(key=lambda item: str(item.get("name", "")).lower())
+    payload["projects"] = projects
+    _save_cladex_projects(payload)
+    print(f"Saved workgroup `{name}` with {len(members)} relay(s).")
+    return 0
+
+
+def _project_by_name(name: str) -> dict[str, Any]:
+    target = str(name or "").strip().lower()
+    for project in _load_cladex_projects().get("projects", []):
+        if str(project.get("name", "")).strip().lower() == target:
+            return project
+    raise SystemExit(f"No saved workgroup named `{name}`.")
+
+
+def cmd_project_start(args: argparse.Namespace) -> int:
+    project = _project_by_name(args.name)
+    members, missing = _resolve_project_members(project)
+    for profile in members:
+        start_profile(profile)
+    if getattr(args, "json", False):
+        print(json.dumps({"started": [profile.get("name", "") for profile in members], "missing": missing}))
+        return 0
+    print(f"Started workgroup `{project['name']}`.")
+    return 0
+
+
+def cmd_project_stop(args: argparse.Namespace) -> int:
+    project = _project_by_name(args.name)
+    members, missing = _resolve_project_members(project)
+    for profile in members:
+        stop_profile(profile)
+    if getattr(args, "json", False):
+        print(json.dumps({"stopped": [profile.get("name", "") for profile in members], "missing": missing}))
+        return 0
+    print(f"Stopped workgroup `{project['name']}`.")
+    return 0
+
+
+def cmd_project_remove(args: argparse.Namespace) -> int:
+    target = str(args.name or "").strip()
+    payload = _load_cladex_projects()
+    projects = payload.get("projects", [])
+    remaining = [project for project in projects if str(project.get("name", "")).strip().lower() != target.lower()]
+    if len(remaining) == len(projects):
+        print(f"No saved workgroup named `{target}`.")
+        return 1
+    payload["projects"] = remaining
+    _save_cladex_projects(payload)
+    print(f"Removed workgroup `{target}`.")
     return 0
 
 
@@ -616,6 +1008,12 @@ def build_parser() -> argparse.ArgumentParser:
     status_parser.add_argument("--json", action="store_true", help="Output as JSON for API")
     status_parser.set_defaults(func=cmd_status)
 
+    show_parser = subparsers.add_parser("show", help="Show one profile.")
+    show_parser.add_argument("name")
+    show_parser.add_argument("--type", choices=("codex", "claude"), default=None)
+    show_parser.add_argument("--json", action="store_true", help="Output as JSON for API")
+    show_parser.set_defaults(func=cmd_show)
+
     start_parser = subparsers.add_parser("start", help="Start a profile or all profiles of a type.")
     start_parser.add_argument("name", nargs="?")
     start_parser.add_argument("--type", choices=("codex", "claude"), default=None)
@@ -626,10 +1024,28 @@ def build_parser() -> argparse.ArgumentParser:
     stop_parser.add_argument("--type", choices=("codex", "claude"), default=None)
     stop_parser.set_defaults(func=cmd_stop)
 
+    stop_all_parser = subparsers.add_parser("stop-all", help="Stop every profile or every profile of a type.")
+    stop_all_parser.add_argument("--type", choices=("codex", "claude"), default=None)
+    stop_all_parser.add_argument("--json", action="store_true", help="Output as JSON for API")
+    stop_all_parser.set_defaults(func=cmd_stop_all)
+
     restart_parser = subparsers.add_parser("restart", help="Restart a profile or all profiles of a type.")
     restart_parser.add_argument("name", nargs="?")
     restart_parser.add_argument("--type", choices=("codex", "claude"), default=None)
     restart_parser.set_defaults(func=cmd_restart)
+
+    update_parser = subparsers.add_parser("update-profile", help="Update editable relay profile settings.")
+    update_parser.add_argument("name")
+    update_parser.add_argument("--type", choices=("codex", "claude"), default=None)
+    update_parser.add_argument("--bot-name")
+    update_parser.add_argument("--model")
+    update_parser.add_argument("--trigger-mode", choices=("all", "mention_or_dm", "dm_only"), default=None)
+    update_parser.add_argument("--allow-dms", action="store_true", default=False)
+    update_parser.add_argument("--deny-dms", action="store_true", default=False)
+    update_parser.add_argument("--allowed-user-ids")
+    update_parser.add_argument("--allowed-channel-id")
+    update_parser.add_argument("--json", action="store_true", help="Output the updated profile as JSON")
+    update_parser.set_defaults(func=cmd_update)
 
     logs_parser = subparsers.add_parser("logs", help="Show recent logs for one profile.")
     logs_parser.add_argument("name")
@@ -642,6 +1058,32 @@ def build_parser() -> argparse.ArgumentParser:
     remove_parser.add_argument("name")
     remove_parser.add_argument("--type", choices=("codex", "claude"), default=None)
     remove_parser.set_defaults(func=cmd_remove)
+
+    project_parser = subparsers.add_parser("project", help="Manage saved CLADEX workgroups.")
+    project_subparsers = project_parser.add_subparsers(dest="project_command")
+
+    project_list_parser = project_subparsers.add_parser("list", help="List saved workgroups.")
+    project_list_parser.add_argument("--json", action="store_true", help="Output as JSON for API")
+    project_list_parser.set_defaults(func=cmd_project_list)
+
+    project_save_parser = project_subparsers.add_parser("save", help="Save or update a workgroup.")
+    project_save_parser.add_argument("name")
+    project_save_parser.add_argument("--member", action="append", default=[], help="Workgroup member as relayType:name")
+    project_save_parser.set_defaults(func=cmd_project_save)
+
+    project_start_parser = project_subparsers.add_parser("start", help="Start a workgroup.")
+    project_start_parser.add_argument("name")
+    project_start_parser.add_argument("--json", action="store_true", help="Output as JSON for API")
+    project_start_parser.set_defaults(func=cmd_project_start)
+
+    project_stop_parser = project_subparsers.add_parser("stop", help="Stop a workgroup.")
+    project_stop_parser.add_argument("name")
+    project_stop_parser.add_argument("--json", action="store_true", help="Output as JSON for API")
+    project_stop_parser.set_defaults(func=cmd_project_stop)
+
+    project_remove_parser = project_subparsers.add_parser("remove", help="Remove a workgroup.")
+    project_remove_parser.add_argument("name")
+    project_remove_parser.set_defaults(func=cmd_project_remove)
 
     gui_parser = subparsers.add_parser("gui", help="Open the CLADEX GUI.")
     gui_parser.set_defaults(func=cmd_gui)

@@ -174,6 +174,8 @@ def test_list_json_contains_runtime_fields(monkeypatch, capsys) -> None:
     assert payload[0]["botName"] == "Kurt"
     assert payload[0]["allowDms"] is True
     assert payload[0]["stateNamespace"] == "codex-ns"
+    assert payload[0]["displayName"] == "Kurt"
+    assert payload[0]["workspaceLabel"] == "repo"
 
 
 def test_status_json_returns_profiles_and_running(monkeypatch, capsys) -> None:
@@ -235,3 +237,54 @@ def test_cmd_remove_codex_uses_registry_cleanup(monkeypatch, capsys) -> None:
     assert rc == 0
     assert removed == ["codex-one"]
     assert "Removed codex-one [codex]." in capsys.readouterr().out
+
+
+def test_cmd_update_passes_fields_to_update_profile(monkeypatch, capsys) -> None:
+    updated: list[tuple[dict, dict]] = []
+    profile = {"name": "codex-one", "_relay_type": "codex", "workspace": "C:/repo", "_bot_name": "Tyson"}
+    monkeypatch.setattr(cladex, "_filter_profiles", lambda name=None, relay_type=None: [profile])
+    monkeypatch.setattr(
+        cladex,
+        "update_profile",
+        lambda selected, **kwargs: updated.append((selected, kwargs)),
+    )
+
+    rc = cladex.cmd_update(
+        SimpleNamespace(
+            name="codex-one",
+            type="codex",
+            bot_name="Tyson",
+            model="gpt-5.4",
+            trigger_mode="mention_or_dm",
+            allow_dms=True,
+            deny_dms=False,
+            allowed_user_ids="1,2",
+            allowed_channel_id="3",
+            json=False,
+        )
+    )
+
+    assert rc == 0
+    assert updated[0][1]["bot_name"] == "Tyson"
+    assert updated[0][1]["allow_dms"] is True
+    assert "Updated codex-one [codex]." in capsys.readouterr().out
+
+
+def test_project_list_json(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        cladex,
+        "_load_cladex_projects",
+        lambda: {"projects": [{"name": "core", "members": [{"name": "codex-one", "relayType": "codex"}]}]},
+    )
+    monkeypatch.setattr(
+        cladex,
+        "_resolve_project_members",
+        lambda project: ([{"name": "codex-one", "_relay_type": "codex", "workspace": "C:/repo", "_bot_name": "Tyson"}], []),
+    )
+
+    rc = cladex.cmd_project_list(SimpleNamespace(json=True))
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload[0]["name"] == "core"
+    assert payload[0]["members"][0]["displayName"] == "Tyson"
