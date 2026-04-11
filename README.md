@@ -29,7 +29,7 @@ npm start  # Runs API server + Vite dev server
 ```
 
 Optional desktop UI environment variables live in `.env.example`.
-They are local settings only. CLADEX does not require Gemini, Google, AI Studio, or Cloud Run configuration.
+They are local settings for the Electron app and local API server only.
 
 ### Build Installer
 
