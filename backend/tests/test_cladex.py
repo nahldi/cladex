@@ -80,6 +80,8 @@ def test_claude_runtime_state_reads_status_json(tmp_path: Path, monkeypatch) -> 
                 "session_id": "sess-123",
                 "active_worktree": "C:/repo/worktree",
                 "active_channel": "456",
+                "model": "claude-opus-4-5-20251101",
+                "effort": "high",
             }
         ),
         encoding="utf-8",
@@ -96,6 +98,8 @@ def test_claude_runtime_state_reads_status_json(tmp_path: Path, monkeypatch) -> 
     assert state["session_id"] == "sess-123"
     assert state["active_worktree"] == "C:/repo/worktree"
     assert state["active_channel"] == "456"
+    assert state["model"] == "claude-opus-4-5-20251101"
+    assert state["effort"] == "high"
 
 
 def test_start_claude_profile_uses_windowless_launch(monkeypatch) -> None:
@@ -148,6 +152,10 @@ def test_list_json_contains_runtime_fields(monkeypatch, capsys) -> None:
                 "_provider": "codex-app-server",
                 "_model": "gpt-5.4",
                 "_trigger_mode": "mention_or_dm",
+                "_effort": "high",
+                "_bot_name": "Kurt",
+                "_allow_dms": True,
+                "_state_namespace": "codex-ns",
                 "workspace": "C:/repo",
                 "_log_path": "C:/repo/relay.log",
                 "attach_channel_id": "123",
@@ -162,6 +170,10 @@ def test_list_json_contains_runtime_fields(monkeypatch, capsys) -> None:
     assert payload[0]["relayType"] == "codex"
     assert payload[0]["running"] is True
     assert payload[0]["discordChannel"] == "123"
+    assert payload[0]["effort"] == "high"
+    assert payload[0]["botName"] == "Kurt"
+    assert payload[0]["allowDms"] is True
+    assert payload[0]["stateNamespace"] == "codex-ns"
 
 
 def test_status_json_returns_profiles_and_running(monkeypatch, capsys) -> None:

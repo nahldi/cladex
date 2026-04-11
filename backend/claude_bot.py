@@ -264,6 +264,8 @@ class ClaudeRelayBot(commands.Bot):
             "active_channel": self._backend.current_channel if self._backend else None,
             "bot_user": str(self.user) if self.user else None,
             "session_id": self._backend.session_id if self._backend else None,
+            "model": self._backend.configured_model if self._backend else None,
+            "effort": self._backend.effort if self._backend else None,
             "timestamp": datetime.utcnow().isoformat(),
         }
         atomic_write_text(status_file, json.dumps(data, indent=2))

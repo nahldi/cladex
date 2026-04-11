@@ -31,6 +31,8 @@ from relay_runtime import DurableRuntime, _extract_blocker, _extract_next_step, 
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_CLAUDE_MODEL = "claude-opus-4-5-20251101"
+
 PROMPT_CONTEXT_FILES: tuple[tuple[str, int], ...] = (
     ("AGENTS.md", 3000),
     ("memory/STATUS.md", 2500),
@@ -176,11 +178,16 @@ class ClaudeBackend:
             state_namespace=state_dir.name or "default",
             agent_name="claude",
         )
+        self.model = (os.environ.get("CLAUDE_MODEL") or DEFAULT_CLAUDE_MODEL).strip() or DEFAULT_CLAUDE_MODEL
+        self.reasoning_effort_quick = (os.environ.get("CLAUDE_REASONING_EFFORT_QUICK", "medium").strip().lower() or "medium")
+        self.reasoning_effort_default = (os.environ.get("CLAUDE_REASONING_EFFORT_DEFAULT", "high").strip().lower() or "high")
+        self.reasoning_effort_allow_xhigh = os.environ.get("CLAUDE_REASONING_EFFORT_ALLOW_XHIGH", "false").strip().lower() in {"1", "true", "yes", "on"}
         self._sessions: dict[str, ClaudeSession] = {}
         self._seen_channels: set[str] = set()
         self._last_session_id: str | None = None
         self._last_channel_id: str | None = None
         self._last_worktree: Path = workspace
+        self._last_effort: str = self.reasoning_effort_default
 
         self._running = False
         self._process_lock = threading.Lock()
@@ -253,7 +260,7 @@ class ClaudeBackend:
         started_at = _now_iso()
 
         self.on_status(
-            f"Claude working on {msg.channel_type.value} message from {msg.sender_name} in {binding.worktree_path.name}."
+            f"Claude working on {msg.channel_type.value} message from {msg.sender_name} in {binding.worktree_path.name} (effort: {self._effort_for_message(msg.content)})."
         )
         result = self._run_turn(prompt, use_resume=session.initialized, cwd=binding.worktree_path, session=session)
 
@@ -367,6 +374,8 @@ class ClaudeBackend:
         return True
 
     def _format_prompt(self, msg: InboundMessage, prompt_workspace: Path, durable_bundle: str) -> str:
+        effort = self._effort_for_message(msg.content)
+        self._last_effort = effort
         parts = [
             (
                 "You are Claude running inside CLADEX as a durable coding relay.\n"
@@ -380,7 +389,8 @@ class ClaudeBackend:
                 "- Keep replies compact and operationally useful.\n"
                 "- Before answering, check AGENTS.md, memory/*, code, tests, and git state in the current worktree.\n"
                 "- After meaningful progress, make sure durable memory and handoff remain truthful.\n"
-                "- If another AI made a claim, verify it before trusting it."
+                "- If another AI made a claim, verify it before trusting it.\n"
+                f"- Current relay effort policy for this turn: {effort}."
             )
         ]
         parts.append(f"Durable runtime context:\n{durable_bundle}")
@@ -427,7 +437,7 @@ class ClaudeBackend:
             "--output-format",
             "stream-json",
             "--model",
-            "claude-opus-4-5-20251101",
+            self.model,
         ]
         if use_resume:
             cmd.extend(["--resume", session.session_id])
@@ -630,6 +640,46 @@ class ClaudeBackend:
                 return normalized[:280]
         return text.strip()[:280] or "Claude completed the turn."
 
+    def _effort_for_message(self, text: str) -> str:
+        normalized = text.strip().lower()
+        quick_markers = (
+            "status",
+            "what changed",
+            "what happened",
+            "why",
+            "explain",
+            "list",
+            "show",
+        )
+        hard_markers = (
+            "implement",
+            "fix",
+            "repair",
+            "refactor",
+            "audit",
+            "verify",
+            "durable",
+            "architecture",
+            "multi-file",
+            "long session",
+            "restart",
+            "compaction",
+        )
+        hardest_markers = (
+            "full rearchitecture",
+            "deep research",
+            "full audit",
+            "large refactor",
+            "cross repo",
+        )
+        if any(marker in normalized for marker in quick_markers):
+            return self.reasoning_effort_quick
+        if self.reasoning_effort_allow_xhigh and any(marker in normalized for marker in hardest_markers):
+            return "xhigh"
+        if any(marker in normalized for marker in hard_markers) or len(normalized) > 500:
+            return self.reasoning_effort_default
+        return self.reasoning_effort_quick
+
     @property
     def session_id(self) -> str | None:
         return self._last_session_id
@@ -641,6 +691,14 @@ class ClaudeBackend:
     @property
     def current_channel(self) -> str | None:
         return self._last_channel_id
+
+    @property
+    def effort(self) -> str:
+        return self._last_effort
+
+    @property
+    def configured_model(self) -> str:
+        return self.model
 
 
 class RelayBackend:
@@ -684,6 +742,14 @@ class RelayBackend:
     @property
     def current_channel(self) -> str | None:
         return self._claude.current_channel
+
+    @property
+    def effort(self) -> str:
+        return self._claude.effort
+
+    @property
+    def configured_model(self) -> str:
+        return self._claude.configured_model
 
     def _route_response(self, msg: OutboundMessage) -> None:
         if msg.channel_type == ChannelType.DISCORD:

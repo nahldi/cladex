@@ -42,9 +42,24 @@ type ProfileRecord = {
   provider: string;
   model: string;
   triggerMode: string;
+  effort?: string;
+  botName?: string;
+  allowDms?: boolean;
+  stateNamespace?: string;
   discordChannel: string;
+  activeChannel?: string;
+  activeWorktree?: string;
+  sessionId?: string;
+  statusText?: string;
   state: 'idle' | 'working';
   logPath: string;
+};
+
+type RuntimeInfo = {
+  apiBase: string;
+  backendDir: string;
+  packaged: boolean;
+  appVersion: string;
 };
 
 async function runPython(args: string[], cwd = BACKEND_DIR): Promise<{ stdout: string; stderr: string; code: number }> {
@@ -83,6 +98,16 @@ async function findProfile(id: string, relayType?: string): Promise<ProfileRecor
   const profiles = await getProfiles();
   return profiles.find((profile) => profile.id === id && (!relayType || profile.relayType === relayType));
 }
+
+app.get('/api/runtime-info', async (_req, res) => {
+  const payload: RuntimeInfo = {
+    apiBase: `http://localhost:${Number(process.env.API_PORT || 3001)}`,
+    backendDir: BACKEND_DIR,
+    packaged: app.get('env') === 'production' || !!process.resourcesPath,
+    appVersion: process.env.npm_package_version || '2.0.0',
+  };
+  res.json(payload);
+});
 
 app.get('/api/profiles', async (_req, res) => {
   try {
@@ -187,6 +212,11 @@ app.post('/api/profiles', async (req, res) => {
   const workspace = String(req.body?.workspace || '').trim();
   const discordToken = String(req.body?.discordToken || '').trim();
   const channelId = String(req.body?.channelId || '').trim();
+  const model = String(req.body?.model || '').trim();
+  const triggerMode = String(req.body?.triggerMode || 'mention_or_dm').trim();
+  const allowDms = Boolean(req.body?.allowDms);
+  const operatorIds = String(req.body?.operatorIds || '').trim();
+  const allowedUserIds = String(req.body?.allowedUserIds || '').trim();
 
   if (!name || !workspace || !discordToken || !channelId) {
     res.status(400).json({ success: false, error: 'name, workspace, discordToken, and channelId are required' });
@@ -212,6 +242,11 @@ app.post('/api/profiles', async (req, res) => {
       name,
       '--allowed-channel-id',
       channelId,
+      '--trigger-mode',
+      triggerMode,
+      ...(allowDms ? ['--allow-dms'] : []),
+      ...(model ? ['--model', model] : []),
+      ...[operatorIds, allowedUserIds].flatMap((value) => value.split(',').map((id) => id.trim()).filter(Boolean)).flatMap((id) => ['--allowed-user-id', id]),
     ]);
   } else {
     result = await runPython(
@@ -224,6 +259,12 @@ app.post('/api/profiles', async (req, res) => {
         name,
         '--allowed-channel-id',
         channelId,
+        '--trigger-mode',
+        triggerMode,
+        ...(allowDms ? ['--allow-dms'] : []),
+        ...(model ? ['--model', model] : []),
+        ...(operatorIds ? ['--operator-ids', operatorIds] : []),
+        ...(allowedUserIds ? ['--allowed-user-ids', allowedUserIds] : []),
       ],
       absoluteWorkspace,
     );

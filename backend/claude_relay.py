@@ -132,6 +132,7 @@ def _profile_from_env(env: dict[str, str]) -> dict:
     normalized["OPERATOR_IDS"] = _parse_csv_ids(normalized.get("OPERATOR_IDS", ""))
     normalized["ALLOWED_USER_IDS"] = _parse_csv_ids(normalized.get("ALLOWED_USER_IDS", ""))
     normalized["ALLOWED_CHANNEL_IDS"] = _parse_csv_ids(normalized.get("ALLOWED_CHANNEL_IDS", ""))
+    normalized["CLAUDE_MODEL"] = (normalized.get("CLAUDE_MODEL", "") or "").strip()
 
     PROFILES_DIR.mkdir(parents=True, exist_ok=True)
     _write_env_file(profile_env_path, normalized)
@@ -285,11 +286,12 @@ def cmd_register(args: argparse.Namespace) -> int:
         "RELAY_BOT_NAME": args.bot_name or "",
         "CLAUDE_WORKDIR": str(workspace),
         "OPERATOR_IDS": _parse_csv_ids(args.operator_ids or ""),
-        "ALLOWED_USER_IDS": _parse_csv_ids(args.operator_ids or ""),
+        "ALLOWED_USER_IDS": _parse_csv_ids(args.allowed_user_ids or args.operator_ids or ""),
         "ALLOW_DMS": "true" if args.allow_dms else "false",
         "BOT_TRIGGER_MODE": args.trigger_mode or "mention_or_dm",
         "ALLOWED_CHANNEL_IDS": _parse_csv_ids(args.allowed_channel_id or ""),
         "CHANNEL_HISTORY_LIMIT": str(args.channel_history_limit or 20),
+        "CLAUDE_MODEL": (args.model or "").strip(),
     }
 
     profile = _profile_from_env(env)
@@ -512,10 +514,12 @@ def main() -> int:
     reg_parser.add_argument("--discord-bot-token", required=True)
     reg_parser.add_argument("--bot-name")
     reg_parser.add_argument("--operator-ids")
+    reg_parser.add_argument("--allowed-user-ids")
     reg_parser.add_argument("--allow-dms", action="store_true")
     reg_parser.add_argument("--trigger-mode", default="mention_or_dm")
     reg_parser.add_argument("--allowed-channel-id")
     reg_parser.add_argument("--channel-history-limit", type=int, default=20)
+    reg_parser.add_argument("--model", default="")
 
     # status
     subparsers.add_parser("status", help="Show status")

@@ -26,11 +26,22 @@ interface Profile {
   provider?: string;
   model?: string;
   triggerMode?: string;
+  effort?: string;
+  botName?: string;
+  allowDms?: boolean;
+  stateNamespace?: string;
   statusText?: string;
   sessionId?: string;
   activeWorktree?: string;
   activeChannel?: string;
   logPath?: string;
+}
+
+interface RuntimeInfo {
+  apiBase: string;
+  backendDir: string;
+  packaged: boolean;
+  appVersion: string;
 }
 
 const API_BASE = 'http://localhost:3001/api';
@@ -100,6 +111,11 @@ async function createProfile(data: {
   workspace: string;
   discordToken: string;
   channelId: string;
+  model?: string;
+  triggerMode?: string;
+  allowDms?: boolean;
+  operatorIds?: string;
+  allowedUserIds?: string;
 }): Promise<boolean> {
   try {
     const res = await fetch(`${API_BASE}/profiles`, {
@@ -121,6 +137,16 @@ async function fetchLogs(id: string, type: string): Promise<string[]> {
     return data.logs || [];
   } catch {
     return [];
+  }
+}
+
+async function fetchRuntimeInfo(): Promise<RuntimeInfo | null> {
+  try {
+    const res = await fetch(`${API_BASE}/runtime-info`);
+    if (!res.ok) throw new Error('Failed to fetch');
+    return await res.json();
+  } catch {
+    return null;
   }
 }
 
@@ -683,9 +709,13 @@ function ChatView({ profiles, onRefresh }: { profiles: Profile[]; onRefresh: () 
               <InspectorRow label="Worktree" value={activeProfile.activeWorktree || activeProfile.workspace} mono />
               <InspectorRow label="Status" value={`${activeProfile.status}${activeProfile.ready ? ' / ready' : ''}`} />
               <InspectorRow label="Relay Type" value={activeProfile.type} />
+              <InspectorRow label="Bot Name" value={activeProfile.botName || activeProfile.name} />
               <InspectorRow label="Backend" value={activeProfile.provider || '-'} mono />
               <InspectorRow label="Model" value={activeProfile.model || (activeProfile.type === 'Claude' ? 'CLI default' : 'gpt-5.4')} mono />
+              <InspectorRow label="Effort" value={activeProfile.effort || (activeProfile.type === 'Claude' ? 'adaptive prompt policy' : 'adaptive relay policy')} mono />
               <InspectorRow label="Trigger" value={activeProfile.triggerMode || '-'} mono />
+              <InspectorRow label="DM Access" value={activeProfile.allowDms ? 'Enabled' : 'Disabled'} />
+              <InspectorRow label="Namespace" value={activeProfile.stateNamespace || '-'} mono />
               <InspectorRow label="Channel" value={activeProfile.activeChannel || activeProfile.discordChannel || '-'} mono />
               <InspectorRow label="Session" value={activeProfile.sessionId || '-'} mono />
               <div className="pt-3 border-t border-white/5">
@@ -744,19 +774,24 @@ function InspectorRow({ label, value, mono = false }: { label: string; value: st
 
 function AddProfileModal({ onClose, onAdd }: {
   onClose: () => void;
-  onAdd: (data: { name: string; type: ProfileType; workspace: string; discordToken: string; channelId: string }) => void;
+  onAdd: (data: { name: string; type: ProfileType; workspace: string; discordToken: string; channelId: string; model?: string; triggerMode?: string; allowDms?: boolean; operatorIds?: string; allowedUserIds?: string }) => void;
 }) {
   const [type, setType] = useState<ProfileType>('Claude');
   const [name, setName] = useState('');
   const [workspace, setWorkspace] = useState('');
   const [discordToken, setDiscordToken] = useState('');
   const [channelId, setChannelId] = useState('');
+  const [model, setModel] = useState('');
+  const [triggerMode, setTriggerMode] = useState('mention_or_dm');
+  const [allowDms, setAllowDms] = useState(false);
+  const [operatorIds, setOperatorIds] = useState('');
+  const [allowedUserIds, setAllowedUserIds] = useState('');
   const [loading, setLoading] = useState(false);
 
   const handleSubmit = async () => {
-    if (!name || !workspace) return;
+    if (!name || !workspace || !discordToken || !channelId) return;
     setLoading(true);
-    await onAdd({ name, type, workspace, discordToken, channelId });
+    await onAdd({ name, type, workspace, discordToken, channelId, model, triggerMode, allowDms, operatorIds, allowedUserIds });
     setLoading(false);
   };
 
@@ -813,9 +848,45 @@ function AddProfileModal({ onClose, onAdd }: {
           onChange={(e) => setChannelId(e.target.value)}
           className="w-full bg-black/50 border border-white/10 rounded-xl p-3 text-white focus:border-indigo-500 outline-none"
         />
+        <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+          <input
+            type="text"
+            placeholder={type === 'Claude' ? 'Model override (optional)' : 'Codex model override (optional)'}
+            value={model}
+            onChange={(e) => setModel(e.target.value)}
+            className="w-full bg-black/50 border border-white/10 rounded-xl p-3 text-white focus:border-indigo-500 outline-none font-mono text-sm"
+          />
+          <select
+            value={triggerMode}
+            onChange={(e) => setTriggerMode(e.target.value)}
+            className="w-full bg-black/50 border border-white/10 rounded-xl p-3 text-white outline-none"
+          >
+            <option value="mention_or_dm">Mention or DM</option>
+            <option value="all">All messages</option>
+            <option value="dm_only">DM only</option>
+          </select>
+        </div>
+        <input
+          type="text"
+          placeholder="Operator IDs (comma-separated, optional)"
+          value={operatorIds}
+          onChange={(e) => setOperatorIds(e.target.value)}
+          className="w-full bg-black/50 border border-white/10 rounded-xl p-3 text-white focus:border-indigo-500 outline-none font-mono text-sm"
+        />
+        <input
+          type="text"
+          placeholder="Additional allowed user IDs (comma-separated, optional)"
+          value={allowedUserIds}
+          onChange={(e) => setAllowedUserIds(e.target.value)}
+          className="w-full bg-black/50 border border-white/10 rounded-xl p-3 text-white focus:border-indigo-500 outline-none font-mono text-sm"
+        />
+        <label className="flex items-center gap-3 rounded-xl border border-white/10 bg-black/30 px-4 py-3 text-sm text-gray-300">
+          <input type="checkbox" checked={allowDms} onChange={(e) => setAllowDms(e.target.checked)} className="h-4 w-4 accent-indigo-500" />
+          Allow direct messages for approved users
+        </label>
         <button
           onClick={handleSubmit}
-          disabled={loading || !name || !workspace}
+          disabled={loading || !name || !workspace || !discordToken || !channelId}
           className="w-full py-3 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-bold shadow-[0_0_20px_rgba(99,102,241,0.4)] transition-all disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
         >
           {loading ? <Loader2 size={18} className="animate-spin" /> : null}
@@ -827,28 +898,37 @@ function AddProfileModal({ onClose, onAdd }: {
 }
 
 function SettingsModal({ onClose }: { onClose: () => void }) {
+  const [runtimeInfo, setRuntimeInfo] = useState<RuntimeInfo | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    void fetchRuntimeInfo().then((payload) => {
+      if (!cancelled) {
+        setRuntimeInfo(payload);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   return (
-    <ModalWrapper onClose={onClose} title="CLADEX Settings">
+    <ModalWrapper onClose={onClose} title="CLADEX Runtime">
       <div className="space-y-6">
-        <div>
-          <label className="text-xs font-bold text-gray-500 uppercase tracking-widest mb-2 block">API Server</label>
-          <input
-            type="text"
-            defaultValue="http://localhost:3001"
-            className="w-full bg-black/50 border border-white/10 rounded-xl p-3 text-white outline-none font-mono text-sm"
-          />
-        </div>
-        <div>
-          <label className="text-xs font-bold text-gray-500 uppercase tracking-widest mb-2 block">Log Retention</label>
-          <select className="w-full bg-black/50 border border-white/10 rounded-xl p-3 text-white outline-none appearance-none">
-            <option>7 Days</option>
-            <option>14 Days</option>
-            <option>30 Days</option>
-          </select>
-        </div>
-        <div>
-          <label className="text-xs font-bold text-gray-500 uppercase tracking-widest mb-2 block">Default Port Range</label>
-          <input type="number" defaultValue={8080} className="w-full bg-black/50 border border-white/10 rounded-xl p-3 text-white outline-none font-mono" />
+        <p className="text-sm leading-relaxed text-gray-400">
+          This panel shows the real desktop runtime state. Relay behavior is configured per profile, not through fake global controls.
+        </p>
+        <InspectorRow label="API" value={runtimeInfo?.apiBase || 'http://localhost:3001'} mono />
+        <InspectorRow label="Backend" value={runtimeInfo?.backendDir || 'Loading...'} mono />
+        <InspectorRow label="App Version" value={runtimeInfo?.appVersion || '2.0.0'} mono />
+        <InspectorRow label="Packaging" value={runtimeInfo?.packaged ? 'Packaged desktop build' : 'Source/dev runtime'} />
+        <div className="rounded-2xl border border-white/5 bg-black/30 p-4 text-sm text-gray-300 leading-relaxed">
+          <div className="text-[10px] uppercase tracking-[0.22em] text-gray-500 font-bold mb-2">Parity Notes</div>
+          <ul className="space-y-2 text-sm text-gray-400">
+            <li>Codex uses app-server plus durable runtime state.</li>
+            <li>Claude now uses the same durable runtime contract for worktrees, status, handoff, and task memory.</li>
+            <li>Model and trigger behavior are set per profile during registration.</li>
+          </ul>
         </div>
       </div>
     </ModalWrapper>

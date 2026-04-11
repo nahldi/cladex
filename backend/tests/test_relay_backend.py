@@ -36,6 +36,7 @@ def test_build_command_uses_session_id_then_resume(tmp_path: Path) -> None:
     resume_cmd = backend._build_command("hello again", use_resume=True, session=session)
     assert "--resume" in resume_cmd
     assert "--session-id" not in resume_cmd
+    assert "claude-opus-4-5-20251101" in resume_cmd
 
 
 def test_process_message_retries_with_fresh_session_on_resume_failure(tmp_path: Path) -> None:
@@ -120,6 +121,7 @@ def test_format_prompt_includes_durable_context_and_caveman_rules(tmp_path: Path
     assert "[AGENTS.md]" in prompt
     assert "[memory/STATUS.md]" in prompt
     assert "User message:\nfix the relay" in prompt
+    assert "Current relay effort policy for this turn: high." in prompt
 
 
 def test_process_message_writes_durable_memory_and_handoff(tmp_path: Path) -> None:
@@ -185,3 +187,16 @@ def test_session_rebinds_from_runtime_thread_when_session_file_is_missing(tmp_pa
 
     assert session.session_id == "session-rebound"
     assert session.initialized is True
+
+
+def test_effort_policy_uses_quick_and_default_modes(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("CLAUDE_REASONING_EFFORT_QUICK", "medium")
+    monkeypatch.setenv("CLAUDE_REASONING_EFFORT_DEFAULT", "high")
+    backend = ClaudeBackend(
+        workspace=tmp_path,
+        state_dir=tmp_path / "state",
+        on_response=lambda msg: None,
+    )
+
+    assert backend._effort_for_message("status?") == "medium"
+    assert backend._effort_for_message("implement a durable restart-safe relay runtime") == "high"

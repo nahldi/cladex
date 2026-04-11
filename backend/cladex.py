@@ -76,6 +76,8 @@ def _claude_profile_runtime_state(profile: dict[str, Any]) -> dict[str, Any]:
     session_id = ""
     active_worktree = ""
     active_channel = ""
+    model = ""
+    effort = ""
     if pid_file.exists():
         try:
             pid = int(pid_file.read_text(encoding="utf-8").strip())
@@ -92,6 +94,8 @@ def _claude_profile_runtime_state(profile: dict[str, Any]) -> dict[str, Any]:
         session_id = str(status_payload.get("session_id", "")).strip()
         active_worktree = str(status_payload.get("active_worktree", "")).strip()
         active_channel = str(status_payload.get("active_channel", "")).strip()
+        model = str(status_payload.get("model", "")).strip()
+        effort = str(status_payload.get("effort", "")).strip()
         if raw_status == "working":
             state = "working"
         elif raw_status in {"error", "stopped"}:
@@ -112,6 +116,8 @@ def _claude_profile_runtime_state(profile: dict[str, Any]) -> dict[str, Any]:
         "session_id": session_id,
         "active_worktree": active_worktree,
         "active_channel": active_channel,
+        "model": model,
+        "effort": effort,
     }
 
 
@@ -131,6 +137,10 @@ def _codex_profiles() -> list[dict[str, Any]]:
                 "_model": env.get("CODEX_MODEL", relayctl.DEFAULT_CODEX_MODEL),
                 "_trigger_mode": env.get("BOT_TRIGGER_MODE", "mention_or_dm"),
                 "_log_path": str(runtime["log_path"]),
+                "_bot_name": env.get("RELAY_BOT_NAME", profile.get("bot_name", "")),
+                "_allow_dms": env.get("ALLOW_DMS", "false").strip().lower() in {"1", "true", "yes"},
+                "_state_namespace": profile.get("state_namespace", ""),
+                "_effort": env.get("CODEX_REASONING_EFFORT_DEFAULT", "high"),
             }
         )
         records.append(record)
@@ -150,7 +160,7 @@ def _claude_profiles() -> list[dict[str, Any]]:
                 "_ready": bool(runtime["ready"]),
                 "_status": "running" if runtime["running"] else "stopped",
                 "_provider": "claude-code",
-                "_model": env.get("CLAUDE_MODEL", ""),
+                "_model": runtime.get("model") or env.get("CLAUDE_MODEL", ""),
                 "_trigger_mode": env.get("BOT_TRIGGER_MODE", "mention_or_dm"),
                 "_log_path": str(runtime["log_path"]),
                 "_state": runtime.get("state", "idle"),
@@ -158,6 +168,10 @@ def _claude_profiles() -> list[dict[str, Any]]:
                 "_session_id": runtime.get("session_id", ""),
                 "_active_worktree": runtime.get("active_worktree", ""),
                 "_active_channel": runtime.get("active_channel", ""),
+                "_effort": runtime.get("effort", ""),
+                "_bot_name": env.get("RELAY_BOT_NAME", profile.get("bot_name", "")),
+                "_allow_dms": env.get("ALLOW_DMS", "false").strip().lower() in {"1", "true", "yes"},
+                "_state_namespace": profile.get("state_namespace", ""),
             }
         )
         records.append(record)
@@ -280,6 +294,10 @@ def _profile_json_record(profile: dict[str, Any]) -> dict[str, Any]:
         "provider": profile.get("_provider", ""),
         "model": profile.get("_model", ""),
         "triggerMode": profile.get("_trigger_mode", ""),
+        "botName": profile.get("_bot_name", ""),
+        "allowDms": bool(profile.get("_allow_dms", False)),
+        "stateNamespace": profile.get("_state_namespace", profile.get("state_namespace", "")),
+        "effort": profile.get("_effort", ""),
         "discordChannel": attach_channel,
         "state": profile.get("_state", "working" if profile.get("_running") else "idle"),
         "statusText": profile.get("_status_message", ""),
