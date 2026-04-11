@@ -73,7 +73,15 @@ def test_claude_runtime_state_reads_status_json(tmp_path: Path, monkeypatch) -> 
     state_dir.mkdir(parents=True)
     (state_dir / "relay.pid").write_text("555", encoding="utf-8")
     (state_dir / "status.json").write_text(
-        json.dumps({"status": "working", "detail": "Claude working on discord message", "session_id": "sess-123"}),
+        json.dumps(
+            {
+                "status": "working",
+                "detail": "Claude working on discord message",
+                "session_id": "sess-123",
+                "active_worktree": "C:/repo/worktree",
+                "active_channel": "456",
+            }
+        ),
         encoding="utf-8",
     )
     monkeypatch.setattr(cladex, "CLAUDE_DATA_ROOT", data_root)
@@ -86,6 +94,8 @@ def test_claude_runtime_state_reads_status_json(tmp_path: Path, monkeypatch) -> 
     assert state["state"] == "working"
     assert state["status_message"] == "Claude working on discord message"
     assert state["session_id"] == "sess-123"
+    assert state["active_worktree"] == "C:/repo/worktree"
+    assert state["active_channel"] == "456"
 
 
 def test_start_claude_profile_uses_windowless_launch(monkeypatch) -> None:

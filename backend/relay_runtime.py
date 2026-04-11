@@ -1522,7 +1522,7 @@ class DurableRuntime:
             entry_type="status",
             key="latest-summary",
             content=summary,
-            source="codex-turn",
+            source=f"{self.agent_name}-turn",
             evidence=_compact_join(validations or commands_run),
             confidence=0.9,
         )
@@ -1532,7 +1532,7 @@ class DurableRuntime:
                 entry_type="next-step",
                 key="exact-next-step",
                 content=next_step,
-                source="codex-turn",
+                source=f"{self.agent_name}-turn",
                 evidence=summary,
                 confidence=0.95,
             )
@@ -1542,7 +1542,7 @@ class DurableRuntime:
                 entry_type="blocker",
                 key="current-blocker",
                 content=blocker,
-                source="codex-turn",
+                source=f"{self.agent_name}-turn",
                 evidence=summary,
                 confidence=0.95,
             )

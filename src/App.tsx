@@ -5,6 +5,7 @@ import {
   Send, Plus, FileText, Trash2,
   MessageSquare, LayoutGrid, RefreshCw, Loader2
 } from 'lucide-react';
+import CladexBackground from './components/CladexBackground';
 
 // --- Types ---
 
@@ -27,6 +28,8 @@ interface Profile {
   triggerMode?: string;
   statusText?: string;
   sessionId?: string;
+  activeWorktree?: string;
+  activeChannel?: string;
   logPath?: string;
 }
 
@@ -198,6 +201,8 @@ export default function App() {
 
   return (
     <div className="relative min-h-screen bg-[#050505] text-gray-100 font-sans overflow-hidden selection:bg-indigo-500/30">
+      <CladexBackground />
+
       {/* Interactive Ambient Glow */}
       <motion.div
         className="pointer-events-none fixed inset-0 z-0 opacity-40"
@@ -207,7 +212,7 @@ export default function App() {
         transition={{ type: 'tween', ease: 'backOut', duration: 0.5 }}
       />
 
-      <div className="absolute inset-0 bg-[url('https://grainy-gradients.vercel.app/noise.svg')] opacity-[0.15] mix-blend-overlay pointer-events-none z-0"></div>
+      <div className="absolute inset-0 z-0 pointer-events-none bg-[radial-gradient(circle_at_top,rgba(249,115,22,0.1),transparent_28%),radial-gradient(circle_at_bottom_right,rgba(16,185,129,0.1),transparent_32%)]"></div>
 
       {/* Main Content Area */}
       <main className="relative z-10 h-screen flex flex-col pb-24">
@@ -287,8 +292,9 @@ function DashboardView({ profiles, loading, actionLoading, onToggle, onDelete, o
     >
       <header className="mb-12 flex items-center justify-between">
         <div className="flex items-center gap-4">
-          <div className="h-12 w-12 rounded-2xl bg-indigo-500/20 border border-indigo-500/30 flex items-center justify-center shadow-[0_0_30px_rgba(99,102,241,0.3)]">
-            <Activity className="text-indigo-400" size={24} />
+          <div className="relative h-14 w-14 overflow-hidden rounded-2xl border border-white/10 bg-white/5 shadow-[0_0_30px_rgba(99,102,241,0.18)]">
+            <img src="/cladex.jpg" alt="CLADEX" className="h-full w-full object-cover" />
+            <div className="absolute inset-0 rounded-2xl ring-1 ring-inset ring-white/10" />
           </div>
           <div>
             <h1 className="text-3xl font-black tracking-tighter bg-clip-text text-transparent bg-gradient-to-r from-white to-gray-500 relative group cursor-default">
@@ -296,7 +302,8 @@ function DashboardView({ profiles, loading, actionLoading, onToggle, onDelete, o
               <span className="absolute inset-0 bg-clip-text text-transparent bg-gradient-to-r from-indigo-500 to-purple-500 opacity-0 group-hover:opacity-100 group-hover:animate-pulse transition-opacity duration-300 -translate-x-[1px] translate-y-[1px]">CLADEX</span>
               <span className="absolute inset-0 bg-clip-text text-transparent bg-gradient-to-r from-red-500 to-orange-500 opacity-0 group-hover:opacity-100 group-hover:animate-pulse transition-opacity duration-300 translate-x-[1px] -translate-y-[1px]" style={{ animationDelay: '50ms' }}>CLADEX</span>
             </h1>
-            <p className="text-indigo-400 font-mono text-xs tracking-widest uppercase">Unified Relay Control</p>
+            <p className="font-mono text-xs uppercase tracking-[0.28em] text-orange-300/90">Unified Relay Control</p>
+            <p className="mt-2 max-w-xl text-sm text-gray-400">Real Codex and Claude relay control, live operator visibility, and readable runtime state without placeholder telemetry.</p>
           </div>
         </div>
         <button
@@ -673,12 +680,13 @@ function ChatView({ profiles, onRefresh }: { profiles: Profile[]; onRefresh: () 
             <div className="space-y-4">
               <InspectorRow label="Profile" value={activeProfile.name} />
               <InspectorRow label="Workspace" value={activeProfile.workspace} mono />
+              <InspectorRow label="Worktree" value={activeProfile.activeWorktree || activeProfile.workspace} mono />
               <InspectorRow label="Status" value={`${activeProfile.status}${activeProfile.ready ? ' / ready' : ''}`} />
               <InspectorRow label="Relay Type" value={activeProfile.type} />
               <InspectorRow label="Backend" value={activeProfile.provider || '-'} mono />
               <InspectorRow label="Model" value={activeProfile.model || (activeProfile.type === 'Claude' ? 'CLI default' : 'gpt-5.4')} mono />
               <InspectorRow label="Trigger" value={activeProfile.triggerMode || '-'} mono />
-              <InspectorRow label="Channel" value={activeProfile.discordChannel || '-'} mono />
+              <InspectorRow label="Channel" value={activeProfile.activeChannel || activeProfile.discordChannel || '-'} mono />
               <InspectorRow label="Session" value={activeProfile.sessionId || '-'} mono />
               <div className="pt-3 border-t border-white/5">
                 <div className="text-[10px] uppercase tracking-[0.22em] text-gray-500 font-bold mb-2">Current Detail</div>

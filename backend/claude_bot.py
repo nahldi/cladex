@@ -260,6 +260,8 @@ class ClaudeRelayBot(commands.Bot):
             "status": status,
             "detail": self._status_detail,
             "workspace": str(self.config.workspace),
+            "active_worktree": self._backend.current_worktree if self._backend else str(self.config.workspace),
+            "active_channel": self._backend.current_channel if self._backend else None,
             "bot_user": str(self.user) if self.user else None,
             "session_id": self._backend.session_id if self._backend else None,
             "timestamp": datetime.utcnow().isoformat(),

@@ -16,6 +16,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import subprocess
 import threading
 import time
@@ -25,7 +26,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable
 
-from claude_common import claude_code_bin, claude_code_version, atomic_write_text
+from claude_common import claude_code_bin, claude_code_version, atomic_write_text, slugify
+from relay_runtime import DurableRuntime, _extract_blocker, _extract_next_step, _now_iso
 
 logger = logging.getLogger(__name__)
 
@@ -132,6 +134,17 @@ class ClaudeSession:
         self.last_success_at = None
         self._save()
 
+    def adopt(self, session_id: str, *, initialized: bool = True) -> None:
+        normalized = str(session_id or "").strip()
+        if not normalized:
+            return
+        self.session_id = normalized
+        self.initialized = initialized
+        if not self.created_at:
+            self.created_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        self.last_success_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()) if initialized else None
+        self._save()
+
     def mark_success(self) -> None:
         self.initialized = True
         self.last_success_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -157,7 +170,17 @@ class ClaudeBackend:
         self.state_dir = state_dir
         self.on_response = on_response
         self.on_status = on_status or (lambda s: None)
-        self.session = ClaudeSession(state_dir, workspace)
+        self.runtime = DurableRuntime(
+            state_dir=state_dir,
+            repo_path=workspace,
+            state_namespace=state_dir.name or "default",
+            agent_name="claude",
+        )
+        self._sessions: dict[str, ClaudeSession] = {}
+        self._seen_channels: set[str] = set()
+        self._last_session_id: str | None = None
+        self._last_channel_id: str | None = None
+        self._last_worktree: Path = workspace
 
         self._running = False
         self._process_lock = threading.Lock()
@@ -176,12 +199,17 @@ class ClaudeBackend:
             self.on_status("ERROR: Claude Code CLI not found")
             return False
         self._running = True
-        self.on_status(f"Claude ready (session: {self.session.session_id[:8]}...)")
+        self.on_status("Claude ready. Durable memory and session recovery are active.")
         return True
 
     def stop(self) -> None:
         self._running = False
         self.interrupt()
+        for channel_key in sorted(self._seen_channels):
+            try:
+                self.runtime.record_shutdown(channel_key, reason="Claude relay stopped.")
+            except Exception:
+                logger.exception("Failed to record Claude shutdown for %s", channel_key)
         self.on_status("Claude stopped")
 
     def interrupt(self) -> None:
@@ -200,29 +228,133 @@ class ClaudeBackend:
         if not self.start():
             return False
 
-        prompt = self._format_prompt(msg)
-        self.on_status(f"Claude working on {msg.channel_type.value} message from {msg.sender_name}.")
-        result = self._run_turn(prompt, use_resume=self.session.initialized)
+        binding = self.runtime.observe_incoming_message(
+            channel_key=msg.channel_id,
+            author_name=msg.sender_name,
+            author_id=int(msg.sender_id) if str(msg.sender_id).isdigit() else 0,
+            author_is_bot=msg.channel_type != ChannelType.DISCORD,
+            text=msg.content,
+        )
+        if msg.channel_id not in self._seen_channels:
+            self.runtime.record_startup(msg.channel_id)
+            self._seen_channels.add(msg.channel_id)
+        session = self._session_for_channel(msg.channel_id, binding.worktree_path)
+        self.runtime.bind_thread(
+            msg.channel_id,
+            thread_id=session.session_id or "",
+            backend="claude-print-resume",
+            status="active",
+        )
+        prompt = self._format_prompt(msg, binding.worktree_path, self.runtime.build_context_bundle(msg.channel_id))
+        self._last_channel_id = msg.channel_id
+        self._last_worktree = binding.worktree_path
+        self._last_session_id = session.session_id
+        before_changes = self._git_status(binding.worktree_path)
+        started_at = _now_iso()
+
+        self.on_status(
+            f"Claude working on {msg.channel_type.value} message from {msg.sender_name} in {binding.worktree_path.name}."
+        )
+        result = self._run_turn(prompt, use_resume=session.initialized, cwd=binding.worktree_path, session=session)
 
         if self._should_retry_fresh_session(result):
             logger.warning(
                 "Claude resume failed for session %s; creating a fresh session",
-                self.session.session_id,
+                session.session_id,
             )
             self.on_status("Claude session was stale. Recreating session.")
-            self.session.reset()
-            result = self._run_turn(prompt, use_resume=False)
+            session.reset()
+            self.runtime.bind_thread(
+                msg.channel_id,
+                thread_id=session.session_id or "",
+                backend="claude-print-resume",
+                status="rebound",
+            )
+            result = self._run_turn(prompt, use_resume=False, cwd=binding.worktree_path, session=session)
+
+        after_changes = self._git_status(binding.worktree_path)
+        changed_files = sorted(set(after_changes) | set(before_changes))
 
         if result.returncode != 0:
+            failure_message = self._failure_text(result)
+            self.runtime.record_turn_result(
+                channel_key=msg.channel_id,
+                thread_id=session.session_id or "claude-missing-session",
+                turn_id=f"claude-error-{int(time.time() * 1000)}",
+                summary=f"Claude turn failed: {failure_message}",
+                files_changed=changed_files,
+                commands_run=[self._display_command(result.args)],
+                validations=[],
+                blocker=failure_message,
+                next_step="Retry the same task from durable memory after fixing the Claude CLI failure.",
+                command_exit_codes=[result.returncode],
+                cwd=str(binding.worktree_path),
+                approvals=[],
+                error_category="claude-cli-error",
+                started_at=started_at,
+                completed_at=_now_iso(),
+                backend="claude-print-resume",
+                degraded=False,
+            )
             self._report_failure(result)
             return False
 
         content = self._extract_response_text(result.stdout)
         if not content.strip():
+            self.runtime.record_turn_result(
+                channel_key=msg.channel_id,
+                thread_id=session.session_id or "claude-missing-session",
+                turn_id=f"claude-empty-{int(time.time() * 1000)}",
+                summary="Claude returned no text.",
+                files_changed=changed_files,
+                commands_run=[self._display_command(result.args)],
+                validations=[],
+                blocker="Claude returned no text.",
+                next_step="Retry the same task from durable memory and inspect the Claude CLI output.",
+                command_exit_codes=[result.returncode],
+                cwd=str(binding.worktree_path),
+                approvals=[],
+                error_category="empty-response",
+                started_at=started_at,
+                completed_at=_now_iso(),
+                backend="claude-print-resume",
+                degraded=False,
+            )
             self._report_failure(result, default_message="Claude returned no text.")
             return False
 
-        self.session.mark_success()
+        session.mark_success()
+        self.runtime.bind_thread(
+            msg.channel_id,
+            thread_id=session.session_id or "",
+            backend="claude-print-resume",
+            status="active",
+        )
+        self._last_session_id = session.session_id
+        validations = self._extract_validation_lines(content)
+        commands_run = [self._display_command(result.args), *self._extract_command_lines(content)]
+        summary = self._summarize_response(content)
+        next_step = _extract_next_step(content) or "Continue from STATUS.md and the latest handoff."
+        blocker = _extract_blocker(content)
+        self.runtime.record_turn_result(
+            channel_key=msg.channel_id,
+            thread_id=session.session_id or "claude-missing-session",
+            turn_id=f"claude-{int(time.time() * 1000)}",
+            summary=summary,
+            files_changed=changed_files,
+            commands_run=commands_run[:8],
+            validations=validations[:8],
+            blocker=blocker,
+            next_step=next_step,
+            command_exit_codes=[result.returncode],
+            cwd=str(binding.worktree_path),
+            approvals=[],
+            error_category="",
+            started_at=started_at,
+            completed_at=_now_iso(),
+            backend="claude-print-resume",
+            degraded=False,
+        )
         self.on_response(
             OutboundMessage(
                 channel_type=msg.channel_type,
@@ -234,7 +366,7 @@ class ClaudeBackend:
         self.on_status("Claude turn complete.")
         return True
 
-    def _format_prompt(self, msg: InboundMessage) -> str:
+    def _format_prompt(self, msg: InboundMessage, prompt_workspace: Path, durable_bundle: str) -> str:
         parts = [
             (
                 "You are Claude running inside CLADEX as a durable coding relay.\n"
@@ -245,19 +377,24 @@ class ClaudeBackend:
                 "- In shared team channels, default to caveman mode: facts, decisions, blockers, results.\n"
                 "- No filler, no agreement-only replies, no loop chatter, no fake completion claims.\n"
                 "- Use the lightest path that solves the task. Do not burn tools or context without reason.\n"
-                "- Keep replies compact and operationally useful."
+                "- Keep replies compact and operationally useful.\n"
+                "- Before answering, check AGENTS.md, memory/*, code, tests, and git state in the current worktree.\n"
+                "- After meaningful progress, make sure durable memory and handoff remain truthful.\n"
+                "- If another AI made a claim, verify it before trusting it."
             )
         ]
-        durable_context = self._durable_context()
+        parts.append(f"Durable runtime context:\n{durable_bundle}")
+        durable_context = self._durable_context(prompt_workspace)
         if durable_context:
-            parts.append(f"Durable repo context:\n{durable_context}")
+            parts.append(f"Relevant repo documents:\n{durable_context}")
         parts.append(
             "\n".join(
                 [
                     "Inbound message context:",
                     f"- channel_type: {msg.channel_type.value}",
                     f"- sender: {msg.sender_name} ({msg.sender_id})",
-                    f"- workspace: {self.workspace}",
+                    f"- relay workspace: {self.workspace}",
+                    f"- active worktree: {prompt_workspace}",
                 ]
             )
         )
@@ -266,10 +403,10 @@ class ClaudeBackend:
         parts.append(f"User message:\n{msg.content.strip()}")
         return "\n\n".join(part for part in parts if part)
 
-    def _durable_context(self) -> str:
+    def _durable_context(self, prompt_workspace: Path) -> str:
         sections: list[str] = []
         for relative_path, limit in PROMPT_CONTEXT_FILES:
-            path = self.workspace / relative_path
+            path = prompt_workspace / relative_path
             if not path.exists() or not path.is_file():
                 continue
             try:
@@ -283,7 +420,7 @@ class ClaudeBackend:
             sections.append(f"[{relative_path}]\n{content}")
         return "\n\n".join(sections)
 
-    def _build_command(self, prompt: str, *, use_resume: bool) -> list[str]:
+    def _build_command(self, prompt: str, *, use_resume: bool, session: ClaudeSession) -> list[str]:
         cmd = [
             claude_code_bin(),
             "-p",
@@ -293,19 +430,20 @@ class ClaudeBackend:
             "claude-opus-4-5-20251101",
         ]
         if use_resume:
-            cmd.extend(["--resume", self.session.session_id])
+            cmd.extend(["--resume", session.session_id])
         else:
-            cmd.extend(["--session-id", self.session.session_id])
+            cmd.extend(["--session-id", session.session_id])
         cmd.append(prompt)
         return cmd
 
-    def _run_turn(self, prompt: str, *, use_resume: bool) -> CommandResult:
-        cmd = self._build_command(prompt, use_resume=use_resume)
+    def _run_turn(self, prompt: str, *, use_resume: bool, cwd: Path, session: ClaudeSession) -> CommandResult:
+        cmd = self._build_command(prompt, use_resume=use_resume, session=session)
         env = os.environ.copy()
-        env["CLAUDE_CODE_ENTRYPOINT"] = "discord-claude-relay"
+        env["CLAUDE_CODE_ENTRYPOINT"] = "cladex"
+        env["CLADEX_ACTIVE_WORKTREE"] = str(cwd)
 
         kwargs = {
-            "cwd": str(self.workspace),
+            "cwd": str(cwd),
             "env": env,
             "stdin": subprocess.DEVNULL,
             "stdout": subprocess.PIPE,
@@ -406,11 +544,7 @@ class ClaudeBackend:
         return any(needle in haystack for needle in needles)
 
     def _report_failure(self, result: CommandResult, *, default_message: str | None = None) -> None:
-        message = default_message
-        if not message:
-            stderr = result.stderr.strip()
-            stdout = result.stdout.strip()
-            message = stderr or stdout or f"Claude command failed with exit code {result.returncode}"
+        message = default_message or self._failure_text(result)
         self.on_status(f"ERROR: {message}")
         logger.error(
             "Claude command failed (rc=%s, resume=%s): %s",
@@ -418,6 +552,95 @@ class ClaudeBackend:
             result.used_resume,
             " ".join(result.args),
         )
+
+    def _session_for_channel(self, channel_key: str, prompt_workspace: Path) -> ClaudeSession:
+        channel_id = slugify(channel_key)
+        session = self._sessions.get(channel_key)
+        if session is None:
+            session = ClaudeSession(self.state_dir / "channels" / channel_id, prompt_workspace)
+            rebound_thread = self.runtime.active_thread_id(channel_key)
+            if rebound_thread and (not session.initialized or session.session_id != rebound_thread):
+                session.adopt(rebound_thread, initialized=True)
+            self._sessions[channel_key] = session
+        return session
+
+    def _git_status(self, cwd: Path) -> list[str]:
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(cwd), "status", "--short"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except Exception:
+            return []
+        if result.returncode != 0:
+            return []
+        paths: list[str] = []
+        for raw_line in result.stdout.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            path = line[3:].strip()
+            if " -> " in path:
+                path = path.split(" -> ", 1)[-1].strip()
+            if path:
+                paths.append(path.replace("\\", "/"))
+        return sorted(dict.fromkeys(paths))
+
+    def _failure_text(self, result: CommandResult) -> str:
+        stderr = result.stderr.strip()
+        stdout = result.stdout.strip()
+        return stderr or stdout or f"Claude command failed with exit code {result.returncode}"
+
+    def _display_command(self, args: list[str]) -> str:
+        if not args:
+            return "claude"
+        if len(args) <= 7:
+            return " ".join(args)
+        visible = [*args[:7], "...<prompt>"]
+        return " ".join(visible)
+
+    def _extract_command_lines(self, text: str) -> list[str]:
+        commands: list[str] = []
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if stripped.startswith("`") and stripped.endswith("`") and len(stripped) > 2:
+                commands.append(stripped.strip("`"))
+                continue
+            if stripped.lower().startswith(("ran ", "run ", "command:")):
+                commands.append(stripped)
+        return list(dict.fromkeys(commands))
+
+    def _extract_validation_lines(self, text: str) -> list[str]:
+        lines: list[str] = []
+        pattern = re.compile(r"(pytest|test|tests|lint|build|tsc|vitest|passed|failed|green)", re.IGNORECASE)
+        for line in text.splitlines():
+            stripped = line.strip(" -*")
+            if stripped and pattern.search(stripped):
+                lines.append(stripped)
+        return list(dict.fromkeys(lines))
+
+    def _summarize_response(self, text: str) -> str:
+        for chunk in re.split(r"\n\s*\n", text.strip()):
+            normalized = " ".join(chunk.split())
+            if normalized:
+                return normalized[:280]
+        return text.strip()[:280] or "Claude completed the turn."
+
+    @property
+    def session_id(self) -> str | None:
+        return self._last_session_id
+
+    @property
+    def current_worktree(self) -> str:
+        return str(self._last_worktree)
+
+    @property
+    def current_channel(self) -> str | None:
+        return self._last_channel_id
 
 
 class RelayBackend:
@@ -452,7 +675,15 @@ class RelayBackend:
 
     @property
     def session_id(self) -> str | None:
-        return self._claude.session.session_id
+        return self._claude.session_id
+
+    @property
+    def current_worktree(self) -> str:
+        return self._claude.current_worktree
+
+    @property
+    def current_channel(self) -> str | None:
+        return self._claude.current_channel
 
     def _route_response(self, msg: OutboundMessage) -> None:
         if msg.channel_type == ChannelType.DISCORD:

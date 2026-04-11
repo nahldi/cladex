@@ -74,6 +74,8 @@ def _claude_profile_runtime_state(profile: dict[str, Any]) -> dict[str, Any]:
     state = "idle"
     status_message = ""
     session_id = ""
+    active_worktree = ""
+    active_channel = ""
     if pid_file.exists():
         try:
             pid = int(pid_file.read_text(encoding="utf-8").strip())
@@ -88,6 +90,8 @@ def _claude_profile_runtime_state(profile: dict[str, Any]) -> dict[str, Any]:
         raw_status = str(status_payload.get("status", "")).strip().lower()
         status_message = str(status_payload.get("detail", "")).strip()
         session_id = str(status_payload.get("session_id", "")).strip()
+        active_worktree = str(status_payload.get("active_worktree", "")).strip()
+        active_channel = str(status_payload.get("active_channel", "")).strip()
         if raw_status == "working":
             state = "working"
         elif raw_status in {"error", "stopped"}:
@@ -106,6 +110,8 @@ def _claude_profile_runtime_state(profile: dict[str, Any]) -> dict[str, Any]:
         "state": state,
         "status_message": status_message,
         "session_id": session_id,
+        "active_worktree": active_worktree,
+        "active_channel": active_channel,
     }
 
 
@@ -150,6 +156,8 @@ def _claude_profiles() -> list[dict[str, Any]]:
                 "_state": runtime.get("state", "idle"),
                 "_status_message": runtime.get("status_message", ""),
                 "_session_id": runtime.get("session_id", ""),
+                "_active_worktree": runtime.get("active_worktree", ""),
+                "_active_channel": runtime.get("active_channel", ""),
             }
         )
         records.append(record)
@@ -276,6 +284,8 @@ def _profile_json_record(profile: dict[str, Any]) -> dict[str, Any]:
         "state": profile.get("_state", "working" if profile.get("_running") else "idle"),
         "statusText": profile.get("_status_message", ""),
         "sessionId": profile.get("_session_id", ""),
+        "activeWorktree": profile.get("_active_worktree", ""),
+        "activeChannel": profile.get("_active_channel", ""),
         "logPath": profile.get("_log_path", ""),
     }
 
