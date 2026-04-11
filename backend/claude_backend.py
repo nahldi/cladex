@@ -289,6 +289,8 @@ class ClaudeBackend:
             "-p",
             "--output-format",
             "stream-json",
+            "--model",
+            "claude-opus-4-5-20251101",
         ]
         if use_resume:
             cmd.extend(["--resume", self.session.session_id])
