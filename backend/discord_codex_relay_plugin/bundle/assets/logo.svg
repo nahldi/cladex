@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 256" role="img" aria-label="Discord Codex Relay logo">
+  <rect width="512" height="256" rx="36" fill="#EFF6FF"/>
+  <rect x="28" y="28" width="200" height="200" rx="28" fill="#2563EB"/>
+  <path d="M68 86h120v18H68zM68 120h78v18H68zM68 154h120v18H68z" fill="#FFFFFF"/>
+  <circle cx="178" cy="137" r="32" fill="#0F172A"/>
+  <path d="M178 119v36M160 137h36" stroke="#93C5FD" stroke-width="10" stroke-linecap="round"/>
+  <text x="262" y="110" fill="#0F172A" font-size="34" font-family="Arial, sans-serif" font-weight="700">Discord</text>
+  <text x="262" y="154" fill="#1D4ED8" font-size="34" font-family="Arial, sans-serif" font-weight="700">Codex Relay</text>
+  <text x="262" y="192" fill="#334155" font-size="18" font-family="Arial, sans-serif">Workspace relay plugin for Codex</text>
+</svg>

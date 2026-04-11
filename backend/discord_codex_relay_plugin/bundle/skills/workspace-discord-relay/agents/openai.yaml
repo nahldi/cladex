@@ -1,0 +1,8 @@
+interface:
+  display_name: "Workspace Discord Relay"
+  short_description: "Set up and manage the Discord Codex relay"
+  brand_color: "#2563EB"
+  default_prompt: "Use $workspace-discord-relay to install, run, update, repair, or extend the Discord Codex relay for this workspace."
+
+policy:
+  allow_implicit_invocation: true

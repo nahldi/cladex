@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="Discord Codex Relay icon">
+  <rect width="128" height="128" rx="28" fill="#2563EB"/>
+  <path d="M32 40h64v10H32zM32 59h42v10H32zM32 78h64v10H32z" fill="#FFFFFF"/>
+  <circle cx="91" cy="64" r="17" fill="#0F172A"/>
+  <path d="M91 54v20M81 64h20" stroke="#93C5FD" stroke-width="6" stroke-linecap="round"/>
+</svg>

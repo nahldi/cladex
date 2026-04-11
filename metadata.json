@@ -1,0 +1,5 @@
+{
+  "name": "CLADEX GUI",
+  "description": "A simple dashboard for managing Discord relay profiles for Claude Code and Codex CLI.",
+  "requestFramePermissions": []
+}

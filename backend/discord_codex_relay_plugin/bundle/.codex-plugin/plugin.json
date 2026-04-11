@@ -1,0 +1,35 @@
+{
+  "name": "discord-codex-relay",
+  "version": "2.0.0",
+  "description": "Launch a live Codex Discord relay from the current workspace.",
+  "author": {
+    "name": "Discord Codex Relay Contributors"
+  },
+  "license": "MIT",
+  "keywords": [
+    "discord",
+    "codex",
+    "relay",
+    "workspace"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Discord Codex Relay",
+    "shortDescription": "Run a workspace-local Codex relay through Discord.",
+    "longDescription": "Adds a workspace-local `codex-discord` launcher so a live Codex CLI session can be controlled through Discord while staying isolated to the current workspace and bot profile.",
+    "developerName": "discord-codex-relay",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Run codex-discord from this workspace.",
+      "Show the relay status and logs for this workspace.",
+      "Register this workspace for Discord relay."
+    ],
+    "brandColor": "#2563EB",
+    "composerIcon": "./assets/icon.svg",
+    "logo": "./assets/logo.svg"
+  }
+}

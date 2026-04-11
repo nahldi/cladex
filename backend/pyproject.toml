@@ -1,0 +1,64 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "discord-codex-relay"
+version = "2.0.0"
+description = "Unified Discord relay manager for Claude Code and Codex CLI."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [
+  {name = "CLADEX Contributors"}
+]
+keywords = ["cladex", "claude", "codex", "discord", "relay", "cli", "automation"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Operating System :: MacOS",
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Communications :: Chat",
+  "Topic :: Software Development :: Build Tools",
+]
+dependencies = [
+  "aiohttp>=3.12.15,<4",
+  "discord.py>=2.5.2,<3",
+  "platformdirs>=4.3,<5",
+  "psutil>=7,<8",
+  "python-dotenv>=1.1.1,<2",
+]
+
+[project.scripts]
+codex-discord = "relayctl:main"
+codex-discord-install-plugin = "install_plugin:main"
+claude-discord = "claude_relay:main"
+cladex = "cladex:main"
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8,<9",
+]
+
+[tool.setuptools]
+include-package-data = false
+py-modules = ["bot", "cladex", "install_plugin", "relay_backend", "relay_common", "relay_runtime", "relayctl", "claude_relay", "claude_bot", "claude_backend", "claude_common"]
+
+[tool.setuptools.packages.find]
+include = ["discord_codex_relay_plugin*"]
+
+[tool.setuptools.package-data]
+discord_codex_relay_plugin = [
+  "bundle/.codex-plugin/plugin.json",
+  "bundle/SOUL.md",
+  "bundle/assets/icon.svg",
+  "bundle/assets/logo.svg",
+  "bundle/skills/workspace-discord-relay/SKILL.md",
+  "bundle/skills/workspace-discord-relay/agents/openai.yaml",
+  "bundle/skills/workspace-discord-relay/scripts/bootstrap.py",
+]

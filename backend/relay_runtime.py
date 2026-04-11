@@ -1,0 +1,1720 @@
+from __future__ import annotations
+
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import threading
+import time
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from relay_common import atomic_write_json, atomic_write_text, slugify, workspace_root
+
+
+MEMORY_DIR_NAME = "memory"
+STATUS_SECTIONS = (
+    "Current objective",
+    "Active task",
+    "Owner",
+    "Worktree / branch",
+    "Last verified commit or diff scope",
+    "Last validation result",
+    "Current blocker",
+    "Exact next step",
+)
+
+
+def _now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _now_iso_from_ts(value: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(value))
+
+
+def _repo_branch(path: Path) -> str:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "--abbrev-ref", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout.strip() or "HEAD"
+    except Exception:
+        return "HEAD"
+
+
+def _head_commit(path: Path) -> str:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "--short", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout.strip() or ""
+    except Exception:
+        return ""
+
+
+def _read_json(path: Path, default: Any) -> Any:
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return default
+
+
+def _read_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except Exception:
+        return ""
+
+
+def _parse_sections(text: str) -> dict[str, str]:
+    sections: dict[str, list[str]] = {}
+    current: str | None = None
+    for raw_line in text.splitlines():
+        line = raw_line.rstrip()
+        if line.startswith("## "):
+            current = line[3:].strip()
+            sections[current] = []
+            continue
+        if current is not None:
+            sections[current].append(line)
+    return {key: "\n".join(value).strip() for key, value in sections.items()}
+
+
+def _ensure_sectioned_markdown(path: Path, title: str, sections: dict[str, str]) -> None:
+    lines = [f"# {title}", ""]
+    headings = STATUS_SECTIONS if title == "STATUS" else tuple(sections.keys())
+    for heading in headings:
+        body = sections.get(heading, "").strip() or "_none_"
+        lines.extend([f"## {heading}", body, ""])
+    atomic_write_text(path, "\n".join(lines).rstrip() + "\n")
+
+
+def _write_status_file(path: Path, fields: dict[str, str | None]) -> None:
+    current = _parse_sections(_read_text(path))
+    for key, value in fields.items():
+        if value is not None:
+            current[key] = value.strip()
+    _ensure_sectioned_markdown(path, "STATUS", {heading: current.get(heading, "") for heading in STATUS_SECTIONS})
+
+
+def _append_markdown_entry(path: Path, title: str, body: str, *, prepend: bool = False) -> None:
+    existing = _read_text(path).strip()
+    header = f"# {title}\n"
+    if existing.startswith(header):
+        existing_body = existing[len(header) :].lstrip("\n")
+    else:
+        existing_body = existing
+    entry = body.strip() + "\n"
+    if prepend:
+        payload = header + "\n" + entry + ("\n" + existing_body if existing_body else "")
+    else:
+        payload = header + "\n" + ((existing_body + "\n\n") if existing_body else "") + entry
+    atomic_write_text(path, payload.rstrip() + "\n")
+
+
+def _normalize_paths(files: list[str]) -> list[str]:
+    cleaned: list[str] = []
+    for item in files:
+        text = item.strip().replace("\\", "/")
+        if text and text not in cleaned:
+            cleaned.append(text)
+    return cleaned
+
+
+def _glob_prefix(value: str) -> str:
+    prefix = value.replace("\\", "/")
+    for token in ("**", "*", "?"):
+        if token in prefix:
+            prefix = prefix.split(token, 1)[0]
+    return prefix.strip("/").lower()
+
+
+def _globs_conflict(left: str, right: str) -> bool:
+    lprefix = _glob_prefix(left)
+    rprefix = _glob_prefix(right)
+    if not lprefix or not rprefix:
+        return left == right
+    return lprefix.startswith(rprefix) or rprefix.startswith(lprefix)
+
+
+def _extract_bullets(text: str, patterns: tuple[str, ...], *, limit: int = 6) -> list[str]:
+    lowered_patterns = tuple(pattern.lower() for pattern in patterns)
+    results: list[str] = []
+    for raw_line in text.splitlines():
+        cleaned = raw_line.strip().lstrip("-* ").strip()
+        lowered = cleaned.lower()
+        if cleaned and any(pattern in lowered for pattern in lowered_patterns):
+            if cleaned not in results:
+                results.append(cleaned)
+        if len(results) >= limit:
+            break
+    return results
+
+
+def _extract_preferences_and_constraints(text: str) -> tuple[list[str], list[str]]:
+    preferences: list[str] = []
+    constraints: list[str] = []
+    for raw_sentence in re.split(r"(?<=[.!?])\s+|\n+", text):
+        sentence = re.sub(r"\s+", " ", raw_sentence.strip())
+        if not sentence:
+            continue
+        lowered = sentence.lower()
+        if any(token in lowered for token in ("prefer ", "default ", "usually ", "by default", "keep it ")):
+            if sentence not in preferences:
+                preferences.append(sentence)
+        if any(token in lowered for token in ("must ", "must not", "never ", "do not ", "don't ", "only ", "non-negotiable", "forbidden")):
+            if sentence not in constraints:
+                constraints.append(sentence)
+    return preferences[:8], constraints[:12]
+
+
+def _extract_next_step(text: str) -> str:
+    for raw_line in text.splitlines():
+        line = raw_line.strip().lstrip("-* ").strip()
+        lowered = line.lower()
+        if any(token in lowered for token in ("next step", "next:", "todo:", "remaining:", "follow-up")):
+            return line
+    cleaned = re.sub(r"\s+", " ", text.strip())
+    return cleaned[:220]
+
+
+def _extract_blocker(text: str) -> str:
+    for raw_line in text.splitlines():
+        line = raw_line.strip().lstrip("-* ").strip()
+        lowered = line.lower()
+        if "blocker" in lowered or "blocked" in lowered:
+            return line
+    return ""
+
+
+def _extract_decision_candidates(text: str, *, limit: int = 4) -> list[str]:
+    decisions: list[str] = []
+    for raw_sentence in re.split(r"(?<=[.!?])\s+|\n+", text):
+        sentence = re.sub(r"\s+", " ", raw_sentence.strip())
+        lowered = sentence.lower()
+        if not sentence:
+            continue
+        if any(token in lowered for token in ("decide", "decision", "we will", "use ", "prefer ", "must ", "should ")) and sentence not in decisions:
+            decisions.append(sentence)
+        if len(decisions) >= limit:
+            break
+    return decisions
+
+
+def _compact_join(items: list[str], *, limit: int = 6) -> str:
+    return "; ".join(item for item in items[:limit] if item.strip())
+
+
+@dataclass(slots=True)
+class ChannelBinding:
+    channel_id: str
+    project_id: str
+    repo_path: Path
+    worktree_path: Path
+    current_branch: str
+    primary_thread_id: str | None = None
+    backend: str = "codex-app-server"
+
+
+@dataclass(slots=True)
+class LeaseConflict:
+    task_id: str
+    owner_agent: str
+    path_glob: str
+
+
+class TaskLeaseConflictError(RuntimeError):
+    def __init__(self, conflicts: list[LeaseConflict]) -> None:
+        self.conflicts = conflicts
+        details = ", ".join(f"{item.owner_agent}:{item.path_glob}" for item in conflicts)
+        super().__init__(f"Task lease conflict: {details}")
+
+
+class RuntimeStore:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+        self._init_schema()
+
+    def synthetic_thread_id(self, seed: str) -> str:
+        return f"cli-{slugify(seed)}"
+
+    def list_threads_for_project(self, project_id: str) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT thread_id, backend, status, channel_id, updated_at FROM codex_threads WHERE project_id = ? ORDER BY updated_at DESC",
+                (project_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.path)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _init_schema(self) -> None:
+        with self._lock, self._connect() as conn:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS channels (
+                    discord_channel_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL,
+                    repo_path TEXT NOT NULL,
+                    worktree_path TEXT NOT NULL,
+                    primary_thread_id TEXT,
+                    current_branch TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS codex_threads (
+                    thread_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL,
+                    channel_id TEXT NOT NULL,
+                    backend TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    last_turn_id TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS task_leases (
+                    task_id TEXT PRIMARY KEY,
+                    channel_id TEXT NOT NULL,
+                    owner_agent TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    target_files_glob TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    validation_plan_json TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    heartbeat_at TEXT NOT NULL,
+                    lease_expires_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS memory_entries (
+                    id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL,
+                    type TEXT NOT NULL,
+                    key TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    evidence TEXT,
+                    confidence REAL NOT NULL,
+                    supersedes_id TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS verification_records (
+                    id TEXT PRIMARY KEY,
+                    claim_id TEXT NOT NULL,
+                    verdict TEXT NOT NULL,
+                    evidence_text TEXT NOT NULL,
+                    command_log TEXT,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS turn_records (
+                    id TEXT PRIMARY KEY,
+                    thread_id TEXT NOT NULL,
+                    turn_id TEXT NOT NULL,
+                    summary TEXT NOT NULL,
+                    files_changed_json TEXT NOT NULL,
+                    commands_run_json TEXT NOT NULL,
+                    validations_json TEXT NOT NULL,
+                    next_step TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS agent_claims (
+                    id TEXT PRIMARY KEY,
+                    source_agent TEXT NOT NULL,
+                    message_ref TEXT NOT NULL,
+                    claim_text TEXT NOT NULL,
+                    claim_type TEXT NOT NULL,
+                    verification_status TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS file_ownership (
+                    id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL,
+                    path_glob TEXT NOT NULL,
+                    owner_agent TEXT NOT NULL,
+                    task_id TEXT NOT NULL,
+                    lease_expires_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS compaction_events (
+                    id TEXT PRIMARY KEY,
+                    thread_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS sync_state (
+                    project_id TEXT PRIMARY KEY,
+                    last_memory_sync_at TEXT,
+                    last_handoff_sync_at TEXT,
+                    last_status_sync_at TEXT
+                );
+                """
+            )
+            self._ensure_column(conn, "turn_records", "command_exit_codes_json", "TEXT NOT NULL DEFAULT '[]'")
+            self._ensure_column(conn, "turn_records", "cwd", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "turn_records", "approvals_json", "TEXT NOT NULL DEFAULT '[]'")
+            self._ensure_column(conn, "turn_records", "blocker", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "turn_records", "error_category", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "turn_records", "started_at", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "turn_records", "completed_at", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "turn_records", "backend", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "turn_records", "degraded", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(conn, "channels", "last_rebind_at", "TEXT")
+
+    def _ensure_column(self, conn: sqlite3.Connection, table: str, column: str, spec: str) -> None:
+        columns = {str(row["name"]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        if column not in columns:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {spec}")
+
+    def upsert_channel(self, binding: ChannelBinding) -> None:
+        now = _now_iso()
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO channels(discord_channel_id, project_id, repo_path, worktree_path, primary_thread_id, current_branch, created_at, updated_at)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(discord_channel_id) DO UPDATE SET
+                    project_id=excluded.project_id,
+                    repo_path=excluded.repo_path,
+                    worktree_path=excluded.worktree_path,
+                    primary_thread_id=COALESCE(excluded.primary_thread_id, channels.primary_thread_id),
+                    current_branch=excluded.current_branch,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    binding.channel_id,
+                    binding.project_id,
+                    str(binding.repo_path),
+                    str(binding.worktree_path),
+                    binding.primary_thread_id,
+                    binding.current_branch,
+                    now,
+                    now,
+                ),
+            )
+
+    def get_channel(self, channel_id: str) -> sqlite3.Row | None:
+        with self._connect() as conn:
+            return conn.execute(
+                "SELECT * FROM channels WHERE discord_channel_id = ?",
+                (channel_id,),
+            ).fetchone()
+
+    def bind_thread(
+        self,
+        *,
+        thread_id: str,
+        project_id: str,
+        channel_id: str,
+        backend: str,
+        status: str,
+        last_turn_id: str | None = None,
+        rebound: bool = False,
+    ) -> None:
+        now = _now_iso()
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO codex_threads(thread_id, project_id, channel_id, backend, status, last_turn_id, created_at, updated_at)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(thread_id) DO UPDATE SET
+                    project_id=excluded.project_id,
+                    channel_id=excluded.channel_id,
+                    backend=excluded.backend,
+                    status=excluded.status,
+                    last_turn_id=COALESCE(excluded.last_turn_id, codex_threads.last_turn_id),
+                    updated_at=excluded.updated_at
+                """,
+                (thread_id, project_id, channel_id, backend, status, last_turn_id, now, now),
+            )
+            conn.execute(
+                "UPDATE channels SET primary_thread_id = ?, updated_at = ?, last_rebind_at = ? WHERE discord_channel_id = ?",
+                (thread_id, now, now if rebound else None, channel_id),
+            )
+
+    def record_turn(
+        self,
+        *,
+        thread_id: str,
+        turn_id: str,
+        summary: str,
+        files_changed: list[str],
+        commands_run: list[str],
+        validations: list[str],
+        next_step: str,
+        command_exit_codes: list[int] | None = None,
+        cwd: str = "",
+        approvals: list[str] | None = None,
+        blocker: str = "",
+        error_category: str = "",
+        started_at: str = "",
+        completed_at: str = "",
+        backend: str = "",
+        degraded: bool = False,
+    ) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO turn_records(
+                    id, thread_id, turn_id, summary, files_changed_json, commands_run_json, validations_json,
+                    next_step, created_at, command_exit_codes_json, cwd, approvals_json, blocker,
+                    error_category, started_at, completed_at, backend, degraded
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(uuid.uuid4()),
+                    thread_id,
+                    turn_id,
+                    summary,
+                    json.dumps(_normalize_paths(files_changed)),
+                    json.dumps(commands_run),
+                    json.dumps(validations),
+                    next_step,
+                    _now_iso(),
+                    json.dumps(command_exit_codes or []),
+                    cwd,
+                    json.dumps(approvals or []),
+                    blocker,
+                    error_category,
+                    started_at,
+                    completed_at,
+                    backend,
+                    1 if degraded else 0,
+                ),
+            )
+            conn.execute(
+                "UPDATE codex_threads SET last_turn_id = ?, updated_at = ? WHERE thread_id = ?",
+                (turn_id, _now_iso(), thread_id),
+            )
+
+    def latest_memory_entry(self, *, project_id: str, entry_type: str, key: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM memory_entries
+                WHERE project_id = ? AND type = ? AND key = ?
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """,
+                (project_id, entry_type, key),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def add_memory_entry(
+        self,
+        *,
+        project_id: str,
+        entry_type: str,
+        key: str,
+        content: str,
+        source: str,
+        evidence: str = "",
+        confidence: float = 1.0,
+        supersedes_id: str | None = None,
+    ) -> None:
+        now = _now_iso()
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO memory_entries(id, project_id, type, key, content, source, evidence, confidence, supersedes_id, created_at, updated_at)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(uuid.uuid4()),
+                    project_id,
+                    entry_type,
+                    key,
+                    content,
+                    source,
+                    evidence,
+                    confidence,
+                    supersedes_id,
+                    now,
+                    now,
+                ),
+            )
+
+    def upsert_memory_entry(
+        self,
+        *,
+        project_id: str,
+        entry_type: str,
+        key: str,
+        content: str,
+        source: str,
+        evidence: str = "",
+        confidence: float = 1.0,
+    ) -> str:
+        latest = self.latest_memory_entry(project_id=project_id, entry_type=entry_type, key=key)
+        if latest and latest.get("content") == content and latest.get("evidence", "") == evidence:
+            with self._lock, self._connect() as conn:
+                conn.execute(
+                    "UPDATE memory_entries SET updated_at = ?, confidence = ? WHERE id = ?",
+                    (_now_iso(), confidence, latest["id"]),
+                )
+            return str(latest["id"])
+        new_id = str(uuid.uuid4())
+        now = _now_iso()
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO memory_entries(id, project_id, type, key, content, source, evidence, confidence, supersedes_id, created_at, updated_at)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    new_id,
+                    project_id,
+                    entry_type,
+                    key,
+                    content,
+                    source,
+                    evidence,
+                    confidence,
+                    latest["id"] if latest else None,
+                    now,
+                    now,
+                ),
+            )
+        return new_id
+
+    def upsert_sync_state(self, project_id: str, *, memory: bool = False, handoff: bool = False, status: bool = False) -> None:
+        now = _now_iso()
+        with self._lock, self._connect() as conn:
+            row = conn.execute("SELECT * FROM sync_state WHERE project_id = ?", (project_id,)).fetchone()
+            payload = {
+                "last_memory_sync_at": now if memory else (row["last_memory_sync_at"] if row else None),
+                "last_handoff_sync_at": now if handoff else (row["last_handoff_sync_at"] if row else None),
+                "last_status_sync_at": now if status else (row["last_status_sync_at"] if row else None),
+            }
+            conn.execute(
+                """
+                INSERT INTO sync_state(project_id, last_memory_sync_at, last_handoff_sync_at, last_status_sync_at)
+                VALUES(?, ?, ?, ?)
+                ON CONFLICT(project_id) DO UPDATE SET
+                    last_memory_sync_at=excluded.last_memory_sync_at,
+                    last_handoff_sync_at=excluded.last_handoff_sync_at,
+                    last_status_sync_at=excluded.last_status_sync_at
+                """,
+                (project_id, payload["last_memory_sync_at"], payload["last_handoff_sync_at"], payload["last_status_sync_at"]),
+            )
+
+    def record_claim(self, *, source_agent: str, message_ref: str, claim_text: str, claim_type: str, verification_status: str) -> str:
+        claim_id = str(uuid.uuid4())
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO agent_claims(id, source_agent, message_ref, claim_text, claim_type, verification_status, created_at)
+                VALUES(?, ?, ?, ?, ?, ?, ?)
+                """,
+                (claim_id, source_agent, message_ref, claim_text, claim_type, verification_status, _now_iso()),
+            )
+        return claim_id
+
+    def update_claim_verdict(self, *, claim_id: str, verdict: str, evidence_text: str, command_log: str = "") -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE agent_claims SET verification_status = ? WHERE id = ?",
+                (verdict, claim_id),
+            )
+            conn.execute(
+                """
+                INSERT INTO verification_records(id, claim_id, verdict, evidence_text, command_log, created_at)
+                VALUES(?, ?, ?, ?, ?, ?)
+                """,
+                (str(uuid.uuid4()), claim_id, verdict, evidence_text, command_log, _now_iso()),
+            )
+
+    def unresolved_claims(self, project_id: str) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT agent_claims.*
+                FROM agent_claims
+                JOIN channels ON channels.discord_channel_id = SUBSTR(agent_claims.message_ref, 1, INSTR(agent_claims.message_ref, ':') - 1)
+                WHERE channels.project_id = ? AND agent_claims.verification_status = 'unresolved'
+                ORDER BY agent_claims.created_at DESC
+                LIMIT 10
+                """,
+                (project_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def recent_claims(self, project_id: str, *, limit: int = 10) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT agent_claims.*
+                FROM agent_claims
+                JOIN channels ON channels.discord_channel_id = SUBSTR(agent_claims.message_ref, 1, INSTR(agent_claims.message_ref, ':') - 1)
+                WHERE channels.project_id = ?
+                ORDER BY agent_claims.created_at DESC
+                LIMIT ?
+                """,
+                (project_id, limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def recent_turns(self, thread_id: str, *, limit: int = 8) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM turn_records WHERE thread_id = ? ORDER BY created_at DESC LIMIT ?",
+                (thread_id, limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def claim_task(
+        self,
+        *,
+        channel_id: str,
+        project_id: str,
+        owner_agent: str,
+        title: str,
+        target_files: list[str],
+        validation: list[str],
+        lease_seconds: int = 1800,
+        task_id: str | None = None,
+    ) -> str:
+        now = time.time()
+        task_id = task_id or f"task-{uuid.uuid4().hex[:8]}"
+        expires_at = _now_iso_from_ts(now + lease_seconds)
+        started_at = _now_iso_from_ts(now)
+        heartbeat_at = started_at
+        targets = _normalize_paths(target_files)
+        conflicts = self.find_conflicts(project_id=project_id, owner_agent=owner_agent, target_files=targets, now_ts=now) if targets else []
+        if conflicts:
+            raise TaskLeaseConflictError(conflicts)
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO task_leases(task_id, channel_id, owner_agent, title, target_files_glob, status, validation_plan_json, started_at, heartbeat_at, lease_expires_at)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    channel_id,
+                    owner_agent,
+                    title,
+                    json.dumps(targets),
+                    "claimed",
+                    json.dumps(validation),
+                    started_at,
+                    heartbeat_at,
+                    expires_at,
+                ),
+            )
+            conn.execute("DELETE FROM file_ownership WHERE task_id = ?", (task_id,))
+            for item in targets:
+                conn.execute(
+                    """
+                    INSERT INTO file_ownership(id, project_id, path_glob, owner_agent, task_id, lease_expires_at)
+                    VALUES(?, ?, ?, ?, ?, ?)
+                    """,
+                    (str(uuid.uuid4()), project_id, item, owner_agent, task_id, expires_at),
+                )
+
+        return task_id
+
+    def heartbeat_task(self, task_id: str, *, lease_seconds: int = 1800) -> None:
+        now = time.time()
+        with self._lock, self._connect() as conn:
+            row = conn.execute("SELECT * FROM task_leases WHERE task_id = ?", (task_id,)).fetchone()
+            if row is None:
+                return
+            expires_at = _now_iso_from_ts(now + lease_seconds)
+            conn.execute(
+                "UPDATE task_leases SET heartbeat_at = ?, lease_expires_at = ? WHERE task_id = ?",
+                (_now_iso_from_ts(now), expires_at, task_id),
+            )
+            conn.execute(
+                "UPDATE file_ownership SET lease_expires_at = ? WHERE task_id = ?",
+                (expires_at, task_id),
+            )
+
+    def release_task(self, task_id: str) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute("UPDATE task_leases SET status = 'released' WHERE task_id = ?", (task_id,))
+            conn.execute("DELETE FROM file_ownership WHERE task_id = ?", (task_id,))
+
+    def active_task(self, channel_id: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM task_leases
+                WHERE channel_id = ? AND status = 'claimed'
+                ORDER BY heartbeat_at DESC
+                LIMIT 1
+                """,
+                (channel_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def list_tasks(self, channel_id: str) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM task_leases WHERE channel_id = ? ORDER BY started_at DESC",
+                (channel_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def find_conflicts(self, *, project_id: str, owner_agent: str, target_files: list[str], now_ts: float | None = None) -> list[LeaseConflict]:
+        now_text = _now_iso_from_ts(now_ts or time.time())
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT file_ownership.task_id, file_ownership.owner_agent, file_ownership.path_glob
+                FROM file_ownership
+                WHERE project_id = ? AND owner_agent != ? AND lease_expires_at >= ?
+                """,
+                (project_id, owner_agent, now_text),
+            ).fetchall()
+        conflicts: list[LeaseConflict] = []
+        for row in rows:
+            for target in target_files:
+                if _globs_conflict(target, row["path_glob"]):
+                    conflicts.append(
+                        LeaseConflict(
+                            task_id=str(row["task_id"]),
+                            owner_agent=str(row["owner_agent"]),
+                            path_glob=str(row["path_glob"]),
+                        )
+                    )
+                    break
+        return conflicts
+
+    def record_compaction(self, thread_id: str, event_type: str) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "INSERT INTO compaction_events(id, thread_id, event_type, created_at) VALUES(?, ?, ?, ?)",
+                (str(uuid.uuid4()), thread_id, event_type, _now_iso()),
+            )
+
+
+class WorktreeManager:
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.root.mkdir(parents=True, exist_ok=True)
+
+    def ensure(self, repo_path: Path, *, project_id: str, channel_id: str) -> tuple[Path, str]:
+        repo_root = workspace_root(repo_path)
+        if not (repo_root / ".git").exists() and not (repo_root / ".git").is_file():
+            return repo_root, _repo_branch(repo_root)
+        worktree_root = self.root / slugify(project_id)
+        worktree_root.mkdir(parents=True, exist_ok=True)
+        worktree_path = worktree_root / slugify(channel_id)
+        branch_name = f"relay/{slugify(project_id)}-{slugify(channel_id)}"
+        if worktree_path.exists():
+            return worktree_path, _repo_branch(worktree_path)
+        try:
+            branch_exists = subprocess.run(
+                ["git", "-C", str(repo_root), "branch", "--list", branch_name],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            if branch_exists:
+                subprocess.run(
+                    ["git", "-C", str(repo_root), "worktree", "add", str(worktree_path), branch_name],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+            else:
+                subprocess.run(
+                    ["git", "-C", str(repo_root), "worktree", "add", "-b", branch_name, str(worktree_path), "HEAD"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+            return worktree_path, _repo_branch(worktree_path)
+        except Exception:
+            return repo_root, _repo_branch(repo_root)
+
+
+class VerificationEngine:
+    FILE_BLOCK_PATTERN = re.compile(r"files?\s+on\s+disk\s*:\s*(?P<body>.+)", re.IGNORECASE | re.DOTALL)
+    FILE_NAME_PATTERN = re.compile(r"(?mi)^(?:[-*]\s+)?(?P<name>[A-Za-z0-9_./-]+\.[A-Za-z0-9]+)$")
+    COMMIT_PATTERN = re.compile(r"\bcommit\s+([0-9a-f]{7,40})\b", re.IGNORECASE)
+    BRANCH_PATTERN = re.compile(r"\bbranch\s+([A-Za-z0-9._/-]+)\b", re.IGNORECASE)
+    SYMBOL_PATTERN = re.compile(r"\b(?:class|function|symbol|type|method)\s+([A-Za-z_][A-Za-z0-9_]*)\b", re.IGNORECASE)
+    TEST_PATTERN = re.compile(r"(?im)^(.+?(?:pytest|vitest|tsc|lint|build).+?(?:->\s*pass|passed|\bpass\b).*)$")
+    DIFF_PATTERN = re.compile(r"\b(?:changed|modified|updated|added)\s+([A-Za-z0-9_./-]+\.[A-Za-z0-9]+)\b", re.IGNORECASE)
+
+    def __init__(self, store: RuntimeStore) -> None:
+        self.store = store
+
+    def ingest_message(self, binding: ChannelBinding, *, source_agent: str, message_ref: str, text: str) -> list[dict[str, str]]:
+        claims: list[tuple[str, str]] = []
+        match = self.FILE_BLOCK_PATTERN.search(text)
+        if match:
+            names = [file_match.group("name") for file_match in self.FILE_NAME_PATTERN.finditer(match.group("body"))]
+            for name in names:
+                claims.append(("file_exists", name))
+        for commit_id in self.COMMIT_PATTERN.findall(text):
+            claims.append(("commit_exists", commit_id))
+        for branch_name in self.BRANCH_PATTERN.findall(text):
+            claims.append(("branch_exists", branch_name))
+        for symbol in self.SYMBOL_PATTERN.findall(text):
+            claims.append(("symbol_exists", symbol))
+        for changed_path in self.DIFF_PATTERN.findall(text):
+            claims.append(("diff_exists", changed_path))
+        for command_line in self.TEST_PATTERN.findall(text):
+            claims.append(("tests_passed", command_line.strip()))
+        lowered = text.lower()
+        if "done" in lowered or "complete" in lowered:
+            claims.append(("milestone_completed", text.strip()[:280]))
+        if "decision" in lowered:
+            claims.append(("decision_claim", text.strip()[:280]))
+        if "owner" in lowered or "claimed" in lowered:
+            claims.append(("ownership_claim", text.strip()[:280]))
+        if "blocker" in lowered or "status" in lowered:
+            claims.append(("status_claim", text.strip()[:280]))
+        results: list[dict[str, str]] = []
+        for claim_type, claim_text in claims:
+            claim_id = self.store.record_claim(
+                source_agent=source_agent,
+                message_ref=message_ref,
+                claim_text=claim_text,
+                claim_type=claim_type,
+                verification_status="unresolved",
+            )
+            verdict, evidence = self.verify_claim(binding, claim_type=claim_type, claim_text=claim_text)
+            self.store.update_claim_verdict(claim_id=claim_id, verdict=verdict, evidence_text=evidence)
+            results.append({"claim_id": claim_id, "verdict": verdict, "evidence": evidence, "claim_text": claim_text})
+        return results
+
+    def verify_claim(self, binding: ChannelBinding, *, claim_type: str, claim_text: str) -> tuple[str, str]:
+        if claim_type == "file_exists":
+            candidate = binding.worktree_path / claim_text
+            if candidate.exists():
+                return "verified", f"{claim_text} exists at {candidate}"
+            repo_candidate = binding.repo_path / claim_text
+            if repo_candidate.exists():
+                return "verified", f"{claim_text} exists at {repo_candidate}"
+            return "false", f"{claim_text} was not found in {binding.worktree_path} or {binding.repo_path}"
+        if claim_type == "diff_exists":
+            result = subprocess.run(
+                ["git", "-C", str(binding.worktree_path), "diff", "--name-only"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            changed = {line.strip().replace("\\", "/") for line in result.stdout.splitlines() if line.strip()}
+            target = claim_text.strip().replace("\\", "/")
+            if target in changed:
+                return "verified", f"`git diff --name-only` includes {target}"
+            return "false", f"`git diff --name-only` does not include {target}"
+        if claim_type == "commit_exists":
+            try:
+                subprocess.run(
+                    ["git", "-C", str(binding.worktree_path), "cat-file", "-e", f"{claim_text}^{{commit}}"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                return "verified", f"git cat-file confirmed commit {claim_text}"
+            except Exception:
+                return "false", f"git cat-file could not find commit {claim_text}"
+        if claim_type == "branch_exists":
+            result = subprocess.run(
+                ["git", "-C", str(binding.worktree_path), "branch", "--list", claim_text],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if result.stdout.strip():
+                return "verified", f"git branch lists `{claim_text}`"
+            return "false", f"git branch does not list `{claim_text}`"
+        if claim_type == "symbol_exists":
+            result = subprocess.run(
+                ["rg", "-n", rf"\b{re.escape(claim_text)}\b", str(binding.worktree_path)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                first = result.stdout.splitlines()[0].strip()
+                return "verified", f"ripgrep matched `{claim_text}` at {first}"
+            return "false", f"ripgrep did not find symbol `{claim_text}`"
+        if claim_type == "tests_passed":
+            evidence = self._verify_test_claim(binding, claim_text)
+            return evidence
+        if claim_type == "decision_claim":
+            decisions = _read_text(binding.worktree_path / MEMORY_DIR_NAME / "DECISIONS.md")
+            if claim_text[:120] in decisions:
+                return "verified", "Decision text already exists in memory/DECISIONS.md"
+            return "unresolved", "Decision claim is not yet mirrored in memory/DECISIONS.md"
+        if claim_type == "ownership_claim":
+            tasks = _read_json(binding.worktree_path / MEMORY_DIR_NAME / "TASKS.json", {"tasks": []})
+            text = json.dumps(tasks)
+            if claim_text[:80] in text:
+                return "verified", "Ownership claim matched memory/TASKS.json"
+            return "unresolved", "Ownership claim needs explicit task/lease evidence."
+        if claim_type == "milestone_completed":
+            handoff = _read_text(binding.worktree_path / MEMORY_DIR_NAME / "HANDOFF.md")
+            if claim_text[:120] in handoff:
+                return "verified", "Milestone claim matched memory/HANDOFF.md"
+            return "unresolved", "Milestone claim needs validation evidence or handoff entry."
+        if claim_type == "status_claim":
+            status = _read_text(binding.worktree_path / MEMORY_DIR_NAME / "STATUS.md")
+            if claim_text[:120] in status:
+                return "verified", "Status claim matched memory/STATUS.md"
+            return "unresolved", "Status claim needs current STATUS/HANDOFF evidence."
+        return "unresolved", "Claim requires explicit validation before it can be trusted."
+
+    def _verify_test_claim(self, binding: ChannelBinding, claim_text: str) -> tuple[str, str]:
+        recent = self.store.recent_turns(binding.primary_thread_id or "", limit=8) if binding.primary_thread_id else []
+        for row in recent:
+            commands = json.loads(row.get("commands_run_json") or "[]")
+            validations = json.loads(row.get("validations_json") or "[]")
+            haystack = "\n".join(commands + validations)
+            if claim_text in haystack:
+                return "verified", f"Matched recent recorded validation in turn {row['turn_id']}"
+        command = claim_text.split("->", 1)[0].strip()
+        cheap_prefixes = ("pytest ", "python -m pytest", "npm run lint", "npm run build", "npx tsc --noEmit", "npx vitest run")
+        if not any(command.startswith(prefix) for prefix in cheap_prefixes):
+            return "unresolved", "Validation claim not found in recorded turn artifacts and is too expensive/unsafe to rerun automatically."
+        if os.name == "nt":
+            runner = ["cmd", "/c", command]
+        else:
+            runner = ["sh", "-lc", command]
+        result = subprocess.run(runner, cwd=binding.worktree_path, capture_output=True, text=True, check=False, timeout=120)
+        if result.returncode == 0:
+            return "verified", f"Reran cheap validation successfully: {command}"
+        stderr = (result.stderr or result.stdout or "").strip().splitlines()
+        tail = stderr[-1] if stderr else f"exit {result.returncode}"
+        return "false", f"Cheap validation rerun failed for `{command}`: {tail}"
+
+
+class DurableRuntime:
+    def __init__(self, *, state_dir: Path, repo_path: Path, state_namespace: str, agent_name: str) -> None:
+        self.state_dir = state_dir
+        self.repo_path = workspace_root(repo_path)
+        self.agent_name = agent_name or "codex"
+        self.project_id = f"{slugify(self.repo_path.name)}-{slugify(state_namespace)}"
+        self.turn_artifacts_dir = state_dir / "turn-artifacts"
+        self.turn_artifacts_dir.mkdir(parents=True, exist_ok=True)
+        self.store = RuntimeStore(state_dir / "durable-runtime.sqlite3")
+        self.worktrees = WorktreeManager(state_dir / "worktrees")
+        self.verifier = VerificationEngine(self.store)
+        self.ensure_repo_contract(self.repo_path)
+
+    def _append_turn_artifact(
+        self,
+        binding: ChannelBinding,
+        *,
+        thread_id: str,
+        turn_id: str,
+        summary: str,
+        files_changed: list[str],
+        commands_run: list[str],
+        validations: list[str],
+        next_step: str,
+        command_exit_codes: list[int] | None,
+        cwd: str,
+        approvals: list[str] | None,
+        blocker: str,
+        error_category: str,
+        started_at: str,
+        completed_at: str,
+        backend: str,
+        degraded: bool,
+    ) -> None:
+        artifact_path = self.turn_artifacts_dir / f"{binding.project_id}.jsonl"
+        record = {
+            "recorded_at": _now_iso(),
+            "project_id": binding.project_id,
+            "channel_id": binding.channel_id,
+            "thread_id": thread_id,
+            "turn_id": turn_id,
+            "summary": summary,
+            "files_changed": _normalize_paths(files_changed),
+            "commands_run": commands_run,
+            "command_exit_codes": command_exit_codes or [],
+            "validations": validations,
+            "cwd": cwd,
+            "approvals": approvals or [],
+            "blocker": blocker,
+            "next_step": next_step,
+            "error_category": error_category,
+            "started_at": started_at,
+            "completed_at": completed_at,
+            "backend": backend,
+            "degraded": degraded,
+        }
+        with artifact_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=True) + "\n")
+
+    def _upsert_memory_fact(
+        self,
+        binding: ChannelBinding,
+        *,
+        entry_type: str,
+        key: str,
+        content: str,
+        source: str,
+        evidence: str = "",
+        confidence: float = 1.0,
+    ) -> None:
+        self.store.upsert_memory_entry(
+            project_id=binding.project_id,
+            entry_type=entry_type,
+            key=key,
+            content=content.strip(),
+            source=source,
+            evidence=evidence,
+            confidence=confidence,
+        )
+
+    def ensure_repo_contract(self, repo_path: Path) -> None:
+        repo_path.mkdir(parents=True, exist_ok=True)
+        memory_dir = repo_path / MEMORY_DIR_NAME
+        memory_dir.mkdir(parents=True, exist_ok=True)
+        agents_path = repo_path / "AGENTS.md"
+        if not agents_path.exists():
+            atomic_write_text(agents_path, self._agents_markdown())
+        project_spec = memory_dir / "PROJECT_SPEC.md"
+        if not project_spec.exists():
+            atomic_write_text(
+                project_spec,
+                "\n".join(
+                    [
+                        "# PROJECT_SPEC",
+                        "",
+                        f"- Project root: `{repo_path}`",
+                        "- Durable runtime contract is active.",
+                        "- Discord is transport, not memory.",
+                        "- Repo files + relay state are source of truth.",
+                    ]
+                )
+                + "\n",
+            )
+        if not (memory_dir / "PLAN.md").exists():
+            atomic_write_text(
+                memory_dir / "PLAN.md",
+                "# PLAN\n\n## Milestones\n- Define milestones here.\n\n## Acceptance Criteria\n- Define acceptance checks here.\n\n## Validation Commands\n- Add the minimal relevant commands before implementation.\n\n## Stop-And-Fix Rules\n- If validation fails, fix it before claiming success.\n",
+            )
+        if not (memory_dir / "STATUS.md").exists():
+            _ensure_sectioned_markdown(memory_dir / "STATUS.md", "STATUS", {heading: "" for heading in STATUS_SECTIONS})
+        if not (memory_dir / "TASKS.json").exists():
+            atomic_write_json(memory_dir / "TASKS.json", {"tasks": []})
+        if not (memory_dir / "DECISIONS.md").exists():
+            atomic_write_text(memory_dir / "DECISIONS.md", "# DECISIONS\n")
+        if not (memory_dir / "HANDOFF.md").exists():
+            atomic_write_text(memory_dir / "HANDOFF.md", "# HANDOFF\n")
+        if not (memory_dir / "DRIFT_LOG.md").exists():
+            atomic_write_text(memory_dir / "DRIFT_LOG.md", "# DRIFT_LOG\n")
+        if not (memory_dir / "KNOWN_FACTS.json").exists():
+            atomic_write_json(memory_dir / "KNOWN_FACTS.json", {"preferences": [], "constraints": [], "facts": []})
+
+    def _agents_markdown(self) -> str:
+        return "\n".join(
+            [
+                "# AGENTS",
+                "",
+                "- Discord messages are transport, not source of truth.",
+                "- Before editing files or answering factual repo questions, read `memory/STATUS.md`, `memory/TASKS.json`, `memory/DECISIONS.md`, `memory/HANDOFF.md`, and relevant code/tests.",
+                "- Verify claims from other agents against files, git diff, tests, or docs before accepting them.",
+                "- Claim a task before editing files.",
+                "- Do not edit files owned by another fresh lease.",
+                "- For medium or large tasks, plan first in `memory/PLAN.md`, then implement, validate, repair, and update memory files.",
+                "- After every milestone, run validation and fix failures before proceeding.",
+                "- Before ending a turn, update STATUS, TASKS, DECISIONS if changed, and HANDOFF.",
+                "- If another agent drifted, correct it with evidence and log it in `memory/DRIFT_LOG.md`.",
+                "- Success claims require evidence.",
+            ]
+        ) + "\n"
+
+    def ensure_binding(self, channel_key: str) -> ChannelBinding:
+        existing = self.store.get_channel(channel_key)
+        if existing is not None:
+            binding = ChannelBinding(
+                channel_id=str(existing["discord_channel_id"]),
+                project_id=str(existing["project_id"]),
+                repo_path=Path(str(existing["repo_path"])),
+                worktree_path=Path(str(existing["worktree_path"])),
+                current_branch=str(existing["current_branch"] or "HEAD"),
+                primary_thread_id=str(existing["primary_thread_id"]) if existing["primary_thread_id"] else None,
+            )
+            self.ensure_repo_contract(binding.worktree_path)
+            return binding
+        worktree_path, branch = self.worktrees.ensure(self.repo_path, project_id=self.project_id, channel_id=channel_key)
+        binding = ChannelBinding(
+            channel_id=channel_key,
+            project_id=self.project_id,
+            repo_path=self.repo_path,
+            worktree_path=worktree_path,
+            current_branch=branch,
+        )
+        self.store.upsert_channel(binding)
+        self.ensure_repo_contract(worktree_path)
+        self._sync_status(binding, next_step="Resume the existing objective from durable memory.")
+        return binding
+
+    def bind_thread(self, channel_key: str, *, thread_id: str, backend: str, status: str, last_turn_id: str | None = None) -> ChannelBinding:
+        binding = self.ensure_binding(channel_key)
+        binding.primary_thread_id = thread_id
+        binding.backend = backend
+        self.store.bind_thread(
+            thread_id=thread_id,
+            project_id=binding.project_id,
+            channel_id=binding.channel_id,
+            backend=backend,
+            status=status,
+            last_turn_id=last_turn_id,
+            rebound=status == "rebound",
+        )
+        self.store.upsert_channel(binding)
+        self._sync_status(binding, worktree_branch=f"{binding.worktree_path} @ {binding.current_branch}")
+        return binding
+
+    def active_thread_id(self, channel_key: str) -> str | None:
+        binding = self.ensure_binding(channel_key)
+        return binding.primary_thread_id
+
+    def observe_incoming_message(
+        self,
+        *,
+        channel_key: str,
+        author_name: str,
+        author_id: int,
+        author_is_bot: bool,
+        text: str,
+    ) -> ChannelBinding:
+        binding = self.ensure_binding(channel_key)
+        sender_type = "other-ai" if author_is_bot else "user"
+        content = text.strip()
+        preferences, constraints = _extract_preferences_and_constraints(content)
+        facts = _read_json(binding.worktree_path / MEMORY_DIR_NAME / "KNOWN_FACTS.json", {"preferences": [], "constraints": [], "facts": []})
+        for item in preferences:
+            if item not in facts["preferences"]:
+                facts["preferences"].append(item)
+                self.store.add_memory_entry(
+                    project_id=binding.project_id,
+                    entry_type="preference",
+                    key=slugify(item)[:48],
+                    content=item,
+                    source=f"{sender_type}:{author_name}",
+                )
+        for item in constraints:
+            if item not in facts["constraints"]:
+                facts["constraints"].append(item)
+                self.store.add_memory_entry(
+                    project_id=binding.project_id,
+                    entry_type="constraint",
+                    key=slugify(item)[:48],
+                    content=item,
+                    source=f"{sender_type}:{author_name}",
+                )
+        atomic_write_json(binding.worktree_path / MEMORY_DIR_NAME / "KNOWN_FACTS.json", facts)
+        if sender_type == "user" and content:
+            self._upsert_memory_fact(
+                binding,
+                entry_type="objective",
+                key="current-objective",
+                content=content,
+                source=f"user:{author_name}",
+            )
+            self._upsert_memory_fact(
+                binding,
+                entry_type="instruction",
+                key="latest-authoritative-human-instruction",
+                content=content,
+                source=f"user:{author_name}",
+            )
+            task = self.ensure_task(
+                channel_key=channel_key,
+                title=content[:120],
+                owner_agent=self.agent_name,
+                target_files=[],
+                validation=[],
+            )
+            self._sync_status(
+                binding,
+                objective=f"{author_name}: {content}",
+                active_task=task["title"],
+                owner=task["owner"],
+                last_verified_scope=_head_commit(binding.worktree_path) or "working tree",
+                blocker="none",
+                next_step=_extract_next_step(content) or "Continue the current task using repo memory as source of truth.",
+            )
+        elif sender_type == "other-ai" and content:
+            message_ref = f"{channel_key}:{author_id}:{int(time.time())}"
+            verification_results = self.verifier.ingest_message(
+                binding,
+                source_agent=author_name,
+                message_ref=message_ref,
+                text=content,
+            )
+            for result in verification_results:
+                if result["verdict"] == "false":
+                    self.append_drift(
+                        binding,
+                        source_agent=author_name,
+                        claim=result["claim_text"],
+                        verdict="false",
+                        evidence=result["evidence"],
+                        correction="Do not trust the claim without repo evidence.",
+                    )
+                elif result["verdict"] == "verified":
+                    self._upsert_memory_fact(
+                        binding,
+                        entry_type="verified-claim",
+                        key=slugify(result["claim_text"])[:64],
+                        content=result["claim_text"],
+                        source=f"other-ai:{author_name}",
+                        evidence=result["evidence"],
+                        confidence=0.8,
+                    )
+            self._sync_status(binding, next_step="Verify external claims before relying on them.")
+        blocker = _extract_blocker(content)
+        if blocker:
+            self._upsert_memory_fact(
+                binding,
+                entry_type="blocker",
+                key="current-blocker",
+                content=blocker,
+                source=f"{sender_type}:{author_name}",
+            )
+            self._sync_status(binding, blocker=blocker)
+        for decision in _extract_decision_candidates(content):
+            self._upsert_memory_fact(
+                binding,
+                entry_type="decision-candidate",
+                key=slugify(decision)[:64],
+                content=decision,
+                source=f"{sender_type}:{author_name}",
+                confidence=0.6 if sender_type == "other-ai" else 0.8,
+            )
+        self.store.upsert_sync_state(binding.project_id, memory=True, status=True)
+        return binding
+
+    def ensure_task(
+        self,
+        *,
+        channel_key: str,
+        title: str,
+        owner_agent: str,
+        target_files: list[str],
+        validation: list[str],
+    ) -> dict[str, Any]:
+        binding = self.ensure_binding(channel_key)
+        active = self.store.active_task(channel_key)
+        if active is not None:
+            self.store.heartbeat_task(str(active["task_id"]))
+            self._write_tasks_file(binding)
+            return {
+                "id": str(active["task_id"]),
+                "title": str(active["title"]),
+                "owner": str(active["owner_agent"]),
+            }
+        task_id = self.store.claim_task(
+            channel_id=channel_key,
+            project_id=binding.project_id,
+            owner_agent=owner_agent,
+            title=title,
+            target_files=target_files,
+            validation=validation,
+        )
+        self._write_tasks_file(binding)
+        return {"id": task_id, "title": title, "owner": owner_agent}
+
+    def claim_task(
+        self,
+        *,
+        channel_key: str,
+        title: str,
+        owner_agent: str,
+        target_files: list[str],
+        validation: list[str],
+    ) -> dict[str, Any]:
+        binding = self.ensure_binding(channel_key)
+        task_id = self.store.claim_task(
+            channel_id=channel_key,
+            project_id=binding.project_id,
+            owner_agent=owner_agent,
+            title=title,
+            target_files=target_files,
+            validation=validation,
+        )
+        self._write_tasks_file(binding)
+        self._sync_status(binding, active_task=title, owner=owner_agent)
+        return {"id": task_id, "title": title, "owner": owner_agent}
+
+    def release_task(self, *, channel_key: str, task_id: str) -> None:
+        binding = self.ensure_binding(channel_key)
+        self.store.release_task(task_id)
+        self._write_tasks_file(binding)
+        self._sync_status(binding, active_task="none", blocker="none")
+
+    def build_context_bundle(self, channel_key: str, *, max_chars: int = 6000) -> str:
+        binding = self.ensure_binding(channel_key)
+        memory_dir = binding.worktree_path / MEMORY_DIR_NAME
+        status = _read_text(memory_dir / "STATUS.md").strip()
+        decisions = _read_text(memory_dir / "DECISIONS.md")
+        handoff = _read_text(memory_dir / "HANDOFF.md")
+        facts = _read_json(memory_dir / "KNOWN_FACTS.json", {"preferences": [], "constraints": [], "facts": []})
+        unresolved = self.store.unresolved_claims(binding.project_id)
+        active = self.store.active_task(channel_key)
+        lines = [
+            "Durable runtime context.",
+            "Discord is transport, not memory.",
+            f"Project id: {binding.project_id}",
+            f"Repo path: {binding.repo_path}",
+            f"Worktree path: {binding.worktree_path}",
+            f"Current branch: {binding.current_branch}",
+            "",
+            "Source of truth files:",
+            "- AGENTS.md",
+            "- memory/STATUS.md",
+            "- memory/TASKS.json",
+            "- memory/DECISIONS.md",
+            "- memory/HANDOFF.md",
+            "- memory/KNOWN_FACTS.json",
+            "",
+            "Current verified status:",
+            status or "_none_",
+        ]
+        if active:
+            lines.extend(
+                [
+                    "",
+                    "Active lease:",
+                    f"- task_id: {active['task_id']}",
+                    f"- owner: {active['owner_agent']}",
+                    f"- title: {active['title']}",
+                    f"- target_files: {', '.join(json.loads(active['target_files_glob']))}",
+                    f"- validation: {', '.join(json.loads(active['validation_plan_json'])) or 'pending'}",
+                ]
+            )
+        if facts.get("preferences") or facts.get("constraints"):
+            lines.append("")
+            lines.append("Stable constraints:")
+            for item in facts.get("constraints", [])[:8]:
+                lines.append(f"- {item}")
+            for item in facts.get("preferences", [])[:6]:
+                lines.append(f"- prefer: {item}")
+        decision_highlights = _extract_bullets(decisions, ("decision", "rationale", "evidence"))
+        if decision_highlights:
+            lines.append("")
+            lines.append("Recent decisions:")
+            lines.extend(f"- {item}" for item in decision_highlights[:6])
+        handoff_highlights = _extract_bullets(handoff, ("next step", "result", "blocker", "changed files"))
+        if handoff_highlights:
+            lines.append("")
+            lines.append("Latest handoff:")
+            lines.extend(f"- {item}" for item in handoff_highlights[:6])
+        if unresolved:
+            lines.append("")
+            lines.append("Unresolved claims needing verification:")
+            for item in unresolved[:6]:
+                lines.append(f"- {item['source_agent']}: {item['claim_text']}")
+        lines.append("")
+        lines.append("Do not rely on Discord transcript recall when repo memory already captures the truth.")
+        text = "\n".join(lines)
+        if len(text) <= max_chars:
+            return text
+        trimmed: list[str] = []
+        running = 0
+        for line in lines:
+            if running + len(line) + 1 > max_chars:
+                break
+            trimmed.append(line)
+            running += len(line) + 1
+        trimmed.append("")
+        trimmed.append("[context truncated to fit budget]")
+        return "\n".join(trimmed)
+
+    def record_turn_result(
+        self,
+        *,
+        channel_key: str,
+        thread_id: str,
+        turn_id: str,
+        summary: str,
+        files_changed: list[str],
+        commands_run: list[str],
+        validations: list[str],
+        blocker: str = "",
+        next_step: str = "",
+        command_exit_codes: list[int] | None = None,
+        cwd: str = "",
+        approvals: list[str] | None = None,
+        error_category: str = "",
+        started_at: str = "",
+        completed_at: str = "",
+        backend: str = "",
+        degraded: bool = False,
+    ) -> None:
+        binding = self.ensure_binding(channel_key)
+        self.store.record_turn(
+            thread_id=thread_id,
+            turn_id=turn_id,
+            summary=summary,
+            files_changed=files_changed,
+            commands_run=commands_run,
+            validations=validations,
+            next_step=next_step or "Continue from STATUS.md and HANDOFF.md.",
+            command_exit_codes=command_exit_codes,
+            cwd=cwd or str(binding.worktree_path),
+            approvals=approvals,
+            blocker=blocker,
+            error_category=error_category,
+            started_at=started_at,
+            completed_at=completed_at or _now_iso(),
+            backend=backend or binding.backend,
+            degraded=degraded,
+        )
+        self._append_turn_artifact(
+            binding,
+            thread_id=thread_id,
+            turn_id=turn_id,
+            summary=summary,
+            files_changed=files_changed,
+            commands_run=commands_run,
+            validations=validations,
+            next_step=next_step or "Continue from STATUS.md and HANDOFF.md.",
+            command_exit_codes=command_exit_codes,
+            cwd=cwd or str(binding.worktree_path),
+            approvals=approvals,
+            blocker=blocker,
+            error_category=error_category,
+            started_at=started_at,
+            completed_at=completed_at or _now_iso(),
+            backend=backend or binding.backend,
+            degraded=degraded,
+        )
+        active = self.store.active_task(channel_key)
+        if active:
+            self.store.heartbeat_task(str(active["task_id"]))
+        validation_text = "; ".join(validations) if validations else ("pending verification" if files_changed else "no validation required")
+        objective_entry = self.store.latest_memory_entry(
+            project_id=binding.project_id,
+            entry_type="instruction",
+            key="latest-authoritative-human-instruction",
+        )
+        self._sync_status(
+            binding,
+            objective=(objective_entry or {}).get("content"),
+            owner=self.agent_name,
+            worktree_branch=f"{binding.worktree_path} @ {binding.current_branch}",
+            last_verified_scope=_head_commit(binding.worktree_path) or "working tree",
+            last_validation_result=validation_text,
+            blocker=blocker or "none",
+            next_step=next_step or "Continue from the latest handoff entry.",
+        )
+        self._upsert_memory_fact(
+            binding,
+            entry_type="status",
+            key="latest-summary",
+            content=summary,
+            source="codex-turn",
+            evidence=_compact_join(validations or commands_run),
+            confidence=0.9,
+        )
+        if next_step:
+            self._upsert_memory_fact(
+                binding,
+                entry_type="next-step",
+                key="exact-next-step",
+                content=next_step,
+                source="codex-turn",
+                evidence=summary,
+                confidence=0.95,
+            )
+        if blocker:
+            self._upsert_memory_fact(
+                binding,
+                entry_type="blocker",
+                key="current-blocker",
+                content=blocker,
+                source="codex-turn",
+                evidence=summary,
+                confidence=0.95,
+            )
+        for decision in _extract_decision_candidates(summary):
+            self.append_decision(binding, decision=decision, rationale="Turn summary recorded a durable decision.", evidence=_compact_join(validations or commands_run))
+        self._write_tasks_file(binding)
+        self.write_handoff(
+            binding,
+            task_id=str(active["task_id"]) if active else "unclaimed",
+            changed_files=files_changed,
+            commands_run=commands_run,
+            result=summary,
+            blocker=blocker or "none",
+            next_step=next_step or "Continue from STATUS.md.",
+        )
+        self.store.upsert_sync_state(binding.project_id, handoff=True, status=True)
+
+    def record_shutdown(self, channel_key: str, *, reason: str) -> None:
+        binding = self.ensure_binding(channel_key)
+        self._upsert_memory_fact(
+            binding,
+            entry_type="lifecycle",
+            key="last-shutdown",
+            content=reason,
+            source="relay",
+            confidence=0.8,
+        )
+        self._sync_status(binding, blocker=reason, next_step="Resume the same thread and continue from durable memory.")
+
+    def record_startup(self, channel_key: str) -> None:
+        binding = self.ensure_binding(channel_key)
+        self._upsert_memory_fact(
+            binding,
+            entry_type="lifecycle",
+            key="last-startup",
+            content="Relay started or resumed.",
+            source="relay",
+            confidence=0.8,
+        )
+        self._sync_status(binding, next_step="Resume the same thread and continue without asking for a recap.")
+
+    def record_compaction_event(self, channel_key: str, *, thread_id: str, event_type: str) -> None:
+        binding = self.ensure_binding(channel_key)
+        self.store.record_compaction(thread_id, event_type)
+        self._upsert_memory_fact(
+            binding,
+            entry_type="compaction",
+            key="last-compaction",
+            content=f"{event_type} on {thread_id}",
+            source="relay",
+            confidence=0.9,
+        )
+        self.write_handoff(
+            binding,
+            task_id=(self.store.active_task(channel_key) or {}).get("task_id", "unclaimed"),
+            changed_files=[],
+            commands_run=[],
+            result=f"Compaction event recorded: {event_type}",
+            blocker="none",
+            next_step="Rehydrate from durable memory and continue the same objective.",
+        )
+        self._sync_status(binding, next_step="Rehydrate from durable memory and continue the same objective.")
+
+    def recent_handoff(self, channel_key: str) -> str:
+        binding = self.ensure_binding(channel_key)
+        return _read_text(binding.worktree_path / MEMORY_DIR_NAME / "HANDOFF.md")
+
+    def append_decision(self, binding: ChannelBinding, *, decision: str, rationale: str, evidence: str) -> None:
+        body = "\n".join(
+            [
+                f"## {_now_iso()}",
+                f"- Decision: {decision}",
+                f"- Rationale: {rationale}",
+                f"- Evidence: {evidence}",
+            ]
+        )
+        _append_markdown_entry(binding.worktree_path / MEMORY_DIR_NAME / "DECISIONS.md", "DECISIONS", body)
+
+    def append_drift(self, binding: ChannelBinding, *, source_agent: str, claim: str, verdict: str, evidence: str, correction: str) -> None:
+        body = "\n".join(
+            [
+                f"## {_now_iso()}",
+                f"- Source agent: {source_agent}",
+                f"- Claim: {claim}",
+                f"- Verdict: {verdict}",
+                f"- Evidence: {evidence}",
+                f"- Correction posted: {correction}",
+            ]
+        )
+        _append_markdown_entry(binding.worktree_path / MEMORY_DIR_NAME / "DRIFT_LOG.md", "DRIFT_LOG", body)
+
+    def write_handoff(
+        self,
+        binding: ChannelBinding,
+        *,
+        task_id: str,
+        changed_files: list[str],
+        commands_run: list[str],
+        result: str,
+        blocker: str,
+        next_step: str,
+    ) -> None:
+        entry = "\n".join(
+            [
+                f"## {_now_iso()}",
+                f"- task id: {task_id}",
+                f"- changed files: {', '.join(_normalize_paths(changed_files)) or 'none'}",
+                f"- commands/tests run: {', '.join(commands_run) or 'none captured'}",
+                f"- result: {result or 'none'}",
+                f"- blocker: {blocker or 'none'}",
+                f"- exact next step: {next_step or 'Continue from STATUS.md.'}",
+            ]
+        )
+        _append_markdown_entry(binding.worktree_path / MEMORY_DIR_NAME / "HANDOFF.md", "HANDOFF", entry, prepend=True)
+
+    def _write_tasks_file(self, binding: ChannelBinding) -> None:
+        tasks = []
+        for row in self.store.list_tasks(binding.channel_id):
+            tasks.append(
+                {
+                    "id": row["task_id"],
+                    "title": row["title"],
+                    "status": row["status"],
+                    "owner": row["owner_agent"],
+                    "target_files": json.loads(row["target_files_glob"]),
+                    "validation": json.loads(row["validation_plan_json"]),
+                    "started_at": row["started_at"],
+                    "heartbeat_at": row["heartbeat_at"],
+                    "lease_expires_at": row["lease_expires_at"],
+                }
+            )
+        atomic_write_json(binding.worktree_path / MEMORY_DIR_NAME / "TASKS.json", {"tasks": tasks})
+
+    def _sync_status(
+        self,
+        binding: ChannelBinding,
+        *,
+        objective: str | None = None,
+        active_task: str | None = None,
+        owner: str | None = None,
+        worktree_branch: str | None = None,
+        last_verified_scope: str | None = None,
+        last_validation_result: str | None = None,
+        blocker: str | None = None,
+        next_step: str | None = None,
+    ) -> None:
+        status_fields = {
+            "Current objective": objective,
+            "Active task": active_task,
+            "Owner": owner,
+            "Worktree / branch": worktree_branch if worktree_branch is not None else f"{binding.worktree_path} @ {binding.current_branch}",
+            "Last verified commit or diff scope": last_verified_scope if last_verified_scope is not None else _head_commit(binding.worktree_path) or "working tree",
+            "Last validation result": last_validation_result,
+            "Current blocker": blocker,
+            "Exact next step": next_step,
+        }
+        _write_status_file(binding.worktree_path / MEMORY_DIR_NAME / "STATUS.md", status_fields)
+
+    def status_snapshot(self, channel_key: str) -> dict[str, Any]:
+        binding = self.ensure_binding(channel_key)
+        active = self.store.active_task(channel_key)
+        channel_row = self.store.get_channel(channel_key)
+        return {
+            "project_id": binding.project_id,
+            "repo_path": str(binding.repo_path),
+            "worktree_path": str(binding.worktree_path),
+            "branch": binding.current_branch,
+            "thread_id": binding.primary_thread_id,
+            "backend": binding.backend,
+            "last_rebind_at": str(channel_row["last_rebind_at"]) if channel_row and channel_row["last_rebind_at"] else "",
+            "active_task": active,
+            "status_md": _read_text(binding.worktree_path / MEMORY_DIR_NAME / "STATUS.md"),
+            "handoff_md": _read_text(binding.worktree_path / MEMORY_DIR_NAME / "HANDOFF.md"),
+            "claims": self.store.recent_claims(binding.project_id),
+        }
