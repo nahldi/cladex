@@ -4,6 +4,7 @@ const { promisify } = require('util');
 const fs = require('fs/promises');
 const path = require('path');
 const fsSync = require('fs');
+const os = require('os');
 
 const execFileAsync = promisify(execFile);
 const app = express();
@@ -58,7 +59,49 @@ function resolvePythonLaunchers() {
   return launchers;
 }
 
+function resolvePythonwLaunchers() {
+  const launchers = [];
+  const localAppData = process.env.LOCALAPPDATA || '';
+  const directCandidates = [
+    process.env.CLADEX_PYTHONW || '',
+    localAppData ? path.join(localAppData, 'discord-codex-relay', 'runtime', 'Scripts', 'pythonw.exe') : '',
+    localAppData ? path.join(localAppData, 'Programs', 'Python', 'Python313', 'pythonw.exe') : '',
+    localAppData ? path.join(localAppData, 'Programs', 'Python', 'Python312', 'pythonw.exe') : '',
+    localAppData ? path.join(localAppData, 'Programs', 'Python', 'Python311', 'pythonw.exe') : '',
+    localAppData ? path.join(localAppData, 'Programs', 'Python', 'Python310', 'pythonw.exe') : '',
+    'pyw.exe',
+  ].filter(Boolean);
+  for (const candidate of directCandidates) {
+    if (!launchers.includes(candidate) && (candidate.toLowerCase().endsWith('.exe') ? fsSync.existsSync(candidate) : true)) {
+      launchers.push(candidate);
+    }
+  }
+  return launchers;
+}
+
 async function runPython(args, cwd = BACKEND_DIR) {
+  if (process.platform === 'win32') {
+    const pythonwLaunchers = resolvePythonwLaunchers();
+    for (const launcher of pythonwLaunchers) {
+      try {
+        const outputPath = path.join(os.tmpdir(), `cladex-api-${Date.now()}-${Math.random().toString(16).slice(2)}.json`);
+        await execFileAsync(launcher, ['api_runner.py', '--output', outputPath, ...args], { cwd, windowsHide: true });
+        const raw = await fs.readFile(outputPath, 'utf-8');
+        await fs.unlink(outputPath).catch(() => undefined);
+        const payload = JSON.parse(raw || '{}');
+        return {
+          stdout: String(payload.stdout ?? ''),
+          stderr: String(payload.stderr ?? ''),
+          code: Number(payload.code ?? 1),
+        };
+      } catch (err) {
+        if (err && err.code === 'ENOENT') {
+          continue;
+        }
+      }
+    }
+  }
+
   const launchers = resolvePythonLaunchers();
   let lastError = '';
 
@@ -108,7 +151,7 @@ app.get('/api/runtime-info', async (_req, res) => {
     apiBase: `http://${API_HOST}:${API_PORT}`,
     backendDir: BACKEND_DIR,
     packaged: process.env.NODE_ENV === 'production' || !!process.resourcesPath,
-    appVersion: process.env.npm_package_version || '2.0.9',
+    appVersion: process.env.npm_package_version || '2.0.10',
   });
 });
 
