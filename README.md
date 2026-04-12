@@ -30,7 +30,7 @@ The shipped product is local-first:
 ```bash
 npm install
 py -m pip install -e backend
-CLADEX.cmd
+npm run app
 ```
 
 That gives you the desktop manager plus the Python relay commands:
@@ -45,16 +45,10 @@ npm install
 npm run app
 ```
 
-Fastest local launcher from this repo:
-
-```bat
-CLADEX.cmd
-```
-
 ### Development Mode
 
 ```bash
-npm start  # Runs API server + Vite dev server
+npm run dev:stack  # Runs API server + Vite dev server
 ```
 
 Optional desktop UI environment variables live in `.env.example`.
@@ -68,8 +62,8 @@ npm run electron:build  # Creates installer in release/
 ```
 
 Packaged launchers produced by the build:
-- `release\CLADEX Setup 2.0.3.exe`
-- `release\CLADEX 2.0.3.exe`
+- `release\CLADEX Setup 2.0.4.exe`
+- `release\CLADEX 2.0.4.exe`
 - `release\win-unpacked\CLADEX.exe`
 
 ### Backend CLI
@@ -96,7 +90,6 @@ cladex/
     relayctl.py         # Codex relay
     bot.py              # Codex Discord bot
     relay_runtime.py    # Shared durable runtime
-  CLADEX.cmd       # Easy local launcher
 ```
 
 ## CLI Commands
