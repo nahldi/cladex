@@ -505,33 +505,11 @@ class ClaudeBackend:
     def _extract_text_from_event(self, event: dict) -> str:
         event_type = event.get("type", "")
 
+        # Only extract from streaming deltas to avoid duplication
+        # Final message/assistant events duplicate the delta content
         if event_type == "content_block_delta":
             delta = event.get("delta", {})
             return delta.get("text", "")
-
-        if event_type == "message":
-            parts: list[str] = []
-            for block in event.get("content", []):
-                if isinstance(block, dict) and block.get("type") == "text":
-                    parts.append(block.get("text", ""))
-            return "".join(parts)
-
-        if event_type == "assistant":
-            message = event.get("message", {})
-            if isinstance(message, dict):
-                content = message.get("content")
-                if isinstance(content, str):
-                    return content
-                if isinstance(content, list):
-                    return "".join(
-                        part.get("text", "")
-                        for part in content
-                        if isinstance(part, dict) and part.get("type") == "text"
-                    )
-            return event.get("content", "")
-
-        if event_type == "result":
-            return event.get("result", "") or event.get("text", "")
 
         if event_type == "error":
             error = event.get("error", {})
