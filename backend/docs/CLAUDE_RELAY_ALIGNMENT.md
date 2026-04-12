@@ -17,9 +17,11 @@ Claude support is now built into this repo and uses the same durable runtime as 
 The current Claude CLI contract used here is:
 
 - first successful turn:
-  - `claude -p --output-format stream-json --model claude-opus-4-5-20251101 --session-id <uuid>`
+  - `claude -p --verbose --output-format stream-json --model claude-opus-4-5-20251101 --dangerously-skip-permissions --session-id <uuid>`
 - later turns:
-  - `claude -p --output-format stream-json --model claude-opus-4-5-20251101 --resume <session_id>`
+  - `claude -p --verbose --output-format stream-json --model claude-opus-4-5-20251101 --dangerously-skip-permissions --resume <session_id>`
+
+The permission bypass is part of the spawned Claude CLI command. It is not injected into chat content or sent as a separate preflight message.
 
 That replaced the earlier incorrect assumption that `claude -p` could be kept alive as a long-lived chat subprocess.
 

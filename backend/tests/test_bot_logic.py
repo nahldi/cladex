@@ -110,6 +110,43 @@ def test_load_config_disables_visible_terminal_on_stdio(tmp_path) -> None:
     assert config.open_visible_terminal is False
 
 
+def test_durable_context_budget_trims_lightweight_coordination_turns() -> None:
+    bot = _load_bot_module()
+
+    assert (
+        bot._durable_context_budget(
+            directive=bot.RelayDirective(kind="lightweight_ping", authoritative=False, reply_required=False, reason=""),
+            cleaned_text="ping",
+            new_thread=False,
+        )
+        == 1400
+    )
+    assert (
+        bot._durable_context_budget(
+            directive=bot.RelayDirective(kind="teammate_question", authoritative=True, reply_required=True, reason=""),
+            cleaned_text="yes or no?",
+            new_thread=False,
+        )
+        == 1800
+    )
+    assert (
+        bot._durable_context_budget(
+            directive=bot.RelayDirective(kind="teammate_handoff", authoritative=True, reply_required=False, reason=""),
+            cleaned_text="take over the audit and verify the restart logs",
+            new_thread=False,
+        )
+        == 2200
+    )
+    assert (
+        bot._durable_context_budget(
+            directive=bot.RelayDirective(kind="teammate_question", authoritative=True, reply_required=True, reason=""),
+            cleaned_text="yes or no?",
+            new_thread=True,
+        )
+        == 6000
+    )
+
+
 def test_open_visible_terminal_uses_dangerous_resume_flag(monkeypatch, tmp_path) -> None:
     bot = _load_bot_module()
     session = bot.CodexSession("channel-visible-terminal")

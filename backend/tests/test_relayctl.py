@@ -163,6 +163,27 @@ def test_profile_normalization_drops_stale_provider_keys(tmp_path: Path) -> None
     assert "RELAY_PROVIDER" not in env
 
 
+def test_quarantine_stale_session_bindings_uses_relay_codex_home(tmp_path: Path, monkeypatch) -> None:
+    state_dir = tmp_path / "state"
+    session_dir = state_dir / "sessions"
+    session_dir.mkdir(parents=True)
+    session_file = session_dir / "channel-1.json"
+    session_file.write_text('{"thread_id":"thread-live"}\n', encoding="utf-8")
+
+    relay_home = tmp_path / "relay-home"
+    live_sessions = relay_home / "sessions" / "2026" / "04" / "12"
+    live_sessions.mkdir(parents=True)
+    (live_sessions / "rollout-thread-live.jsonl").write_text("{}\n", encoding="utf-8")
+
+    monkeypatch.setattr(relayctl, "prepare_relay_codex_home", lambda workspace: relay_home)
+
+    moved = relayctl._quarantine_stale_session_bindings(state_dir, tmp_path / "workspace")
+
+    assert moved == 0
+    assert session_file.exists()
+    assert not (state_dir / "bad-sessions").exists()
+
+
 def test_load_env_file_tolerates_utf8_bom(tmp_path: Path) -> None:
     env_path = tmp_path / "profile.env"
     env_path.write_bytes("\ufeffDISCORD_BOT_TOKEN=token-value\nALLOW_DMS=true\n".encode("utf-8"))
@@ -967,7 +988,7 @@ def test_run_profile_waits_for_existing_launch_when_lock_is_held(tmp_path: Path)
 
     relayctl._acquire_pid_lock = lambda path: (_ for _ in ()).throw(OSError("busy"))
     relayctl._wait_for_inflight_launch = lambda item: called.append(item["name"]) or 0
-    relayctl._quarantine_stale_session_bindings = lambda path: 0
+    relayctl._quarantine_stale_session_bindings = lambda path, workspace=None: 0
     relayctl._release_pid_lock = lambda handle: None
     try:
         result = relayctl._run_profile(profile)

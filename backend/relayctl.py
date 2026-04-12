@@ -28,12 +28,12 @@ from relay_common import (
     atomic_write_json,
     atomic_write_text,
     codex_config_path,
-    codex_sessions_root,
     default_namespace_for_workspace,
     default_port_for_workspace,
     follow_file,
     listening_pids,
     pid_exists,
+    prepare_relay_codex_home,
     relay_codex_env,
     resolve_codex_bin,
     slugify,
@@ -1352,11 +1352,14 @@ def _profile_runtime_state(profile: dict) -> dict:
     }
 
 
-def _quarantine_stale_session_bindings(state_dir: Path) -> int:
+def _quarantine_stale_session_bindings(state_dir: Path, workspace: Path | None = None) -> int:
     session_dir = state_dir / "sessions"
     if not session_dir.exists():
         return 0
-    codex_root = codex_sessions_root()
+    if workspace is not None:
+        codex_root = prepare_relay_codex_home(workspace) / "sessions"
+    else:
+        codex_root = prepare_relay_codex_home(Path.cwd()) / "sessions"
     moved = 0
     for session_file in session_dir.glob("*.json"):
         try:
@@ -1548,7 +1551,7 @@ def _run_profile_foreground(profile: dict) -> int:
     state_dir = state_dir_for_namespace(env["STATE_NAMESPACE"])
     state_dir.mkdir(parents=True, exist_ok=True)
     (state_dir / "logs").mkdir(parents=True, exist_ok=True)
-    _quarantine_stale_session_bindings(state_dir)
+    _quarantine_stale_session_bindings(state_dir, Path(profile["workspace"]))
     launch_lock = None
     try:
         try:
@@ -1597,7 +1600,7 @@ def _run_profile(profile: dict) -> int:
     state_dir = state_dir_for_namespace(env["STATE_NAMESPACE"])
     state_dir.mkdir(parents=True, exist_ok=True)
     (state_dir / "logs").mkdir(parents=True, exist_ok=True)
-    _quarantine_stale_session_bindings(state_dir)
+    _quarantine_stale_session_bindings(state_dir, Path(profile["workspace"]))
     launch_lock = None
     try:
         try:

@@ -40,6 +40,34 @@ PROMPT_CONTEXT_FILES: tuple[tuple[str, int], ...] = (
     ("memory/DECISIONS.md", 2000),
 )
 
+# Lightweight context for simple coordination messages
+LIGHTWEIGHT_CONTEXT_FILES: tuple[tuple[str, int], ...] = (
+    ("memory/STATUS.md", 800),
+)
+
+# Patterns that indicate a lightweight coordination message (yes/no, ack, status check)
+LIGHTWEIGHT_MESSAGE_PATTERNS: tuple[str, ...] = (
+    "yes",
+    "no",
+    "ok",
+    "okay",
+    "ack",
+    "acknowledged",
+    "confirmed",
+    "done",
+    "ready",
+    "waiting",
+    "here",
+    "present",
+    "understood",
+    "got it",
+    "will do",
+    "on it",
+    "working",
+    "ping",
+    "pong",
+)
+
 
 class ChannelType(Enum):
     DISCORD = "discord"
@@ -205,8 +233,15 @@ class ClaudeBackend:
             logger.error("Claude Code CLI not found")
             self.on_status("ERROR: Claude Code CLI not found")
             return False
+        self.runtime.record_restart_event(reason="process-startup")
         self._running = True
-        self.on_status("Claude ready. Durable memory and session recovery are active.")
+        # Check for restart churn
+        if self.runtime.is_restart_churn():
+            restart_count = self.runtime.count_recent_restarts()
+            logger.warning("Restart churn detected: %d restarts in last 5 minutes", restart_count)
+            self.on_status(f"WARNING: Restart churn detected ({restart_count} restarts in 5min). Check relay logs.")
+        else:
+            self.on_status("Claude ready. Durable memory and session recovery are active.")
         return True
 
     def stop(self) -> None:
@@ -281,6 +316,25 @@ class ClaudeBackend:
 
         after_changes = self._git_status(binding.worktree_path)
         changed_files = sorted(set(after_changes) | set(before_changes))
+        content = self._extract_response_text(result.stdout) if result.returncode == 0 else ""
+
+        if self._should_retry_empty_response(result, content=content, before_changes=before_changes, after_changes=after_changes):
+            logger.warning(
+                "Claude returned no text for session %s with no observed workspace changes; retrying once with a fresh session",
+                session.session_id,
+            )
+            self.on_status("Claude returned no text. Retrying once with a fresh session.")
+            session.reset()
+            self.runtime.bind_thread(
+                msg.channel_id,
+                thread_id=session.session_id or "",
+                backend="claude-print-resume",
+                status="rebound",
+            )
+            result = self._run_turn(prompt, use_resume=False, cwd=binding.worktree_path, session=session)
+            after_changes = self._git_status(binding.worktree_path)
+            changed_files = sorted(set(after_changes) | set(before_changes))
+            content = self._extract_response_text(result.stdout) if result.returncode == 0 else ""
 
         if result.returncode != 0:
             failure_message = self._failure_text(result)
@@ -306,7 +360,6 @@ class ClaudeBackend:
             self._report_failure(result)
             return False
 
-        content = self._extract_response_text(result.stdout)
         if not content.strip():
             self.runtime.record_turn_result(
                 channel_key=msg.channel_id,
@@ -374,9 +427,46 @@ class ClaudeBackend:
         self.on_status("Claude turn complete.")
         return True
 
+    def claim_inbound_discord_message(self, channel_key: str, message_id: str | int | None) -> bool:
+        return self.runtime.claim_inbound_discord_message(channel_key, message_id)
+
+    def claim_outbound_discord_reply(
+        self,
+        channel_key: str,
+        source_message_id: str | int | None,
+        content: str,
+        *,
+        force: bool = False,
+    ) -> bool:
+        return self.runtime.claim_outbound_discord_reply(
+            channel_key,
+            source_message_id,
+            content,
+            force=force,
+        )
+
     def _format_prompt(self, msg: InboundMessage, prompt_workspace: Path, durable_bundle: str) -> str:
         effort = self._effort_for_message(msg.content)
         self._last_effort = effort
+        is_lightweight = self._is_lightweight_message(msg.content)
+
+        if is_lightweight:
+            # Lightweight fast path for simple coordination messages
+            parts = [
+                (
+                    "You are Claude in CLADEX relay. This is a lightweight coordination message.\n"
+                    "Rules: Be brief. No filler. Respond directly to the message.\n"
+                    f"Effort: {effort}."
+                )
+            ]
+            # Minimal context for lightweight messages
+            lightweight_context = self._durable_context(prompt_workspace, lightweight=True)
+            if lightweight_context:
+                parts.append(f"Status:\n{lightweight_context}")
+            parts.append(f"Sender: {msg.sender_name}\nMessage: {msg.content.strip()}")
+            return "\n\n".join(part for part in parts if part)
+
+        # Full context path for substantive messages
         parts = [
             (
                 "You are Claude running inside CLADEX as a durable coding relay.\n"
@@ -395,7 +485,7 @@ class ClaudeBackend:
             )
         ]
         parts.append(f"Durable runtime context:\n{durable_bundle}")
-        durable_context = self._durable_context(prompt_workspace)
+        durable_context = self._durable_context(prompt_workspace, lightweight=False)
         if durable_context:
             parts.append(f"Relevant repo documents:\n{durable_context}")
         parts.append(
@@ -414,9 +504,10 @@ class ClaudeBackend:
         parts.append(f"User message:\n{msg.content.strip()}")
         return "\n\n".join(part for part in parts if part)
 
-    def _durable_context(self, prompt_workspace: Path) -> str:
+    def _durable_context(self, prompt_workspace: Path, *, lightweight: bool = False) -> str:
         sections: list[str] = []
-        for relative_path, limit in PROMPT_CONTEXT_FILES:
+        context_files = LIGHTWEIGHT_CONTEXT_FILES if lightweight else PROMPT_CONTEXT_FILES
+        for relative_path, limit in context_files:
             path = prompt_workspace / relative_path
             if not path.exists() or not path.is_file():
                 continue
@@ -572,6 +663,20 @@ class ClaudeBackend:
         ]
         return any(needle in haystack for needle in needles)
 
+    def _should_retry_empty_response(
+        self,
+        result: CommandResult,
+        *,
+        content: str,
+        before_changes: list[str],
+        after_changes: list[str],
+    ) -> bool:
+        if result.returncode != 0:
+            return False
+        if content.strip():
+            return False
+        return sorted(before_changes) == sorted(after_changes)
+
     def _report_failure(self, result: CommandResult, *, default_message: str | None = None) -> None:
         message = default_message or self._failure_text(result)
         self.on_status(f"ERROR: {message}")
@@ -660,8 +765,28 @@ class ClaudeBackend:
                 return normalized[:280]
         return text.strip()[:280] or "Claude completed the turn."
 
+    def _is_lightweight_message(self, text: str) -> bool:
+        """Check if message is a simple coordination message that needs minimal context."""
+        normalized = text.strip().lower()
+        # Very short messages (under 30 chars) that match coordination patterns
+        if len(normalized) > 50:
+            return False
+        # Check for exact or near-exact matches to lightweight patterns
+        words = set(normalized.replace(",", " ").replace(".", " ").replace("!", " ").replace("?", " ").split())
+        if not words:
+            return False
+        # If message is just 1-3 words and matches lightweight patterns
+        if len(words) <= 3:
+            for pattern in LIGHTWEIGHT_MESSAGE_PATTERNS:
+                if pattern in normalized or normalized in pattern:
+                    return True
+        return False
+
     def _effort_for_message(self, text: str) -> str:
         normalized = text.strip().lower()
+        # Lightweight messages get quick effort
+        if self._is_lightweight_message(text):
+            return self.reasoning_effort_quick
         quick_markers = (
             "status",
             "what changed",
@@ -733,7 +858,7 @@ class RelayBackend:
         self,
         workspace: Path,
         state_dir: Path,
-        on_discord_response: Callable[[str, str], None],
+        on_discord_response: Callable[[str, str, str], None],
         on_status: Callable[[str], None] | None = None,
     ):
         self.workspace = workspace
@@ -774,11 +899,29 @@ class RelayBackend:
 
     def _route_response(self, msg: OutboundMessage) -> None:
         if msg.channel_type == ChannelType.DISCORD:
-            self._on_discord(msg.channel_id, msg.content)
+            self._on_discord(msg.channel_id, msg.content, msg.reply_to)
             return
         future = self._pending_local.get(msg.reply_to)
         if future and not future.done():
             future.set_result(msg.content)
+
+    def claim_inbound_discord_message(self, channel_id: str, message_id: str | int | None) -> bool:
+        return self._claude.claim_inbound_discord_message(channel_id, message_id)
+
+    def claim_outbound_discord_reply(
+        self,
+        channel_id: str,
+        source_message_id: str | int | None,
+        content: str,
+        *,
+        force: bool = False,
+    ) -> bool:
+        return self._claude.claim_outbound_discord_reply(
+            channel_id,
+            source_message_id,
+            content,
+            force=force,
+        )
 
     async def start(self) -> bool:
         if not self._claude.start():

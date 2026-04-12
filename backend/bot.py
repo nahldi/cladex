@@ -2029,7 +2029,14 @@ def _dm_turn_input(
 ) -> str:
     cleaned = _clean_user_text(message, client.user)
     directive = directive or _classify_relay_message(message, client.user)
-    runtime_context_lines = DURABLE_RUNTIME.build_context_bundle(_history_key(message)).splitlines()
+    runtime_context_lines = DURABLE_RUNTIME.build_context_bundle(
+        _history_key(message),
+        max_chars=_durable_context_budget(
+            directive=directive,
+            cleaned_text=cleaned,
+            new_thread=new_thread,
+        ),
+    ).splitlines()
     lines = []
     if new_thread:
         lines.append("Discord DM relay session attached to this live Codex thread.")
@@ -2060,7 +2067,14 @@ async def _channel_turn_input(
 ) -> str:
     cleaned = _clean_user_text(message, client.user)
     directive = directive or _classify_relay_message(message, client.user)
-    runtime_context_lines = DURABLE_RUNTIME.build_context_bundle(_history_key(message)).splitlines()
+    runtime_context_lines = DURABLE_RUNTIME.build_context_bundle(
+        _history_key(message),
+        max_chars=_durable_context_budget(
+            directive=directive,
+            cleaned_text=cleaned,
+            new_thread=new_thread,
+        ),
+    ).splitlines()
     relay_name_line = (
         [f"Relay bot identity in this channel: {CONFIG.relay_bot_name}."]
         if CONFIG.relay_bot_name
@@ -2163,7 +2177,7 @@ def _batched_channel_context_input(
     latest_authoritative_instruction: str | None = None,
 ) -> str:
     channel_key = _history_key(messages[-1]) if messages else "channel-unknown"
-    runtime_context_lines = DURABLE_RUNTIME.build_context_bundle(channel_key).splitlines()
+    runtime_context_lines = DURABLE_RUNTIME.build_context_bundle(channel_key, max_chars=1800).splitlines()
     relay_name_line = (
         [f"Relay bot identity in this channel: {CONFIG.relay_bot_name}."]
         if CONFIG.relay_bot_name
@@ -2191,6 +2205,23 @@ def _batched_channel_context_input(
         ]
     )
     return "\n".join(lines)
+
+
+def _durable_context_budget(
+    *,
+    directive: RelayDirective,
+    cleaned_text: str,
+    new_thread: bool,
+) -> int:
+    if new_thread:
+        return 6000
+    if directive.kind in {"lightweight_ping", "channel_context"}:
+        return 1400
+    if directive.kind == "teammate_question" and len(cleaned_text) <= 280:
+        return 1800
+    if directive.kind == "teammate_handoff" and len(cleaned_text) <= 320:
+        return 2200
+    return 6000
 
 
 def _attachment_is_image(attachment: discord.Attachment) -> bool:
@@ -4422,9 +4453,22 @@ async def _stop_turn_feedback_tasks(turn: ActiveTurn) -> None:
 
 
 async def _deliver_reply(turn: ActiveTurn, reply_text: str) -> None:
+    latest_message = turn.latest_message
+    if latest_message is None:
+        return
+    if not DURABLE_RUNTIME.claim_outbound_discord_reply(
+        _history_key(latest_message),
+        latest_message.id,
+        reply_text,
+    ):
+        if turn.progress_message is not None:
+            with contextlib.suppress(Exception):
+                await turn.progress_message.delete()
+        _log_observer_event("suppressed", "Duplicate Discord reply suppressed.")
+        return
+
     chunks = _split_message(reply_text)
     progress_message = turn.progress_message
-    latest_message = turn.latest_message
 
     if progress_message is not None:
         try:
@@ -4466,7 +4510,7 @@ class RetryView(discord.ui.View):
         except discord.NotFound:
             return
 
-        await _handle_relay_message(self.origin_message)
+        await _handle_relay_message_internal(self.origin_message, force=True)
 
         for child in self.children:
             child.disabled = True
@@ -4499,7 +4543,14 @@ async def _send_relay_error(
 
 
 async def _handle_relay_message(message: discord.Message) -> None:
+    return await _handle_relay_message_internal(message, force=False)
+
+
+async def _handle_relay_message_internal(message: discord.Message, *, force: bool) -> None:
     key = _history_key(message)
+    if not force and not DURABLE_RUNTIME.claim_inbound_discord_message(key, message.id):
+        _log_observer_event("suppressed", f"Duplicate inbound Discord message suppressed: {message.id}")
+        return
     session = _get_session(key)
 
     dispatch_retries = 0
@@ -4600,6 +4651,22 @@ async def _handle_relay_message(message: discord.Message) -> None:
             continue
 
         await _stop_turn_feedback_tasks(turn)
+        if force:
+            if turn.progress_message is not None:
+                with contextlib.suppress(Exception):
+                    await turn.progress_message.delete()
+            chunks = _split_message(reply_text)
+            first = True
+            for chunk in chunks:
+                if first:
+                    sent = await message.reply(chunk, mention_author=False)
+                    _remember_relay_message_id(sent.id)
+                    first = False
+                else:
+                    sent = await message.channel.send(chunk)
+                    _remember_relay_message_id(sent.id)
+            _log_observer_event("delivered", _short_observer_text(reply_text, limit=240))
+            return
         await _deliver_reply(turn, reply_text)
         return
 
@@ -4922,6 +4989,7 @@ async def _codex_healthcheck() -> None:
 
 
 async def _startup_preflight() -> None:
+    DURABLE_RUNTIME.record_restart_event(reason="process-startup")
     logged_in, status_text = _native_codex_login_status()
     print(f"Native {RUNTIME_NAME} login: {'ok' if logged_in else 'missing'}")
     if status_text:

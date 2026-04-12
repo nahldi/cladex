@@ -45,6 +45,35 @@ def test_runtime_persists_primary_thread_mapping(tmp_path: Path) -> None:
     assert resumed.active_thread_id("channel-55") == "thread-abc"
 
 
+def test_runtime_persists_inbound_discord_message_dedup(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    state = tmp_path / "state"
+    _init_git_repo(repo)
+
+    runtime = DurableRuntime(state_dir=state, repo_path=repo, state_namespace="test", agent_name="codex")
+
+    assert runtime.claim_inbound_discord_message("channel-77", "12345") is True
+    assert runtime.claim_inbound_discord_message("channel-77", "12345") is False
+
+    resumed = DurableRuntime(state_dir=state, repo_path=repo, state_namespace="test", agent_name="codex")
+    assert resumed.claim_inbound_discord_message("channel-77", "12345") is False
+
+
+def test_runtime_persists_outbound_discord_reply_dedup(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    state = tmp_path / "state"
+    _init_git_repo(repo)
+
+    runtime = DurableRuntime(state_dir=state, repo_path=repo, state_namespace="test", agent_name="codex")
+
+    assert runtime.claim_outbound_discord_reply("channel-88", "222", "done") is True
+    assert runtime.claim_outbound_discord_reply("channel-88", "222", "done") is False
+    assert runtime.claim_outbound_discord_reply("channel-88", "222", "done", force=True) is True
+
+    resumed = DurableRuntime(state_dir=state, repo_path=repo, state_namespace="test", agent_name="codex")
+    assert resumed.claim_outbound_discord_reply("channel-88", "222", "done") is False
+
+
 def test_runtime_rejects_overlapping_fresh_leases(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     state = tmp_path / "state"
@@ -183,3 +212,47 @@ def test_runtime_writes_turn_artifact_jsonl(tmp_path: Path) -> None:
     assert payload["turn_id"] == "turn-6"
     assert payload["files_changed"] == ["bot.py", "relay_runtime.py"]
     assert payload["command_exit_codes"] == [0]
+
+
+def test_runtime_tracks_restart_churn(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    state = tmp_path / "state"
+    _init_git_repo(repo)
+
+    runtime = DurableRuntime(state_dir=state, repo_path=repo, state_namespace="test", agent_name="claude")
+
+    # Initially no churn
+    assert runtime.is_restart_churn(threshold=5) is False
+    assert runtime.count_recent_restarts() == 0
+
+    # Record some restarts
+    for _ in range(4):
+        runtime.record_restart_event(reason="test")
+
+    # Not yet churn (threshold is 5)
+    assert runtime.is_restart_churn(threshold=5) is False
+    assert runtime.count_recent_restarts() == 4
+
+    # One more triggers churn
+    runtime.record_restart_event(reason="test")
+    assert runtime.is_restart_churn(threshold=5) is True
+    assert runtime.count_recent_restarts() == 5
+
+    # Persists across runtime instances
+    resumed = DurableRuntime(state_dir=state, repo_path=repo, state_namespace="test", agent_name="claude")
+    assert resumed.is_restart_churn(threshold=5) is True
+    assert resumed.count_recent_restarts() == 5
+
+
+def test_runtime_channel_startup_marker_does_not_increment_restart_churn(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    state = tmp_path / "state"
+    _init_git_repo(repo)
+
+    runtime = DurableRuntime(state_dir=state, repo_path=repo, state_namespace="test", agent_name="claude")
+    runtime.record_startup("channel-99")
+
+    assert runtime.count_recent_restarts() == 0
+    binding = runtime.ensure_binding("channel-99")
+    status_text = (binding.worktree_path / "memory" / "STATUS.md").read_text(encoding="utf-8")
+    assert "Resume the same thread and continue without asking for a recap." in status_text

@@ -133,23 +133,39 @@ class ClaudeRelayBot(commands.Bot):
             await self._backend.stop()
         await super().close()
 
-    def _queue_discord_response(self, channel_id: str, content: str) -> None:
+    def _queue_discord_response(self, channel_id: str, content: str, reply_to: str = "") -> None:
         """Queue a response for Discord (called from backend thread)."""
         asyncio.run_coroutine_threadsafe(
-            self._send_discord_response(channel_id, content),
+            self._send_discord_response(channel_id, content, reply_to),
             self.loop
         )
 
-    async def _send_discord_response(self, channel_id: str, content: str) -> None:
+    async def _send_discord_response(self, channel_id: str, content: str, reply_to: str = "") -> None:
         """Send response to Discord channel."""
         try:
+            if not self._backend.claim_outbound_discord_reply(channel_id, reply_to, content):
+                logger.info("Suppressed duplicate Claude Discord reply for channel %s source %s", channel_id, reply_to or "-")
+                return
+
             channel = self.get_channel(int(channel_id))
             if not channel:
                 channel = await self.fetch_channel(int(channel_id))
 
             if channel and hasattr(channel, "send"):
+                source_message = None
+                if reply_to and hasattr(channel, "fetch_message"):
+                    try:
+                        source_message = await channel.fetch_message(int(reply_to))
+                    except Exception:
+                        source_message = None
+
+                first = True
                 for chunk in self._split_message(content):
-                    await channel.send(chunk)
+                    if first and source_message is not None:
+                        await source_message.reply(chunk, mention_author=False)
+                    else:
+                        await channel.send(chunk)
+                    first = False
 
         except Exception as e:
             logger.exception(f"Failed to send Discord response: {e}")
@@ -258,6 +274,9 @@ class ClaudeRelayBot(commands.Bot):
 
         content = self._clean_content(message)
         if not content:
+            return
+        if not self._backend.claim_inbound_discord_message(str(message.channel.id), str(message.id)):
+            logger.info("Suppressed duplicate inbound Claude Discord message %s in channel %s", message.id, message.channel.id)
             return
 
         logger.info(f"[RECV] {message.author}: {content[:100]}...")

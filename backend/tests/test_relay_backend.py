@@ -33,12 +33,16 @@ def test_build_command_uses_session_id_then_resume(tmp_path: Path) -> None:
     assert "--session-id" in create_cmd
     assert "--resume" not in create_cmd
     assert "--dangerously-skip-permissions" in create_cmd
+    assert create_cmd[-1] == "hello"
+    assert create_cmd.index("--dangerously-skip-permissions") < len(create_cmd) - 1
 
     resume_cmd = backend._build_command("hello again", use_resume=True, session=session)
     assert "--resume" in resume_cmd
     assert "--session-id" not in resume_cmd
     assert "--dangerously-skip-permissions" in resume_cmd
     assert "claude-opus-4-5-20251101" in resume_cmd
+    assert resume_cmd[-1] == "hello again"
+    assert resume_cmd.index("--dangerously-skip-permissions") < len(resume_cmd) - 1
 
 
 def test_process_message_retries_with_fresh_session_on_resume_failure(tmp_path: Path) -> None:
@@ -93,6 +97,55 @@ def test_process_message_retries_with_fresh_session_on_resume_failure(tmp_path: 
     assert any("stale" in status.lower() for status in statuses)
 
 
+def test_process_message_retries_once_when_claude_returns_no_text(tmp_path: Path) -> None:
+    responses: list[str] = []
+    statuses: list[str] = []
+    backend = ClaudeBackend(
+        workspace=tmp_path,
+        state_dir=tmp_path / "state",
+        on_response=lambda msg: responses.append(msg.content),
+        on_status=statuses.append,
+    )
+
+    calls: list[bool] = []
+
+    def fake_run_turn(prompt: str, *, use_resume: bool, cwd: Path, session: ClaudeSession) -> CommandResult:
+        calls.append(use_resume)
+        if len(calls) == 1:
+            return CommandResult(
+                args=["claude", "--session-id", session.session_id],
+                returncode=0,
+                stdout='{"type":"result","result":""}\n',
+                stderr="",
+                used_resume=use_resume,
+            )
+        return CommandResult(
+            args=["claude", "--session-id", session.session_id],
+            returncode=0,
+            stdout='{"type":"result","result":"done after retry"}\n',
+            stderr="",
+            used_resume=use_resume,
+        )
+
+    backend._run_turn = fake_run_turn  # type: ignore[method-assign]
+    backend.start = lambda: True  # type: ignore[method-assign]
+
+    ok = backend.process_message(
+        InboundMessage(
+            channel_type=ChannelType.DISCORD,
+            channel_id="123",
+            sender_id="u1",
+            sender_name="user",
+            content="fix it",
+        )
+    )
+
+    assert ok is True
+    assert calls == [False, False]
+    assert responses == ["done after retry"]
+    assert any("retrying once" in status.lower() for status in statuses)
+
+
 def test_format_prompt_includes_durable_context_and_caveman_rules(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     (workspace / "memory").mkdir(parents=True)
@@ -124,6 +177,22 @@ def test_format_prompt_includes_durable_context_and_caveman_rules(tmp_path: Path
     assert "[memory/STATUS.md]" in prompt
     assert "User message:\nfix the relay" in prompt
     assert "Current relay effort policy for this turn: high." in prompt
+
+
+def test_start_records_process_restart_event(tmp_path: Path, monkeypatch) -> None:
+    backend = ClaudeBackend(
+        workspace=tmp_path,
+        state_dir=tmp_path / "state",
+        on_response=lambda msg: None,
+    )
+    monkeypatch.setattr("claude_backend.claude_code_version", lambda: "claude 1.0.0")
+
+    assert backend.runtime.count_recent_restarts() == 0
+
+    ok = backend.start()
+
+    assert ok is True
+    assert backend.runtime.count_recent_restarts() == 1
 
 
 def test_process_message_writes_durable_memory_and_handoff(tmp_path: Path) -> None:
@@ -202,3 +271,74 @@ def test_effort_policy_uses_quick_and_default_modes(tmp_path: Path, monkeypatch)
 
     assert backend._effort_for_message("status?") == "medium"
     assert backend._effort_for_message("implement a durable restart-safe relay runtime") == "high"
+
+
+def test_lightweight_message_detection(tmp_path: Path) -> None:
+    backend = ClaudeBackend(
+        workspace=tmp_path,
+        state_dir=tmp_path / "state",
+        on_response=lambda msg: None,
+    )
+
+    # Lightweight coordination messages
+    assert backend._is_lightweight_message("yes") is True
+    assert backend._is_lightweight_message("no") is True
+    assert backend._is_lightweight_message("ok") is True
+    assert backend._is_lightweight_message("done") is True
+    assert backend._is_lightweight_message("ready") is True
+    assert backend._is_lightweight_message("acknowledged") is True
+    assert backend._is_lightweight_message("got it") is True
+    assert backend._is_lightweight_message("Yes!") is True
+    assert backend._is_lightweight_message("OK.") is True
+
+    # Substantive messages should NOT be lightweight
+    assert backend._is_lightweight_message("fix the relay dedup bug") is False
+    assert backend._is_lightweight_message("implement durable restart tracking") is False
+    assert backend._is_lightweight_message("what is the status of the project?") is False
+    assert backend._is_lightweight_message("a" * 60) is False  # Too long
+
+
+def test_format_prompt_uses_lightweight_path_for_short_messages(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "memory").mkdir(parents=True)
+    (workspace / "memory" / "STATUS.md").write_text("## Current objective\nTest objective", encoding="utf-8")
+    (workspace / "AGENTS.md").write_text("# AGENTS\nTest agents file", encoding="utf-8")
+
+    backend = ClaudeBackend(
+        workspace=workspace,
+        state_dir=tmp_path / "state",
+        on_response=lambda msg: None,
+    )
+
+    # Lightweight message uses minimal prompt
+    lightweight_prompt = backend._format_prompt(
+        InboundMessage(
+            channel_type=ChannelType.DISCORD,
+            channel_id="123",
+            sender_id="u1",
+            sender_name="Finn",
+            content="yes",
+        ),
+        workspace,
+        "context bundle",
+    )
+    assert "lightweight coordination message" in lightweight_prompt
+    assert "AGENTS.md" not in lightweight_prompt  # Full agents not included in lightweight
+    assert "Be brief" in lightweight_prompt
+
+    # Full message uses complete prompt
+    full_prompt = backend._format_prompt(
+        InboundMessage(
+            channel_type=ChannelType.DISCORD,
+            channel_id="123",
+            sender_id="u1",
+            sender_name="Finn",
+            content="implement durable restart tracking",
+        ),
+        workspace,
+        "context bundle",
+    )
+    assert "lightweight coordination message" not in full_prompt
+    assert "caveman mode" in full_prompt
+    assert "AGENTS.md" in full_prompt or "Relevant repo documents:" in full_prompt

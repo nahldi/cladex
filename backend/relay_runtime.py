@@ -8,6 +8,7 @@ import subprocess
 import threading
 import time
 import uuid
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -364,6 +365,20 @@ class RuntimeStore:
                     last_handoff_sync_at TEXT,
                     last_status_sync_at TEXT
                 );
+                CREATE TABLE IF NOT EXISTS relay_message_receipts (
+                    direction TEXT NOT NULL,
+                    channel_id TEXT NOT NULL,
+                    receipt_key TEXT NOT NULL,
+                    fingerprint TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY(direction, channel_id, receipt_key)
+                );
+                CREATE TABLE IF NOT EXISTS relay_restart_events (
+                    id TEXT PRIMARY KEY,
+                    agent_name TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
                 """
             )
             self._ensure_column(conn, "turn_records", "command_exit_codes_json", "TEXT NOT NULL DEFAULT '[]'")
@@ -415,6 +430,56 @@ class RuntimeStore:
                 "SELECT * FROM channels WHERE discord_channel_id = ?",
                 (channel_id,),
             ).fetchone()
+
+    def claim_message_receipt(
+        self,
+        *,
+        direction: str,
+        channel_id: str,
+        receipt_key: str,
+        fingerprint: str = "",
+    ) -> bool:
+        normalized_key = str(receipt_key or "").strip()
+        if not normalized_key:
+            return True
+        with self._lock, self._connect() as conn:
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO relay_message_receipts(direction, channel_id, receipt_key, fingerprint, created_at)
+                    VALUES(?, ?, ?, ?, ?)
+                    """,
+                    (direction, channel_id, normalized_key, fingerprint, _now_iso()),
+                )
+                return True
+            except sqlite3.IntegrityError:
+                return False
+
+    def record_restart(self, agent_name: str, reason: str = "normal") -> None:
+        """Record a relay restart event for churn detection."""
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO relay_restart_events(id, agent_name, reason, created_at)
+                VALUES(?, ?, ?, ?)
+                """,
+                (str(uuid.uuid4()), agent_name, reason, _now_iso()),
+            )
+
+    def count_recent_restarts(self, agent_name: str, window_seconds: int = 300) -> int:
+        """Count restarts in the last N seconds to detect churn."""
+        cutoff = time.time() - window_seconds
+        cutoff_iso = _now_iso_from_ts(cutoff)
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) as cnt FROM relay_restart_events WHERE agent_name = ? AND created_at > ?",
+                (agent_name, cutoff_iso),
+            ).fetchone()
+            return int(row["cnt"]) if row else 0
+
+    def is_restart_churn(self, agent_name: str, threshold: int = 5, window_seconds: int = 300) -> bool:
+        """Check if the relay is in a restart churn loop."""
+        return self.count_recent_restarts(agent_name, window_seconds) >= threshold
 
     def bind_thread(
         self,
@@ -1203,6 +1268,47 @@ class DurableRuntime:
         binding = self.ensure_binding(channel_key)
         return binding.primary_thread_id
 
+    @staticmethod
+    def _reply_fingerprint(content: str) -> str:
+        normalized = re.sub(r"\s+", " ", str(content or "").strip())
+        if not normalized:
+            return ""
+        return hashlib.sha1(normalized.encode("utf-8")).hexdigest()
+
+    def claim_inbound_discord_message(self, channel_key: str, message_id: str | int | None) -> bool:
+        normalized = str(message_id or "").strip()
+        if not normalized:
+            return True
+        binding = self.ensure_binding(channel_key)
+        return self.store.claim_message_receipt(
+            direction="discord-inbound",
+            channel_id=binding.channel_id,
+            receipt_key=normalized,
+            fingerprint="",
+        )
+
+    def claim_outbound_discord_reply(
+        self,
+        channel_key: str,
+        source_message_id: str | int | None,
+        content: str,
+        *,
+        force: bool = False,
+    ) -> bool:
+        if force:
+            return True
+        binding = self.ensure_binding(channel_key)
+        reply_hash = self._reply_fingerprint(content)
+        if not reply_hash:
+            return True
+        source_key = str(source_message_id or "").strip() or "no-source"
+        return self.store.claim_message_receipt(
+            direction="discord-outbound",
+            channel_id=binding.channel_id,
+            receipt_key=f"{source_key}:{reply_hash}",
+            fingerprint=reply_hash,
+        )
+
     def observe_incoming_message(
         self,
         *,
@@ -1600,6 +1706,18 @@ class DurableRuntime:
             confidence=0.8,
         )
         self._sync_status(binding, next_step="Resume the same thread and continue without asking for a recap.")
+
+    def record_restart_event(self, reason: str = "normal") -> None:
+        """Record a relay restart for churn detection."""
+        self.store.record_restart(self.agent_name, reason)
+
+    def count_recent_restarts(self, window_seconds: int = 300) -> int:
+        """Count restarts in the last N seconds."""
+        return self.store.count_recent_restarts(self.agent_name, window_seconds)
+
+    def is_restart_churn(self, threshold: int = 5, window_seconds: int = 300) -> bool:
+        """Check if relay is in a restart churn loop (5+ restarts in 5 minutes)."""
+        return self.store.is_restart_churn(self.agent_name, threshold, window_seconds)
 
     def record_compaction_event(self, channel_key: str, *, thread_id: str, event_type: str) -> None:
         binding = self.ensure_binding(channel_key)
