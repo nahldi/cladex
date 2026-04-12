@@ -43,6 +43,7 @@ class BotConfig:
     operator_ids: list[str]
     allowed_user_ids: list[str]
     allowed_channel_ids: list[str]
+    allowed_bot_ids: list[str]
     allow_dms: bool = True
     trigger_mode: str = "mention_or_dm"  # mention_or_dm, prefix, always
     prefix: str = "!"
@@ -58,6 +59,7 @@ class BotConfig:
             operator_ids=_parse_ids(os.environ.get("OPERATOR_IDS", "")),
             allowed_user_ids=_parse_ids(os.environ.get("ALLOWED_USER_IDS", "")),
             allowed_channel_ids=_parse_ids(os.environ.get("ALLOWED_CHANNEL_IDS", "")),
+            allowed_bot_ids=_parse_ids(os.environ.get("ALLOWED_BOT_IDS", "")),
             allow_dms=os.environ.get("ALLOW_DMS", "true").lower() in ("1", "true", "yes"),
             trigger_mode=os.environ.get("BOT_TRIGGER_MODE", "mention_or_dm"),
             prefix=os.environ.get("BOT_PREFIX", "!"),
@@ -196,9 +198,11 @@ class ClaudeRelayBot(commands.Bot):
         if message.author.id == self.user.id:
             return False
 
-        # Never respond to other bots
+        # Block other bots unless explicitly allowed
         if message.author.bot:
-            return False
+            bot_id = str(message.author.id)
+            if bot_id not in self.config.allowed_bot_ids:
+                return False
 
         # Check user allowlist (if set)
         if self.config.allowed_user_ids:

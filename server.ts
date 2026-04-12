@@ -295,6 +295,7 @@ app.patch('/api/profiles/:id', async (req, res) => {
   if (req.body?.allowDms === false) args.push('--deny-dms');
   if (Object.prototype.hasOwnProperty.call(req.body, 'operatorIds')) args.push('--operator-ids', String(req.body?.operatorIds || '').trim());
   if (Object.prototype.hasOwnProperty.call(req.body, 'allowedUserIds')) args.push('--allowed-user-ids', String(req.body?.allowedUserIds || '').trim());
+  if (Object.prototype.hasOwnProperty.call(req.body, 'allowedBotIds')) args.push('--allowed-bot-ids', String(req.body?.allowedBotIds || '').trim());
   if (Object.prototype.hasOwnProperty.call(req.body, 'channelId')) args.push('--allowed-channel-id', String(req.body?.channelId || '').trim());
   if (Object.prototype.hasOwnProperty.call(req.body, 'allowedChannelAuthorIds')) args.push('--allowed-channel-author-ids', String(req.body?.allowedChannelAuthorIds || '').trim());
   if (Object.prototype.hasOwnProperty.call(req.body, 'channelNoMentionAuthorIds')) args.push('--channel-no-mention-author-ids', String(req.body?.channelNoMentionAuthorIds || '').trim());
@@ -411,6 +412,7 @@ app.post('/api/profiles', async (req, res) => {
   const allowDms = Boolean(req.body?.allowDms);
   const operatorIds = String(req.body?.operatorIds || '').trim();
   const allowedUserIds = String(req.body?.allowedUserIds || '').trim();
+  const allowedBotIds = String(req.body?.allowedBotIds || '').trim();
   const allowedChannelAuthorIds = String(req.body?.allowedChannelAuthorIds || '').trim();
   const channelNoMentionAuthorIds = String(req.body?.channelNoMentionAuthorIds || '').trim();
   const channelHistoryLimit = String(req.body?.channelHistoryLimit || '').trim();
@@ -453,6 +455,7 @@ app.post('/api/profiles', async (req, res) => {
       ...(allowedChannelAuthorIds ? allowedChannelAuthorIds.split(',').map((id) => id.trim()).filter(Boolean).flatMap((id) => ['--allowed-channel-author-id', id]) : []),
       ...(channelNoMentionAuthorIds ? channelNoMentionAuthorIds.split(',').map((id) => id.trim()).filter(Boolean).flatMap((id) => ['--channel-no-mention-author-id', id]) : []),
       ...[operatorIds, allowedUserIds].flatMap((value) => value.split(',').map((id) => id.trim()).filter(Boolean)).flatMap((id) => ['--allowed-user-id', id]),
+      ...(allowedBotIds ? ['--allowed-bot-ids', allowedBotIds] : []),
     ]);
   } else {
     result = await runPython([
@@ -473,6 +476,7 @@ app.post('/api/profiles', async (req, res) => {
       ...(channelHistoryLimit ? ['--channel-history-limit', channelHistoryLimit] : []),
       ...(operatorIds ? ['--operator-ids', operatorIds] : []),
       ...(allowedUserIds ? ['--allowed-user-ids', allowedUserIds] : []),
+      ...(allowedBotIds ? ['--allowed-bot-ids', allowedBotIds] : []),
     ]);
   }
 

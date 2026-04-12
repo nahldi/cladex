@@ -56,6 +56,7 @@ interface Profile {
   operatorIds?: string;
   allowedUserIds?: string;
   allowedChannelIds?: string;
+  allowedBotIds?: string;
   allowedChannelAuthorIds?: string;
   channelNoMentionAuthorIds?: string;
   channelHistoryLimit?: string;
@@ -89,6 +90,7 @@ interface ProfileFormData {
   allowDms?: boolean;
   operatorIds?: string;
   allowedUserIds?: string;
+  allowedBotIds?: string;
   allowedChannelAuthorIds?: string;
   channelNoMentionAuthorIds?: string;
   channelHistoryLimit?: string;
@@ -117,6 +119,7 @@ interface ProfileSettingsData {
   channelId: string;
   operatorIds?: string;
   allowedUserIds: string;
+  allowedBotIds?: string;
   allowedChannelAuthorIds?: string;
   channelNoMentionAuthorIds?: string;
   channelHistoryLimit?: string;
@@ -900,6 +903,7 @@ function AddProfileModal({ onClose, onSubmit }: { onClose: () => void; onSubmit:
   const [allowDms, setAllowDms] = useState(false);
   const [operatorIds, setOperatorIds] = useState('');
   const [allowedUserIds, setAllowedUserIds] = useState('');
+  const [allowedBotIds, setAllowedBotIds] = useState('');
   const [allowedChannelAuthorIds, setAllowedChannelAuthorIds] = useState('');
   const [channelNoMentionAuthorIds, setChannelNoMentionAuthorIds] = useState('');
   const [channelHistoryLimit, setChannelHistoryLimit] = useState('20');
@@ -935,6 +939,9 @@ function AddProfileModal({ onClose, onSubmit }: { onClose: () => void; onSubmit:
           </div>
           <div className="grid gap-4 md:grid-cols-2">
             <FormInput label="Operator IDs" value={operatorIds} onChange={setOperatorIds} placeholder="Comma-separated Discord user IDs" mono />
+            <FormInput label="Allowed bot IDs" value={allowedBotIds} onChange={setAllowedBotIds} placeholder="Comma-separated Discord bot IDs for bot-to-bot chat" mono />
+          </div>
+          <div className="grid gap-4 md:grid-cols-2">
             <FormInput label="Channel history limit" value={channelHistoryLimit} onChange={setChannelHistoryLimit} placeholder="20" mono />
           </div>
           {codex ? (
@@ -971,6 +978,7 @@ function AddProfileModal({ onClose, onSubmit }: { onClose: () => void; onSubmit:
                 allowDms,
                 operatorIds,
                 allowedUserIds,
+                allowedBotIds,
                 allowedChannelAuthorIds,
                 channelNoMentionAuthorIds,
                 channelHistoryLimit,
@@ -998,6 +1006,7 @@ function EditProfileModal({ profile, onClose, onSubmit }: { profile: Profile; on
   const [channelId, setChannelId] = useState(profile.allowedChannelIds || profile.discordChannel || '');
   const [operatorIds, setOperatorIds] = useState(profile.operatorIds || '');
   const [allowedUserIds, setAllowedUserIds] = useState(profile.allowedUserIds || '');
+  const [allowedBotIds, setAllowedBotIds] = useState(profile.allowedBotIds || '');
   const [allowedChannelAuthorIds, setAllowedChannelAuthorIds] = useState(profile.allowedChannelAuthorIds || '');
   const [channelNoMentionAuthorIds, setChannelNoMentionAuthorIds] = useState(profile.channelNoMentionAuthorIds || '');
   const [channelHistoryLimit, setChannelHistoryLimit] = useState(profile.channelHistoryLimit || '20');
@@ -1029,6 +1038,9 @@ function EditProfileModal({ profile, onClose, onSubmit }: { profile: Profile; on
           </div>
           <div className="grid gap-4 md:grid-cols-2">
             <FormInput label="Operator IDs" value={operatorIds} onChange={setOperatorIds} placeholder="Comma-separated Discord user IDs" mono />
+            <FormInput label="Allowed bot IDs" value={allowedBotIds} onChange={setAllowedBotIds} placeholder="Comma-separated Discord bot IDs for bot-to-bot chat" mono />
+          </div>
+          <div className="grid gap-4 md:grid-cols-2">
             <FormInput label="Channel history limit" value={channelHistoryLimit} onChange={setChannelHistoryLimit} placeholder="20" mono />
           </div>
           {codex ? (
@@ -1064,6 +1076,7 @@ function EditProfileModal({ profile, onClose, onSubmit }: { profile: Profile; on
                 channelId,
                 operatorIds,
                 allowedUserIds,
+                allowedBotIds,
                 allowedChannelAuthorIds,
                 channelNoMentionAuthorIds,
                 channelHistoryLimit,

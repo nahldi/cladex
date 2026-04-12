@@ -57,6 +57,7 @@ ENV_KEY_ORDER = [
     "BOT_TRIGGER_MODE",
     "OPERATOR_IDS",
     "ALLOWED_USER_IDS",
+    "ALLOWED_BOT_IDS",
     "ALLOWED_CHANNEL_IDS",
     "CHANNEL_HISTORY_LIMIT",
 ]
@@ -131,6 +132,7 @@ def _profile_from_env(env: dict[str, str]) -> dict:
     normalized["CHANNEL_HISTORY_LIMIT"] = str(normalized.get("CHANNEL_HISTORY_LIMIT", "20") or "20")
     normalized["OPERATOR_IDS"] = _parse_csv_ids(normalized.get("OPERATOR_IDS", ""))
     normalized["ALLOWED_USER_IDS"] = _parse_csv_ids(normalized.get("ALLOWED_USER_IDS", ""))
+    normalized["ALLOWED_BOT_IDS"] = _parse_csv_ids(normalized.get("ALLOWED_BOT_IDS", ""))
     normalized["ALLOWED_CHANNEL_IDS"] = _parse_csv_ids(normalized.get("ALLOWED_CHANNEL_IDS", ""))
     normalized["CLAUDE_MODEL"] = (normalized.get("CLAUDE_MODEL", "") or "").strip()
 
@@ -290,6 +292,7 @@ def cmd_register(args: argparse.Namespace) -> int:
         "CLAUDE_WORKDIR": str(workspace),
         "OPERATOR_IDS": _parse_csv_ids(args.operator_ids or ""),
         "ALLOWED_USER_IDS": _parse_csv_ids(args.allowed_user_ids or args.operator_ids or ""),
+        "ALLOWED_BOT_IDS": _parse_csv_ids(getattr(args, "allowed_bot_ids", "") or ""),
         "ALLOW_DMS": "true" if args.allow_dms else "false",
         "BOT_TRIGGER_MODE": args.trigger_mode or "mention_or_dm",
         "ALLOWED_CHANNEL_IDS": _parse_csv_ids(args.allowed_channel_id or ""),
@@ -516,6 +519,7 @@ def main() -> int:
     reg_parser.add_argument("--bot-name")
     reg_parser.add_argument("--operator-ids")
     reg_parser.add_argument("--allowed-user-ids")
+    reg_parser.add_argument("--allowed-bot-ids")
     reg_parser.add_argument("--allow-dms", action="store_true")
     reg_parser.add_argument("--trigger-mode", default="mention_or_dm")
     reg_parser.add_argument("--allowed-channel-id")

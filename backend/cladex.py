@@ -235,6 +235,7 @@ def _codex_profiles() -> list[dict[str, Any]]:
                 "_state_namespace": profile.get("state_namespace", ""),
                 "_effort": env.get("CODEX_REASONING_EFFORT_DEFAULT", "high"),
                 "_allowed_user_ids": env.get("ALLOWED_USER_IDS", ""),
+                "_allowed_bot_ids": env.get("ALLOWED_BOT_IDS", ""),
                 "_allowed_channel_ids": env.get("ALLOWED_CHANNEL_IDS", ""),
                 "_allowed_channel_author_ids": env.get("ALLOWED_CHANNEL_AUTHOR_IDS", ""),
                 "_channel_no_mention_author_ids": env.get("CHANNEL_NO_MENTION_AUTHOR_IDS", ""),
@@ -275,6 +276,7 @@ def _claude_profiles() -> list[dict[str, Any]]:
                 "_state_namespace": profile.get("state_namespace", ""),
                 "_operator_ids": env.get("OPERATOR_IDS", ""),
                 "_allowed_user_ids": env.get("ALLOWED_USER_IDS", ""),
+                "_allowed_bot_ids": env.get("ALLOWED_BOT_IDS", ""),
                 "_allowed_channel_ids": env.get("ALLOWED_CHANNEL_IDS", ""),
                 "_channel_history_limit": env.get("CHANNEL_HISTORY_LIMIT", "20"),
             }
@@ -461,6 +463,7 @@ def _profile_json_record(profile: dict[str, Any]) -> dict[str, Any]:
         "logPath": profile.get("_log_path", ""),
         "operatorIds": profile.get("_operator_ids", ""),
         "allowedUserIds": profile.get("_allowed_user_ids", ""),
+        "allowedBotIds": profile.get("_allowed_bot_ids", ""),
         "allowedChannelIds": profile.get("_allowed_channel_ids", ""),
         "allowedChannelAuthorIds": profile.get("_allowed_channel_author_ids", ""),
         "channelNoMentionAuthorIds": profile.get("_channel_no_mention_author_ids", ""),
@@ -570,6 +573,7 @@ def _update_codex_profile(
     trigger_mode: str | None = None,
     allow_dms: bool | None = None,
     allowed_user_ids: str | None = None,
+    allowed_bot_ids: str | None = None,
     allowed_channel_id: str | None = None,
     allowed_channel_author_ids: str | None = None,
     channel_no_mention_author_ids: str | None = None,
@@ -596,6 +600,8 @@ def _update_codex_profile(
         env["ALLOW_DMS"] = "true" if allow_dms else "false"
     if allowed_user_ids is not None:
         env["ALLOWED_USER_IDS"] = relayctl._parse_csv_ids(allowed_user_ids)
+    if allowed_bot_ids is not None:
+        env["ALLOWED_BOT_IDS"] = relayctl._parse_csv_ids(allowed_bot_ids)
     if allowed_channel_id is not None:
         channel_ids = relayctl._parse_csv_ids(allowed_channel_id)
         env["ALLOWED_CHANNEL_IDS"] = channel_ids
@@ -627,6 +633,7 @@ def _update_claude_profile(
     trigger_mode: str | None = None,
     allow_dms: bool | None = None,
     allowed_user_ids: str | None = None,
+    allowed_bot_ids: str | None = None,
     allowed_channel_id: str | None = None,
     operator_ids: str | None = None,
     channel_history_limit: str | None = None,
@@ -649,6 +656,8 @@ def _update_claude_profile(
         env["OPERATOR_IDS"] = claude_relay._parse_csv_ids(operator_ids)
     if allowed_user_ids is not None:
         env["ALLOWED_USER_IDS"] = claude_relay._parse_csv_ids(allowed_user_ids)
+    if allowed_bot_ids is not None:
+        env["ALLOWED_BOT_IDS"] = claude_relay._parse_csv_ids(allowed_bot_ids)
     if allowed_channel_id is not None:
         env["ALLOWED_CHANNEL_IDS"] = claude_relay._parse_csv_ids(allowed_channel_id)
     if channel_history_limit is not None:
@@ -657,6 +666,7 @@ def _update_claude_profile(
     env["BOT_TRIGGER_MODE"] = env.get("BOT_TRIGGER_MODE", "mention_or_dm") or "mention_or_dm"
     env["OPERATOR_IDS"] = claude_relay._parse_csv_ids(env.get("OPERATOR_IDS", ""))
     env["ALLOWED_USER_IDS"] = claude_relay._parse_csv_ids(env.get("ALLOWED_USER_IDS", ""))
+    env["ALLOWED_BOT_IDS"] = claude_relay._parse_csv_ids(env.get("ALLOWED_BOT_IDS", ""))
     env["ALLOWED_CHANNEL_IDS"] = claude_relay._parse_csv_ids(env.get("ALLOWED_CHANNEL_IDS", ""))
     env["CLAUDE_MODEL"] = (env.get("CLAUDE_MODEL", "") or "").strip()
     new_profile = claude_relay._profile_from_env(env)
@@ -688,6 +698,7 @@ def update_profile(
     trigger_mode: str | None = None,
     allow_dms: bool | None = None,
     allowed_user_ids: str | None = None,
+    allowed_bot_ids: str | None = None,
     allowed_channel_id: str | None = None,
     allowed_channel_author_ids: str | None = None,
     channel_no_mention_author_ids: str | None = None,
@@ -708,6 +719,7 @@ def update_profile(
             trigger_mode=trigger_mode,
             allow_dms=allow_dms,
             allowed_user_ids=allowed_user_ids,
+            allowed_bot_ids=allowed_bot_ids,
             allowed_channel_id=allowed_channel_id,
             allowed_channel_author_ids=allowed_channel_author_ids,
             channel_no_mention_author_ids=channel_no_mention_author_ids,
@@ -727,6 +739,7 @@ def update_profile(
             trigger_mode=trigger_mode,
             allow_dms=allow_dms,
             allowed_user_ids=allowed_user_ids,
+            allowed_bot_ids=allowed_bot_ids,
             allowed_channel_id=allowed_channel_id,
             operator_ids=operator_ids,
             channel_history_limit=channel_history_limit,
@@ -917,6 +930,7 @@ def cmd_update(args: argparse.Namespace) -> int:
         allow_dms=allow_dms,
         operator_ids=getattr(args, "operator_ids", None),
         allowed_user_ids=getattr(args, "allowed_user_ids", None),
+        allowed_bot_ids=getattr(args, "allowed_bot_ids", None),
         allowed_channel_id=getattr(args, "allowed_channel_id", None),
         allowed_channel_author_ids=getattr(args, "allowed_channel_author_ids", None),
         channel_no_mention_author_ids=getattr(args, "channel_no_mention_author_ids", None),
@@ -1313,6 +1327,7 @@ def build_parser() -> argparse.ArgumentParser:
     update_parser.add_argument("--deny-dms", action="store_true", default=False)
     update_parser.add_argument("--operator-ids")
     update_parser.add_argument("--allowed-user-ids")
+    update_parser.add_argument("--allowed-bot-ids")
     update_parser.add_argument("--allowed-channel-id")
     update_parser.add_argument("--allowed-channel-author-ids")
     update_parser.add_argument("--channel-no-mention-author-ids")

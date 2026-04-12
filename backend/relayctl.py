@@ -64,6 +64,7 @@ ENV_KEY_ORDER = [
     "ALLOW_DMS",
     "BOT_TRIGGER_MODE",
     "ALLOWED_USER_IDS",
+    "ALLOWED_BOT_IDS",
     "ALLOWED_CHANNEL_AUTHOR_IDS",
     "CHANNEL_NO_MENTION_AUTHOR_IDS",
     "STARTUP_DM_USER_IDS",
@@ -534,6 +535,7 @@ def _normalized_profile_env(env: dict[str, str]) -> dict[str, str]:
     )
     normalized["STARTUP_DM_TEXT"] = normalized.get("STARTUP_DM_TEXT") or "Discord relay online. DM me here to chat with Codex."
     normalized["ALLOWED_USER_IDS"] = _parse_csv_ids(normalized.get("ALLOWED_USER_IDS", ""))
+    normalized["ALLOWED_BOT_IDS"] = _parse_csv_ids(normalized.get("ALLOWED_BOT_IDS", ""))
     allowed_dm_ids = [part for part in normalized["ALLOWED_USER_IDS"].split(",") if part]
     allowed_channel_author_ids = {
         part.strip()
@@ -2998,6 +3000,7 @@ def cmd_register(args: argparse.Namespace) -> int:
         "ALLOW_DMS": "true" if args.allow_dms else "false",
         "BOT_TRIGGER_MODE": inferred_trigger_mode,
         "ALLOWED_USER_IDS": ",".join(args.allowed_user_ids),
+        "ALLOWED_BOT_IDS": _parse_csv_ids(getattr(args, "allowed_bot_ids", "") or ""),
         "ALLOWED_CHANNEL_AUTHOR_IDS": ",".join(args.allowed_channel_author_ids),
         "CHANNEL_NO_MENTION_AUTHOR_IDS": ",".join(args.channel_no_mention_author_ids),
         "STARTUP_DM_USER_IDS": ",".join(args.allowed_user_ids),
@@ -3667,6 +3670,7 @@ def build_parser() -> argparse.ArgumentParser:
     register_parser.add_argument("--bot-name", help="Optional bot identity name used for relay targeting context")
     register_parser.add_argument("--allowed-channel-id", dest="allowed_channel_ids", action="append", default=[], metavar="CHANNEL_ID", help="Main or additional channel IDs this relay may respond in")
     register_parser.add_argument("--allowed-user-id", dest="allowed_user_ids", action="append", default=[], metavar="USER_ID", help="DM user IDs allowed to talk to this relay")
+    register_parser.add_argument("--allowed-bot-ids", default="", help="Comma-separated Discord bot IDs allowed for bot-to-bot chat")
     register_parser.add_argument("--allowed-channel-author-id", dest="allowed_channel_author_ids", action="append", default=[], metavar="ID", help="Optional allowlist for who may trigger the relay in allowed channels")
     register_parser.add_argument("--channel-no-mention-author-id", dest="channel_no_mention_author_ids", action="append", default=[], metavar="ID", help="Allowed channel author IDs that may trigger without mentioning the relay")
     register_parser.add_argument("--extra-trigger-id", dest="allowed_channel_author_ids", action="append", metavar="ID", help="Alias for --allowed-channel-author-id")
