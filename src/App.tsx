@@ -116,7 +116,7 @@ function labelFor(profile: Profile): string {
   if (profile.botName && !looksTechnicalLabel(profile.botName)) {
     return profile.botName;
   }
-  return profile.workspaceLabel || humanize(profile.technicalName || profile.name || 'Relay');
+  return humanize(profile.workspaceLabel || profile.technicalName || profile.name || 'Relay');
 }
 
 function workspaceFor(profile: Profile): string {
@@ -258,9 +258,9 @@ export default function App() {
               <p className={`mt-3 max-w-xl text-sm ${isDark ? 'text-gray-400' : 'text-slate-600'}`}>Claude and Codex relay control with live runtime state behind every card. Readable labels, real settings, real logs.</p>
             </div>
           </div>
-          <div className="hidden gap-3 self-center md:flex">
-            <ActionButton label="Refresh" icon={<RefreshCw size={16} />} busy={loading} onClick={() => void loadAll()} />
-            <ActionButton label="Stop All" icon={<PauseCircle size={16} />} busy={busyKey === 'stop-all'} tone="danger" light={!isDark} onClick={() => void runAction('stop-all', api.stopAll)} />
+          <div className="hidden gap-2 self-center md:flex">
+            <MiniIconButton label="Refresh" icon={<RefreshCw size={15} />} onClick={() => void loadAll()} />
+            <MiniIconButton label="Stop All" icon={<PauseCircle size={15} />} tone="danger" onClick={() => void runAction('stop-all', api.stopAll)} />
           </div>
         </header>
 
@@ -350,20 +350,12 @@ function RelayDashboard({
   onEdit: (profile: Profile) => void;
   onLogs: (profile: Profile) => void;
 }) {
-  const runningCount = profiles.filter((profile) => profile.running).length;
-  const readyCount = profiles.filter((profile) => profile.ready).length;
-
   return (
-    <div className="mx-auto flex w-full max-w-6xl flex-1 flex-col px-8 pb-10 pt-4">
-      <div className="mb-7 flex flex-wrap items-center justify-between gap-4">
+    <div className="mx-auto flex w-full max-w-6xl flex-1 flex-col px-8 pb-10 pt-3">
+      <div className="mb-5 flex flex-wrap items-center justify-between gap-4">
         <div>
           <div className="text-[11px] font-bold uppercase tracking-[0.28em] text-slate-500 dark:text-gray-500">Relay canvas</div>
           <div className="mt-2 text-sm text-slate-600 dark:text-gray-400">Start, stop, edit, inspect, and recover each relay from one surface.</div>
-        </div>
-        <div className="flex flex-wrap items-center gap-2 text-xs font-medium text-slate-500 dark:text-gray-400">
-          <InlineStat label="Configured" value={String(profiles.length)} />
-          <InlineStat label="Running" value={String(runningCount)} />
-          <InlineStat label="Ready" value={String(readyCount)} />
         </div>
       </div>
       {loading ? (
@@ -933,15 +925,6 @@ function LogsModal({ profile, onClose }: { profile: Profile; onClose: () => void
         {loading ? <div className="flex items-center gap-2 text-indigo-300"><Loader2 size={14} className="animate-spin" /> Loading logs...</div> : logs.length ? logs.map((line, index) => <div key={`${profile.id}-${index}`}>{line}</div>) : <div className="text-gray-500">No log lines recorded yet for this relay.</div>}
       </div>
     </ModalShell>
-  );
-}
-
-function InlineStat({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/[0.04] px-3 py-1.5 text-xs dark:text-gray-300">
-      <span className="font-semibold text-white">{value}</span>
-      <span className="uppercase tracking-[0.18em] text-slate-400">{label}</span>
-    </div>
   );
 }
 

@@ -95,9 +95,18 @@ def _humanize_name(value: str) -> str:
     return " ".join(part.capitalize() for part in parts[:4])
 
 
+def _looks_technical_label(value: str) -> bool:
+    text = str(value or "").strip().lower()
+    if not text:
+        return True
+    if re.fullmatch(r"[a-z0-9]+-[0-9a-f]{6,}", text):
+        return True
+    return text in {"codexcmd", "claudecmd", "relay", "bot"}
+
+
 def _display_name(profile: dict[str, Any]) -> str:
     bot_name = str(profile.get("_bot_name") or profile.get("bot_name") or "").strip()
-    if bot_name:
+    if bot_name and not _looks_technical_label(bot_name):
         return bot_name if re.search(r"[A-Z\s]", bot_name) else _humanize_name(bot_name)
     workspace_name = _workspace_label(str(profile.get("workspace", "")))
     if workspace_name and workspace_name.lower() not in {"workspace", "repo"}:
