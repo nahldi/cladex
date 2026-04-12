@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "discord-codex-relay"
-version = "2.0.8"
+version = "2.0.9"
 description = "Unified Discord relay manager for Claude Code and Codex CLI."
 readme = "README.md"
 requires-python = ">=3.10"

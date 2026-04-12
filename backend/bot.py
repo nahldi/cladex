@@ -634,6 +634,26 @@ def _uses_websocket_transport() -> bool:
     return CONFIG.app_server_transport == "websocket"
 
 
+def _windows_hidden_subprocess_kwargs() -> dict[str, object]:
+    if os.name != "nt":
+        return {}
+    kwargs: dict[str, object] = {}
+    creationflags = (
+        getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        | getattr(subprocess, "DETACHED_PROCESS", 0)
+        | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    )
+    if creationflags:
+        kwargs["creationflags"] = creationflags
+    startupinfo_factory = getattr(subprocess, "STARTUPINFO", None)
+    if startupinfo_factory is not None:
+        startupinfo = startupinfo_factory()
+        startupinfo.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 0)
+        startupinfo.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
+        kwargs["startupinfo"] = startupinfo
+    return kwargs
+
+
 def _native_codex_login_status() -> tuple[bool, str]:
     command = [CODEX_BIN, "login", "status"]
     try:
@@ -644,7 +664,7 @@ def _native_codex_login_status() -> tuple[bool, str]:
             timeout=20,
             check=False,
             env=relay_codex_env(CONFIG.codex_workdir, os.environ.copy()),
-            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            **_windows_hidden_subprocess_kwargs(),
         )
     except Exception as exc:
         return False, str(exc)
@@ -2400,7 +2420,7 @@ class AppServerManager:
                 env=relay_codex_env(CONFIG.codex_workdir, os.environ.copy()),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
-                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+                **_windows_hidden_subprocess_kwargs(),
             )
             _record_app_server_pid("__websocket__", self.process.pid)
             self.log_task = asyncio.create_task(self._log_output())
@@ -3485,7 +3505,7 @@ class CodexSession:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             limit=STDIO_STREAM_LIMIT_BYTES,
-            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            **_windows_hidden_subprocess_kwargs(),
         )
         _record_app_server_pid(self.key, self.app_server_process.pid)
         self.app_server_stderr_task = asyncio.create_task(self._log_stdio_app_server_stderr())

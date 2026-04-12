@@ -286,6 +286,26 @@ class CliResumeCodexBackend(CodexBackend):
             command.extend(["--sandbox", "workspace-write", "--ask-for-approval", "never"])
         return command
 
+    @staticmethod
+    def _windows_hidden_subprocess_kwargs() -> dict[str, object]:
+        if os.name != "nt":
+            return {}
+        kwargs: dict[str, object] = {}
+        creationflags = (
+            getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            | getattr(subprocess, "DETACHED_PROCESS", 0)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        )
+        if creationflags:
+            kwargs["creationflags"] = creationflags
+        startupinfo_factory = getattr(subprocess, "STARTUPINFO", None)
+        if startupinfo_factory is not None:
+            startupinfo = startupinfo_factory()
+            startupinfo.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 0)
+            startupinfo.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
+            kwargs["startupinfo"] = startupinfo
+        return kwargs
+
     async def _run_cli_turn(
         self,
         *,
@@ -301,7 +321,6 @@ class CliResumeCodexBackend(CodexBackend):
         command = self._base_command(resume_thread_id=resume_thread_id, review=review)
         command.extend(["-o", str(last_message_path), "-"])
         env = relay_codex_env(self.session._runtime_workdir(), os.environ.copy())
-        creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" and hasattr(subprocess, "CREATE_NO_WINDOW") else 0
         process = await asyncio.create_subprocess_exec(
             *command,
             cwd=str(self.session._runtime_workdir()),
@@ -309,7 +328,7 @@ class CliResumeCodexBackend(CodexBackend):
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
-            creationflags=creationflags,
+            **self._windows_hidden_subprocess_kwargs(),
         )
         stdout, _ = await process.communicate(prompt_text.encode("utf-8"))
         raw_output = stdout.decode("utf-8", errors="replace")

@@ -29,8 +29,37 @@ function resolveBackendDir() {
 
 const BACKEND_DIR = resolveBackendDir();
 
+function resolvePythonLaunchers() {
+  const launchers = [];
+  const localAppData = process.env.LOCALAPPDATA || '';
+  const directCandidates = [
+    process.env.CLADEX_PYTHON || '',
+    localAppData ? path.join(localAppData, 'discord-codex-relay', 'runtime', 'Scripts', 'python.exe') : '',
+    localAppData ? path.join(localAppData, 'Programs', 'Python', 'Python313', 'python.exe') : '',
+    localAppData ? path.join(localAppData, 'Programs', 'Python', 'Python312', 'python.exe') : '',
+    localAppData ? path.join(localAppData, 'Programs', 'Python', 'Python311', 'python.exe') : '',
+    localAppData ? path.join(localAppData, 'Programs', 'Python', 'Python310', 'python.exe') : '',
+  ].filter(Boolean);
+
+  for (const candidate of directCandidates) {
+    if (fsSync.existsSync(candidate) && !launchers.includes(candidate)) {
+      launchers.push(candidate);
+    }
+  }
+
+  const pathLaunchers = process.platform === 'win32'
+    ? ['python', 'python3', 'py']
+    : ['python3', 'python'];
+  for (const launcher of pathLaunchers) {
+    if (!launchers.includes(launcher)) {
+      launchers.push(launcher);
+    }
+  }
+  return launchers;
+}
+
 async function runPython(args, cwd = BACKEND_DIR) {
-  const launchers = process.platform === 'win32' ? ['py', 'python'] : ['python3', 'python'];
+  const launchers = resolvePythonLaunchers();
   let lastError = '';
 
   for (const launcher of launchers) {
@@ -79,7 +108,7 @@ app.get('/api/runtime-info', async (_req, res) => {
     apiBase: `http://${API_HOST}:${API_PORT}`,
     backendDir: BACKEND_DIR,
     packaged: process.env.NODE_ENV === 'production' || !!process.resourcesPath,
-    appVersion: process.env.npm_package_version || '2.0.8',
+    appVersion: process.env.npm_package_version || '2.0.9',
   });
 });
 
