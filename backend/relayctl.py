@@ -309,7 +309,7 @@ def _gui_python_executable() -> str:
 def _launch_gui_detached() -> int:
     env = os.environ.copy()
     env[GUI_CHILD_ENV] = "1"
-    command = [_gui_python_executable(), "-m", "relayctl", "gui"]
+    command = [_gui_python_executable(), _backend_script_path("relayctl.py"), "gui"]
     kwargs: dict[str, object] = {"env": env, "close_fds": True}
     if os.name == "nt":
         kwargs["creationflags"] = (
@@ -1494,6 +1494,10 @@ def _background_python_windowless_executable() -> str:
     return _background_python_executable()
 
 
+def _backend_script_path(name: str) -> str:
+    return str(Path(__file__).resolve().with_name(name))
+
+
 def _codex_login_status(workspace: Path) -> tuple[bool, str]:
     provider_name = "codex"
     creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
@@ -1537,8 +1541,7 @@ def _launch_bot_worker(env_file: Path, workspace: Path, *, log_path: Path | None
             [
                 _background_python_windowless_executable(),
                 "-u",
-                "-m",
-                "bot",
+                _backend_script_path("bot.py"),
             ],
             **popen_kwargs,
         )
@@ -1649,8 +1652,7 @@ def _run_profile(profile: dict) -> int:
         process = subprocess.Popen(
             [
                 _background_python_windowless_executable(),
-                "-m",
-                "relayctl",
+                _backend_script_path("relayctl.py"),
                 "serve",
                 "--env-file",
                 profile["env_file"],

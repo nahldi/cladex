@@ -504,7 +504,7 @@ def test_profile_runtime_state_reads_app_server_pid_file(tmp_path: Path) -> None
     assert state["running"] is True
 
 
-def test_launch_bot_worker_uses_module_entrypoint(tmp_path: Path) -> None:
+def test_launch_bot_worker_uses_local_script_entrypoint(tmp_path: Path) -> None:
     env_file = tmp_path / "profile.env"
     env_file.write_text("DISCORD_BOT_TOKEN=token-value\n", encoding="utf-8")
     workspace = tmp_path / "workspace"
@@ -525,7 +525,7 @@ def test_launch_bot_worker_uses_module_entrypoint(tmp_path: Path) -> None:
         relayctl.subprocess.Popen = original_popen
 
     assert process.pid == 1234
-    assert captured["command"] == ["python-bg", "-u", "-m", "bot"]
+    assert captured["command"] == ["python-bg", "-u", relayctl._backend_script_path("bot.py")]
 
 
 def test_internal_serve_command_is_hidden_from_help() -> None:
@@ -556,7 +556,7 @@ def test_cmd_run_defaults_to_background_supervisor() -> None:
     assert called == ["background"]
 
 
-def test_run_profile_launches_supervisor_via_module(tmp_path: Path) -> None:
+def test_run_profile_launches_supervisor_via_local_script(tmp_path: Path) -> None:
     env_file = tmp_path / "profile.env"
     env_file.write_text(
         "\n".join(
@@ -620,8 +620,7 @@ def test_run_profile_launches_supervisor_via_module(tmp_path: Path) -> None:
 
     assert captured["command"] == [
         "python-bg",
-        "-m",
-        "relayctl",
+        relayctl._backend_script_path("relayctl.py"),
         "serve",
         "--env-file",
         str(env_file),
@@ -1057,7 +1056,7 @@ def test_cmd_gui_launches_detached_child_by_default(capsys) -> None:
     assert result == 0
     assert calls
     command, kwargs = calls[0]
-    assert command[-2:] == ["relayctl", "gui"]
+    assert command == ["pythonw.exe", relayctl._backend_script_path("relayctl.py"), "gui"]
     assert kwargs["env"][relayctl.GUI_CHILD_ENV] == "1"
     assert "Opened relay manager GUI." in capsys.readouterr().out
 
