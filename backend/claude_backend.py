@@ -341,7 +341,7 @@ class ClaudeBackend:
             self.runtime.record_turn_result(
                 channel_key=msg.channel_id,
                 thread_id=session.session_id or "claude-missing-session",
-                turn_id=f"claude-error-{int(time.time() * 1000)}",
+                turn_id=f"claude-error-{msg.message_id or int(time.time() * 1000)}",
                 summary=f"Claude turn failed: {failure_message}",
                 files_changed=changed_files,
                 commands_run=[self._display_command(result.args)],
@@ -364,7 +364,7 @@ class ClaudeBackend:
             self.runtime.record_turn_result(
                 channel_key=msg.channel_id,
                 thread_id=session.session_id or "claude-missing-session",
-                turn_id=f"claude-empty-{int(time.time() * 1000)}",
+                turn_id=f"claude-empty-{msg.message_id or int(time.time() * 1000)}",
                 summary="Claude returned no text.",
                 files_changed=changed_files,
                 commands_run=[self._display_command(result.args)],
@@ -396,10 +396,12 @@ class ClaudeBackend:
         summary = self._summarize_response(content)
         next_step = _extract_next_step(content) or "Continue from STATUS.md and the latest handoff."
         blocker = _extract_blocker(content)
-        self.runtime.record_turn_result(
+        # Use message_id for idempotent turn_id (prevents duplicate processing on restart)
+        turn_id = f"claude-{msg.message_id or int(time.time() * 1000)}"
+        turn_recorded = self.runtime.record_turn_result(
             channel_key=msg.channel_id,
             thread_id=session.session_id or "claude-missing-session",
-            turn_id=f"claude-{int(time.time() * 1000)}",
+            turn_id=turn_id,
             summary=summary,
             files_changed=changed_files,
             commands_run=commands_run[:8],
@@ -415,6 +417,11 @@ class ClaudeBackend:
             backend="claude-print-resume",
             degraded=False,
         )
+        # If turn was duplicate (already processed), skip sending response
+        if not turn_recorded:
+            logger.info("Duplicate turn %s detected, skipping response", turn_id)
+            self.on_status("Claude turn was duplicate (already processed).")
+            return True
         self.on_response(
             OutboundMessage(
                 channel_type=msg.channel_type,

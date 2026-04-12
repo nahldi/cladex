@@ -513,6 +513,15 @@ class RuntimeStore:
                 (thread_id, now, now if rebound else None, channel_id),
             )
 
+    def is_turn_recorded(self, turn_id: str) -> bool:
+        """Check if a turn has already been recorded (dedup check)."""
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM turn_records WHERE turn_id = ? LIMIT 1",
+                (turn_id,),
+            ).fetchone()
+            return row is not None
+
     def record_turn(
         self,
         *,
@@ -532,8 +541,16 @@ class RuntimeStore:
         completed_at: str = "",
         backend: str = "",
         degraded: bool = False,
-    ) -> None:
+    ) -> bool:
+        """Record a turn. Returns False if turn_id was already recorded (dedup)."""
         with self._lock, self._connect() as conn:
+            # Check for duplicate turn_id first
+            existing = conn.execute(
+                "SELECT 1 FROM turn_records WHERE turn_id = ? LIMIT 1",
+                (turn_id,),
+            ).fetchone()
+            if existing:
+                return False
             conn.execute(
                 """
                 INSERT INTO turn_records(
@@ -568,6 +585,7 @@ class RuntimeStore:
                 "UPDATE codex_threads SET last_turn_id = ?, updated_at = ? WHERE thread_id = ?",
                 (turn_id, _now_iso(), thread_id),
             )
+            return True
 
     def latest_memory_entry(self, *, project_id: str, entry_type: str, key: str) -> dict[str, Any] | None:
         with self._connect() as conn:
@@ -1582,9 +1600,11 @@ class DurableRuntime:
         completed_at: str = "",
         backend: str = "",
         degraded: bool = False,
-    ) -> None:
+    ) -> bool:
+        """Record turn result. Returns False if turn_id was already recorded (dedup)."""
         binding = self.ensure_binding(channel_key)
-        self.store.record_turn(
+        # Dedup: if turn already recorded, skip all side effects (handoff, status, etc.)
+        if not self.store.record_turn(
             thread_id=thread_id,
             turn_id=turn_id,
             summary=summary,
@@ -1601,7 +1621,8 @@ class DurableRuntime:
             completed_at=completed_at or _now_iso(),
             backend=backend or binding.backend,
             degraded=degraded,
-        )
+        ):
+            return False  # Duplicate turn_id, skip all side effects
         self._append_turn_artifact(
             binding,
             thread_id=thread_id,
@@ -1682,6 +1703,7 @@ class DurableRuntime:
             next_step=next_step or "Continue from STATUS.md.",
         )
         self.store.upsert_sync_state(binding.project_id, handoff=True, status=True)
+        return True
 
     def record_shutdown(self, channel_key: str, *, reason: str) -> None:
         binding = self.ensure_binding(channel_key)
