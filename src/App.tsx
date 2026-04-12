@@ -92,7 +92,7 @@ interface ProfileSettingsData {
   allowedUserIds: string;
 }
 
-const API_BASE = 'http://localhost:3001/api';
+const API_BASE = 'http://127.0.0.1:3001/api';
 const CLADEX_LOGO = new URL('../assets/icon.png', import.meta.url).href;
 
 function looksTechnicalLabel(value: string | undefined): boolean {
@@ -186,6 +186,8 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [busyKey, setBusyKey] = useState<string | null>(null);
   const [errorText, setErrorText] = useState('');
+  const [bootPending, setBootPending] = useState(true);
+  const bootFailureCount = useRef(0);
   const isDark = true;
 
   useEffect(() => {
@@ -193,6 +195,7 @@ export default function App() {
   }, [isDark]);
 
   const loadAll = useCallback(async (silent = false) => {
+    let keepLoading = false;
     if (!silent) {
       setLoading(true);
     }
@@ -201,15 +204,26 @@ export default function App() {
       setProfiles(profileRows);
       setProjects(projectRows);
       setRuntimeInfo(runtime);
+      bootFailureCount.current = 0;
+      setBootPending(false);
       setErrorText('');
     } catch (error) {
-      setErrorText(error instanceof Error ? error.message : 'Failed to refresh CLADEX state.');
+      const message = error instanceof Error ? error.message : 'Failed to refresh CLADEX state.';
+      const nextFailures = bootFailureCount.current + 1;
+      bootFailureCount.current = nextFailures;
+      if (bootPending && nextFailures < 5) {
+        keepLoading = true;
+        setErrorText('');
+      } else {
+        setBootPending(false);
+        setErrorText(message);
+      }
     } finally {
       if (!silent) {
-        setLoading(false);
+        setLoading(keepLoading ? true : false);
       }
     }
-  }, []);
+  }, [bootPending]);
 
   useEffect(() => {
     void loadAll();
@@ -247,23 +261,23 @@ export default function App() {
       <CladexBackground isDark={isDark} />
       <div className={`pointer-events-none absolute inset-0 z-0 transition-opacity duration-500 ${isDark ? 'bg-[radial-gradient(circle_at_top,rgba(249,115,22,0.12),transparent_28%),radial-gradient(circle_at_bottom_right,rgba(16,185,129,0.12),transparent_32%)] opacity-100' : 'bg-[radial-gradient(circle_at_top,rgba(212,115,94,0.16),transparent_30%),radial-gradient(circle_at_bottom_right,rgba(125,181,165,0.18),transparent_34%)] opacity-80'}`} />
       <main className="relative z-10 flex min-h-screen flex-col overflow-y-auto pb-28">
-        <header className="mx-auto flex w-full max-w-7xl items-start justify-between gap-6 px-8 pb-1 pt-7">
+        <header className="mx-auto flex w-full max-w-7xl items-start justify-between gap-6 px-8 pb-2 pt-7">
           <div className="flex items-center gap-4">
             <div className={`relative h-12 w-12 overflow-hidden rounded-[18px] border shadow-[0_0_28px_rgba(99,102,241,0.16)] ${isDark ? 'border-white/10 bg-white/5' : 'border-black/10 bg-white/70 shadow-[0_0_30px_rgba(212,115,94,0.12)]'}`}>
               <img src={CLADEX_LOGO} alt="CLADEX" className="h-full w-full object-cover" />
             </div>
             <div>
-              <h1 className={`text-[2.55rem] leading-none font-black tracking-tight ${isDark ? 'text-white' : 'text-slate-900'}`}>ClaDex</h1>
-              <p className={`mt-2 font-mono text-[11px] uppercase tracking-[0.32em] ${isDark ? 'text-orange-300/85' : 'text-[#b15f4e]'}`}>Unified Relay Network</p>
+              <h1 className={`text-[2.15rem] leading-none font-black tracking-tight ${isDark ? 'text-white' : 'text-slate-900'}`}>ClaDex</h1>
+              <p className={`mt-1.5 font-mono text-[11px] uppercase tracking-[0.32em] ${isDark ? 'text-orange-300/85' : 'text-[#b15f4e]'}`}>Unified Relay Network</p>
             </div>
           </div>
-          <div className="flex gap-2 self-start pt-6">
+          <div className="flex gap-2 self-start pt-4">
             <MiniIconButton label="Refresh" icon={<RefreshCw size={15} />} onClick={() => void loadAll()} />
             <MiniIconButton label="Stop All" icon={<PauseCircle size={15} />} tone="danger" onClick={() => void runAction('stop-all', api.stopAll)} />
           </div>
         </header>
 
-        {errorText ? <div className={`mx-auto mt-4 w-full max-w-7xl rounded-2xl border px-4 py-3 text-sm ${isDark ? 'border-amber-500/20 bg-amber-500/10 text-amber-100' : 'border-amber-300 bg-amber-50 text-amber-950'}`}>{errorText}</div> : null}
+        {!bootPending && errorText ? <div className={`mx-auto mt-3 w-full max-w-7xl rounded-2xl border px-4 py-3 text-sm ${isDark ? 'border-amber-500/20 bg-amber-500/10 text-amber-100' : 'border-amber-300 bg-amber-50 text-amber-950'}`}>{errorText}</div> : null}
 
         <AnimatePresence mode="wait">
           {view === 'relays' ? (
@@ -271,6 +285,7 @@ export default function App() {
               <RelayDashboard
                 profiles={profiles}
                 loading={loading}
+                bootPending={bootPending}
                 busyKey={busyKey}
                 errorText={errorText}
                 onRefresh={() => void loadAll()}
@@ -333,6 +348,7 @@ export default function App() {
 function RelayDashboard({
   profiles,
   loading,
+  bootPending,
   busyKey,
   errorText,
   onRefresh,
@@ -345,6 +361,7 @@ function RelayDashboard({
 }: {
   profiles: Profile[];
   loading: boolean;
+  bootPending: boolean;
   busyKey: string | null;
   errorText: string;
   onRefresh: () => void;
@@ -358,15 +375,17 @@ function RelayDashboard({
   return (
     <div className="mx-auto flex w-full max-w-7xl flex-1 flex-col px-8 pb-10 pt-4">
       {loading ? (
-        <div className="flex h-[50vh] items-center justify-center">
-          <Loader2 className="h-8 w-8 animate-spin text-indigo-300" />
-        </div>
+        <EmptyState
+          title={bootPending ? 'Starting the local CLADEX runtime...' : 'Loading relay state...'}
+          detail={bootPending ? 'Waiting for the packaged relay API to become ready.' : 'Refreshing current relay state and active workspaces.'}
+          compact={false}
+        />
       ) : errorText && profiles.length === 0 ? (
         <EmptyState title="CLADEX could not reach the local relay API." detail="Use Refresh once the packaged backend is up. This is a runtime startup error, not an empty relay list." actionLabel="Refresh" onAction={onRefresh} />
       ) : profiles.length === 0 ? (
         <EmptyState title="No relays configured yet." detail="Choose Add Relay and register a Claude or Codex workspace." />
       ) : (
-        <div className="grid gap-6 md:grid-cols-2 xl:grid-cols-3">
+        <div className="grid auto-rows-fr gap-6 md:grid-cols-2 xl:grid-cols-3">
           {profiles.map((profile) => (
             <React.Fragment key={profile.id}>
               <RelayCard
@@ -415,8 +434,8 @@ function RelayCard({
   const pointerY = useMotionValue(0);
   const springX = useSpring(tiltX, { stiffness: 280, damping: 26, mass: 0.4 });
   const springY = useSpring(tiltY, { stiffness: 280, damping: 26, mass: 0.4 });
-  const rotateX = useTransform(springY, [-0.5, 0.5], ['10deg', '-10deg']);
-  const rotateY = useTransform(springX, [-0.5, 0.5], ['-10deg', '10deg']);
+  const rotateX = useTransform(springY, [-0.5, 0.5], ['8deg', '-8deg']);
+  const rotateY = useTransform(springX, [-0.5, 0.5], ['-8deg', '8deg']);
   const spotlight = useMotionTemplate`radial-gradient(300px circle at ${pointerX}px ${pointerY}px, ${isClaude ? 'rgba(212,115,94,0.18)' : 'rgba(125,181,165,0.18)'}, transparent 48%)`;
 
   function handlePointerMove(event: React.MouseEvent<HTMLDivElement>) {
@@ -438,7 +457,7 @@ function RelayCard({
       onMouseLeave={resetPointer}
       style={{ rotateX, rotateY, transformStyle: 'preserve-3d' }}
       whileHover={{ scale: 1.01 }}
-      className="group relative h-[264px] [perspective:1200px]"
+      className="group relative h-[276px] [perspective:1200px]"
     >
       <div className="absolute inset-0 rounded-[32px] bg-black/25 blur-2xl dark:bg-black/35" />
       <div className="relative h-full overflow-hidden rounded-[28px] border border-slate-200/70 bg-white/70 p-5 shadow-[0_18px_44px_rgba(15,23,42,0.12)] backdrop-blur-xl transition-colors duration-500 dark:border-white/10 dark:bg-[#09090b]/90 dark:shadow-2xl">
@@ -449,18 +468,17 @@ function RelayCard({
         <div className="flex items-start justify-between gap-4">
           <div>
             <div className={`inline-flex rounded-full border px-2.5 py-1 text-[10px] font-bold uppercase tracking-[0.24em] ${isClaude ? 'border-orange-500/30 bg-orange-500/10 text-orange-700 dark:text-orange-200' : 'border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-200'}`}>{profile.type}</div>
-            <h3 className="mt-3 text-[1.95rem] leading-none font-bold tracking-tight text-slate-900 dark:text-white">{labelFor(profile)}</h3>
+            <h3 className="mt-3 text-[1.9rem] leading-none font-bold tracking-tight text-slate-900 dark:text-white">{labelFor(profile)}</h3>
             <p className="mt-2 text-sm text-slate-500 dark:text-gray-400"># {workspaceFor(profile)}</p>
           </div>
           <div className="flex gap-2">
             <MiniIconButton label="Logs" icon={<FileText size={14} />} onClick={onLogs} />
             <MiniIconButton label="Edit" icon={<Pencil size={14} />} onClick={onEdit} />
-            <MiniIconButton label="Restart" icon={<RotateCcw size={14} />} onClick={onRestart} />
             <MiniIconButton label="Remove" icon={<Trash2 size={14} />} tone="danger" onClick={onDelete} />
           </div>
         </div>
 
-        <div className="mt-3 flex flex-1 items-center justify-center">
+        <div className="mt-4 flex flex-1 items-center justify-center">
           <div className="flex w-full max-w-[220px] items-center justify-between">
             <div className="flex h-11 w-11 items-center justify-center rounded-2xl border-2 bg-white shadow-lg dark:bg-[#09090b]" style={{ borderColor: running ? accent : 'rgba(148,163,184,0.35)', color: running ? accent : undefined }}>
               {isClaude ? <Bot size={18} /> : <Terminal size={18} />}
@@ -481,7 +499,7 @@ function RelayCard({
           </div>
         </div>
 
-        <div className="mt-4 flex items-end justify-between gap-4">
+        <div className="mt-5 flex items-end justify-between gap-4">
           <div className="flex items-center gap-2 text-sm text-slate-500 dark:text-gray-400">
             <span className={`h-2.5 w-2.5 rounded-full ${running ? (isClaude ? 'bg-orange-400' : 'bg-emerald-400') : 'bg-slate-400 dark:bg-gray-600'} ${running ? 'animate-pulse' : ''}`} />
             <div>
@@ -983,5 +1001,5 @@ function SecondaryButton({ label, onClick }: { label: string; onClick: () => voi
 }
 
 function MiniIconButton({ label, icon, onClick, tone = 'default' }: { label: string; icon: React.ReactNode; onClick: () => void; tone?: 'default' | 'danger' }) {
-  return <button title={label} onClick={onClick} className={`rounded-full p-2 transition-colors ${tone === 'danger' ? 'bg-red-500/10 text-red-700 hover:bg-red-500/20 dark:text-red-200' : 'bg-slate-100 text-slate-500 hover:bg-slate-200 hover:text-slate-900 dark:bg-white/5 dark:text-gray-400 dark:hover:bg-white/10 dark:hover:text-white'}`}>{icon}</button>;
+  return <button title={label} onClick={onClick} className={`inline-flex h-9 w-9 items-center justify-center rounded-full border transition-colors ${tone === 'danger' ? 'border-red-500/20 bg-red-500/10 text-red-700 hover:bg-red-500/20 dark:text-red-200' : 'border-slate-200/80 bg-white/70 text-slate-500 hover:bg-slate-200 hover:text-slate-900 dark:border-white/5 dark:bg-white/5 dark:text-gray-400 dark:hover:bg-white/10 dark:hover:text-white'}`}>{icon}</button>;
 }

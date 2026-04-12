@@ -137,6 +137,7 @@ function createWindow() {
 app.whenReady().then(async () => {
   try {
     await startApiServer();
+    await waitForApi();
   } catch (error) {
     console.error(error);
     logDesktop(`Startup error: ${error && error.stack ? error.stack : error}`);
