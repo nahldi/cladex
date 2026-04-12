@@ -218,7 +218,7 @@ class ClaudeRelayBot(commands.Bot):
             return True
 
         # Check trigger mode
-        if self.config.trigger_mode == "always":
+        if self.config.trigger_mode in ("always", "all"):
             return True
 
         if self.config.trigger_mode == "prefix":
