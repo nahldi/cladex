@@ -53,6 +53,15 @@ interface Profile {
   activeChannel?: string;
   sessionId?: string;
   stateNamespace?: string;
+  operatorIds?: string;
+  allowedUserIds?: string;
+  allowedChannelIds?: string;
+  allowedChannelAuthorIds?: string;
+  channelNoMentionAuthorIds?: string;
+  channelHistoryLimit?: string;
+  startupDmUserIds?: string;
+  startupDmText?: string;
+  startupChannelText?: string;
 }
 
 interface RuntimeInfo {
@@ -80,20 +89,61 @@ interface ProfileFormData {
   allowDms?: boolean;
   operatorIds?: string;
   allowedUserIds?: string;
+  allowedChannelAuthorIds?: string;
+  channelNoMentionAuthorIds?: string;
+  channelHistoryLimit?: string;
+  startupDmUserIds?: string;
+  startupDmText?: string;
+  startupChannelText?: string;
+}
+
+interface ChatMessageRecord {
+  id: string;
+  role: 'user' | 'assistant';
+  content: string;
+  channelId?: string;
+  senderName?: string;
+  timestamp?: string;
 }
 
 interface ProfileSettingsData {
   type: ProfileType;
+  workspace: string;
+  discordToken?: string;
   botName: string;
   model: string;
   triggerMode: string;
   allowDms: boolean;
   channelId: string;
+  operatorIds?: string;
   allowedUserIds: string;
+  allowedChannelAuthorIds?: string;
+  channelNoMentionAuthorIds?: string;
+  channelHistoryLimit?: string;
+  startupDmUserIds?: string;
+  startupDmText?: string;
+  startupChannelText?: string;
+}
+
+declare global {
+  interface Window {
+    cladexDesktop?: {
+      chooseDirectory: () => Promise<string>;
+    };
+  }
 }
 
 const API_BASE = 'http://127.0.0.1:3001/api';
 const CLADEX_LOGO = new URL('../assets/icon.png', import.meta.url).href;
+
+async function chooseWorkspaceFolder(currentValue = ''): Promise<string> {
+  try {
+    const chosen = await window.cladexDesktop?.chooseDirectory?.();
+    return chosen || currentValue;
+  } catch {
+    return currentValue;
+  }
+}
 
 function looksTechnicalLabel(value: string | undefined): boolean {
   const normalized = (value || '').trim().toLowerCase();
@@ -161,6 +211,9 @@ const api = {
   projects: () => fetchJson<ProjectRecord[]>(`${API_BASE}/projects`),
   runtimeInfo: () => fetchJson<RuntimeInfo>(`${API_BASE}/runtime-info`),
   logs: (id: string, relayType: RelayType) => fetchJson<{ logs: string[] }>(`${API_BASE}/profiles/${id}/logs?type=${relayType}`),
+  chatHistory: (id: string, relayType: RelayType) => fetchJson<{ messages: ChatMessageRecord[] }>(`${API_BASE}/profiles/${id}/chat/history?type=${relayType}`),
+  sendChat: (id: string, relayType: RelayType, body: { message: string; channelId?: string; senderName?: string; senderId?: string }) =>
+    fetchJson<{ ok: boolean; reply: string; channelId?: string }>(`${API_BASE}/profiles/${id}/chat`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...body, type: relayType }) }),
   createProfile: (body: ProfileFormData) => fetchJson(`${API_BASE}/profiles`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }),
   updateProfile: (id: string, relayType: RelayType, body: ProfileSettingsData) =>
     fetchJson(`${API_BASE}/profiles/${id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...body, type: relayType }) }),
@@ -612,8 +665,10 @@ function LiveFeed({
 }) {
   const workspaces = Array.from(new Set(profiles.map((profile) => profile.workspace))).sort();
   const [activeWorkspace, setActiveWorkspace] = useState(workspaces[0] || '');
-  const [logs, setLogs] = useState<string[]>([]);
+  const [messages, setMessages] = useState<ChatMessageRecord[]>([]);
   const [loading, setLoading] = useState(false);
+  const [sending, setSending] = useState(false);
+  const [draft, setDraft] = useState('');
   const workspaceProfiles = profiles.filter((profile) => profile.workspace === activeWorkspace);
   const activeProfile = workspaceProfiles.find((profile) => profile.id === selectedProfileId) || workspaceProfiles[0] || null;
 
@@ -635,16 +690,16 @@ function LiveFeed({
 
   useEffect(() => {
     let cancelled = false;
-    const loadLogs = async () => {
+    const loadHistory = async () => {
       if (!activeProfile) {
-        setLogs([]);
+        setMessages([]);
         return;
       }
       setLoading(true);
       try {
-        const payload = await api.logs(activeProfile.id, activeProfile.relayType);
+        const payload = await api.chatHistory(activeProfile.id, activeProfile.relayType);
         if (!cancelled) {
-          setLogs(payload.logs || []);
+          setMessages(payload.messages || []);
         }
       } finally {
         if (!cancelled) {
@@ -652,13 +707,66 @@ function LiveFeed({
         }
       }
     };
-    void loadLogs();
-    const interval = window.setInterval(() => void loadLogs(), 3000);
+    void loadHistory();
+    const interval = window.setInterval(() => void loadHistory(), 3000);
     return () => {
       cancelled = true;
       window.clearInterval(interval);
     };
   }, [activeProfile]);
+
+  async function sendMessage() {
+    if (!activeProfile || !draft.trim() || sending) {
+      return;
+    }
+    const content = draft.trim();
+    setDraft('');
+    setSending(true);
+    setMessages((current) => [
+      ...current,
+      {
+        id: `local-${Date.now()}`,
+        role: 'user',
+        content,
+        channelId: activeProfile.activeChannel || activeProfile.discordChannel,
+        senderName: 'Operator',
+        timestamp: new Date().toISOString(),
+      },
+    ]);
+    try {
+      const payload = await api.sendChat(activeProfile.id, activeProfile.relayType, {
+        message: content,
+        channelId: activeProfile.activeChannel || activeProfile.discordChannel,
+        senderName: 'Operator',
+        senderId: '0',
+      });
+      setMessages((current) => [
+        ...current,
+        {
+          id: `assistant-${Date.now()}`,
+          role: 'assistant',
+          content: payload.reply || 'No reply returned from the relay.',
+          channelId: payload.channelId || activeProfile.activeChannel || activeProfile.discordChannel,
+          senderName: labelFor(activeProfile),
+          timestamp: new Date().toISOString(),
+        },
+      ]);
+    } catch (error) {
+      setMessages((current) => [
+        ...current,
+        {
+          id: `error-${Date.now()}`,
+          role: 'assistant',
+          content: error instanceof Error ? error.message : 'Failed to send local operator message.',
+          channelId: activeProfile.activeChannel || activeProfile.discordChannel,
+          senderName: labelFor(activeProfile),
+          timestamp: new Date().toISOString(),
+        },
+      ]);
+    } finally {
+      setSending(false);
+    }
+  }
 
   return (
     <div className="mx-auto flex w-full max-w-6xl flex-1 flex-col px-8 pb-8 pt-8">
@@ -692,31 +800,67 @@ function LiveFeed({
             <div className="border-b border-slate-200 bg-white/60 px-6 py-5 dark:border-white/5 dark:bg-white/[0.03]">
               {activeProfile ? (
                 <>
-                  <div className="text-[10px] font-bold uppercase tracking-[0.22em] text-slate-500 dark:text-gray-500">Live relay feed</div>
+                  <div className="text-[10px] font-bold uppercase tracking-[0.22em] text-slate-500 dark:text-gray-500">Local operator chat</div>
                   <div className="mt-2 text-2xl font-bold tracking-tight text-slate-900 dark:text-white">{labelFor(activeProfile)}</div>
-                  <div className="mt-2 text-sm text-slate-600 dark:text-gray-400">{activeProfile.statusText || 'Watching the actual relay log stream for this bot.'}</div>
+                  <div className="mt-2 text-sm text-slate-600 dark:text-gray-400">
+                    Chat with the same running relay session from inside CLADEX. Discord is still live; this is just the local operator surface.
+                  </div>
                 </>
               ) : (
                 <div className="text-slate-500 dark:text-gray-500">Select a relay to inspect it.</div>
               )}
             </div>
-            <div className="h-[560px] overflow-y-auto bg-[#f7f3ea]/70 p-6 font-mono text-xs text-slate-700 dark:bg-black/30 dark:text-gray-300">
+            <div className="flex h-[560px] flex-col bg-[#f7f3ea]/70 dark:bg-black/30">
+              <div className="flex-1 overflow-y-auto p-6">
               {!activeProfile ? (
                 <EmptyState title="No relay selected." detail="Pick a relay on the left to inspect its feed." compact />
-              ) : loading && !logs.length ? (
-                <div className="flex items-center gap-2 text-indigo-500 dark:text-indigo-300"><Loader2 size={16} className="animate-spin" /> Loading relay feed...</div>
-              ) : logs.length ? (
-                <div className="space-y-2">
-                  {logs.map((line, index) => (
-                    <div key={`${activeProfile.id}-${index}-${line.slice(0, 12)}`} className="rounded-2xl border border-slate-200 bg-white/80 px-4 py-3 leading-relaxed dark:border-white/5 dark:bg-white/[0.03]">
-                      <span className="mr-3 text-slate-400 dark:text-gray-500">{String(index + 1).padStart(2, '0')}</span>
-                      <span className={line.toLowerCase().includes('error') ? 'text-red-600 dark:text-red-200' : line.toLowerCase().includes('working') ? 'text-indigo-600 dark:text-indigo-200' : 'text-slate-800 dark:text-gray-200'}>{line}</span>
-                    </div>
-                  ))}
+              ) : loading && !messages.length ? (
+                <div className="flex items-center gap-2 text-indigo-500 dark:text-indigo-300"><Loader2 size={16} className="animate-spin" /> Loading local chat history...</div>
+              ) : messages.length ? (
+                <div className="space-y-4">
+                  {messages.map((message) => {
+                    const assistant = message.role === 'assistant';
+                    return (
+                      <div key={message.id} className={`flex ${assistant ? 'justify-start' : 'justify-end'}`}>
+                        <div className={`max-w-[85%] rounded-[22px] border px-4 py-3 text-sm leading-relaxed shadow-sm ${assistant ? 'border-slate-200 bg-white/85 text-slate-800 dark:border-white/5 dark:bg-white/[0.04] dark:text-gray-200' : 'border-indigo-500/25 bg-indigo-500/12 text-indigo-900 dark:text-indigo-100'}`}>
+                          <div className={`mb-1 text-[10px] font-bold uppercase tracking-[0.22em] ${assistant ? 'text-slate-400 dark:text-gray-500' : 'text-indigo-400'}`}>
+                            {assistant ? (message.senderName || labelFor(activeProfile)) : (message.senderName || 'Operator')}
+                          </div>
+                          <div className="whitespace-pre-wrap break-words">{message.content}</div>
+                        </div>
+                      </div>
+                    );
+                  })}
                 </div>
               ) : (
-                <EmptyState title="No log lines yet." detail="Once the relay starts working, the feed will appear here." compact />
+                <EmptyState title="No local chat yet." detail="Send a message here to talk to the running relay without using Discord." compact />
               )}
+              </div>
+              <div className="border-t border-slate-200 bg-white/70 p-4 dark:border-white/5 dark:bg-white/[0.03]">
+                <div className="flex gap-3">
+                  <textarea
+                    value={draft}
+                    onChange={(event) => setDraft(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === 'Enter' && !event.shiftKey) {
+                        event.preventDefault();
+                        void sendMessage();
+                      }
+                    }}
+                    placeholder={activeProfile ? `Message ${labelFor(activeProfile)} here instead of Discord...` : 'Select a relay first'}
+                    disabled={!activeProfile || sending}
+                    className="min-h-[88px] flex-1 resize-none rounded-[22px] border border-slate-200 bg-white/85 px-4 py-3 text-sm text-slate-900 outline-none transition-colors focus:border-indigo-500 dark:border-white/10 dark:bg-black/40 dark:text-white"
+                  />
+                  <button
+                    onClick={() => void sendMessage()}
+                    disabled={!activeProfile || !draft.trim() || sending}
+                    className="inline-flex min-w-[120px] items-center justify-center gap-2 self-end rounded-[22px] bg-indigo-600 px-4 py-3 text-sm font-semibold text-white transition-colors hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    {sending ? <Loader2 size={16} className="animate-spin" /> : <MessageSquare size={16} />}
+                    Send
+                  </button>
+                </div>
+              </div>
             </div>
           </div>
 
@@ -756,33 +900,84 @@ function AddProfileModal({ onClose, onSubmit }: { onClose: () => void; onSubmit:
   const [allowDms, setAllowDms] = useState(false);
   const [operatorIds, setOperatorIds] = useState('');
   const [allowedUserIds, setAllowedUserIds] = useState('');
+  const [allowedChannelAuthorIds, setAllowedChannelAuthorIds] = useState('');
+  const [channelNoMentionAuthorIds, setChannelNoMentionAuthorIds] = useState('');
+  const [channelHistoryLimit, setChannelHistoryLimit] = useState('20');
+  const [startupDmUserIds, setStartupDmUserIds] = useState('');
+  const [startupDmText, setStartupDmText] = useState('Discord relay online. DM me here to chat with Codex.');
+  const [startupChannelText, setStartupChannelText] = useState('');
   const [saving, setSaving] = useState(false);
+
+  const codex = type === 'Codex';
 
   return (
     <ModalShell title="Add Relay" onClose={onClose} wide>
-      <div className="space-y-4">
+      <div className="space-y-6">
         <div className="grid grid-cols-2 gap-4">
           <TypeButton active={type === 'Claude'} label="Claude Code" icon={<Bot size={18} />} onClick={() => setType('Claude')} tone="orange" />
           <TypeButton active={type === 'Codex'} label="Codex" icon={<Terminal size={18} />} onClick={() => setType('Codex')} tone="emerald" />
         </div>
-        <FormInput label="Bot label" value={name} onChange={setName} placeholder="Tyson" />
-        <FormInput label="Workspace folder" value={workspace} onChange={setWorkspace} placeholder="C:\\Projects\\my-repo" mono />
-        <FormInput label="Discord bot token" value={discordToken} onChange={setDiscordToken} placeholder="Paste token" type="password" />
-        <FormInput label="Allowed channel ID" value={channelId} onChange={setChannelId} placeholder="123456789012345678" mono />
-        <div className="grid gap-4 md:grid-cols-2">
-          <FormInput label="Model override" value={model} onChange={setModel} placeholder={type === 'Claude' ? 'claude-opus-4-5-20251101' : 'gpt-5.4'} mono />
-          <FormSelect label="Trigger mode" value={triggerMode} onChange={setTriggerMode} options={[{ value: 'mention_or_dm', label: 'Mention or direct message' }, { value: 'all', label: 'Every message in the channel' }, { value: 'dm_only', label: 'Direct messages only' }]} />
-        </div>
-        <FormInput label="Operator IDs" value={operatorIds} onChange={setOperatorIds} placeholder="Comma-separated Discord user IDs" mono />
-        <FormInput label="Additional allowed user IDs" value={allowedUserIds} onChange={setAllowedUserIds} placeholder="Comma-separated Discord user IDs" mono />
-        <ToggleRow checked={allowDms} onChange={setAllowDms} label="Allow direct messages for approved users" />
+
+        <FormSection title="Basics">
+          <FormInput label="Bot label" value={name} onChange={setName} placeholder="Tyson" />
+          <BrowseField label="Workspace folder" value={workspace} onChange={setWorkspace} placeholder="C:\\Projects\\my-repo" />
+          <FormInput label="Discord bot token" value={discordToken} onChange={setDiscordToken} placeholder="Paste token" type="password" />
+          <div className="grid gap-4 md:grid-cols-2">
+            <FormInput label="Allowed channel IDs" value={channelId} onChange={setChannelId} placeholder="123456789012345678, 234567890123456789" mono />
+            <FormInput label="Model override" value={model} onChange={setModel} placeholder={codex ? 'gpt-5.4' : 'claude-opus-4-5-20251101'} mono />
+          </div>
+        </FormSection>
+
+        <FormSection title="Access">
+          <div className="grid gap-4 md:grid-cols-2">
+            <FormSelect label="Trigger mode" value={triggerMode} onChange={setTriggerMode} options={[{ value: 'mention_or_dm', label: 'Mention or direct message' }, { value: 'all', label: 'Every message in the channel' }, { value: 'dm_only', label: 'Direct messages only' }]} />
+            <FormInput label={codex ? 'Approved DM user IDs' : 'Approved user IDs'} value={allowedUserIds} onChange={setAllowedUserIds} placeholder="Comma-separated Discord user IDs" mono />
+          </div>
+          <div className="grid gap-4 md:grid-cols-2">
+            <FormInput label="Operator IDs" value={operatorIds} onChange={setOperatorIds} placeholder="Comma-separated Discord user IDs" mono />
+            <FormInput label="Channel history limit" value={channelHistoryLimit} onChange={setChannelHistoryLimit} placeholder="20" mono />
+          </div>
+          {codex ? (
+            <div className="grid gap-4 md:grid-cols-2">
+              <FormInput label="Allowed channel author IDs" value={allowedChannelAuthorIds} onChange={setAllowedChannelAuthorIds} placeholder="Comma-separated Discord user IDs" mono />
+              <FormInput label="No-mention author IDs" value={channelNoMentionAuthorIds} onChange={setChannelNoMentionAuthorIds} placeholder="Comma-separated Discord user IDs" mono />
+            </div>
+          ) : null}
+          <ToggleRow checked={allowDms} onChange={setAllowDms} label="Allow direct messages for approved users" />
+        </FormSection>
+
+        {codex ? (
+          <FormSection title="Startup">
+            <FormInput label="Startup DM user IDs" value={startupDmUserIds} onChange={setStartupDmUserIds} placeholder="Comma-separated Discord user IDs" mono />
+            <FormInput label="Startup DM text" value={startupDmText} onChange={setStartupDmText} placeholder="Discord relay online. DM me here to chat with Codex." />
+            <FormInput label="Startup channel text" value={startupChannelText} onChange={setStartupChannelText} placeholder="Optional message posted in the main channel on startup" />
+          </FormSection>
+        ) : null}
+
         <div className="flex justify-end gap-3 pt-2">
           <SecondaryButton label="Cancel" onClick={onClose} />
           <PrimaryButton label={saving ? 'Saving...' : 'Save relay'} icon={saving ? <Loader2 size={16} className="animate-spin" /> : <Plus size={16} />} onClick={async () => {
             if (!name || !workspace || !discordToken || !channelId) return;
             setSaving(true);
             try {
-              await onSubmit({ name, type, workspace, discordToken, channelId, model, triggerMode, allowDms, operatorIds, allowedUserIds });
+              await onSubmit({
+                name,
+                type,
+                workspace,
+                discordToken,
+                channelId,
+                model,
+                triggerMode,
+                allowDms,
+                operatorIds,
+                allowedUserIds,
+                allowedChannelAuthorIds,
+                channelNoMentionAuthorIds,
+                channelHistoryLimit,
+                startupDmUserIds,
+                startupDmText,
+                startupChannelText,
+              });
             } finally {
               setSaving(false);
             }
@@ -794,33 +989,88 @@ function AddProfileModal({ onClose, onSubmit }: { onClose: () => void; onSubmit:
 }
 
 function EditProfileModal({ profile, onClose, onSubmit }: { profile: Profile; onClose: () => void; onSubmit: (data: ProfileSettingsData) => Promise<void> }) {
+  const [workspace, setWorkspace] = useState(profile.workspace);
+  const [discordToken, setDiscordToken] = useState('');
   const [botName, setBotName] = useState(profile.botName || profile.displayName || '');
   const [model, setModel] = useState(profile.model || '');
   const [triggerMode, setTriggerMode] = useState(profile.triggerMode || 'mention_or_dm');
   const [allowDms, setAllowDms] = useState(Boolean(profile.allowDms));
-  const [channelId, setChannelId] = useState(profile.discordChannel || '');
-  const [allowedUserIds, setAllowedUserIds] = useState('');
+  const [channelId, setChannelId] = useState(profile.allowedChannelIds || profile.discordChannel || '');
+  const [operatorIds, setOperatorIds] = useState(profile.operatorIds || '');
+  const [allowedUserIds, setAllowedUserIds] = useState(profile.allowedUserIds || '');
+  const [allowedChannelAuthorIds, setAllowedChannelAuthorIds] = useState(profile.allowedChannelAuthorIds || '');
+  const [channelNoMentionAuthorIds, setChannelNoMentionAuthorIds] = useState(profile.channelNoMentionAuthorIds || '');
+  const [channelHistoryLimit, setChannelHistoryLimit] = useState(profile.channelHistoryLimit || '20');
+  const [startupDmUserIds, setStartupDmUserIds] = useState(profile.startupDmUserIds || '');
+  const [startupDmText, setStartupDmText] = useState(profile.startupDmText || '');
+  const [startupChannelText, setStartupChannelText] = useState(profile.startupChannelText || '');
   const [saving, setSaving] = useState(false);
+
+  const codex = profile.type === 'Codex';
 
   return (
     <ModalShell title={`Edit ${labelFor(profile)}`} onClose={onClose} wide>
-      <div className="space-y-4">
-        <InspectorRow label="Relay type" value={profile.type} />
-        <InspectorRow label="Workspace" value={profile.workspace} mono />
-        <FormInput label="Bot label" value={botName} onChange={setBotName} placeholder="Tyson" />
-        <div className="grid gap-4 md:grid-cols-2">
-          <FormInput label="Model" value={model} onChange={setModel} placeholder={profile.type === 'Claude' ? 'claude-opus-4-5-20251101' : 'gpt-5.4'} mono />
-          <FormSelect label="Trigger mode" value={triggerMode} onChange={setTriggerMode} options={[{ value: 'mention_or_dm', label: 'Mention or direct message' }, { value: 'all', label: 'Every message in the channel' }, { value: 'dm_only', label: 'Direct messages only' }]} />
-        </div>
-        <FormInput label="Allowed channel ID" value={channelId} onChange={setChannelId} placeholder="123456789012345678" mono />
-        <FormInput label="Allowed user IDs" value={allowedUserIds} onChange={setAllowedUserIds} placeholder="Comma-separated Discord user IDs" mono />
-        <ToggleRow checked={allowDms} onChange={setAllowDms} label="Allow direct messages for approved users" />
+      <div className="space-y-6">
+        <FormSection title="Basics">
+          <InspectorRow label="Relay type" value={profile.type} />
+          <BrowseField label="Workspace folder" value={workspace} onChange={setWorkspace} placeholder="C:\\Projects\\my-repo" />
+          <FormInput label="Bot label" value={botName} onChange={setBotName} placeholder="Tyson" />
+          <FormInput label="Replace bot token" value={discordToken} onChange={setDiscordToken} placeholder="Leave blank to keep the current token" type="password" />
+          <div className="grid gap-4 md:grid-cols-2">
+            <FormInput label="Allowed channel IDs" value={channelId} onChange={setChannelId} placeholder="123456789012345678, 234567890123456789" mono />
+            <FormInput label="Model" value={model} onChange={setModel} placeholder={codex ? 'gpt-5.4' : 'claude-opus-4-5-20251101'} mono />
+          </div>
+        </FormSection>
+
+        <FormSection title="Access">
+          <div className="grid gap-4 md:grid-cols-2">
+            <FormSelect label="Trigger mode" value={triggerMode} onChange={setTriggerMode} options={[{ value: 'mention_or_dm', label: 'Mention or direct message' }, { value: 'all', label: 'Every message in the channel' }, { value: 'dm_only', label: 'Direct messages only' }]} />
+            <FormInput label={codex ? 'Approved DM user IDs' : 'Approved user IDs'} value={allowedUserIds} onChange={setAllowedUserIds} placeholder="Comma-separated Discord user IDs" mono />
+          </div>
+          <div className="grid gap-4 md:grid-cols-2">
+            <FormInput label="Operator IDs" value={operatorIds} onChange={setOperatorIds} placeholder="Comma-separated Discord user IDs" mono />
+            <FormInput label="Channel history limit" value={channelHistoryLimit} onChange={setChannelHistoryLimit} placeholder="20" mono />
+          </div>
+          {codex ? (
+            <div className="grid gap-4 md:grid-cols-2">
+              <FormInput label="Allowed channel author IDs" value={allowedChannelAuthorIds} onChange={setAllowedChannelAuthorIds} placeholder="Comma-separated Discord user IDs" mono />
+              <FormInput label="No-mention author IDs" value={channelNoMentionAuthorIds} onChange={setChannelNoMentionAuthorIds} placeholder="Comma-separated Discord user IDs" mono />
+            </div>
+          ) : null}
+          <ToggleRow checked={allowDms} onChange={setAllowDms} label="Allow direct messages for approved users" />
+        </FormSection>
+
+        {codex ? (
+          <FormSection title="Startup">
+            <FormInput label="Startup DM user IDs" value={startupDmUserIds} onChange={setStartupDmUserIds} placeholder="Comma-separated Discord user IDs" mono />
+            <FormInput label="Startup DM text" value={startupDmText} onChange={setStartupDmText} placeholder="Discord relay online. DM me here to chat with Codex." />
+            <FormInput label="Startup channel text" value={startupChannelText} onChange={setStartupChannelText} placeholder="Optional message posted in the main channel on startup" />
+          </FormSection>
+        ) : null}
+
         <div className="flex justify-end gap-3 pt-2">
           <SecondaryButton label="Cancel" onClick={onClose} />
           <PrimaryButton label={saving ? 'Saving...' : 'Save changes'} icon={saving ? <Loader2 size={16} className="animate-spin" /> : <Pencil size={16} />} onClick={async () => {
             setSaving(true);
             try {
-              await onSubmit({ type: profile.type, botName, model, triggerMode, allowDms, channelId, allowedUserIds });
+              await onSubmit({
+                type: profile.type,
+                workspace,
+                discordToken,
+                botName,
+                model,
+                triggerMode,
+                allowDms,
+                channelId,
+                operatorIds,
+                allowedUserIds,
+                allowedChannelAuthorIds,
+                channelNoMentionAuthorIds,
+                channelHistoryLimit,
+                startupDmUserIds,
+                startupDmText,
+                startupChannelText,
+              });
             } finally {
               setSaving(false);
             }
@@ -963,6 +1213,35 @@ function InspectorRow({ label, value, mono = false }: { label: string; value: st
 
 function FormInput({ label, value, onChange, placeholder, mono = false, type = 'text' }: { label: string; value: string; onChange: (value: string) => void; placeholder: string; mono?: boolean; type?: string }) {
   return <label className="block"><div className="mb-2 text-[10px] font-bold uppercase tracking-[0.22em] text-slate-500 dark:text-gray-500">{label}</div><input type={type} value={value} onChange={(event) => onChange(event.target.value)} placeholder={placeholder} className={`w-full rounded-2xl border border-slate-200 bg-white/80 px-4 py-3 text-slate-900 outline-none focus:border-indigo-500 dark:border-white/10 dark:bg-black/40 dark:text-white ${mono ? 'font-mono text-sm' : 'text-sm'}`} /></label>;
+}
+
+function BrowseField({ label, value, onChange, placeholder }: { label: string; value: string; onChange: (value: string) => void; placeholder: string }) {
+  return (
+    <label className="block">
+      <div className="mb-2 text-[10px] font-bold uppercase tracking-[0.22em] text-slate-500 dark:text-gray-500">{label}</div>
+      <div className="flex gap-3">
+        <input value={value} onChange={(event) => onChange(event.target.value)} placeholder={placeholder} className="min-w-0 flex-1 rounded-2xl border border-slate-200 bg-white/80 px-4 py-3 text-sm text-slate-900 outline-none focus:border-indigo-500 dark:border-white/10 dark:bg-black/40 dark:text-white" />
+        <button
+          type="button"
+          onClick={async () => onChange(await chooseWorkspaceFolder(value))}
+          className="rounded-2xl border border-slate-200 bg-white/80 px-4 py-3 text-sm font-semibold text-slate-700 transition-colors hover:bg-slate-100 dark:border-white/10 dark:bg-white/[0.03] dark:text-gray-200 dark:hover:bg-white/[0.08]"
+        >
+          Browse
+        </button>
+      </div>
+    </label>
+  );
+}
+
+function FormSection({ title, children }: { title: string; children: React.ReactNode }) {
+  return (
+    <section className="space-y-4">
+      <div className="text-[10px] font-bold uppercase tracking-[0.22em] text-slate-500 dark:text-gray-500">{title}</div>
+      <div className="space-y-4 rounded-[26px] border border-slate-200/80 bg-white/60 p-4 dark:border-white/10 dark:bg-black/20">
+        {children}
+      </div>
+    </section>
+  );
 }
 
 function FormSelect({ label, value, onChange, options }: { label: string; value: string; onChange: (value: string) => void; options: Array<{ value: string; label: string }> }) {

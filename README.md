@@ -16,6 +16,8 @@ The shipped product is local-first:
 - **CLI Tools**: `cladex`, `claude-discord`, `codex-discord` commands
 - **Session Persistence**: Automatic session management with resume capability
 - **Workspace-Scoped**: Each workspace can have multiple relay profiles
+- **Local Operator Chat**: Talk to a running relay from inside CLADEX without using Discord while staying on the same bound relay session
+- **Saved Workgroups**: Start or stop related relays together, including migrated legacy Codex project groups
 
 ## Quick Start
 
@@ -62,8 +64,8 @@ npm run electron:build  # Creates installer in release/
 ```
 
 Packaged launchers produced by the build:
-- `release\CLADEX Setup 2.0.7.exe`
-- `release\CLADEX 2.0.7.exe`
+- `release\CLADEX Setup 2.0.8.exe`
+- `release\CLADEX 2.0.8.exe`
 - `release\win-unpacked\CLADEX.exe`
 
 ### Backend CLI

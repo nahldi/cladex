@@ -7,6 +7,8 @@ import re
 import shutil
 import subprocess
 import sys
+import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +27,8 @@ CLADEX_APP_NAME = "cladex"
 CLADEX_CONFIG_ROOT = Path(user_config_dir(CLADEX_APP_NAME, False))
 CLADEX_PROJECTS_PATH = CLADEX_CONFIG_ROOT / "projects.json"
 GUI_CHILD_ENV = "CLADEX_GUI_CHILD"
+OPERATOR_POLL_INTERVAL_SECONDS = 0.25
+OPERATOR_TIMEOUT_SECONDS = 120
 
 
 def _load_json_file(path: Path, *, default: dict[str, Any]) -> dict[str, Any]:
@@ -46,7 +50,32 @@ def _load_claude_registry() -> dict[str, Any]:
 
 
 def _load_cladex_projects() -> dict[str, Any]:
-    return _load_json_file(CLADEX_PROJECTS_PATH, default={"projects": []})
+    payload = _load_json_file(CLADEX_PROJECTS_PATH, default={"projects": []})
+    projects = payload.get("projects", [])
+    if projects:
+        return payload
+    legacy = relayctl._load_registry().get("projects", [])
+    if not legacy:
+        return payload
+    migrated = {
+        "projects": [
+            _project_record(
+                str(project.get("name", "")).strip(),
+                [
+                    _member_ref(profile)
+                    for profile_name in project.get("profiles", [])
+                    for profile in _filter_profiles(name=str(profile_name), relay_type=None)
+                ],
+            )
+            for project in legacy
+            if str(project.get("name", "")).strip()
+        ]
+    }
+    migrated["projects"] = [project for project in migrated["projects"] if project.get("members")]
+    if migrated["projects"]:
+        _save_cladex_projects(migrated)
+        return migrated
+    return payload
 
 
 def _save_cladex_projects(payload: dict[str, Any]) -> None:
@@ -206,6 +235,14 @@ def _codex_profiles() -> list[dict[str, Any]]:
                 "_allow_dms": env.get("ALLOW_DMS", "false").strip().lower() in {"1", "true", "yes"},
                 "_state_namespace": profile.get("state_namespace", ""),
                 "_effort": env.get("CODEX_REASONING_EFFORT_DEFAULT", "high"),
+                "_allowed_user_ids": env.get("ALLOWED_USER_IDS", ""),
+                "_allowed_channel_ids": env.get("ALLOWED_CHANNEL_IDS", ""),
+                "_allowed_channel_author_ids": env.get("ALLOWED_CHANNEL_AUTHOR_IDS", ""),
+                "_channel_no_mention_author_ids": env.get("CHANNEL_NO_MENTION_AUTHOR_IDS", ""),
+                "_channel_history_limit": env.get("CHANNEL_HISTORY_LIMIT", "20"),
+                "_startup_dm_user_ids": env.get("STARTUP_DM_USER_IDS", ""),
+                "_startup_dm_text": env.get("STARTUP_DM_TEXT", ""),
+                "_startup_channel_text": env.get("STARTUP_CHANNEL_TEXT", ""),
             }
         )
         records.append(record)
@@ -237,6 +274,10 @@ def _claude_profiles() -> list[dict[str, Any]]:
                 "_bot_name": env.get("RELAY_BOT_NAME", profile.get("bot_name", "")),
                 "_allow_dms": env.get("ALLOW_DMS", "false").strip().lower() in {"1", "true", "yes"},
                 "_state_namespace": profile.get("state_namespace", ""),
+                "_operator_ids": env.get("OPERATOR_IDS", ""),
+                "_allowed_user_ids": env.get("ALLOWED_USER_IDS", ""),
+                "_allowed_channel_ids": env.get("ALLOWED_CHANNEL_IDS", ""),
+                "_channel_history_limit": env.get("CHANNEL_HISTORY_LIMIT", "20"),
             }
         )
         records.append(record)
@@ -384,7 +425,98 @@ def _profile_json_record(profile: dict[str, Any]) -> dict[str, Any]:
         "activeWorktree": profile.get("_active_worktree", ""),
         "activeChannel": profile.get("_active_channel", ""),
         "logPath": profile.get("_log_path", ""),
+        "operatorIds": profile.get("_operator_ids", ""),
+        "allowedUserIds": profile.get("_allowed_user_ids", ""),
+        "allowedChannelIds": profile.get("_allowed_channel_ids", ""),
+        "allowedChannelAuthorIds": profile.get("_allowed_channel_author_ids", ""),
+        "channelNoMentionAuthorIds": profile.get("_channel_no_mention_author_ids", ""),
+        "channelHistoryLimit": str(profile.get("_channel_history_limit", "") or ""),
+        "startupDmUserIds": profile.get("_startup_dm_user_ids", ""),
+        "startupDmText": profile.get("_startup_dm_text", ""),
+        "startupChannelText": profile.get("_startup_channel_text", ""),
     }
+
+
+def _profile_state_dir(profile: dict[str, Any]) -> Path:
+    relay_type = str(profile.get("_relay_type", "")).strip().lower()
+    namespace = str(profile.get("state_namespace") or profile.get("_state_namespace") or "").strip()
+    if not namespace:
+        raise RuntimeError(f"Profile `{profile.get('name', '')}` is missing a state namespace.")
+    if relay_type == "codex":
+        return relayctl.state_dir_for_namespace(namespace)
+    if relay_type == "claude":
+        return claude_relay.state_dir_for_namespace(namespace)
+    raise RuntimeError(f"Unknown relay type: {relay_type}")
+
+
+def _operator_dir(profile: dict[str, Any]) -> Path:
+    return _profile_state_dir(profile) / "operator"
+
+
+def _operator_requests_dir(profile: dict[str, Any]) -> Path:
+    return _operator_dir(profile) / "requests"
+
+
+def _operator_responses_dir(profile: dict[str, Any]) -> Path:
+    return _operator_dir(profile) / "responses"
+
+
+def _operator_history_path(profile: dict[str, Any]) -> Path:
+    return _operator_dir(profile) / "history.json"
+
+
+def _read_operator_history(profile: dict[str, Any]) -> list[dict[str, Any]]:
+    path = _operator_history_path(profile)
+    if not path.exists():
+        return []
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    messages = payload.get("messages") if isinstance(payload, dict) else None
+    return messages if isinstance(messages, list) else []
+
+
+def _chat_with_profile(
+    profile: dict[str, Any],
+    *,
+    message: str,
+    channel_id: str | None = None,
+    sender_name: str = "Operator",
+    sender_id: str = "0",
+    timeout_seconds: int = OPERATOR_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    requests_dir = _operator_requests_dir(profile)
+    responses_dir = _operator_responses_dir(profile)
+    requests_dir.mkdir(parents=True, exist_ok=True)
+    responses_dir.mkdir(parents=True, exist_ok=True)
+    request_id = uuid.uuid4().hex
+    request_path = requests_dir / f"{request_id}.json"
+    response_path = responses_dir / f"{request_id}.json"
+    payload = {
+        "id": request_id,
+        "message": message.strip(),
+        "channelId": str(channel_id or "").strip(),
+        "senderName": sender_name.strip() or "Operator",
+        "senderId": str(sender_id or "0").strip() or "0",
+        "createdAt": time.time(),
+    }
+    relayctl.atomic_write_text(request_path, json.dumps(payload, indent=2))
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        if response_path.exists():
+            try:
+                response = json.loads(response_path.read_text(encoding="utf-8"))
+            finally:
+                response_path.unlink(missing_ok=True)
+            if not isinstance(response, dict):
+                raise RuntimeError("Operator bridge returned invalid data.")
+            if not response.get("ok"):
+                raise RuntimeError(str(response.get("error", "Operator bridge failed.")))
+            return response
+        time.sleep(OPERATOR_POLL_INTERVAL_SECONDS)
+    request_path.unlink(missing_ok=True)
+    raise RuntimeError("Timed out waiting for the running relay to answer the local operator message.")
 
 
 def _update_profile_registry(registry: dict[str, Any], *, name: str, changes: dict[str, Any]) -> None:
@@ -397,15 +529,27 @@ def _update_profile_registry(registry: dict[str, Any], *, name: str, changes: di
 def _update_codex_profile(
     profile: dict[str, Any],
     *,
+    workspace: str | None = None,
+    discord_bot_token: str | None = None,
     bot_name: str | None = None,
     model: str | None = None,
     trigger_mode: str | None = None,
     allow_dms: bool | None = None,
     allowed_user_ids: str | None = None,
     allowed_channel_id: str | None = None,
+    allowed_channel_author_ids: str | None = None,
+    channel_no_mention_author_ids: str | None = None,
+    channel_history_limit: str | None = None,
+    startup_dm_user_ids: str | None = None,
+    startup_dm_text: str | None = None,
+    startup_channel_text: str | None = None,
 ) -> None:
     env_path = Path(str(profile.get("env_file", "")).strip())
     env = relayctl._normalized_profile_env(relayctl._load_env_file(env_path))
+    if workspace is not None and workspace.strip():
+        env["CODEX_WORKDIR"] = str(Path(workspace.strip()).expanduser().resolve())
+    if discord_bot_token is not None and discord_bot_token.strip():
+        env["DISCORD_BOT_TOKEN"] = discord_bot_token.strip()
     if bot_name is not None:
         env["RELAY_BOT_NAME"] = bot_name.strip()
     if model is not None:
@@ -422,33 +566,43 @@ def _update_codex_profile(
         channel_ids = relayctl._parse_csv_ids(allowed_channel_id)
         env["ALLOWED_CHANNEL_IDS"] = channel_ids
         env["RELAY_ATTACH_CHANNEL_ID"] = channel_ids.split(",", 1)[0] if channel_ids else ""
+    if allowed_channel_author_ids is not None:
+        env["ALLOWED_CHANNEL_AUTHOR_IDS"] = relayctl._parse_csv_ids(allowed_channel_author_ids)
+    if channel_no_mention_author_ids is not None:
+        env["CHANNEL_NO_MENTION_AUTHOR_IDS"] = relayctl._parse_csv_ids(channel_no_mention_author_ids)
+    if channel_history_limit is not None:
+        env["CHANNEL_HISTORY_LIMIT"] = str(channel_history_limit).strip() or env.get("CHANNEL_HISTORY_LIMIT", "20")
+    if startup_dm_user_ids is not None:
+        env["STARTUP_DM_USER_IDS"] = relayctl._parse_csv_ids(startup_dm_user_ids)
+    if startup_dm_text is not None:
+        env["STARTUP_DM_TEXT"] = startup_dm_text.strip()
+    if startup_channel_text is not None:
+        env["STARTUP_CHANNEL_TEXT"] = startup_channel_text.strip()
     env = relayctl._normalized_profile_env(env)
-    relayctl._write_env_file(env_path, env)
-
-    registry = relayctl._load_registry()
-    _update_profile_registry(
-        registry,
-        name=str(profile.get("name", "")),
-        changes={
-            "bot_name": env.get("RELAY_BOT_NAME", ""),
-            "attach_channel_id": env.get("RELAY_ATTACH_CHANNEL_ID", ""),
-        },
-    )
-    relayctl._save_registry(registry)
+    new_profile = relayctl._profile_from_env(env)
+    relayctl._replace_profile_registration(profile, new_profile)
 
 
 def _update_claude_profile(
     profile: dict[str, Any],
     *,
+    workspace: str | None = None,
+    discord_bot_token: str | None = None,
     bot_name: str | None = None,
     model: str | None = None,
     trigger_mode: str | None = None,
     allow_dms: bool | None = None,
     allowed_user_ids: str | None = None,
     allowed_channel_id: str | None = None,
+    operator_ids: str | None = None,
+    channel_history_limit: str | None = None,
 ) -> None:
     env_path = Path(str(profile.get("env_file", "")).strip())
     env = claude_relay._load_env_file(env_path)
+    if workspace is not None and workspace.strip():
+        env["CLAUDE_WORKDIR"] = str(Path(workspace.strip()).expanduser().resolve())
+    if discord_bot_token is not None and discord_bot_token.strip():
+        env["DISCORD_BOT_TOKEN"] = discord_bot_token.strip()
     if bot_name is not None:
         env["RELAY_BOT_NAME"] = bot_name.strip()
     if model is not None:
@@ -457,62 +611,91 @@ def _update_claude_profile(
         env["BOT_TRIGGER_MODE"] = trigger_mode.strip() or env.get("BOT_TRIGGER_MODE", "mention_or_dm")
     if allow_dms is not None:
         env["ALLOW_DMS"] = "true" if allow_dms else "false"
+    if operator_ids is not None:
+        env["OPERATOR_IDS"] = claude_relay._parse_csv_ids(operator_ids)
     if allowed_user_ids is not None:
         env["ALLOWED_USER_IDS"] = claude_relay._parse_csv_ids(allowed_user_ids)
     if allowed_channel_id is not None:
         env["ALLOWED_CHANNEL_IDS"] = claude_relay._parse_csv_ids(allowed_channel_id)
+    if channel_history_limit is not None:
+        env["CHANNEL_HISTORY_LIMIT"] = str(channel_history_limit).strip() or env.get("CHANNEL_HISTORY_LIMIT", "20")
     env["ALLOW_DMS"] = "true" if env.get("ALLOW_DMS", "false").lower() in {"1", "true", "yes"} else "false"
     env["BOT_TRIGGER_MODE"] = env.get("BOT_TRIGGER_MODE", "mention_or_dm") or "mention_or_dm"
     env["OPERATOR_IDS"] = claude_relay._parse_csv_ids(env.get("OPERATOR_IDS", ""))
     env["ALLOWED_USER_IDS"] = claude_relay._parse_csv_ids(env.get("ALLOWED_USER_IDS", ""))
     env["ALLOWED_CHANNEL_IDS"] = claude_relay._parse_csv_ids(env.get("ALLOWED_CHANNEL_IDS", ""))
     env["CLAUDE_MODEL"] = (env.get("CLAUDE_MODEL", "") or "").strip()
-    claude_relay._write_env_file(env_path, env)
-
+    new_profile = claude_relay._profile_from_env(env)
     registry = _load_claude_registry()
-    _update_profile_registry(
-        registry,
-        name=str(profile.get("name", "")),
-        changes={
-            "bot_name": env.get("RELAY_BOT_NAME", ""),
-        },
-    )
-    _save_claude_projects = CLAUDE_REGISTRY_PATH
-    _save_claude_projects.parent.mkdir(parents=True, exist_ok=True)
-    _save_claude_projects.write_text(json.dumps(registry, indent=2) + "\n", encoding="utf-8")
+    previous_name = str(profile.get("name", "")).strip()
+    previous_env = str(profile.get("env_file", "")).strip().lower()
+    registry["profiles"] = [
+        item
+        for item in registry.get("profiles", [])
+        if str(item.get("name", "")).strip() != previous_name
+        and str(item.get("env_file", "")).strip().lower() != previous_env
+    ]
+    registry.setdefault("profiles", []).append(new_profile)
+    registry["profiles"].sort(key=lambda item: str(item.get("name", "")).lower())
+    _save_registry(registry)
+    previous_env_path = Path(str(profile.get("env_file", "")).strip()) if profile.get("env_file") else None
+    new_env_path = Path(str(new_profile.get("env_file", "")).strip()) if new_profile.get("env_file") else None
+    if previous_env_path and previous_env_path != new_env_path:
+        previous_env_path.unlink(missing_ok=True)
 
 
 def update_profile(
     profile: dict[str, Any],
     *,
+    workspace: str | None = None,
+    discord_bot_token: str | None = None,
     bot_name: str | None = None,
     model: str | None = None,
     trigger_mode: str | None = None,
     allow_dms: bool | None = None,
     allowed_user_ids: str | None = None,
     allowed_channel_id: str | None = None,
+    allowed_channel_author_ids: str | None = None,
+    channel_no_mention_author_ids: str | None = None,
+    operator_ids: str | None = None,
+    channel_history_limit: str | None = None,
+    startup_dm_user_ids: str | None = None,
+    startup_dm_text: str | None = None,
+    startup_channel_text: str | None = None,
 ) -> None:
     relay_type = str(profile.get("_relay_type", "")).strip().lower()
     if relay_type == "codex":
         _update_codex_profile(
             profile,
+            workspace=workspace,
+            discord_bot_token=discord_bot_token,
             bot_name=bot_name,
             model=model,
             trigger_mode=trigger_mode,
             allow_dms=allow_dms,
             allowed_user_ids=allowed_user_ids,
             allowed_channel_id=allowed_channel_id,
+            allowed_channel_author_ids=allowed_channel_author_ids,
+            channel_no_mention_author_ids=channel_no_mention_author_ids,
+            channel_history_limit=channel_history_limit,
+            startup_dm_user_ids=startup_dm_user_ids,
+            startup_dm_text=startup_dm_text,
+            startup_channel_text=startup_channel_text,
         )
         return
     if relay_type == "claude":
         _update_claude_profile(
             profile,
+            workspace=workspace,
+            discord_bot_token=discord_bot_token,
             bot_name=bot_name,
             model=model,
             trigger_mode=trigger_mode,
             allow_dms=allow_dms,
             allowed_user_ids=allowed_user_ids,
             allowed_channel_id=allowed_channel_id,
+            operator_ids=operator_ids,
+            channel_history_limit=channel_history_limit,
         )
         return
     raise RuntimeError(f"Unknown relay type: {relay_type}")
@@ -692,12 +875,21 @@ def cmd_update(args: argparse.Namespace) -> int:
         allow_dms = False
     update_profile(
         profiles[0],
-        bot_name=args.bot_name,
-        model=args.model,
-        trigger_mode=args.trigger_mode,
+        workspace=getattr(args, "workspace", None),
+        discord_bot_token=getattr(args, "discord_bot_token", None),
+        bot_name=getattr(args, "bot_name", None),
+        model=getattr(args, "model", None),
+        trigger_mode=getattr(args, "trigger_mode", None),
         allow_dms=allow_dms,
-        allowed_user_ids=args.allowed_user_ids,
-        allowed_channel_id=args.allowed_channel_id,
+        operator_ids=getattr(args, "operator_ids", None),
+        allowed_user_ids=getattr(args, "allowed_user_ids", None),
+        allowed_channel_id=getattr(args, "allowed_channel_id", None),
+        allowed_channel_author_ids=getattr(args, "allowed_channel_author_ids", None),
+        channel_no_mention_author_ids=getattr(args, "channel_no_mention_author_ids", None),
+        channel_history_limit=getattr(args, "channel_history_limit", None),
+        startup_dm_user_ids=getattr(args, "startup_dm_user_ids", None),
+        startup_dm_text=getattr(args, "startup_dm_text", None),
+        startup_channel_text=getattr(args, "startup_channel_text", None),
     )
     refreshed = _filter_profiles(name=args.name, relay_type=args.type)
     record = _profile_json_record(refreshed[0]) if refreshed else {}
@@ -772,6 +964,38 @@ def cmd_logs(args: argparse.Namespace) -> int:
         print(json.dumps({"logs": [line for line in text.splitlines() if line.strip()]}))
         return 0
     print(text, end="")
+    return 0
+
+
+def cmd_chat(args: argparse.Namespace) -> int:
+    profiles = _filter_profiles(name=args.name, relay_type=args.type)
+    if not profiles:
+        print("No matching profiles found.")
+        return 1
+    payload = _chat_with_profile(
+        profiles[0],
+        message=str(args.message or "").strip(),
+        channel_id=args.channel_id,
+        sender_name=args.sender_name or "Operator",
+        sender_id=args.sender_id or "0",
+    )
+    if getattr(args, "json", False):
+        print(json.dumps(payload))
+        return 0
+    print(payload.get("reply", ""))
+    return 0
+
+
+def cmd_chat_history(args: argparse.Namespace) -> int:
+    profiles = _filter_profiles(name=args.name, relay_type=args.type)
+    if not profiles:
+        print("No matching profiles found.")
+        return 1
+    payload = {"messages": _read_operator_history(profiles[0])}
+    if getattr(args, "json", False):
+        print(json.dumps(payload))
+        return 0
+    print(json.dumps(payload, indent=2))
     return 0
 
 
@@ -1046,13 +1270,22 @@ def build_parser() -> argparse.ArgumentParser:
     update_parser = subparsers.add_parser("update-profile", help="Update editable relay profile settings.")
     update_parser.add_argument("name")
     update_parser.add_argument("--type", choices=("codex", "claude"), default=None)
+    update_parser.add_argument("--workspace")
+    update_parser.add_argument("--discord-bot-token")
     update_parser.add_argument("--bot-name")
     update_parser.add_argument("--model")
     update_parser.add_argument("--trigger-mode", choices=("all", "mention_or_dm", "dm_only"), default=None)
     update_parser.add_argument("--allow-dms", action="store_true", default=False)
     update_parser.add_argument("--deny-dms", action="store_true", default=False)
+    update_parser.add_argument("--operator-ids")
     update_parser.add_argument("--allowed-user-ids")
     update_parser.add_argument("--allowed-channel-id")
+    update_parser.add_argument("--allowed-channel-author-ids")
+    update_parser.add_argument("--channel-no-mention-author-ids")
+    update_parser.add_argument("--channel-history-limit")
+    update_parser.add_argument("--startup-dm-user-ids")
+    update_parser.add_argument("--startup-dm-text")
+    update_parser.add_argument("--startup-channel-text")
     update_parser.add_argument("--json", action="store_true", help="Output the updated profile as JSON")
     update_parser.set_defaults(func=cmd_update)
 
@@ -1062,6 +1295,22 @@ def build_parser() -> argparse.ArgumentParser:
     logs_parser.add_argument("--lines", type=int, default=80)
     logs_parser.add_argument("--json", action="store_true", help="Output logs as JSON")
     logs_parser.set_defaults(func=cmd_logs)
+
+    chat_parser = subparsers.add_parser("chat", help="Send a local operator message through a running relay.")
+    chat_parser.add_argument("name")
+    chat_parser.add_argument("--type", choices=("codex", "claude"), default=None)
+    chat_parser.add_argument("--message", required=True)
+    chat_parser.add_argument("--channel-id", default=None)
+    chat_parser.add_argument("--sender-name", default="Operator")
+    chat_parser.add_argument("--sender-id", default="0")
+    chat_parser.add_argument("--json", action="store_true", help="Output as JSON for API")
+    chat_parser.set_defaults(func=cmd_chat)
+
+    chat_history_parser = subparsers.add_parser("chat-history", help="Read local operator chat history for a relay.")
+    chat_history_parser.add_argument("name")
+    chat_history_parser.add_argument("--type", choices=("codex", "claude"), default=None)
+    chat_history_parser.add_argument("--json", action="store_true", help="Output as JSON for API")
+    chat_history_parser.set_defaults(func=cmd_chat_history)
 
     remove_parser = subparsers.add_parser("remove", help="Remove a profile from the unified registry.")
     remove_parser.add_argument("name")

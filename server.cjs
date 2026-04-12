@@ -79,7 +79,7 @@ app.get('/api/runtime-info', async (_req, res) => {
     apiBase: `http://${API_HOST}:${API_PORT}`,
     backendDir: BACKEND_DIR,
     packaged: process.env.NODE_ENV === 'production' || !!process.resourcesPath,
-    appVersion: process.env.npm_package_version || '2.0.7',
+    appVersion: process.env.npm_package_version || '2.0.8',
   });
 });
 
@@ -169,13 +169,22 @@ app.patch('/api/profiles/:id', async (req, res) => {
     return;
   }
   const args = ['cladex.py', 'update-profile', id, '--type', relayType, '--json'];
+  if (Object.prototype.hasOwnProperty.call(req.body, 'workspace')) args.push('--workspace', String(req.body?.workspace || '').trim());
+  if (Object.prototype.hasOwnProperty.call(req.body, 'discordToken')) args.push('--discord-bot-token', String(req.body?.discordToken || '').trim());
   if (Object.prototype.hasOwnProperty.call(req.body, 'botName')) args.push('--bot-name', String(req.body?.botName || '').trim());
   if (Object.prototype.hasOwnProperty.call(req.body, 'model')) args.push('--model', String(req.body?.model || '').trim());
   if (Object.prototype.hasOwnProperty.call(req.body, 'triggerMode')) args.push('--trigger-mode', String(req.body?.triggerMode || '').trim() || 'mention_or_dm');
   if (req.body?.allowDms === true) args.push('--allow-dms');
   if (req.body?.allowDms === false) args.push('--deny-dms');
+  if (Object.prototype.hasOwnProperty.call(req.body, 'operatorIds')) args.push('--operator-ids', String(req.body?.operatorIds || '').trim());
   if (Object.prototype.hasOwnProperty.call(req.body, 'allowedUserIds')) args.push('--allowed-user-ids', String(req.body?.allowedUserIds || '').trim());
   if (Object.prototype.hasOwnProperty.call(req.body, 'channelId')) args.push('--allowed-channel-id', String(req.body?.channelId || '').trim());
+  if (Object.prototype.hasOwnProperty.call(req.body, 'allowedChannelAuthorIds')) args.push('--allowed-channel-author-ids', String(req.body?.allowedChannelAuthorIds || '').trim());
+  if (Object.prototype.hasOwnProperty.call(req.body, 'channelNoMentionAuthorIds')) args.push('--channel-no-mention-author-ids', String(req.body?.channelNoMentionAuthorIds || '').trim());
+  if (Object.prototype.hasOwnProperty.call(req.body, 'channelHistoryLimit')) args.push('--channel-history-limit', String(req.body?.channelHistoryLimit || '').trim());
+  if (Object.prototype.hasOwnProperty.call(req.body, 'startupDmUserIds')) args.push('--startup-dm-user-ids', String(req.body?.startupDmUserIds || '').trim());
+  if (Object.prototype.hasOwnProperty.call(req.body, 'startupDmText')) args.push('--startup-dm-text', String(req.body?.startupDmText || '').trim());
+  if (Object.prototype.hasOwnProperty.call(req.body, 'startupChannelText')) args.push('--startup-channel-text', String(req.body?.startupChannelText || '').trim());
   try {
     res.json(await runJson(args));
   } catch (err) {
@@ -224,6 +233,41 @@ app.get('/api/profiles/:id/logs', async (req, res) => {
   }
 });
 
+app.get('/api/profiles/:id/chat/history', async (req, res) => {
+  const relayType = String(req.query.type || '').trim().toLowerCase();
+  if (relayType !== 'claude' && relayType !== 'codex') {
+    res.status(400).json({ error: 'type must be claude or codex' });
+    return;
+  }
+  try {
+    res.json(await runJson(['cladex.py', 'chat-history', req.params.id, '--type', relayType, '--json']));
+  } catch (err) {
+    res.status(500).json({ error: err?.message ?? 'Failed to load local chat history' });
+  }
+});
+
+app.post('/api/profiles/:id/chat', async (req, res) => {
+  const relayType = String(req.body?.type || '').trim().toLowerCase();
+  const message = String(req.body?.message || '').trim();
+  if (relayType !== 'claude' && relayType !== 'codex') {
+    res.status(400).json({ success: false, error: 'type must be claude or codex' });
+    return;
+  }
+  if (!message) {
+    res.status(400).json({ success: false, error: 'message is required' });
+    return;
+  }
+  const args = ['cladex.py', 'chat', req.params.id, '--type', relayType, '--message', message, '--json'];
+  if (req.body?.channelId) args.push('--channel-id', String(req.body.channelId).trim());
+  if (req.body?.senderName) args.push('--sender-name', String(req.body.senderName).trim());
+  if (req.body?.senderId) args.push('--sender-id', String(req.body.senderId).trim());
+  try {
+    res.json(await runJson(args));
+  } catch (err) {
+    res.status(500).json({ success: false, error: err?.message ?? 'Failed to send local operator message' });
+  }
+});
+
 app.post('/api/actions/stop-all', async (req, res) => {
   const relayType = String(req.body?.type || '').trim().toLowerCase();
   const args = ['cladex.py', 'stop-all', '--json'];
@@ -248,6 +292,12 @@ app.post('/api/profiles', async (req, res) => {
   const allowDms = Boolean(req.body?.allowDms);
   const operatorIds = String(req.body?.operatorIds || '').trim();
   const allowedUserIds = String(req.body?.allowedUserIds || '').trim();
+  const allowedChannelAuthorIds = String(req.body?.allowedChannelAuthorIds || '').trim();
+  const channelNoMentionAuthorIds = String(req.body?.channelNoMentionAuthorIds || '').trim();
+  const channelHistoryLimit = String(req.body?.channelHistoryLimit || '').trim();
+  const startupDmUserIds = String(req.body?.startupDmUserIds || '').trim();
+  const startupDmText = String(req.body?.startupDmText || '').trim();
+  const startupChannelText = String(req.body?.startupChannelText || '').trim();
 
   if (!name || !workspace || !discordToken || !channelId) {
     res.status(400).json({ success: false, error: 'name, workspace, discordToken, and channelId are required' });
@@ -276,6 +326,12 @@ app.post('/api/profiles', async (req, res) => {
       triggerMode,
       ...(allowDms ? ['--allow-dms'] : []),
       ...(model ? ['--model', model] : []),
+      ...(channelHistoryLimit ? ['--channel-history-limit', channelHistoryLimit] : []),
+      ...(startupDmText ? ['--startup-dm-text', startupDmText] : []),
+      ...(startupChannelText ? ['--startup-channel-text', startupChannelText] : []),
+      ...(startupDmUserIds ? startupDmUserIds.split(',').map((id) => id.trim()).filter(Boolean).flatMap((id) => ['--allowed-user-id', id]) : []),
+      ...(allowedChannelAuthorIds ? allowedChannelAuthorIds.split(',').map((id) => id.trim()).filter(Boolean).flatMap((id) => ['--allowed-channel-author-id', id]) : []),
+      ...(channelNoMentionAuthorIds ? channelNoMentionAuthorIds.split(',').map((id) => id.trim()).filter(Boolean).flatMap((id) => ['--channel-no-mention-author-id', id]) : []),
       ...[operatorIds, allowedUserIds].flatMap((value) => value.split(',').map((id) => id.trim()).filter(Boolean)).flatMap((id) => ['--allowed-user-id', id]),
     ]);
   } else {
@@ -293,6 +349,7 @@ app.post('/api/profiles', async (req, res) => {
         triggerMode,
         ...(allowDms ? ['--allow-dms'] : []),
         ...(model ? ['--model', model] : []),
+        ...(channelHistoryLimit ? ['--channel-history-limit', channelHistoryLimit] : []),
         ...(operatorIds ? ['--operator-ids', operatorIds] : []),
         ...(allowedUserIds ? ['--allowed-user-ids', allowedUserIds] : []),
       ],

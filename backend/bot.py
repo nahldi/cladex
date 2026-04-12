@@ -14,6 +14,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 
 import aiohttp
@@ -520,6 +521,11 @@ TURN_WATCHDOG_POLL_SECONDS = 15
 IDLE_CONNECTION_CLOSE_DELAY_SECONDS = 5
 READY_MARKER_PATH = CONFIG.state_dir / ".ready"
 AUTH_FAILURE_MARKER_PATH = CONFIG.state_dir / ".auth_failed"
+OPERATOR_DIR = CONFIG.state_dir / "operator"
+OPERATOR_REQUESTS_DIR = OPERATOR_DIR / "requests"
+OPERATOR_RESPONSES_DIR = OPERATOR_DIR / "responses"
+OPERATOR_HISTORY_PATH = OPERATOR_DIR / "history.json"
+OPERATOR_HISTORY_LIMIT = 80
 DURABLE_RUNTIME = DurableRuntime(
     state_dir=CONFIG.state_dir,
     repo_path=CONFIG.codex_workdir,
@@ -720,6 +726,7 @@ def _developer_instructions() -> str:
 
 STARTUP_COMPLETED = False
 SLASH_SYNC_COMPLETED = False
+OPERATOR_BRIDGE_TASK: asyncio.Task | None = None
 
 
 def _write_ready_marker() -> None:
@@ -1078,6 +1085,175 @@ def _history_key(message: discord.Message) -> str:
     if message.guild is None:
         return f"dm-{message.author.id}"
     return f"channel-{message.channel.id}"
+
+
+def _operator_history_messages() -> list[dict[str, object]]:
+    if not OPERATOR_HISTORY_PATH.exists():
+        return []
+    try:
+        payload = json.loads(OPERATOR_HISTORY_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    messages = payload.get("messages") if isinstance(payload, dict) else None
+    return messages if isinstance(messages, list) else []
+
+
+def _write_operator_history(messages: list[dict[str, object]]) -> None:
+    OPERATOR_DIR.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(
+        OPERATOR_HISTORY_PATH,
+        json.dumps({"messages": messages[-OPERATOR_HISTORY_LIMIT:]}, indent=2),
+    )
+
+
+def _append_operator_history(*, role: str, content: str, channel_id: int, sender_name: str) -> None:
+    history = _operator_history_messages()
+    history.append(
+        {
+            "id": f"operator-{int(time.time() * 1000)}",
+            "role": role,
+            "content": content.strip(),
+            "channelId": str(channel_id),
+            "senderName": sender_name,
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+    )
+    _write_operator_history(history)
+
+
+class _LocalOperatorTyping:
+    async def __aenter__(self) -> "_LocalOperatorTyping":
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> bool:
+        return False
+
+
+class _LocalOperatorCollector:
+    def __init__(self) -> None:
+        self._items: dict[int, str] = {}
+        self._order: list[int] = []
+        self._counter = 0
+
+    def create(self, content: str) -> "_LocalOperatorSentMessage":
+        self._counter += 1
+        message_id = self._counter
+        self._items[message_id] = str(content or "")
+        self._order.append(message_id)
+        return _LocalOperatorSentMessage(message_id, self)
+
+    def update(self, message_id: int, content: str | None = None) -> None:
+        if content is not None:
+            self._items[message_id] = str(content)
+
+    def rendered_text(self) -> str:
+        lines = []
+        for message_id in self._order:
+            text = self._items.get(message_id, "").strip()
+            if not text:
+                continue
+            if text in PROGRESS_FRAMES:
+                continue
+            lines.append(text)
+        return "\n\n".join(lines).strip()
+
+
+class _LocalOperatorSentMessage:
+    def __init__(self, message_id: int, collector: _LocalOperatorCollector) -> None:
+        self.id = message_id
+        self._collector = collector
+
+    async def edit(self, *, content: str | None = None, view=None) -> None:
+        self._collector.update(self.id, content)
+
+
+class _LocalOperatorGuild:
+    id = 0
+
+
+class _LocalOperatorAuthor:
+    def __init__(self, user_id: int, name: str) -> None:
+        self.id = user_id
+        self.name = name
+        self.display_name = name
+        self.global_name = name
+        self.bot = False
+
+
+class _LocalOperatorChannel:
+    def __init__(self, channel_id: int, collector: _LocalOperatorCollector) -> None:
+        self.id = channel_id
+        self._collector = collector
+
+    async def send(self, content: str, **_kwargs) -> _LocalOperatorSentMessage:
+        return self._collector.create(content)
+
+    def typing(self) -> _LocalOperatorTyping:
+        return _LocalOperatorTyping()
+
+    async def history(self, limit: int | None = None, oldest_first: bool = False):
+        if False:
+            yield limit, oldest_first
+        return
+
+
+class _LocalOperatorMessage:
+    def __init__(self, *, content: str, channel_id: int, author_id: int, author_name: str) -> None:
+        self.id = int(time.time() * 1000)
+        self.content = content
+        self.author = _LocalOperatorAuthor(author_id, author_name)
+        self.channel = _LocalOperatorChannel(channel_id, _LocalOperatorCollector())
+        self.guild = _LocalOperatorGuild()
+        self.created_at = datetime.now(timezone.utc)
+        self.mentions = [client.user] if client.user is not None else []
+        self.reference = None
+        self.webhook_id = None
+        self.attachments = []
+        self.embeds = []
+        self.stickers = []
+
+    async def reply(self, content: str, mention_author: bool = False, view=None):
+        return await self.channel.send(content, mention_author=mention_author, view=view)
+
+
+def _operator_author_id() -> int:
+    for pool in (
+        sorted(CONFIG.allowed_channel_author_ids),
+        sorted(CONFIG.allowed_user_ids),
+        sorted(CONFIG.startup_dm_user_ids),
+    ):
+        if pool:
+            return int(pool[0])
+    return 0
+
+
+def _operator_target_channel_id(explicit: str | None = None) -> int | None:
+    raw = str(explicit or "").strip()
+    if raw.isdigit():
+        return int(raw)
+    active_channels = sorted(
+        int(key.split("-", 1)[1])
+        for key in SESSIONS.keys()
+        if key.startswith("channel-") and key.split("-", 1)[1].isdigit()
+    )
+    if active_channels:
+        return active_channels[0]
+    if CONFIG.allowed_channel_ids:
+        return int(sorted(CONFIG.allowed_channel_ids)[0])
+    return None
+
+
+async def _handle_local_operator_message(*, content: str, channel_id: int, sender_name: str) -> str:
+    collector = _LocalOperatorCollector()
+    message = _LocalOperatorMessage(
+        content=content,
+        channel_id=channel_id,
+        author_id=_operator_author_id(),
+        author_name=sender_name,
+    )
+    message.channel = _LocalOperatorChannel(channel_id, collector)
+    await _handle_relay_message(message)
+    return collector.rendered_text()
 
 
 def _session_state_path(key: str) -> Path:
@@ -4422,6 +4598,48 @@ async def _handle_relay_message(message: discord.Message) -> None:
         return
 
 
+async def _process_operator_request(path: Path) -> None:
+    response_path = OPERATOR_RESPONSES_DIR / f"{path.stem}.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        content = str(payload.get("message", "")).strip()
+        sender_name = str(payload.get("senderName", "Operator")).strip() or "Operator"
+        channel_id = _operator_target_channel_id(str(payload.get("channelId", "")).strip())
+        if not content:
+            raise RuntimeError("Operator message was empty.")
+        if channel_id is None:
+            raise RuntimeError("No allowed Discord channel is configured for this relay.")
+        _append_operator_history(role="user", content=content, channel_id=channel_id, sender_name=sender_name)
+        reply = await _handle_local_operator_message(content=content, channel_id=channel_id, sender_name=sender_name)
+        if not reply:
+            reply = "No reply returned from the relay."
+        _append_operator_history(role="assistant", content=reply, channel_id=channel_id, sender_name=CONFIG.relay_bot_name or "Codex")
+        atomic_write_text(response_path, json.dumps({"ok": True, "reply": reply, "channelId": str(channel_id)}, indent=2))
+    except Exception as exc:
+        atomic_write_text(response_path, json.dumps({"ok": False, "error": str(exc)}, indent=2))
+    finally:
+        path.unlink(missing_ok=True)
+
+
+async def _operator_bridge_loop() -> None:
+    OPERATOR_REQUESTS_DIR.mkdir(parents=True, exist_ok=True)
+    OPERATOR_RESPONSES_DIR.mkdir(parents=True, exist_ok=True)
+    while True:
+        try:
+            for request_path in sorted(OPERATOR_REQUESTS_DIR.glob("*.json")):
+                processing_path = request_path.with_suffix(".processing")
+                try:
+                    os.replace(request_path, processing_path)
+                except OSError:
+                    continue
+                await _process_operator_request(processing_path)
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            _append_app_server_log_line(f"Operator bridge error: {exc}")
+        await asyncio.sleep(0.35)
+
+
 intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
@@ -4720,8 +4938,11 @@ async def _startup_preflight() -> None:
 
 @client.event
 async def on_ready() -> None:
-    global STARTUP_COMPLETED, SLASH_SYNC_COMPLETED
+    global STARTUP_COMPLETED, SLASH_SYNC_COMPLETED, OPERATOR_BRIDGE_TASK
     print(f"Discord relay connected as {client.user}")
+
+    if OPERATOR_BRIDGE_TASK is None or OPERATOR_BRIDGE_TASK.done():
+        OPERATOR_BRIDGE_TASK = asyncio.create_task(_operator_bridge_loop())
 
     if not SLASH_SYNC_COMPLETED:
         try:
@@ -4794,6 +5015,12 @@ async def _run() -> None:
         async with client:
             await client.start(CONFIG.discord_bot_token)
     finally:
+        global OPERATOR_BRIDGE_TASK
+        if OPERATOR_BRIDGE_TASK is not None:
+            OPERATOR_BRIDGE_TASK.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await OPERATOR_BRIDGE_TASK
+            OPERATOR_BRIDGE_TASK = None
         for session in list(SESSIONS.values()):
             try:
                 await session.shutdown()

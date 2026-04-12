@@ -15,6 +15,8 @@ import json
 import logging
 import os
 import sys
+import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -29,6 +31,7 @@ from claude_common import (
 )
 
 logger = logging.getLogger(__name__)
+OPERATOR_HISTORY_LIMIT = 80
 
 
 @dataclass
@@ -91,6 +94,11 @@ class ClaudeRelayBot(commands.Bot):
         self._backend: RelayBackend | None = None
         self._status = "starting"
         self._status_detail = ""
+        self._operator_task: asyncio.Task | None = None
+        self._operator_dir = self.state_dir / "operator"
+        self._operator_requests_dir = self._operator_dir / "requests"
+        self._operator_responses_dir = self._operator_dir / "responses"
+        self._operator_history_path = self._operator_dir / "history.json"
 
     async def setup_hook(self) -> None:
         """Called when bot is ready to start."""
@@ -107,9 +115,18 @@ class ClaudeRelayBot(commands.Bot):
             return
 
         logger.info(f"Claude backend started (session: {self._backend.session_id})")
+        self._operator_requests_dir.mkdir(parents=True, exist_ok=True)
+        self._operator_responses_dir.mkdir(parents=True, exist_ok=True)
+        self._operator_task = asyncio.create_task(self._operator_bridge_loop())
 
     async def close(self) -> None:
         """Cleanup on shutdown."""
+        if self._operator_task:
+            self._operator_task.cancel()
+            try:
+                await self._operator_task
+            except asyncio.CancelledError:
+                pass
         if self._backend:
             await self._backend.stop()
         await super().close()
@@ -269,6 +286,83 @@ class ClaudeRelayBot(commands.Bot):
             "timestamp": datetime.utcnow().isoformat(),
         }
         atomic_write_text(status_file, json.dumps(data, indent=2))
+
+    def _load_operator_history(self) -> list[dict]:
+        if not self._operator_history_path.exists():
+            return []
+        try:
+            payload = json.loads(self._operator_history_path.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+        messages = payload.get("messages") if isinstance(payload, dict) else None
+        return messages if isinstance(messages, list) else []
+
+    def _append_operator_history(self, *, role: str, content: str, channel_id: str, sender_name: str) -> None:
+        history = self._load_operator_history()
+        history.append(
+            {
+                "id": str(uuid.uuid4()),
+                "role": role,
+                "content": content.strip(),
+                "channelId": channel_id,
+                "senderName": sender_name,
+                "timestamp": datetime.utcnow().isoformat(),
+            }
+        )
+        atomic_write_text(
+            self._operator_history_path,
+            json.dumps({"messages": history[-OPERATOR_HISTORY_LIMIT:]}, indent=2),
+        )
+
+    def _preferred_operator_channel(self, explicit: str | None = None) -> str:
+        candidate = str(explicit or "").strip()
+        if candidate:
+            return candidate
+        if self._backend and self._backend.current_channel:
+            return self._backend.current_channel
+        if self.config.allowed_channel_ids:
+            return self.config.allowed_channel_ids[0]
+        return "gui"
+
+    async def _operator_bridge_loop(self) -> None:
+        while True:
+            try:
+                for request_path in sorted(self._operator_requests_dir.glob("*.json")):
+                    processing_path = request_path.with_suffix(".processing")
+                    try:
+                        os.replace(request_path, processing_path)
+                    except OSError:
+                        continue
+                    await self._handle_operator_request(processing_path)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("Claude operator bridge loop failed")
+            await asyncio.sleep(0.35)
+
+    async def _handle_operator_request(self, processing_path: Path) -> None:
+        response_path = self._operator_responses_dir / f"{processing_path.stem}.json"
+        try:
+            payload = json.loads(processing_path.read_text(encoding="utf-8"))
+            message = str(payload.get("message", "")).strip()
+            sender_name = str(payload.get("senderName", "Operator")).strip() or "Operator"
+            sender_id = str(payload.get("senderId", "0")).strip() or "0"
+            channel_id = self._preferred_operator_channel(str(payload.get("channelId", "")).strip())
+            if not message:
+                raise RuntimeError("Operator message was empty.")
+            self._append_operator_history(role="user", content=message, channel_id=channel_id, sender_name=sender_name)
+            reply = await self._backend.send_local_message(
+                channel_id=channel_id,
+                sender_id=sender_id,
+                sender_name=sender_name,
+                content=message,
+            )
+            self._append_operator_history(role="assistant", content=reply, channel_id=channel_id, sender_name=self.config.bot_name)
+            atomic_write_text(response_path, json.dumps({"ok": True, "reply": reply, "channelId": channel_id}, indent=2))
+        except Exception as exc:
+            atomic_write_text(response_path, json.dumps({"ok": False, "error": str(exc)}, indent=2))
+        finally:
+            processing_path.unlink(missing_ok=True)
 
 
 async def run_bot(config: BotConfig) -> None:

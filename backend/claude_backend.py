@@ -367,6 +367,7 @@ class ClaudeBackend:
                 channel_type=msg.channel_type,
                 channel_id=msg.channel_id,
                 content=content,
+                reply_to=msg.message_id,
                 is_final=True,
             )
         )
@@ -731,6 +732,7 @@ class RelayBackend:
 
         self._message_queue: asyncio.Queue[InboundMessage] = asyncio.Queue()
         self._worker_task: asyncio.Task | None = None
+        self._pending_local: dict[str, asyncio.Future[str]] = {}
 
     @property
     def session_id(self) -> str | None:
@@ -755,6 +757,10 @@ class RelayBackend:
     def _route_response(self, msg: OutboundMessage) -> None:
         if msg.channel_type == ChannelType.DISCORD:
             self._on_discord(msg.channel_id, msg.content)
+            return
+        future = self._pending_local.get(msg.reply_to)
+        if future and not future.done():
+            future.set_result(msg.content)
 
     async def start(self) -> bool:
         if not self._claude.start():
@@ -790,11 +796,42 @@ class RelayBackend:
             )
         )
 
+    async def send_local_message(
+        self,
+        *,
+        channel_id: str,
+        sender_id: str,
+        sender_name: str,
+        content: str,
+    ) -> str:
+        request_id = str(uuid.uuid4())
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[str] = loop.create_future()
+        self._pending_local[request_id] = future
+        await self._message_queue.put(
+            InboundMessage(
+                channel_type=ChannelType.GUI,
+                channel_id=channel_id,
+                sender_id=sender_id,
+                sender_name=sender_name,
+                content=content,
+                message_id=request_id,
+            )
+        )
+        try:
+            return await asyncio.wait_for(future, timeout=600)
+        finally:
+            self._pending_local.pop(request_id, None)
+
     async def _process_messages(self) -> None:
         while True:
             try:
                 msg = await self._message_queue.get()
-                await asyncio.to_thread(self._claude.process_message, msg)
+                ok = await asyncio.to_thread(self._claude.process_message, msg)
+                if msg.channel_type == ChannelType.GUI:
+                    future = self._pending_local.get(msg.message_id)
+                    if future and not future.done() and not ok:
+                        future.set_exception(RuntimeError("Claude local operator turn failed."))
                 self._message_queue.task_done()
             except asyncio.CancelledError:
                 break

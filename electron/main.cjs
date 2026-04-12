@@ -1,4 +1,4 @@
-const { app, BrowserWindow, shell } = require('electron');
+const { app, BrowserWindow, shell, ipcMain, dialog } = require('electron');
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
@@ -108,6 +108,7 @@ function createWindow() {
     webPreferences: {
       nodeIntegration: false,
       contextIsolation: true,
+      preload: path.join(__dirname, 'preload.cjs'),
     },
     show: false,
     autoHideMenuBar: true,
@@ -133,6 +134,15 @@ function createWindow() {
     mainWindow = null;
   });
 }
+
+ipcMain.handle('cladex:choose-directory', async () => {
+  const target = BrowserWindow.getFocusedWindow() || mainWindow;
+  const result = await dialog.showOpenDialog(target || undefined, {
+    title: 'Choose workspace folder',
+    properties: ['openDirectory', 'createDirectory'],
+  });
+  return result.canceled ? '' : (result.filePaths[0] || '');
+});
 
 app.whenReady().then(async () => {
   try {

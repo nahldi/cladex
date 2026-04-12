@@ -288,3 +288,43 @@ def test_project_list_json(monkeypatch, capsys) -> None:
     payload = json.loads(capsys.readouterr().out)
     assert payload[0]["name"] == "core"
     assert payload[0]["members"][0]["displayName"] == "Tyson"
+
+
+def test_load_cladex_projects_migrates_legacy_codex_projects(monkeypatch) -> None:
+    saved: list[dict] = []
+    monkeypatch.setattr(cladex, "CLADEX_PROJECTS_PATH", Path("C:/missing/projects.json"))
+    monkeypatch.setattr(
+        cladex.relayctl,
+        "_load_registry",
+        lambda: {"projects": [{"name": "gl", "profiles": ["kurt-0cc9b99f-66db"]}]},
+    )
+    monkeypatch.setattr(
+        cladex,
+        "_filter_profiles",
+        lambda name=None, relay_type=None: [
+            {"name": "kurt-0cc9b99f-66db", "_relay_type": "codex", "workspace": "C:/workspace/kurt"}
+        ] if name == "kurt-0cc9b99f-66db" else [],
+    )
+    monkeypatch.setattr(cladex, "_save_cladex_projects", lambda payload: saved.append(payload))
+
+    payload = cladex._load_cladex_projects()
+
+    assert payload["projects"][0]["name"] == "gl"
+    assert payload["projects"][0]["members"][0]["name"] == "kurt-0cc9b99f-66db"
+    assert saved[0]["projects"][0]["name"] == "gl"
+
+
+def test_cmd_chat_history_returns_operator_messages(monkeypatch, capsys) -> None:
+    profile = {"name": "codex-one", "_relay_type": "codex"}
+    monkeypatch.setattr(cladex, "_filter_profiles", lambda name=None, relay_type=None: [profile])
+    monkeypatch.setattr(
+        cladex,
+        "_read_operator_history",
+        lambda selected: [{"id": "m1", "role": "assistant", "content": "Ready.", "channelId": "123"}],
+    )
+
+    rc = cladex.cmd_chat_history(SimpleNamespace(name="codex-one", type="codex", json=True))
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["messages"][0]["content"] == "Ready."
