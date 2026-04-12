@@ -246,19 +246,18 @@ export default function App() {
     <div className={`relative min-h-screen overflow-hidden font-sans transition-colors duration-500 selection:bg-indigo-500/30 ${isDark ? 'bg-[#050505] text-gray-100' : 'bg-[#f2efe7] text-slate-900'}`}>
       <CladexBackground isDark={isDark} />
       <div className={`pointer-events-none absolute inset-0 z-0 transition-opacity duration-500 ${isDark ? 'bg-[radial-gradient(circle_at_top,rgba(249,115,22,0.12),transparent_28%),radial-gradient(circle_at_bottom_right,rgba(16,185,129,0.12),transparent_32%)] opacity-100' : 'bg-[radial-gradient(circle_at_top,rgba(212,115,94,0.16),transparent_30%),radial-gradient(circle_at_bottom_right,rgba(125,181,165,0.18),transparent_34%)] opacity-80'}`} />
-      <main className="relative z-10 flex max-h-screen min-h-screen flex-col overflow-y-auto pb-28">
-        <header className="mx-auto flex w-full max-w-6xl items-start justify-between gap-6 px-8 pb-4 pt-8">
+      <main className="relative z-10 flex min-h-screen flex-col overflow-y-auto pb-28">
+        <header className="mx-auto flex w-full max-w-7xl items-start justify-between gap-6 px-8 pb-1 pt-7">
           <div className="flex items-center gap-4">
-            <div className={`relative h-14 w-14 overflow-hidden rounded-[20px] border shadow-[0_0_35px_rgba(99,102,241,0.18)] ${isDark ? 'border-white/10 bg-white/5' : 'border-black/10 bg-white/70 shadow-[0_0_35px_rgba(212,115,94,0.12)]'}`}>
+            <div className={`relative h-12 w-12 overflow-hidden rounded-[18px] border shadow-[0_0_28px_rgba(99,102,241,0.16)] ${isDark ? 'border-white/10 bg-white/5' : 'border-black/10 bg-white/70 shadow-[0_0_30px_rgba(212,115,94,0.12)]'}`}>
               <img src={CLADEX_LOGO} alt="CLADEX" className="h-full w-full object-cover" />
             </div>
             <div>
-              <h1 className={`text-[2.7rem] leading-none font-black tracking-tight ${isDark ? 'text-white' : 'text-slate-900'}`}>CLADEX</h1>
-              <p className={`mt-2 font-mono text-[11px] uppercase tracking-[0.32em] ${isDark ? 'text-orange-300/90' : 'text-[#b15f4e]'}`}>Unified Relay Network</p>
-              <p className={`mt-3 max-w-xl text-sm ${isDark ? 'text-gray-400' : 'text-slate-600'}`}>Claude and Codex relay control with live runtime state behind every card. Readable labels, real settings, real logs.</p>
+              <h1 className={`text-[2.55rem] leading-none font-black tracking-tight ${isDark ? 'text-white' : 'text-slate-900'}`}>ClaDex</h1>
+              <p className={`mt-2 font-mono text-[11px] uppercase tracking-[0.32em] ${isDark ? 'text-orange-300/85' : 'text-[#b15f4e]'}`}>Unified Relay Network</p>
             </div>
           </div>
-          <div className="hidden gap-2 self-center md:flex">
+          <div className="flex gap-2 self-start pt-6">
             <MiniIconButton label="Refresh" icon={<RefreshCw size={15} />} onClick={() => void loadAll()} />
             <MiniIconButton label="Stop All" icon={<PauseCircle size={15} />} tone="danger" onClick={() => void runAction('stop-all', api.stopAll)} />
           </div>
@@ -273,6 +272,8 @@ export default function App() {
                 profiles={profiles}
                 loading={loading}
                 busyKey={busyKey}
+                errorText={errorText}
+                onRefresh={() => void loadAll()}
                 onStart={(profile) => void runAction(`start-${profile.id}`, () => api.startRelay(profile.id, profile.relayType))}
                 onStop={(profile) => void runAction(`stop-${profile.id}`, () => api.stopRelay(profile.id, profile.relayType))}
                 onRestart={(profile) => void runAction(`restart-${profile.id}`, () => api.restartRelay(profile.id, profile.relayType))}
@@ -333,6 +334,8 @@ function RelayDashboard({
   profiles,
   loading,
   busyKey,
+  errorText,
+  onRefresh,
   onStart,
   onStop,
   onRestart,
@@ -343,6 +346,8 @@ function RelayDashboard({
   profiles: Profile[];
   loading: boolean;
   busyKey: string | null;
+  errorText: string;
+  onRefresh: () => void;
   onStart: (profile: Profile) => void;
   onStop: (profile: Profile) => void;
   onRestart: (profile: Profile) => void;
@@ -351,17 +356,13 @@ function RelayDashboard({
   onLogs: (profile: Profile) => void;
 }) {
   return (
-    <div className="mx-auto flex w-full max-w-6xl flex-1 flex-col px-8 pb-10 pt-3">
-      <div className="mb-5 flex flex-wrap items-center justify-between gap-4">
-        <div>
-          <div className="text-[11px] font-bold uppercase tracking-[0.28em] text-slate-500 dark:text-gray-500">Relay canvas</div>
-          <div className="mt-2 text-sm text-slate-600 dark:text-gray-400">Start, stop, edit, inspect, and recover each relay from one surface.</div>
-        </div>
-      </div>
+    <div className="mx-auto flex w-full max-w-7xl flex-1 flex-col px-8 pb-10 pt-4">
       {loading ? (
         <div className="flex h-[50vh] items-center justify-center">
           <Loader2 className="h-8 w-8 animate-spin text-indigo-300" />
         </div>
+      ) : errorText && profiles.length === 0 ? (
+        <EmptyState title="CLADEX could not reach the local relay API." detail="Use Refresh once the packaged backend is up. This is a runtime startup error, not an empty relay list." actionLabel="Refresh" onAction={onRefresh} />
       ) : profiles.length === 0 ? (
         <EmptyState title="No relays configured yet." detail="Choose Add Relay and register a Claude or Codex workspace." />
       ) : (
@@ -437,7 +438,7 @@ function RelayCard({
       onMouseLeave={resetPointer}
       style={{ rotateX, rotateY, transformStyle: 'preserve-3d' }}
       whileHover={{ scale: 1.01 }}
-      className="group relative h-[272px] [perspective:1200px]"
+      className="group relative h-[264px] [perspective:1200px]"
     >
       <div className="absolute inset-0 rounded-[32px] bg-black/25 blur-2xl dark:bg-black/35" />
       <div className="relative h-full overflow-hidden rounded-[28px] border border-slate-200/70 bg-white/70 p-5 shadow-[0_18px_44px_rgba(15,23,42,0.12)] backdrop-blur-xl transition-colors duration-500 dark:border-white/10 dark:bg-[#09090b]/90 dark:shadow-2xl">
@@ -454,6 +455,7 @@ function RelayCard({
           <div className="flex gap-2">
             <MiniIconButton label="Logs" icon={<FileText size={14} />} onClick={onLogs} />
             <MiniIconButton label="Edit" icon={<Pencil size={14} />} onClick={onEdit} />
+            <MiniIconButton label="Restart" icon={<RotateCcw size={14} />} onClick={onRestart} />
             <MiniIconButton label="Remove" icon={<Trash2 size={14} />} tone="danger" onClick={onDelete} />
           </div>
         </div>
@@ -479,22 +481,15 @@ function RelayCard({
           </div>
         </div>
 
-        <div className="flex flex-wrap gap-2">
-          <MetaPill label={profile.provider || 'Relay runtime'} mono />
-          <MetaPill label={profile.model || (profile.type === 'Codex' ? 'gpt-5.4' : 'claude-opus-4-5-20251101')} mono />
-          <MetaPill label={profile.allowDms ? 'DMs on' : 'DMs off'} />
-        </div>
-
         <div className="mt-4 flex items-end justify-between gap-4">
           <div className="flex items-center gap-2 text-sm text-slate-500 dark:text-gray-400">
             <span className={`h-2.5 w-2.5 rounded-full ${running ? (isClaude ? 'bg-orange-400' : 'bg-emerald-400') : 'bg-slate-400 dark:bg-gray-600'} ${running ? 'animate-pulse' : ''}`} />
             <div>
-              <div className="font-medium text-slate-700 dark:text-gray-200">{running ? (profile.state === 'working' ? 'Working' : 'Listening') : 'Stopped'}</div>
-              <div className="mt-1 text-xs text-slate-500 dark:text-gray-500">{relayCardNote(profile)}</div>
+              <div className="font-medium text-slate-700 dark:text-gray-200">{running ? (profile.state === 'working' ? 'Working...' : 'Listening') : 'Offline'}</div>
+              <div className="mt-1 text-xs text-slate-500 dark:text-gray-500">{running ? relayCardNote(profile) : 'Stopped'}</div>
             </div>
           </div>
           <div className="flex items-center gap-2">
-            <MiniIconButton label="Restart" icon={<RotateCcw size={14} />} onClick={onRestart} />
             <button
               onClick={running ? onStop : onStart}
               disabled={busy}
@@ -936,8 +931,8 @@ function MetaPill({ label, mono = false }: { label: string; mono?: boolean }) {
   );
 }
 
-function EmptyState({ title, detail, compact = false }: { title: string; detail: string; compact?: boolean }) {
-  return <div className={`flex flex-col items-center justify-center rounded-2xl border border-slate-200/80 bg-white/70 px-6 text-center dark:border-white/10 dark:bg-white/[0.03] ${compact ? 'h-48 py-8' : 'h-64 py-12'}`}><Activity size={compact ? 28 : 40} className="mb-4 text-slate-400 dark:text-gray-600" /><div className="text-lg font-semibold text-slate-900 dark:text-white">{title}</div><div className="mt-2 max-w-xl text-sm text-slate-500 dark:text-gray-500">{detail}</div></div>;
+function EmptyState({ title, detail, compact = false, actionLabel, onAction }: { title: string; detail: string; compact?: boolean; actionLabel?: string; onAction?: () => void }) {
+  return <div className={`flex flex-col items-center justify-center rounded-2xl border border-slate-200/80 bg-white/70 px-6 text-center dark:border-white/10 dark:bg-white/[0.03] ${compact ? 'h-48 py-8' : 'h-64 py-12'}`}><Activity size={compact ? 28 : 40} className="mb-4 text-slate-400 dark:text-gray-600" /><div className="text-lg font-semibold text-slate-900 dark:text-white">{title}</div><div className="mt-2 max-w-xl text-sm text-slate-500 dark:text-gray-500">{detail}</div>{actionLabel && onAction ? <button onClick={onAction} className="mt-5 rounded-2xl bg-indigo-600 px-4 py-2 text-sm font-semibold text-white transition-colors hover:bg-indigo-500">{actionLabel}</button> : null}</div>;
 }
 
 function InfoRow({ label, value, mono = false }: { label: string; value: string; mono?: boolean }) {

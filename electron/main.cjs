@@ -1,6 +1,6 @@
 const { app, BrowserWindow, shell } = require('electron');
-const { fork } = require('child_process');
 const http = require('http');
+const fs = require('fs');
 const path = require('path');
 
 let mainWindow = null;
@@ -8,62 +8,66 @@ let apiServer = null;
 const API_PORT = Number(process.env.API_PORT || 3001);
 const API_HOST = process.env.API_HOST || '127.0.0.1';
 
-const isDev = !app.isPackaged;
-
-function startApiServer() {
-  const serverPath = app.isPackaged
-    ? path.join(process.resourcesPath, 'app.asar.unpacked', 'server.cjs')
-    : path.join(__dirname, '..', 'server.cjs');
-  const serverCwd = app.isPackaged
-    ? process.resourcesPath
-    : path.join(__dirname, '..');
-
-  apiServer = fork(serverPath, [], {
-    cwd: serverCwd,
-    silent: true,
-    windowsHide: true,
-  });
-
-  apiServer.stdout?.on('data', (data) => {
-    console.log(`API: ${data}`);
-  });
-
-  apiServer.stderr?.on('data', (data) => {
-    console.error(`API Error: ${data}`);
-  });
-
-  apiServer.on('close', (code) => {
-    console.log(`API server exited with code ${code}`);
-  });
+const singleInstanceLock = app.requestSingleInstanceLock();
+if (!singleInstanceLock) {
+  app.quit();
 }
 
-function waitForApi(timeoutMs = 10000) {
+function logDesktop(message) {
+  try {
+    const logDir = app.getPath('userData');
+    fs.mkdirSync(logDir, { recursive: true });
+    fs.appendFileSync(path.join(logDir, 'desktop.log'), `[${new Date().toISOString()}] ${message}\n`, 'utf8');
+  } catch {}
+}
+
+function getServerModulePath() {
+  return app.isPackaged
+    ? path.join(app.getAppPath(), 'server.cjs')
+    : path.join(__dirname, '..', 'server.cjs');
+}
+
+async function startApiServer() {
+  if (apiServer) {
+    return apiServer;
+  }
+  const serverModulePath = getServerModulePath();
+  logDesktop(`Starting API from ${serverModulePath}`);
+  // eslint-disable-next-line global-require, import/no-dynamic-require
+  const serverModule = require(serverModulePath);
+  try {
+    apiServer = await serverModule.startServer({ host: API_HOST, port: API_PORT, quiet: false });
+    logDesktop(`API started on ${API_HOST}:${API_PORT}`);
+  } catch (error) {
+    if (error && error.code === 'EADDRINUSE') {
+      logDesktop(`API port ${API_PORT} already in use, waiting for existing server`);
+      await waitForApi();
+      return null;
+    }
+    logDesktop(`API start failed: ${error && error.stack ? error.stack : error}`);
+    throw error;
+  }
+  return apiServer;
+}
+
+function waitForApi(timeoutMs = 8000) {
   const startedAt = Date.now();
   return new Promise((resolve, reject) => {
     const attempt = () => {
-      const request = http.get(
-        {
-          host: API_HOST,
-          port: API_PORT,
-          path: '/api/runtime-info',
-          timeout: 1200,
-        },
-        (response) => {
-          response.resume();
-          if (response.statusCode && response.statusCode >= 200 && response.statusCode < 500) {
-            resolve();
-            return;
-          }
-          retry();
-        },
-      );
+      const request = http.get({ host: API_HOST, port: API_PORT, path: '/api/runtime-info', timeout: 1000 }, (response) => {
+        response.resume();
+        if (response.statusCode && response.statusCode >= 200 && response.statusCode < 500) {
+          resolve();
+          return;
+        }
+        retry();
+      });
       request.on('error', retry);
       request.on('timeout', () => {
         request.destroy();
         retry();
       });
     };
-
     const retry = () => {
       if (Date.now() - startedAt > timeoutMs) {
         reject(new Error(`CLADEX API server did not become ready on ${API_HOST}:${API_PORT}`));
@@ -71,9 +75,19 @@ function waitForApi(timeoutMs = 10000) {
       }
       setTimeout(attempt, 250);
     };
-
     attempt();
   });
+}
+
+async function stopApiServer() {
+  if (!apiServer) {
+    return;
+  }
+  const serverModulePath = getServerModulePath();
+  // eslint-disable-next-line global-require, import/no-dynamic-require
+  const serverModule = require(serverModulePath);
+  await serverModule.stopServer();
+  apiServer = null;
 }
 
 function createWindow() {
@@ -121,13 +135,23 @@ function createWindow() {
 }
 
 app.whenReady().then(async () => {
-  startApiServer();
   try {
-    await waitForApi();
+    await startApiServer();
   } catch (error) {
     console.error(error);
+    logDesktop(`Startup error: ${error && error.stack ? error.stack : error}`);
   }
   createWindow();
+
+  app.on('second-instance', () => {
+    if (!mainWindow) {
+      return;
+    }
+    if (mainWindow.isMinimized()) {
+      mainWindow.restore();
+    }
+    mainWindow.focus();
+  });
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
@@ -137,16 +161,12 @@ app.whenReady().then(async () => {
 });
 
 app.on('window-all-closed', () => {
-  if (apiServer) {
-    apiServer.kill();
-  }
+  void stopApiServer();
   if (process.platform !== 'darwin') {
     app.quit();
   }
 });
 
 app.on('before-quit', () => {
-  if (apiServer) {
-    apiServer.kill();
-  }
+  void stopApiServer();
 });

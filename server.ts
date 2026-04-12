@@ -12,6 +12,7 @@ const execFileAsync = promisify(execFile);
 const app = express();
 const API_HOST = process.env.API_HOST || '127.0.0.1';
 const API_PORT = Number(process.env.API_PORT || 3001);
+let serverInstance: import('http').Server | null = null;
 
 app.use(express.json());
 app.use((req, res, next) => {
@@ -118,7 +119,7 @@ app.get('/api/runtime-info', async (_req, res) => {
     apiBase: `http://${API_HOST}:${API_PORT}`,
     backendDir: BACKEND_DIR,
     packaged: app.get('env') === 'production' || !!process.resourcesPath,
-    appVersion: process.env.npm_package_version || '2.0.4',
+    appVersion: process.env.npm_package_version || '2.0.5',
   };
   res.json(payload);
 });
@@ -411,6 +412,49 @@ app.delete('/api/projects/:name', async (req, res) => {
   res.json({ success: true });
 });
 
-app.listen(API_PORT, API_HOST, () => {
-  console.log(`CLADEX API server running on http://${API_HOST}:${API_PORT}`);
-});
+export function startServer(options: { host?: string; port?: number; quiet?: boolean } = {}) {
+  const host = options.host || API_HOST;
+  const port = Number(options.port || API_PORT);
+  const quiet = Boolean(options.quiet);
+
+  if (serverInstance) {
+    return Promise.resolve(serverInstance);
+  }
+
+  return new Promise<import('http').Server>((resolve, reject) => {
+    const server = app.listen(port, host, () => {
+      serverInstance = server;
+      if (!quiet) {
+        console.log(`CLADEX API server running on http://${host}:${port}`);
+      }
+      resolve(server);
+    });
+    server.on('error', (error) => {
+      reject(error);
+    });
+  });
+}
+
+export function stopServer() {
+  if (!serverInstance) {
+    return Promise.resolve();
+  }
+  const activeServer = serverInstance;
+  serverInstance = null;
+  return new Promise<void>((resolve, reject) => {
+    activeServer.close((error?: Error | undefined) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+      resolve();
+    });
+  });
+}
+
+if (process.argv[1] && path.resolve(process.argv[1]) === __filename) {
+  startServer().catch((error) => {
+    console.error(error);
+    process.exitCode = 1;
+  });
+}

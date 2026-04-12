@@ -1,6 +1,6 @@
 {
   "name": "cladex-codex-relay",
-  "version": "2.0.4",
+  "version": "2.0.5",
   "description": "Launch the CLADEX Codex relay from the current workspace.",
   "author": {
     "name": "CLADEX Contributors"
