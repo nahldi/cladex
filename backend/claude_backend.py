@@ -552,6 +552,7 @@ class ClaudeBackend:
             "could not find session",
             "unknown session",
             "invalid session",
+            "no conversation found",
             "resume",
         ]
         return any(needle in haystack for needle in needles)
