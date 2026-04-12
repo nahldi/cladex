@@ -493,16 +493,14 @@ class ClaudeBackend:
             try:
                 event = json.loads(line)
             except json.JSONDecodeError:
-                text_parts.append(line)
+                # Skip non-JSON lines (verbose debug output)
                 continue
             text = self._extract_text_from_event(event)
             if text:
                 text_parts.append(text)
 
         collapsed = "".join(text_parts).strip()
-        if collapsed:
-            return collapsed
-        return stdout.strip()
+        return collapsed
 
     def _extract_text_from_event(self, event: dict) -> str:
         event_type = event.get("type", "")
