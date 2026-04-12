@@ -368,7 +368,7 @@ def start_profile(profile: dict[str, Any]) -> None:
     else:
         popen_kwargs["start_new_session"] = True
 
-    bot_script = _backend_script_path("bot.py")
+    bot_script = _backend_script_path("claude_bot.py")
     process = subprocess.Popen(
         [relayctl._background_python_windowless_executable(), bot_script],
         **popen_kwargs,
