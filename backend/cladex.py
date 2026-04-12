@@ -379,10 +379,6 @@ def start_profile(profile: dict[str, Any]) -> None:
     pid_file = state_dir / "relay.pid"
     pid_file.write_text(str(process.pid))
 
-    print(f"Claude relay started for `{profile.get('name', 'unknown')}`")
-    print(f"workspace: {workspace}")
-    print(f"log: {log_file}")
-
 
 def stop_profile(profile: dict[str, Any]) -> None:
     relay_type = str(profile.get("_relay_type", "")).strip().lower()
@@ -401,8 +397,6 @@ def stop_profile(profile: dict[str, Any]) -> None:
     # Clean up PID file
     pid_file = _claude_state_dir(profile) / "relay.pid"
     pid_file.unlink(missing_ok=True)
-
-    print(f"Claude relay stopped for `{profile.get('name', 'unknown')}`")
 
 
 def restart_profile(profile: dict[str, Any]) -> None:
