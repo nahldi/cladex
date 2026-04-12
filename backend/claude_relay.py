@@ -279,7 +279,10 @@ def cmd_setup(args: argparse.Namespace) -> int:
 
 def cmd_register(args: argparse.Namespace) -> int:
     """Register workspace with bot token."""
-    workspace = workspace_root(Path.cwd())
+    if args.workspace:
+        workspace = workspace_root(Path(args.workspace).resolve())
+    else:
+        workspace = workspace_root(Path.cwd())
 
     env = {
         "DISCORD_BOT_TOKEN": args.discord_bot_token,
@@ -419,11 +422,7 @@ def cmd_gui(args: argparse.Namespace) -> int:
 
     kwargs = {"close_fds": True}
     if os.name == "nt":
-        kwargs["creationflags"] = (
-            getattr(subprocess, "DETACHED_PROCESS", 0)
-            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-            | getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        )
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
     else:
         kwargs["start_new_session"] = True
         kwargs["stdout"] = subprocess.DEVNULL
@@ -479,6 +478,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                 stdout=log,
                 stderr=subprocess.STDOUT,
                 cwd=str(workspace),
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
             )
             process.wait()
     except KeyboardInterrupt:
@@ -511,6 +511,7 @@ def main() -> int:
 
     # register
     reg_parser = subparsers.add_parser("register", help="Register workspace")
+    reg_parser.add_argument("--workspace", help="Workspace path (defaults to cwd)")
     reg_parser.add_argument("--discord-bot-token", required=True)
     reg_parser.add_argument("--bot-name")
     reg_parser.add_argument("--operator-ids")

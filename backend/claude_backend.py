@@ -583,6 +583,7 @@ class ClaudeBackend:
                 capture_output=True,
                 text=True,
                 check=False,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
             )
         except Exception:
             return []

@@ -43,6 +43,7 @@ def _repo_branch(path: Path) -> str:
             check=True,
             capture_output=True,
             text=True,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
         return result.stdout.strip() or "HEAD"
     except Exception:
@@ -56,6 +57,7 @@ def _head_commit(path: Path) -> str:
             check=True,
             capture_output=True,
             text=True,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
         return result.stdout.strip() or ""
     except Exception:
@@ -825,6 +827,7 @@ class WorktreeManager:
                 check=True,
                 capture_output=True,
                 text=True,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
             ).stdout.strip()
             if branch_exists:
                 subprocess.run(
@@ -832,6 +835,7 @@ class WorktreeManager:
                     check=True,
                     capture_output=True,
                     text=True,
+                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
                 )
             else:
                 subprocess.run(
@@ -839,6 +843,7 @@ class WorktreeManager:
                     check=True,
                     capture_output=True,
                     text=True,
+                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
                 )
             return worktree_path, _repo_branch(worktree_path)
         except Exception:
@@ -912,6 +917,7 @@ class VerificationEngine:
                 capture_output=True,
                 text=True,
                 check=False,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
             )
             changed = {line.strip().replace("\\", "/") for line in result.stdout.splitlines() if line.strip()}
             target = claim_text.strip().replace("\\", "/")
@@ -925,6 +931,7 @@ class VerificationEngine:
                     check=True,
                     capture_output=True,
                     text=True,
+                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
                 )
                 return "verified", f"git cat-file confirmed commit {claim_text}"
             except Exception:
@@ -935,6 +942,7 @@ class VerificationEngine:
                 capture_output=True,
                 text=True,
                 check=False,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
             )
             if result.stdout.strip():
                 return "verified", f"git branch lists `{claim_text}`"
@@ -945,6 +953,7 @@ class VerificationEngine:
                 capture_output=True,
                 text=True,
                 check=False,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
             )
             if result.returncode == 0 and result.stdout.strip():
                 first = result.stdout.splitlines()[0].strip()
@@ -992,7 +1001,15 @@ class VerificationEngine:
             runner = ["cmd", "/c", command]
         else:
             runner = ["sh", "-lc", command]
-        result = subprocess.run(runner, cwd=binding.worktree_path, capture_output=True, text=True, check=False, timeout=120)
+        result = subprocess.run(
+            runner,
+            cwd=binding.worktree_path,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=120,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
         if result.returncode == 0:
             return "verified", f"Reran cheap validation successfully: {command}"
         stderr = (result.stderr or result.stdout or "").strip().splitlines()

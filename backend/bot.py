@@ -637,21 +637,7 @@ def _uses_websocket_transport() -> bool:
 def _windows_hidden_subprocess_kwargs() -> dict[str, object]:
     if os.name != "nt":
         return {}
-    kwargs: dict[str, object] = {}
-    creationflags = (
-        getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        | getattr(subprocess, "DETACHED_PROCESS", 0)
-        | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-    )
-    if creationflags:
-        kwargs["creationflags"] = creationflags
-    startupinfo_factory = getattr(subprocess, "STARTUPINFO", None)
-    if startupinfo_factory is not None:
-        startupinfo = startupinfo_factory()
-        startupinfo.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 0)
-        startupinfo.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
-        kwargs["startupinfo"] = startupinfo
-    return kwargs
+    return {"creationflags": subprocess.CREATE_NO_WINDOW}
 
 
 def _native_codex_login_status() -> tuple[bool, str]:

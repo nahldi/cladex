@@ -47,6 +47,7 @@ def workspace_root(path: Path) -> Path:
             check=True,
             capture_output=True,
             text=True,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
     except Exception:
         return path
@@ -118,6 +119,7 @@ def claude_code_version() -> str:
             text=True,
             check=False,
             timeout=10,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
         return (result.stdout or result.stderr or "").strip() or "unknown"
     except Exception:

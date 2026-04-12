@@ -455,26 +455,25 @@ app.post('/api/profiles', async (req, res) => {
       ...[operatorIds, allowedUserIds].flatMap((value) => value.split(',').map((id) => id.trim()).filter(Boolean)).flatMap((id) => ['--allowed-user-id', id]),
     ]);
   } else {
-    result = await runPython(
-      [
-        'claude_relay.py',
-        'register',
-        '--discord-bot-token',
-        discordToken,
-        '--bot-name',
-        name,
-        '--allowed-channel-id',
-        channelId,
-        '--trigger-mode',
-        triggerMode,
-        ...(allowDms ? ['--allow-dms'] : []),
-        ...(model ? ['--model', model] : []),
-        ...(channelHistoryLimit ? ['--channel-history-limit', channelHistoryLimit] : []),
-        ...(operatorIds ? ['--operator-ids', operatorIds] : []),
-        ...(allowedUserIds ? ['--allowed-user-ids', allowedUserIds] : []),
-      ],
+    result = await runPython([
+      'claude_relay.py',
+      'register',
+      '--workspace',
       absoluteWorkspace,
-    );
+      '--discord-bot-token',
+      discordToken,
+      '--bot-name',
+      name,
+      '--allowed-channel-id',
+      channelId,
+      '--trigger-mode',
+      triggerMode,
+      ...(allowDms ? ['--allow-dms'] : []),
+      ...(model ? ['--model', model] : []),
+      ...(channelHistoryLimit ? ['--channel-history-limit', channelHistoryLimit] : []),
+      ...(operatorIds ? ['--operator-ids', operatorIds] : []),
+      ...(allowedUserIds ? ['--allowed-user-ids', allowedUserIds] : []),
+    ]);
   }
 
   if (result.code !== 0) {

@@ -312,11 +312,7 @@ def _launch_gui_detached() -> int:
     command = [_gui_python_executable(), _backend_script_path("relayctl.py"), "gui"]
     kwargs: dict[str, object] = {"env": env, "close_fds": True}
     if os.name == "nt":
-        kwargs["creationflags"] = (
-            getattr(subprocess, "DETACHED_PROCESS", 0)
-            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-            | getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        )
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
     else:
         kwargs["start_new_session"] = True
         kwargs["stdout"] = subprocess.DEVNULL
@@ -471,11 +467,7 @@ for profile in profiles:
         "stderr": subprocess.DEVNULL,
     }
     if os.name == "nt":
-        kwargs["creationflags"] = (
-            getattr(subprocess, "DETACHED_PROCESS", 0)
-            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-            | getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        )
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
     subprocess.Popen(command, **kwargs)
 
 
@@ -1535,7 +1527,7 @@ def _launch_bot_worker(env_file: Path, workspace: Path, *, log_path: Path | None
         popen_kwargs["stdout"] = log_handle
         popen_kwargs["stderr"] = subprocess.STDOUT
     if os.name == "nt":
-        popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
     try:
         process = subprocess.Popen(
             [
@@ -1645,7 +1637,7 @@ def _run_profile(profile: dict) -> int:
             "close_fds": True,
         }
         if os.name == "nt":
-            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+            popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
         else:
             popen_kwargs["start_new_session"] = True
 

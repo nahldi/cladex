@@ -4,7 +4,6 @@ import argparse
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 import time
@@ -299,11 +298,7 @@ def _windowless_popen(command: list[str], *, cwd: str | Path | None = None) -> s
         "stderr": subprocess.DEVNULL,
     }
     if os.name == "nt":
-        kwargs["creationflags"] = (
-            getattr(subprocess, "DETACHED_PROCESS", 0)
-            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-            | getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        )
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
     else:
         kwargs["start_new_session"] = True
     return subprocess.Popen(command, **kwargs)
@@ -324,12 +319,8 @@ def _windowless_run(command: list[str], *, cwd: str | Path | None = None) -> sub
     return subprocess.run(command, **kwargs)
 
 
-def _claude_discord_bin() -> str | None:
-    for name in ("claude-discord", "claude-discord.cmd", "claude-discord.exe"):
-        resolved = shutil.which(name)
-        if resolved:
-            return resolved
-    return None
+def _backend_script_path(name: str) -> str:
+    return str(Path(__file__).parent / name)
 
 
 def start_profile(profile: dict[str, Any]) -> None:
@@ -339,10 +330,58 @@ def start_profile(profile: dict[str, Any]) -> None:
         return
     if relay_type != "claude":
         raise RuntimeError(f"Unknown relay type: {relay_type}")
-    command = _claude_discord_bin()
-    if not command:
-        raise RuntimeError("`claude-discord` is not installed or not on PATH.")
-    _windowless_popen([command, "run"], cwd=profile.get("workspace", ""))
+
+    # Load env from env_file
+    env_file = profile.get("env_file", "")
+    if not env_file or not Path(env_file).exists():
+        raise RuntimeError(f"Config file not found: {env_file}")
+
+    env = _load_claude_env(profile)
+    workspace = str(profile.get("workspace", "") or Path.cwd())
+    state_namespace = str(profile.get("state_namespace", "")).strip()
+
+    # Create state directory
+    state_dir = _claude_state_dir(profile)
+    state_dir.mkdir(parents=True, exist_ok=True)
+
+    # Set up environment for bot
+    run_env = os.environ.copy()
+    run_env.update(env)
+    run_env["CLAUDE_WORKDIR"] = workspace
+    run_env["STATE_NAMESPACE"] = state_namespace
+
+    # Log file
+    log_file = state_dir / "relay.log"
+    log_handle = log_file.open("a")
+
+    # Launch bot.py in background
+    popen_kwargs: dict[str, Any] = {
+        "cwd": workspace,
+        "env": run_env,
+        "stdout": log_handle,
+        "stderr": subprocess.STDOUT,
+        "stdin": subprocess.DEVNULL,
+        "close_fds": True,
+    }
+    if os.name == "nt":
+        popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        popen_kwargs["start_new_session"] = True
+
+    bot_script = _backend_script_path("bot.py")
+    process = subprocess.Popen(
+        [relayctl._background_python_windowless_executable(), bot_script],
+        **popen_kwargs,
+    )
+    log_handle.close()
+
+    # Write PID file
+    pid_file = state_dir / "relay.pid"
+    pid_file.write_text(str(process.pid))
+
+    print(f"Claude relay started for `{profile.get('name', 'unknown')}`")
+    print(f"workspace: {workspace}")
+    print(f"log: {log_file}")
 
 
 def stop_profile(profile: dict[str, Any]) -> None:
@@ -352,17 +391,18 @@ def stop_profile(profile: dict[str, Any]) -> None:
         return
     if relay_type != "claude":
         raise RuntimeError(f"Unknown relay type: {relay_type}")
-    command = _claude_discord_bin()
-    if command:
-        result = _windowless_run([command, "stop"], cwd=profile.get("workspace", ""))
-        if result.returncode == 0:
-            return
+
+    # Terminate process using PID file
     runtime = _claude_profile_runtime_state(profile)
     pid = runtime.get("pid")
     if pid:
         relayctl.terminate_process_tree(pid)
+
+    # Clean up PID file
     pid_file = _claude_state_dir(profile) / "relay.pid"
     pid_file.unlink(missing_ok=True)
+
+    print(f"Claude relay stopped for `{profile.get('name', 'unknown')}`")
 
 
 def restart_profile(profile: dict[str, Any]) -> None:

@@ -198,6 +198,7 @@ def _skill_listing() -> dict[str, bool]:
         capture_output=True,
         text=True,
         check=False,
+        **_windows_subprocess_kwargs(),
     )
     if result.returncode != 0:
         return {}

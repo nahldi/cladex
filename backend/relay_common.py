@@ -43,6 +43,7 @@ def workspace_root(path: Path) -> Path:
             check=True,
             capture_output=True,
             text=True,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
     except Exception:
         return path
@@ -353,7 +354,13 @@ def codex_cli_version() -> str:
         command = ["cmd", "/c", "codex.CMD", "--version"]
     else:
         command = [codex_bin, "--version"]
-    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        check=False,
+        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+    )
     text = (result.stdout or result.stderr or "").strip()
     return text or "unknown"
 
