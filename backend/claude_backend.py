@@ -485,7 +485,9 @@ class ClaudeBackend:
         )
 
     def _extract_response_text(self, stdout: str) -> str:
-        text_parts: list[str] = []
+        delta_parts: list[str] = []
+        final_parts: list[str] = []
+
         for raw_line in stdout.splitlines():
             line = raw_line.strip()
             if not line:
@@ -495,21 +497,58 @@ class ClaudeBackend:
             except json.JSONDecodeError:
                 # Skip non-JSON lines (verbose debug output)
                 continue
-            text = self._extract_text_from_event(event)
-            if text:
-                text_parts.append(text)
 
-        collapsed = "".join(text_parts).strip()
-        return collapsed
+            event_type = event.get("type", "")
+
+            # Collect streaming deltas separately
+            if event_type == "content_block_delta":
+                delta = event.get("delta", {})
+                text = delta.get("text", "")
+                if text:
+                    delta_parts.append(text)
+            # Collect final message/result separately
+            elif event_type in ("assistant", "result"):
+                text = self._extract_text_from_event(event)
+                if text:
+                    final_parts.append(text)
+            elif event_type == "error":
+                text = self._extract_text_from_event(event)
+                if text:
+                    final_parts.append(text)
+
+        # Prefer deltas if we have them, otherwise use final message
+        if delta_parts:
+            return "".join(delta_parts).strip()
+        if final_parts:
+            return "".join(final_parts).strip()
+        return ""
 
     def _extract_text_from_event(self, event: dict) -> str:
         event_type = event.get("type", "")
 
-        # Only extract from streaming deltas to avoid duplication
-        # Final message/assistant events duplicate the delta content
+        # Handle streaming deltas
         if event_type == "content_block_delta":
             delta = event.get("delta", {})
             return delta.get("text", "")
+
+        # Handle assistant message (only if no deltas were found)
+        if event_type == "assistant":
+            message = event.get("message", {})
+            if isinstance(message, dict):
+                content = message.get("content")
+                if isinstance(content, str):
+                    return content
+                if isinstance(content, list):
+                    return "".join(
+                        part.get("text", "")
+                        for part in content
+                        if isinstance(part, dict) and part.get("type") == "text"
+                    )
+            return ""
+
+        # Handle result type
+        if event_type == "result":
+            return event.get("result", "") or event.get("text", "")
 
         if event_type == "error":
             error = event.get("error", {})
