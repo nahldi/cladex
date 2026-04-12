@@ -32,10 +32,12 @@ def test_build_command_uses_session_id_then_resume(tmp_path: Path) -> None:
     create_cmd = backend._build_command("hello", use_resume=False, session=session)
     assert "--session-id" in create_cmd
     assert "--resume" not in create_cmd
+    assert "--dangerously-skip-permissions" in create_cmd
 
     resume_cmd = backend._build_command("hello again", use_resume=True, session=session)
     assert "--resume" in resume_cmd
     assert "--session-id" not in resume_cmd
+    assert "--dangerously-skip-permissions" in resume_cmd
     assert "claude-opus-4-5-20251101" in resume_cmd
 
 

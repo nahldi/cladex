@@ -78,7 +78,7 @@ app.get('/api/runtime-info', async (_req, res) => {
     apiBase: `http://${API_HOST}:${API_PORT}`,
     backendDir: BACKEND_DIR,
     packaged: process.env.NODE_ENV === 'production' || !!process.resourcesPath,
-    appVersion: process.env.npm_package_version || '2.0.2',
+    appVersion: process.env.npm_package_version || '2.0.3',
   });
 });
 

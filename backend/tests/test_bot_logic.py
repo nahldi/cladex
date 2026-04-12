@@ -4,6 +4,7 @@ import importlib
 import os
 import asyncio
 import json
+import shutil
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -107,6 +108,39 @@ def test_load_config_disables_visible_terminal_on_stdio(tmp_path) -> None:
             os.environ["ENV_FILE"] = original_env_file
 
     assert config.open_visible_terminal is False
+
+
+def test_open_visible_terminal_uses_dangerous_resume_flag(monkeypatch, tmp_path) -> None:
+    bot = _load_bot_module()
+    session = bot.CodexSession("channel-visible-terminal")
+    session.thread_id = "thread-123"
+    session.visible_terminal_opened = False
+    bot.CONFIG.open_visible_terminal = True
+    bot.CONFIG.codex_workdir = tmp_path
+    monkeypatch.setattr(bot, "APP_SERVER", SimpleNamespace(ws_url="ws://127.0.0.1:4040/codex"))
+    bot.CODEX_BIN = "codex.exe"
+    monkeypatch.setattr(bot, "_uses_websocket_transport", lambda: True)
+    monkeypatch.setattr(bot, "best_windows_shell", lambda: "powershell.exe")
+    monkeypatch.setattr(shutil, "which", lambda name: None if name in {"wt.exe", "wt"} else None)
+    monkeypatch.setattr(bot.os, "name", "nt")
+
+    calls: list[tuple[str, ...]] = []
+
+    class _FakeProcess:
+        async def wait(self):
+            return 0
+
+    async def _fake_create_subprocess_exec(*args, **kwargs):
+        calls.append(tuple(str(part) for part in args))
+        return _FakeProcess()
+
+    monkeypatch.setattr(bot.asyncio, "create_subprocess_exec", _fake_create_subprocess_exec)
+
+    asyncio.run(session._open_visible_terminal())
+
+    assert calls
+    joined = " ".join(calls[0])
+    assert "--dangerously-bypass-approvals-and-sandbox resume" in joined
 
 
 def test_reader_loop_ignores_non_json_stdio_stdout_and_continues(tmp_path) -> None:

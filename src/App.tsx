@@ -3,9 +3,9 @@ import { AnimatePresence, motion, useMotionTemplate, useMotionValue, useSpring, 
 import {
   Activity,
   Bot,
-  ChevronRight,
   FileText,
   FolderKanban,
+  Hash,
   LayoutGrid,
   Loader2,
   MessageSquare,
@@ -95,8 +95,28 @@ interface ProfileSettingsData {
 const API_BASE = 'http://localhost:3001/api';
 const CLADEX_LOGO = new URL('../assets/icon.png', import.meta.url).href;
 
+function looksTechnicalLabel(value: string | undefined): boolean {
+  const normalized = (value || '').trim().toLowerCase();
+  if (!normalized) {
+    return true;
+  }
+  if (/^[a-z0-9]+-[0-9a-f]{6,}$/.test(normalized)) {
+    return true;
+  }
+  if (normalized === 'codexcmd' || normalized === 'claudecmd' || normalized === 'relay' || normalized === 'bot') {
+    return true;
+  }
+  return false;
+}
+
 function labelFor(profile: Profile): string {
-  return profile.displayName || profile.botName || profile.workspaceLabel || humanize(profile.technicalName || profile.name || 'Relay');
+  if (profile.displayName && !looksTechnicalLabel(profile.displayName)) {
+    return profile.displayName;
+  }
+  if (profile.botName && !looksTechnicalLabel(profile.botName)) {
+    return profile.botName;
+  }
+  return profile.workspaceLabel || humanize(profile.technicalName || profile.name || 'Relay');
 }
 
 function workspaceFor(profile: Profile): string {
@@ -105,6 +125,16 @@ function workspaceFor(profile: Profile): string {
 
 function channelFor(profile: Profile): string {
   return profile.channelLabel || (profile.activeChannel ? `Channel ${profile.activeChannel}` : profile.discordChannel ? `Channel ${profile.discordChannel}` : 'Unassigned');
+}
+
+function relayCardNote(profile: Profile): string {
+  if (profile.statusText) {
+    return profile.statusText;
+  }
+  if (profile.running) {
+    return 'Ready for the next Discord turn.';
+  }
+  return 'Relay is offline until you start it.';
 }
 
 function humanize(value: string): string {
@@ -216,19 +246,19 @@ export default function App() {
     <div className={`relative min-h-screen overflow-hidden font-sans transition-colors duration-500 selection:bg-indigo-500/30 ${isDark ? 'bg-[#050505] text-gray-100' : 'bg-[#f2efe7] text-slate-900'}`}>
       <CladexBackground isDark={isDark} />
       <div className={`pointer-events-none absolute inset-0 z-0 transition-opacity duration-500 ${isDark ? 'bg-[radial-gradient(circle_at_top,rgba(249,115,22,0.12),transparent_28%),radial-gradient(circle_at_bottom_right,rgba(16,185,129,0.12),transparent_32%)] opacity-100' : 'bg-[radial-gradient(circle_at_top,rgba(212,115,94,0.16),transparent_30%),radial-gradient(circle_at_bottom_right,rgba(125,181,165,0.18),transparent_34%)] opacity-80'}`} />
-      <main className="relative z-10 flex h-screen flex-col pb-24">
-        <header className="mx-auto flex w-full max-w-7xl items-center justify-between px-8 pt-8">
+      <main className="relative z-10 flex max-h-screen min-h-screen flex-col overflow-y-auto pb-28">
+        <header className="mx-auto flex w-full max-w-6xl items-start justify-between gap-6 px-8 pb-4 pt-8">
           <div className="flex items-center gap-4">
-            <div className={`relative h-16 w-16 overflow-hidden rounded-[22px] border shadow-[0_0_35px_rgba(99,102,241,0.18)] ${isDark ? 'border-white/10 bg-white/5' : 'border-black/10 bg-white/70 shadow-[0_0_35px_rgba(212,115,94,0.12)]'}`}>
+            <div className={`relative h-14 w-14 overflow-hidden rounded-[20px] border shadow-[0_0_35px_rgba(99,102,241,0.18)] ${isDark ? 'border-white/10 bg-white/5' : 'border-black/10 bg-white/70 shadow-[0_0_35px_rgba(212,115,94,0.12)]'}`}>
               <img src={CLADEX_LOGO} alt="CLADEX" className="h-full w-full object-cover" />
             </div>
             <div>
-              <h1 className={`text-4xl font-black tracking-tight ${isDark ? 'text-white' : 'text-slate-900'}`}>CLADEX</h1>
-              <p className={`font-mono text-xs uppercase tracking-[0.28em] ${isDark ? 'text-orange-300/90' : 'text-[#b15f4e]'}`}>Unified Relay Control</p>
-              <p className={`mt-2 max-w-2xl text-sm ${isDark ? 'text-gray-400' : 'text-slate-600'}`}>Readable Claude and Codex relay control with the real runtime behind it. Real labels. Real settings. Real logs. No placeholder state.</p>
+              <h1 className={`text-[2.7rem] leading-none font-black tracking-tight ${isDark ? 'text-white' : 'text-slate-900'}`}>CLADEX</h1>
+              <p className={`mt-2 font-mono text-[11px] uppercase tracking-[0.32em] ${isDark ? 'text-orange-300/90' : 'text-[#b15f4e]'}`}>Unified Relay Network</p>
+              <p className={`mt-3 max-w-xl text-sm ${isDark ? 'text-gray-400' : 'text-slate-600'}`}>Claude and Codex relay control with live runtime state behind every card. Readable labels, real settings, real logs.</p>
             </div>
           </div>
-          <div className="hidden gap-3 md:flex">
+          <div className="hidden gap-3 self-center md:flex">
             <ActionButton label="Refresh" icon={<RefreshCw size={16} />} busy={loading} onClick={() => void loadAll()} />
             <ActionButton label="Stop All" icon={<PauseCircle size={16} />} busy={busyKey === 'stop-all'} tone="danger" light={!isDark} onClick={() => void runAction('stop-all', api.stopAll)} />
           </div>
@@ -320,16 +350,24 @@ function RelayDashboard({
   onEdit: (profile: Profile) => void;
   onLogs: (profile: Profile) => void;
 }) {
-  return (
-    <div className="mx-auto flex w-full max-w-7xl flex-1 flex-col px-8 pb-8 pt-8">
-      <div className="mb-8 grid gap-4 md:grid-cols-3">
-        <SummaryPanel label="Configured relays" value={String(profiles.length)} detail="Every saved Claude and Codex bot in one manager." />
-        <SummaryPanel label="Running now" value={String(profiles.filter((profile) => profile.running).length)} detail="Relays with live worker processes running." />
-        <SummaryPanel label="Ready for traffic" value={String(profiles.filter((profile) => profile.ready).length)} detail="Relays that started cleanly and are ready to answer." />
-      </div>
+  const runningCount = profiles.filter((profile) => profile.running).length;
+  const readyCount = profiles.filter((profile) => profile.ready).length;
 
+  return (
+    <div className="mx-auto flex w-full max-w-6xl flex-1 flex-col px-8 pb-10 pt-4">
+      <div className="mb-7 flex flex-wrap items-center justify-between gap-4">
+        <div>
+          <div className="text-[11px] font-bold uppercase tracking-[0.28em] text-slate-500 dark:text-gray-500">Relay canvas</div>
+          <div className="mt-2 text-sm text-slate-600 dark:text-gray-400">Start, stop, edit, inspect, and recover each relay from one surface.</div>
+        </div>
+        <div className="flex flex-wrap items-center gap-2 text-xs font-medium text-slate-500 dark:text-gray-400">
+          <InlineStat label="Configured" value={String(profiles.length)} />
+          <InlineStat label="Running" value={String(runningCount)} />
+          <InlineStat label="Ready" value={String(readyCount)} />
+        </div>
+      </div>
       {loading ? (
-        <div className="flex h-[55vh] items-center justify-center">
+        <div className="flex h-[50vh] items-center justify-center">
           <Loader2 className="h-8 w-8 animate-spin text-indigo-300" />
         </div>
       ) : profiles.length === 0 ? (
@@ -386,7 +424,7 @@ function RelayCard({
   const springY = useSpring(tiltY, { stiffness: 280, damping: 26, mass: 0.4 });
   const rotateX = useTransform(springY, [-0.5, 0.5], ['10deg', '-10deg']);
   const rotateY = useTransform(springX, [-0.5, 0.5], ['-10deg', '10deg']);
-  const spotlight = useMotionTemplate`radial-gradient(320px circle at ${pointerX}px ${pointerY}px, ${isClaude ? 'rgba(212,115,94,0.16)' : 'rgba(125,181,165,0.18)'}, transparent 50%)`;
+  const spotlight = useMotionTemplate`radial-gradient(300px circle at ${pointerX}px ${pointerY}px, ${isClaude ? 'rgba(212,115,94,0.18)' : 'rgba(125,181,165,0.18)'}, transparent 48%)`;
 
   function handlePointerMove(event: React.MouseEvent<HTMLDivElement>) {
     const bounds = event.currentTarget.getBoundingClientRect();
@@ -406,30 +444,29 @@ function RelayCard({
       onMouseMove={handlePointerMove}
       onMouseLeave={resetPointer}
       style={{ rotateX, rotateY, transformStyle: 'preserve-3d' }}
-      whileHover={{ scale: 1.015 }}
-      className="relative [perspective:1200px]"
+      whileHover={{ scale: 1.01 }}
+      className="group relative h-[272px] [perspective:1200px]"
     >
-      <div className="absolute inset-0 rounded-[32px] bg-black/20 blur-2xl dark:bg-black/30" />
-      <div className="relative overflow-hidden rounded-[30px] border border-slate-200/80 bg-white/80 p-6 shadow-[0_22px_60px_rgba(15,23,42,0.12)] backdrop-blur-xl transition-colors duration-500 dark:border-white/10 dark:bg-[#0a0a0c]/92 dark:shadow-2xl">
+      <div className="absolute inset-0 rounded-[32px] bg-black/25 blur-2xl dark:bg-black/35" />
+      <div className="relative h-full overflow-hidden rounded-[28px] border border-slate-200/70 bg-white/70 p-5 shadow-[0_18px_44px_rgba(15,23,42,0.12)] backdrop-blur-xl transition-colors duration-500 dark:border-white/10 dark:bg-[#09090b]/90 dark:shadow-2xl">
         <div className="absolute inset-0 bg-[linear-gradient(to_right,#0f172a08_1px,transparent_1px),linear-gradient(to_bottom,#0f172a08_1px,transparent_1px)] bg-[size:24px_24px] opacity-60 dark:bg-[linear-gradient(to_right,#ffffff05_1px,transparent_1px),linear-gradient(to_bottom,#ffffff05_1px,transparent_1px)]" />
-        <motion.div className="pointer-events-none absolute inset-0 rounded-[30px] opacity-0 transition-opacity duration-300 group-hover:opacity-100" style={{ background: spotlight }} />
-        <div className="pointer-events-none absolute -right-14 top-10 h-28 w-28 rounded-full blur-3xl" style={{ background: `${accent}25` }} />
+        <motion.div className="pointer-events-none absolute inset-0 rounded-[28px] opacity-0 transition-opacity duration-300 group-hover:opacity-100" style={{ background: spotlight }} />
+        <div className="pointer-events-none absolute -right-14 top-8 h-24 w-24 rounded-full blur-3xl" style={{ background: `${accent}28` }} />
         <div className="relative z-10 flex h-full flex-col">
         <div className="flex items-start justify-between gap-4">
           <div>
-            <div className={`inline-flex rounded-full border px-2 py-1 text-[10px] font-bold uppercase tracking-[0.22em] ${isClaude ? 'border-orange-500/30 bg-orange-500/10 text-orange-700 dark:text-orange-200' : 'border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-200'}`}>{profile.type}</div>
-            <h3 className="mt-3 text-2xl font-bold tracking-tight text-slate-900 dark:text-white">{labelFor(profile)}</h3>
-            <p className="mt-1 text-sm text-slate-500 dark:text-gray-400">{workspaceFor(profile)}</p>
+            <div className={`inline-flex rounded-full border px-2.5 py-1 text-[10px] font-bold uppercase tracking-[0.24em] ${isClaude ? 'border-orange-500/30 bg-orange-500/10 text-orange-700 dark:text-orange-200' : 'border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-200'}`}>{profile.type}</div>
+            <h3 className="mt-3 text-[1.95rem] leading-none font-bold tracking-tight text-slate-900 dark:text-white">{labelFor(profile)}</h3>
+            <p className="mt-2 text-sm text-slate-500 dark:text-gray-400"># {workspaceFor(profile)}</p>
           </div>
           <div className="flex gap-2">
             <MiniIconButton label="Logs" icon={<FileText size={14} />} onClick={onLogs} />
             <MiniIconButton label="Edit" icon={<Pencil size={14} />} onClick={onEdit} />
-            <MiniIconButton label="Restart" icon={<RotateCcw size={14} />} onClick={onRestart} />
             <MiniIconButton label="Remove" icon={<Trash2 size={14} />} tone="danger" onClick={onDelete} />
           </div>
         </div>
 
-        <div className="mt-5 flex items-center justify-center py-3">
+        <div className="mt-3 flex flex-1 items-center justify-center">
           <div className="flex w-full max-w-[220px] items-center justify-between">
             <div className="flex h-11 w-11 items-center justify-center rounded-2xl border-2 bg-white shadow-lg dark:bg-[#09090b]" style={{ borderColor: running ? accent : 'rgba(148,163,184,0.35)', color: running ? accent : undefined }}>
               {isClaude ? <Bot size={18} /> : <Terminal size={18} />}
@@ -445,42 +482,42 @@ function RelayCard({
               ) : null}
             </div>
             <div className={`flex h-11 w-11 items-center justify-center rounded-2xl border-2 ${running ? 'border-[#5865f2] bg-[#5865f2]/10 text-[#5865f2]' : 'border-slate-300 bg-slate-100 text-slate-400 dark:border-white/10 dark:bg-white/5 dark:text-gray-500'}`}>
-              <MessageSquare size={18} />
+              <Hash size={18} />
             </div>
           </div>
         </div>
 
-        <div className="mt-2 rounded-2xl border border-slate-200/80 bg-white/70 p-4 text-sm leading-relaxed text-slate-700 dark:border-white/10 dark:bg-white/[0.03] dark:text-gray-300">
-          <InfoRow label="Backend" value={profile.provider || 'Relay runtime'} mono />
-          <InfoRow label="Model" value={profile.model || (profile.type === 'Codex' ? 'gpt-5.4' : 'Claude default')} mono />
-          <InfoRow label="Trigger" value={profile.triggerMode || 'Mention or direct message'} />
-          <InfoRow label="Direct messages" value={profile.allowDms ? 'Enabled' : 'Disabled'} />
-          <InfoRow label="Channel" value={channelFor(profile)} />
+        <div className="flex flex-wrap gap-2">
+          <MetaPill label={profile.provider || 'Relay runtime'} mono />
+          <MetaPill label={profile.model || (profile.type === 'Codex' ? 'gpt-5.4' : 'claude-opus-4-5-20251101')} mono />
+          <MetaPill label={profile.allowDms ? 'DMs on' : 'DMs off'} />
         </div>
 
-        <div className="mt-4 rounded-2xl border border-slate-200/80 bg-slate-50/80 p-4 text-sm leading-relaxed text-slate-700 dark:border-white/5 dark:bg-black/30 dark:text-gray-300">
-          {profile.statusText || 'Ready for the next Discord turn.'}
-        </div>
-
-        <div className="mt-auto flex items-center justify-between pt-5">
+        <div className="mt-4 flex items-end justify-between gap-4">
           <div className="flex items-center gap-2 text-sm text-slate-500 dark:text-gray-400">
             <span className={`h-2.5 w-2.5 rounded-full ${running ? (isClaude ? 'bg-orange-400' : 'bg-emerald-400') : 'bg-slate-400 dark:bg-gray-600'} ${running ? 'animate-pulse' : ''}`} />
-            {running ? (profile.state === 'working' ? 'Working' : 'Listening') : 'Stopped'}
+            <div>
+              <div className="font-medium text-slate-700 dark:text-gray-200">{running ? (profile.state === 'working' ? 'Working' : 'Listening') : 'Stopped'}</div>
+              <div className="mt-1 text-xs text-slate-500 dark:text-gray-500">{relayCardNote(profile)}</div>
+            </div>
           </div>
-          <button
-            onClick={running ? onStop : onStart}
-            disabled={busy}
-            className={`inline-flex items-center gap-2 rounded-2xl border px-4 py-2 text-sm font-semibold transition-colors disabled:opacity-50 ${
-              running
-                ? 'border-red-500/30 bg-red-500/10 text-red-200 hover:bg-red-500/20'
-                : isClaude
-                  ? 'border-orange-500/30 bg-orange-500/10 text-orange-700 hover:bg-orange-500/20 dark:text-orange-200'
-                  : 'border-emerald-500/30 bg-emerald-500/10 text-emerald-700 hover:bg-emerald-500/20 dark:text-emerald-200'
-            }`}
-          >
-            {busy ? <Loader2 size={14} className="animate-spin" /> : running ? <Square size={14} fill="currentColor" /> : <Play size={14} fill="currentColor" />}
-            {running ? 'Stop' : 'Start'}
-          </button>
+          <div className="flex items-center gap-2">
+            <MiniIconButton label="Restart" icon={<RotateCcw size={14} />} onClick={onRestart} />
+            <button
+              onClick={running ? onStop : onStart}
+              disabled={busy}
+              className={`inline-flex min-w-[108px] items-center justify-center gap-2 rounded-2xl border px-4 py-2 text-sm font-semibold transition-colors disabled:opacity-50 ${
+                running
+                  ? 'border-red-500/30 bg-red-500/10 text-red-200 hover:bg-red-500/20'
+                  : isClaude
+                    ? 'border-orange-500/30 bg-orange-500/10 text-orange-700 hover:bg-orange-500/20 dark:text-orange-200'
+                    : 'border-emerald-500/30 bg-emerald-500/10 text-emerald-700 hover:bg-emerald-500/20 dark:text-emerald-200'
+              }`}
+            >
+              {busy ? <Loader2 size={14} className="animate-spin" /> : running ? <Square size={14} fill="currentColor" /> : <Play size={14} fill="currentColor" />}
+              {running ? 'Stop' : 'Start'}
+            </button>
+          </div>
         </div>
       </div>
       </div>
@@ -899,8 +936,21 @@ function LogsModal({ profile, onClose }: { profile: Profile; onClose: () => void
   );
 }
 
-function SummaryPanel({ label, value, detail }: { label: string; value: string; detail: string }) {
-  return <div className="rounded-2xl border border-slate-200/80 bg-white/80 p-5 shadow-[0_18px_45px_rgba(15,23,42,0.08)] backdrop-blur-xl dark:border-white/10 dark:bg-white/[0.03] dark:shadow-2xl"><div className="text-[10px] font-bold uppercase tracking-[0.22em] text-slate-500 dark:text-gray-500">{label}</div><div className="mt-2 text-3xl font-black text-slate-900 dark:text-white">{value}</div><div className="mt-2 text-sm text-slate-600 dark:text-gray-400">{detail}</div></div>;
+function InlineStat({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/[0.04] px-3 py-1.5 text-xs dark:text-gray-300">
+      <span className="font-semibold text-white">{value}</span>
+      <span className="uppercase tracking-[0.18em] text-slate-400">{label}</span>
+    </div>
+  );
+}
+
+function MetaPill({ label, mono = false }: { label: string; mono?: boolean }) {
+  return (
+    <div className={`rounded-full border border-slate-200/80 bg-white/70 px-3 py-1.5 text-[11px] text-slate-600 dark:border-white/10 dark:bg-white/[0.04] dark:text-gray-300 ${mono ? 'font-mono' : ''}`}>
+      {label}
+    </div>
+  );
 }
 
 function EmptyState({ title, detail, compact = false }: { title: string; detail: string; compact?: boolean }) {

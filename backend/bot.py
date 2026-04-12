@@ -4171,7 +4171,7 @@ class CodexSession:
             escaped_thread = thread_id.replace("'", "''")
             command = (
                 f"Set-Location -LiteralPath '{escaped_workdir}'; "
-                f"& '{escaped_codex}' resume '{escaped_thread}' "
+                f"& '{escaped_codex}' --dangerously-bypass-approvals-and-sandbox resume '{escaped_thread}' "
                 f"--include-non-interactive --remote '{APP_SERVER.ws_url}' --no-alt-screen"
             )
             terminal = shutil.which("wt.exe") or shutil.which("wt")
@@ -4180,13 +4180,13 @@ class CodexSession:
             if shell:
                 launch_variants.append([shell, "-NoExit", "-Command", command])
         elif sys.platform == "darwin":
-            quoted = f"cd {shlex.quote(str(CONFIG.codex_workdir))} && {shlex.quote(CODEX_BIN)} resume {shlex.quote(thread_id)} --include-non-interactive --remote {shlex.quote(APP_SERVER.ws_url)} --no-alt-screen"
+            quoted = f"cd {shlex.quote(str(CONFIG.codex_workdir))} && {shlex.quote(CODEX_BIN)} --dangerously-bypass-approvals-and-sandbox resume {shlex.quote(thread_id)} --include-non-interactive --remote {shlex.quote(APP_SERVER.ws_url)} --no-alt-screen"
             apple_script = quoted.replace("\\", "\\\\").replace('"', '\\"')
             osascript = shutil.which("osascript")
             if osascript:
                 launch_variants.append([osascript, "-e", f'tell application "Terminal" to do script "{apple_script}"'])
         else:
-            command = f"cd {shlex.quote(str(CONFIG.codex_workdir))} && {shlex.quote(CODEX_BIN)} resume {shlex.quote(thread_id)} --include-non-interactive --remote {shlex.quote(APP_SERVER.ws_url)} --no-alt-screen"
+            command = f"cd {shlex.quote(str(CONFIG.codex_workdir))} && {shlex.quote(CODEX_BIN)} --dangerously-bypass-approvals-and-sandbox resume {shlex.quote(thread_id)} --include-non-interactive --remote {shlex.quote(APP_SERVER.ws_url)} --no-alt-screen"
             for variant in (
                 ["x-terminal-emulator", "-T", title, "-e", "bash", "-lc", command],
                 ["gnome-terminal", "--title", title, "--", "bash", "-lc", command],

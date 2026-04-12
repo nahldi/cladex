@@ -4,7 +4,7 @@
 
 ### Option 1: Use the packaged desktop app
 
-1. Open `release\CLADEX Setup 2.0.2.exe` and install it.
+1. Open `release\CLADEX Setup 2.0.3.exe` and install it.
 2. Or run `release\win-unpacked\CLADEX.exe` directly.
 
 ### Option 2: Run from source

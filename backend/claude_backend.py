@@ -438,6 +438,7 @@ class ClaudeBackend:
             "stream-json",
             "--model",
             self.model,
+            "--dangerously-skip-permissions",
         ]
         if use_resume:
             cmd.extend(["--resume", session.session_id])
