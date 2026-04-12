@@ -435,6 +435,7 @@ class ClaudeBackend:
         cmd = [
             claude_code_bin(),
             "-p",
+            "--verbose",
             "--output-format",
             "stream-json",
             "--model",
