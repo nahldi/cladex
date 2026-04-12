@@ -1431,8 +1431,6 @@ def _wait_for_inflight_launch(profile: dict, timeout_seconds: float = 45.0) -> i
         state = _profile_runtime_state(profile)
         last_state = state
         if state["ready"]:
-            print(f"Relay instance `{profile['name']}` is already starting in another process.")
-            print(f"log: {state['log_path']}")
             return 0
         if state["auth_failed"]:
             recent_log = tail_lines(state["log_path"], 40)
@@ -1558,8 +1556,6 @@ def _run_profile_foreground(profile: dict) -> int:
 
         runtime = _profile_runtime_state(profile)
         if runtime["running"]:
-            print(f"Relay instance `{profile['name']}` is already running.")
-            print(f"log: {runtime['log_path']}")
             return 0
 
         logged_in, login_status = _codex_login_status(Path(profile["workspace"]))
@@ -1609,8 +1605,6 @@ def _run_profile(profile: dict) -> int:
 
         runtime = _profile_runtime_state(profile)
         if runtime["running"]:
-            print(f"Relay instance `{profile['name']}` is already running.")
-            print(f"log: {runtime['log_path']}")
             return 0
 
         launch_env = relay_codex_env(Path(profile["workspace"]), os.environ.copy())
@@ -1660,9 +1654,6 @@ def _run_profile(profile: dict) -> int:
             auth_failure_marker_path=runtime["auth_failure_marker_path"],
             log_path=log_path,
         )
-        print(f"Relay started for `{profile['name']}`.")
-        print(f"workspace: {profile['workspace']}")
-        print(f"log: {log_path}")
         return 0
     finally:
         _release_pid_lock(launch_lock)
@@ -1750,11 +1741,6 @@ def _stop_profile(profile: dict) -> int:
     state["ready_marker_path"].unlink(missing_ok=True)
     state["auth_failure_marker_path"].unlink(missing_ok=True)
 
-    if not stopped:
-        print(f"No running relay instance found for `{profile['name']}`.")
-        return 0
-
-    print(f"Stopped relay instance `{profile['name']}`.")
     return 0
 
 
