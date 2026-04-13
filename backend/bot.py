@@ -2342,6 +2342,11 @@ def _is_status_only_reply(text: str) -> bool:
     return any(pattern.fullmatch(normalized) for pattern in STATUS_ONLY_PATTERNS)
 
 
+def _is_control_reply_text(text: str) -> bool:
+    normalized = text.strip()
+    return normalized in {NO_REPLY_NEEDED_SENTINEL, MISSING_REPLY_SENTINEL}
+
+
 def _typing_indicator_expired(turn: ActiveTurn, *, now: float | None = None) -> bool:
     current_time = time.time() if now is None else now
     return current_time - turn.started_at >= TYPING_INDICATOR_MAX_SECONDS
@@ -4030,10 +4035,19 @@ class CodexSession:
         if turn.final_item_id:
             text = turn.agent_item_text.get(turn.final_item_id, "")
             if text.strip():
-                return text.strip()
+                candidate = text.strip()
+                if not (turn.reply_required and _is_control_reply_text(candidate)):
+                    return candidate
         for candidate in (turn.final_text, turn.fallback_text, turn.streamed_text):
             if candidate.strip():
-                return candidate.strip()
+                normalized = candidate.strip()
+                if not (turn.reply_required and _is_control_reply_text(normalized)):
+                    return normalized
+        if turn.reply_required:
+            for text in reversed(list(turn.agent_item_text.values())):
+                normalized = text.strip()
+                if normalized and not _is_control_reply_text(normalized):
+                    return normalized
         for text in reversed(list(turn.agent_item_text.values())):
             if text.strip():
                 return text.strip()

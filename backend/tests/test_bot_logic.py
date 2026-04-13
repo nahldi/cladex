@@ -783,6 +783,54 @@ def test_finalize_turn_after_grace_uses_no_reply_needed_for_no_reply_turns() -> 
     asyncio.run(_run())
 
 
+def test_best_turn_text_prefers_substantive_reply_over_no_reply_sentinel_when_reply_required() -> None:
+    bot = _load_bot_module()
+    session = bot.CodexSession("channel-42")
+    loop = asyncio.new_event_loop()
+    try:
+        turn = bot.ActiveTurn(
+            turn_id="turn-1",
+            started_at=0.0,
+            last_activity_at=0.0,
+            latest_message=_message(channel_id=42, author_id=7, content="why are you only saying yes"),
+            completion=loop.create_future(),
+            reply_required=True,
+        )
+        turn.agent_item_text["item-1"] = "Because your last few messages were just `sage` and `sage?`, so I treated them as presence checks."
+        turn.agent_item_text["item-2"] = bot.NO_REPLY_NEEDED_SENTINEL
+        turn.final_item_id = "item-2"
+        turn.final_text = bot.NO_REPLY_NEEDED_SENTINEL
+        turn.fallback_text = turn.agent_item_text["item-1"]
+
+        assert session._best_turn_text(turn) == turn.agent_item_text["item-1"]
+    finally:
+        loop.close()
+
+
+def test_best_turn_text_keeps_no_reply_sentinel_for_no_reply_turns() -> None:
+    bot = _load_bot_module()
+    session = bot.CodexSession("channel-42")
+    loop = asyncio.new_event_loop()
+    try:
+        turn = bot.ActiveTurn(
+            turn_id="turn-1",
+            started_at=0.0,
+            last_activity_at=0.0,
+            latest_message=_message(channel_id=42, author_id=8, content="<@999> take over", mentions=[SimpleNamespace(id=999)]),
+            completion=loop.create_future(),
+            reply_required=False,
+        )
+        turn.agent_item_text["item-1"] = "Taking over the task now."
+        turn.agent_item_text["item-2"] = bot.NO_REPLY_NEEDED_SENTINEL
+        turn.final_item_id = "item-2"
+        turn.final_text = bot.NO_REPLY_NEEDED_SENTINEL
+        turn.fallback_text = turn.agent_item_text["item-1"]
+
+        assert session._best_turn_text(turn) == bot.NO_REPLY_NEEDED_SENTINEL
+    finally:
+        loop.close()
+
+
 def test_bot_handoff_does_not_overwrite_latest_human_instruction() -> None:
     bot = _load_bot_module()
 
