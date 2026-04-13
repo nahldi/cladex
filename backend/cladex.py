@@ -352,17 +352,16 @@ def _runtime_pip_install(python_exe: str | Path, requirement: str) -> None:
 
 
 def _ensure_claude_background_runtime() -> None:
+    """Ensure the Claude background runtime Python environment exists.
+
+    Note: As of the subprocess-based refactor, claude-code-sdk is no longer
+    required. The backend uses direct subprocess management with CREATE_NO_WINDOW
+    on Windows for headless Claude CLI execution.
+    """
     runtime_python = relayctl.install_plugin.runtime_python_path()
     if not runtime_python.exists():
         source = relayctl.install_plugin._install_source()
         runtime_python = relayctl.install_plugin._ensure_runtime(source=source)
-    if not _python_supports_module(runtime_python, "claude_code_sdk"):
-        _runtime_pip_install(runtime_python, "claude-code-sdk>=0.0.25,<0.1")
-    if not _python_supports_module(runtime_python, "claude_code_sdk"):
-        raise RuntimeError(
-            "CLADEX background runtime is missing `claude-code-sdk` after refresh. "
-            "Run `py -m pip install -e backend` or reinstall/update the shared runtime."
-        )
 
 
 def start_profile(profile: dict[str, Any]) -> None:
