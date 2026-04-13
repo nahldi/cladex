@@ -2,13 +2,13 @@
 """
 Discord Claude Relay - Backend
 
-Runs Claude Code in one-shot print mode per turn.
+Runs Claude Code through the Python SDK in streaming control-protocol mode.
 
 Why this shape:
-- `claude -p` is a one-shot command that prints a response and exits
-- durable continuity comes from explicit session creation + later `--resume`
-- Discord relay and GUI chat are separate sessions unless they share the same
-  persisted Claude session ID on purpose
+- one persistent Claude SDK client is kept per relay channel/worktree
+- each Discord turn is sent into the existing Claude session id for that channel
+- durable continuity comes from explicit relay session persistence, not prompt
+  replay or one-shot `claude -p` invocations
 """
 from __future__ import annotations
 
@@ -18,13 +18,18 @@ import logging
 import os
 import re
 import subprocess
-import threading
 import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
+
+try:
+    from claude_code_sdk import ClaudeSDKClient, ClaudeCodeOptions
+except Exception:  # pragma: no cover - exercised via runtime dependency checks
+    ClaudeSDKClient = None  # type: ignore[assignment]
+    ClaudeCodeOptions = None  # type: ignore[assignment]
 
 from claude_common import claude_code_bin, claude_code_version, atomic_write_text, slugify
 from relay_runtime import DurableRuntime, _extract_blocker, _extract_next_step, _now_iso
@@ -103,7 +108,7 @@ class OutboundMessage:
 
 @dataclass
 class CommandResult:
-    """Structured result from a one-shot Claude CLI invocation."""
+    """Structured result from one Claude transport turn."""
 
     args: list[str]
     returncode: int
@@ -112,12 +117,23 @@ class CommandResult:
     used_resume: bool
 
 
+@dataclass
+class PersistentClaudeClient:
+    """Per-channel persistent Claude SDK client bound to one worktree."""
+
+    session: ClaudeSession
+    worktree: Path
+    client: Any | None = None
+    loop_id: int | None = None
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+
 class ClaudeSession:
     """
     Persists the Claude session identifier for the relay.
 
-    The first successful turn uses `--session-id <uuid>`.
-    Later turns use `--resume <session_id>`.
+    Each inbound Discord turn is sent into this same Claude session id until the
+    relay explicitly resets it for recovery.
     """
 
     def __init__(self, state_dir: Path, workspace: Path):
@@ -183,10 +199,7 @@ class ClaudeSession:
 
 class ClaudeBackend:
     """
-    Executes one Claude CLI turn per inbound relay message.
-
-    This backend does not try to keep a `claude -p` subprocess alive, because
-    print mode is explicitly one-shot.
+    Executes relay turns through a persistent Claude SDK client per channel.
     """
 
     def __init__(
@@ -211,6 +224,7 @@ class ClaudeBackend:
         self.reasoning_effort_default = (os.environ.get("CLAUDE_REASONING_EFFORT_DEFAULT", "high").strip().lower() or "high")
         self.reasoning_effort_allow_xhigh = os.environ.get("CLAUDE_REASONING_EFFORT_ALLOW_XHIGH", "false").strip().lower() in {"1", "true", "yes", "on"}
         self._sessions: dict[str, ClaudeSession] = {}
+        self._persistent_clients: dict[str, PersistentClaudeClient] = {}
         self._seen_channels: set[str] = set()
         self._last_session_id: str | None = None
         self._last_channel_id: str | None = None
@@ -218,8 +232,7 @@ class ClaudeBackend:
         self._last_effort: str = self.reasoning_effort_default
 
         self._running = False
-        self._process_lock = threading.Lock()
-        self._active_process: subprocess.Popen | None = None
+        self._active_channel_id: str | None = None
 
     @property
     def is_running(self) -> bool:
@@ -228,6 +241,10 @@ class ClaudeBackend:
     def start(self) -> bool:
         if self._running:
             return True
+        if ClaudeSDKClient is None or ClaudeCodeOptions is None:
+            logger.error("claude-code-sdk Python package not found")
+            self.on_status("ERROR: claude-code-sdk is not installed. Run `py -m pip install -e backend` or update the CLADEX runtime.")
+            return False
         version = claude_code_version()
         if "unknown" in version.lower():
             logger.error("Claude Code CLI not found")
@@ -244,9 +261,11 @@ class ClaudeBackend:
             self.on_status("Claude ready. Durable memory and session recovery are active.")
         return True
 
-    def stop(self) -> None:
+    async def stop(self) -> None:
         self._running = False
-        self.interrupt()
+        await self.interrupt()
+        for persistent in self._persistent_clients.values():
+            await self._disconnect_client(persistent)
         for channel_key in sorted(self._seen_channels):
             try:
                 self.runtime.record_shutdown(channel_key, reason="Claude relay stopped.")
@@ -254,19 +273,16 @@ class ClaudeBackend:
                 logger.exception("Failed to record Claude shutdown for %s", channel_key)
         self.on_status("Claude stopped")
 
-    def interrupt(self) -> None:
-        with self._process_lock:
-            process = self._active_process
-        if process and process.poll() is None:
-            try:
-                process.terminate()
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-            except Exception:
-                pass
+    async def interrupt(self) -> None:
+        active = self._persistent_clients.get(self._active_channel_id or "")
+        if not active or active.client is None:
+            return
+        try:
+            await active.client.interrupt()
+        except Exception:
+            logger.exception("Failed to interrupt persistent Claude session")
 
-    def process_message(self, msg: InboundMessage) -> bool:
+    async def process_message(self, msg: InboundMessage) -> bool:
         if not self.start():
             return False
 
@@ -280,11 +296,12 @@ class ClaudeBackend:
         if msg.channel_id not in self._seen_channels:
             self.runtime.record_startup(msg.channel_id)
             self._seen_channels.add(msg.channel_id)
-        session = self._session_for_channel(msg.channel_id, binding.worktree_path)
+        persistent = await self._persistent_client_for_channel(msg.channel_id, binding.worktree_path)
+        session = persistent.session
         self.runtime.bind_thread(
             msg.channel_id,
             thread_id=session.session_id or "",
-            backend="claude-print-resume",
+            backend="claude-sdk-client",
             status="active",
         )
         prompt = self._format_prompt(msg, binding.worktree_path, self.runtime.build_context_bundle(msg.channel_id))
@@ -293,146 +310,149 @@ class ClaudeBackend:
         self._last_session_id = session.session_id
         before_changes = self._git_status(binding.worktree_path)
         started_at = _now_iso()
-
-        self.on_status(
-            f"Claude working on {msg.channel_type.value} message from {msg.sender_name} in {binding.worktree_path.name} (effort: {self._effort_for_message(msg.content)})."
-        )
-        result = self._run_turn(prompt, use_resume=session.initialized, cwd=binding.worktree_path, session=session)
-
-        if self._should_retry_fresh_session(result):
-            logger.warning(
-                "Claude resume failed for session %s; creating a fresh session",
-                session.session_id,
+        self._active_channel_id = msg.channel_id
+        try:
+            self.on_status(
+                f"Claude working on {msg.channel_type.value} message from {msg.sender_name} in {binding.worktree_path.name} (effort: {self._effort_for_message(msg.content)})."
             )
-            self.on_status("Claude session was stale. Recreating session.")
-            session.reset()
-            self.runtime.bind_thread(
-                msg.channel_id,
-                thread_id=session.session_id or "",
-                backend="claude-print-resume",
-                status="rebound",
-            )
-            result = self._run_turn(prompt, use_resume=False, cwd=binding.worktree_path, session=session)
+            result = await self._run_turn(prompt, cwd=binding.worktree_path, persistent=persistent)
 
-        after_changes = self._git_status(binding.worktree_path)
-        changed_files = sorted(set(after_changes) | set(before_changes))
-        content = self._extract_response_text(result.stdout) if result.returncode == 0 else ""
+            if self._should_retry_fresh_session(result):
+                logger.warning(
+                    "Claude session transport failed for session %s; creating a fresh session",
+                    session.session_id,
+                )
+                self.on_status("Claude session was stale. Recreating session.")
+                session.reset()
+                await self._disconnect_client(persistent)
+                self.runtime.bind_thread(
+                    msg.channel_id,
+                    thread_id=session.session_id or "",
+                    backend="claude-sdk-client",
+                    status="rebound",
+                )
+                result = await self._run_turn(prompt, cwd=binding.worktree_path, persistent=persistent)
 
-        if self._should_retry_empty_response(result, content=content, before_changes=before_changes, after_changes=after_changes):
-            logger.warning(
-                "Claude returned no text for session %s with no observed workspace changes; retrying once with a fresh session",
-                session.session_id,
-            )
-            self.on_status("Claude returned no text. Retrying once with a fresh session.")
-            session.reset()
-            self.runtime.bind_thread(
-                msg.channel_id,
-                thread_id=session.session_id or "",
-                backend="claude-print-resume",
-                status="rebound",
-            )
-            result = self._run_turn(prompt, use_resume=False, cwd=binding.worktree_path, session=session)
             after_changes = self._git_status(binding.worktree_path)
             changed_files = sorted(set(after_changes) | set(before_changes))
             content = self._extract_response_text(result.stdout) if result.returncode == 0 else ""
 
-        if result.returncode != 0:
-            failure_message = self._failure_text(result)
-            self.runtime.record_turn_result(
+            if self._should_retry_empty_response(result, content=content, before_changes=before_changes, after_changes=after_changes):
+                logger.warning(
+                    "Claude returned no text for session %s with no observed workspace changes; retrying once with a fresh session",
+                    session.session_id,
+                )
+                self.on_status("Claude returned no text. Retrying once with a fresh session.")
+                session.reset()
+                await self._disconnect_client(persistent)
+                self.runtime.bind_thread(
+                    msg.channel_id,
+                    thread_id=session.session_id or "",
+                    backend="claude-sdk-client",
+                    status="rebound",
+                )
+                result = await self._run_turn(prompt, cwd=binding.worktree_path, persistent=persistent)
+                after_changes = self._git_status(binding.worktree_path)
+                changed_files = sorted(set(after_changes) | set(before_changes))
+                content = self._extract_response_text(result.stdout) if result.returncode == 0 else ""
+
+            if result.returncode != 0:
+                failure_message = self._failure_text(result)
+                self.runtime.record_turn_result(
+                    channel_key=msg.channel_id,
+                    thread_id=session.session_id or "claude-missing-session",
+                    turn_id=f"claude-error-{msg.message_id or int(time.time() * 1000)}",
+                    summary=f"Claude turn failed: {failure_message}",
+                    files_changed=changed_files,
+                    commands_run=[self._display_command(result.args)],
+                    validations=[],
+                    blocker=failure_message,
+                    next_step="Retry the same task from durable memory after fixing the Claude CLI failure.",
+                    command_exit_codes=[result.returncode],
+                    cwd=str(binding.worktree_path),
+                    approvals=[],
+                    error_category="claude-cli-error",
+                    started_at=started_at,
+                    completed_at=_now_iso(),
+                    backend="claude-sdk-client",
+                    degraded=False,
+                )
+                self._report_failure(result)
+                return False
+
+            if not content.strip():
+                self.runtime.record_turn_result(
+                    channel_key=msg.channel_id,
+                    thread_id=session.session_id or "claude-missing-session",
+                    turn_id=f"claude-empty-{msg.message_id or int(time.time() * 1000)}",
+                    summary="Claude returned no text.",
+                    files_changed=changed_files,
+                    commands_run=[self._display_command(result.args)],
+                    validations=[],
+                    blocker="Claude returned no text.",
+                    next_step="Retry the same task from durable memory and inspect the Claude CLI output.",
+                    command_exit_codes=[result.returncode],
+                    cwd=str(binding.worktree_path),
+                    approvals=[],
+                    error_category="empty-response",
+                    started_at=started_at,
+                    completed_at=_now_iso(),
+                    backend="claude-sdk-client",
+                    degraded=False,
+                )
+                self._report_failure(result, default_message="Claude returned no text.")
+                return False
+
+            session.mark_success()
+            self.runtime.bind_thread(
+                msg.channel_id,
+                thread_id=session.session_id or "",
+                backend="claude-sdk-client",
+                status="active",
+            )
+            self._last_session_id = session.session_id
+            validations = self._extract_validation_lines(content)
+            commands_run = [self._display_command(result.args), *self._extract_command_lines(content)]
+            summary = self._summarize_response(content)
+            next_step = _extract_next_step(content) or "Continue from STATUS.md and the latest handoff."
+            blocker = _extract_blocker(content)
+            turn_id = f"claude-{msg.message_id or int(time.time() * 1000)}"
+            turn_recorded = self.runtime.record_turn_result(
                 channel_key=msg.channel_id,
                 thread_id=session.session_id or "claude-missing-session",
-                turn_id=f"claude-error-{msg.message_id or int(time.time() * 1000)}",
-                summary=f"Claude turn failed: {failure_message}",
+                turn_id=turn_id,
+                summary=summary,
                 files_changed=changed_files,
-                commands_run=[self._display_command(result.args)],
-                validations=[],
-                blocker=failure_message,
-                next_step="Retry the same task from durable memory after fixing the Claude CLI failure.",
+                commands_run=commands_run[:8],
+                validations=validations[:8],
+                blocker=blocker,
+                next_step=next_step,
                 command_exit_codes=[result.returncode],
                 cwd=str(binding.worktree_path),
                 approvals=[],
-                error_category="claude-cli-error",
+                error_category="",
                 started_at=started_at,
                 completed_at=_now_iso(),
-                backend="claude-print-resume",
+                backend="claude-sdk-client",
                 degraded=False,
             )
-            self._report_failure(result)
-            return False
-
-        if not content.strip():
-            self.runtime.record_turn_result(
-                channel_key=msg.channel_id,
-                thread_id=session.session_id or "claude-missing-session",
-                turn_id=f"claude-empty-{msg.message_id or int(time.time() * 1000)}",
-                summary="Claude returned no text.",
-                files_changed=changed_files,
-                commands_run=[self._display_command(result.args)],
-                validations=[],
-                blocker="Claude returned no text.",
-                next_step="Retry the same task from durable memory and inspect the Claude CLI output.",
-                command_exit_codes=[result.returncode],
-                cwd=str(binding.worktree_path),
-                approvals=[],
-                error_category="empty-response",
-                started_at=started_at,
-                completed_at=_now_iso(),
-                backend="claude-print-resume",
-                degraded=False,
+            if not turn_recorded:
+                logger.info("Duplicate turn %s detected, skipping response", turn_id)
+                self.on_status("Claude turn was duplicate (already processed).")
+                return True
+            self.on_response(
+                OutboundMessage(
+                    channel_type=msg.channel_type,
+                    channel_id=msg.channel_id,
+                    content=content,
+                    reply_to=msg.message_id,
+                    is_final=True,
+                )
             )
-            self._report_failure(result, default_message="Claude returned no text.")
-            return False
-
-        session.mark_success()
-        self.runtime.bind_thread(
-            msg.channel_id,
-            thread_id=session.session_id or "",
-            backend="claude-print-resume",
-            status="active",
-        )
-        self._last_session_id = session.session_id
-        validations = self._extract_validation_lines(content)
-        commands_run = [self._display_command(result.args), *self._extract_command_lines(content)]
-        summary = self._summarize_response(content)
-        next_step = _extract_next_step(content) or "Continue from STATUS.md and the latest handoff."
-        blocker = _extract_blocker(content)
-        # Use message_id for idempotent turn_id (prevents duplicate processing on restart)
-        turn_id = f"claude-{msg.message_id or int(time.time() * 1000)}"
-        turn_recorded = self.runtime.record_turn_result(
-            channel_key=msg.channel_id,
-            thread_id=session.session_id or "claude-missing-session",
-            turn_id=turn_id,
-            summary=summary,
-            files_changed=changed_files,
-            commands_run=commands_run[:8],
-            validations=validations[:8],
-            blocker=blocker,
-            next_step=next_step,
-            command_exit_codes=[result.returncode],
-            cwd=str(binding.worktree_path),
-            approvals=[],
-            error_category="",
-            started_at=started_at,
-            completed_at=_now_iso(),
-            backend="claude-print-resume",
-            degraded=False,
-        )
-        # If turn was duplicate (already processed), skip sending response
-        if not turn_recorded:
-            logger.info("Duplicate turn %s detected, skipping response", turn_id)
-            self.on_status("Claude turn was duplicate (already processed).")
+            self.on_status("Claude turn complete.")
             return True
-        self.on_response(
-            OutboundMessage(
-                channel_type=msg.channel_type,
-                channel_id=msg.channel_id,
-                content=content,
-                reply_to=msg.message_id,
-                is_final=True,
-            )
-        )
-        self.on_status("Claude turn complete.")
-        return True
+        finally:
+            self._active_channel_id = None
 
     def claim_inbound_discord_message(self, channel_key: str, message_id: str | int | None) -> bool:
         return self.runtime.claim_inbound_discord_message(channel_key, message_id)
@@ -529,64 +549,140 @@ class ClaudeBackend:
             sections.append(f"[{relative_path}]\n{content}")
         return "\n\n".join(sections)
 
-    def _build_command(self, prompt: str, *, use_resume: bool, session: ClaudeSession) -> list[str]:
+    def _build_command(self, *, cwd: Path) -> list[str]:
         cmd = [
             claude_code_bin(),
-            "-p",
-            "--verbose",
             "--output-format",
+            "stream-json",
+            "--verbose",
+            "--input-format",
             "stream-json",
             "--model",
             self.model,
-            "--dangerously-skip-permissions",
+            "--permission-mode",
+            "bypassPermissions",
         ]
-        if use_resume:
-            cmd.extend(["--resume", session.session_id])
-        else:
-            cmd.extend(["--session-id", session.session_id])
-        cmd.append(prompt)
         return cmd
 
-    def _run_turn(self, prompt: str, *, use_resume: bool, cwd: Path, session: ClaudeSession) -> CommandResult:
-        cmd = self._build_command(prompt, use_resume=use_resume, session=session)
-        env = os.environ.copy()
-        env["CLAUDE_CODE_ENTRYPOINT"] = "cladex"
-        env["CLADEX_ACTIVE_WORKTREE"] = str(cwd)
-
-        kwargs = {
-            "cwd": str(cwd),
-            "env": env,
-            "stdin": subprocess.DEVNULL,
-            "stdout": subprocess.PIPE,
-            "stderr": subprocess.PIPE,
-            "text": True,
-        }
-        if os.name == "nt":
-            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-
-        process = subprocess.Popen(cmd, **kwargs)
-        with self._process_lock:
-            self._active_process = process
-        try:
-            stdout, stderr = process.communicate()
-        finally:
-            with self._process_lock:
-                if self._active_process is process:
-                    self._active_process = None
-
-        return CommandResult(
-            args=cmd,
-            returncode=process.returncode,
-            stdout=stdout or "",
-            stderr=stderr or "",
-            used_resume=use_resume,
+    def _sdk_options(self, *, cwd: Path) -> Any:
+        if ClaudeCodeOptions is None:
+            raise RuntimeError("claude-code-sdk is not installed")
+        return ClaudeCodeOptions(
+            cwd=str(cwd),
+            model=self.model,
+            permission_mode="bypassPermissions",
+            env={"CLADEX_ACTIVE_WORKTREE": str(cwd)},
         )
+
+    async def _persistent_client_for_channel(self, channel_key: str, prompt_workspace: Path) -> PersistentClaudeClient:
+        session = self._session_for_channel(channel_key, prompt_workspace)
+        persistent = self._persistent_clients.get(channel_key)
+        current_loop_id = id(asyncio.get_running_loop())
+        if persistent is None:
+            persistent = PersistentClaudeClient(session=session, worktree=prompt_workspace)
+            self._persistent_clients[channel_key] = persistent
+            return persistent
+        persistent.session = session
+        if persistent.worktree != prompt_workspace:
+            await self._disconnect_client(persistent)
+            persistent.worktree = prompt_workspace
+        if persistent.client is not None and persistent.loop_id is not None and persistent.loop_id != current_loop_id:
+            await self._disconnect_client(persistent)
+        return persistent
+
+    async def _connect_client(self, persistent: PersistentClaudeClient) -> Any:
+        current_loop_id = id(asyncio.get_running_loop())
+        if persistent.client is not None and persistent.loop_id == current_loop_id:
+            return persistent.client
+        if persistent.client is not None:
+            await self._disconnect_client(persistent)
+        if ClaudeSDKClient is None:
+            raise RuntimeError("claude-code-sdk is not installed")
+        client = ClaudeSDKClient(self._sdk_options(cwd=persistent.worktree))
+        try:
+            await client.connect()
+        except Exception:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+            raise
+        persistent.client = client
+        persistent.loop_id = current_loop_id
+        return client
+
+    async def _disconnect_client(self, persistent: PersistentClaudeClient) -> None:
+        client = persistent.client
+        persistent.client = None
+        persistent.loop_id = None
+        if client is None:
+            return
+        try:
+            await client.disconnect()
+        except Exception:
+            logger.exception("Failed to disconnect persistent Claude SDK client")
+
+    async def _run_turn(self, prompt: str, *, cwd: Path, persistent: PersistentClaudeClient) -> CommandResult:
+        cmd = self._build_command(cwd=cwd)
+        used_resume = persistent.session.initialized
+        async with persistent.lock:
+            persistent.worktree = cwd
+            try:
+                client = await self._connect_client(persistent)
+                session_id = persistent.session.session_id or "default"
+                await client.query(prompt, session_id=session_id)
+                assistant_parts: list[str] = []
+                result_text = ""
+                stderr_parts: list[str] = []
+                returncode = 0
+                final_session_id: str | None = None
+                async for message in client.receive_response():
+                    message_kind = self._sdk_message_kind(message)
+                    text = self._extract_text_from_sdk_message(message)
+                    if message_kind == "assistant":
+                        if text:
+                            assistant_parts.append(text)
+                        continue
+                    if message_kind == "result":
+                        final_session_id = getattr(message, "session_id", None) or final_session_id
+                        if getattr(message, "is_error", False):
+                            returncode = 1
+                            if text:
+                                stderr_parts.append(text)
+                        elif text and not result_text:
+                            result_text = text
+                        continue
+                    if text:
+                        stderr_parts.append(text)
+                if final_session_id and final_session_id != persistent.session.session_id:
+                    persistent.session.adopt(final_session_id, initialized=returncode == 0)
+                stdout = "\n\n".join(part for part in assistant_parts if part.strip()).strip()
+                if not stdout and result_text.strip():
+                    stdout = result_text.strip()
+                stderr = "\n".join(part for part in stderr_parts if part.strip()).strip()
+                return CommandResult(
+                    args=cmd,
+                    returncode=returncode,
+                    stdout=stdout,
+                    stderr=stderr,
+                    used_resume=used_resume,
+                )
+            except Exception as exc:
+                await self._disconnect_client(persistent)
+                return CommandResult(
+                    args=cmd,
+                    returncode=1,
+                    stdout="",
+                    stderr=str(exc),
+                    used_resume=used_resume,
+                )
 
     def _extract_response_text(self, stdout: str) -> str:
         delta_parts: list[str] = []
         result_text: str = ""
         assistant_text: str = ""
         error_text: str = ""
+        parsed_json = False
 
         for raw_line in stdout.splitlines():
             line = raw_line.strip()
@@ -595,8 +691,8 @@ class ClaudeBackend:
             try:
                 event = json.loads(line)
             except json.JSONDecodeError:
-                # Skip non-JSON lines (verbose debug output)
                 continue
+            parsed_json = True
 
             event_type = event.get("type", "")
 
@@ -629,6 +725,8 @@ class ClaudeBackend:
             return assistant_text.strip()
         if error_text:
             return error_text.strip()
+        if not parsed_json:
+            return stdout.strip()
         return ""
 
     def _extract_text_from_event(self, event: dict) -> str:
@@ -667,9 +765,13 @@ class ClaudeBackend:
         return ""
 
     def _should_retry_fresh_session(self, result: CommandResult) -> bool:
-        if result.returncode == 0 or not result.used_resume:
+        if result.returncode == 0:
             return False
         haystack = f"{result.stdout}\n{result.stderr}".lower()
+        if self._is_session_id_in_use_error(haystack):
+            return True
+        if not result.used_resume:
+            return False
         needles = [
             "session not found",
             "could not find session",
@@ -679,6 +781,11 @@ class ClaudeBackend:
             "resume",
         ]
         return any(needle in haystack for needle in needles)
+
+    @staticmethod
+    def _is_session_id_in_use_error(haystack: str) -> bool:
+        normalized = haystack.lower()
+        return "session" in normalized and "already in use" in normalized
 
     def _should_retry_empty_response(
         self,
@@ -698,7 +805,7 @@ class ClaudeBackend:
         message = default_message or self._failure_text(result)
         self.on_status(f"ERROR: {message}")
         logger.error(
-            "Claude command failed (rc=%s, resume=%s): %s",
+            "Claude transport failed (rc=%s, resume=%s): %s",
             result.returncode,
             result.used_resume,
             " ".join(result.args),
@@ -743,15 +850,61 @@ class ClaudeBackend:
     def _failure_text(self, result: CommandResult) -> str:
         stderr = result.stderr.strip()
         stdout = result.stdout.strip()
-        return stderr or stdout or f"Claude command failed with exit code {result.returncode}"
+        return stderr or stdout or f"Claude transport failed with exit code {result.returncode}"
 
     def _display_command(self, args: list[str]) -> str:
         if not args:
             return "claude"
         if len(args) <= 7:
             return " ".join(args)
-        visible = [*args[:7], "...<prompt>"]
+        visible = [*args[:7], "..."]
         return " ".join(visible)
+
+    def _sdk_message_kind(self, message: Any) -> str:
+        if hasattr(message, "is_error") and hasattr(message, "session_id"):
+            return "result"
+        if hasattr(message, "content") and hasattr(message, "model"):
+            return "assistant"
+        if hasattr(message, "subtype") and hasattr(message, "data"):
+            return "system"
+        if hasattr(message, "event") and hasattr(message, "session_id"):
+            return "stream"
+        return "unknown"
+
+    def _extract_text_from_sdk_message(self, message: Any) -> str:
+        message_kind = self._sdk_message_kind(message)
+        if message_kind == "assistant":
+            content = getattr(message, "content", None)
+            if isinstance(content, list):
+                parts: list[str] = []
+                for block in content:
+                    text = getattr(block, "text", None)
+                    if isinstance(text, str) and text:
+                        parts.append(text)
+                return "".join(parts).strip()
+        if message_kind == "result":
+            result = getattr(message, "result", None)
+            if isinstance(result, str):
+                return result.strip()
+            return ""
+        if message_kind == "system":
+            data = getattr(message, "data", None)
+            if isinstance(data, dict):
+                for key in ("message", "error", "details"):
+                    value = data.get(key)
+                    if isinstance(value, str) and value.strip():
+                        return value.strip()
+            return ""
+        if message_kind == "stream":
+            event = getattr(message, "event", None)
+            if isinstance(event, dict):
+                delta = event.get("delta")
+                if isinstance(delta, dict):
+                    text = delta.get("text")
+                    if isinstance(text, str):
+                        return text.strip()
+            return ""
+        return ""
 
     def _extract_command_lines(self, text: str) -> list[str]:
         commands: list[str] = []
@@ -953,7 +1106,7 @@ class RelayBackend:
                 await self._worker_task
             except asyncio.CancelledError:
                 pass
-        self._claude.stop()
+        await self._claude.stop()
 
     async def send_discord_message(
         self,
@@ -1005,7 +1158,7 @@ class RelayBackend:
         while True:
             try:
                 msg = await self._message_queue.get()
-                ok = await asyncio.to_thread(self._claude.process_message, msg)
+                ok = await self._claude.process_message(msg)
                 if msg.channel_type == ChannelType.GUI:
                     future = self._pending_local.get(msg.message_id)
                     if future and not future.done() and not ok:

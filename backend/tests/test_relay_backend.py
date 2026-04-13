@@ -1,6 +1,79 @@
+import asyncio
 from pathlib import Path
 
 from claude_backend import ClaudeBackend, ClaudeSession, CommandResult, InboundMessage, ChannelType
+
+
+class FakeOptions:
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+
+class FakeTextBlock:
+    def __init__(self, text: str):
+        self.text = text
+
+
+class FakeAssistantMessage:
+    def __init__(self, *parts: str):
+        self.content = [FakeTextBlock(part) for part in parts]
+        self.model = "claude-opus"
+
+
+class FakeResultMessage:
+    def __init__(self, *, session_id: str, result: str | None = None, is_error: bool = False):
+        self.subtype = "result"
+        self.duration_ms = 1
+        self.duration_api_ms = 1
+        self.is_error = is_error
+        self.num_turns = 1
+        self.session_id = session_id
+        self.total_cost_usd = None
+        self.usage = None
+        self.result = result
+
+
+class FakeClaudeSDKClient:
+    instances: list["FakeClaudeSDKClient"] = []
+    responses_queue: list[list[object]] = []
+    connect_error: Exception | None = None
+    query_error: Exception | None = None
+
+    def __init__(self, options=None):
+        self.options = options
+        self.connected = False
+        self.disconnected = False
+        self.interrupted = False
+        self.queries: list[tuple[str, str]] = []
+        self.__class__.instances.append(self)
+
+    @classmethod
+    def reset(cls) -> None:
+        cls.instances = []
+        cls.responses_queue = []
+        cls.connect_error = None
+        cls.query_error = None
+
+    async def connect(self) -> None:
+        if self.__class__.connect_error is not None:
+            raise self.__class__.connect_error
+        self.connected = True
+
+    async def query(self, prompt: str, session_id: str = "default") -> None:
+        if self.__class__.query_error is not None:
+            raise self.__class__.query_error
+        self.queries.append((prompt, session_id))
+
+    async def receive_response(self):
+        responses = list(self.__class__.responses_queue.pop(0)) if self.__class__.responses_queue else []
+        for item in responses:
+            yield item
+
+    async def interrupt(self) -> None:
+        self.interrupted = True
+
+    async def disconnect(self) -> None:
+        self.disconnected = True
 
 
 def test_session_persists_initialized_state(tmp_path: Path) -> None:
@@ -21,28 +94,59 @@ def test_session_persists_initialized_state(tmp_path: Path) -> None:
     assert reloaded.last_success_at
 
 
-def test_build_command_uses_session_id_then_resume(tmp_path: Path) -> None:
+def test_build_command_uses_streaming_sdk_flags(tmp_path: Path) -> None:
     backend = ClaudeBackend(
         workspace=tmp_path,
         state_dir=tmp_path / "state",
         on_response=lambda msg: None,
     )
-    session = backend._session_for_channel("123", tmp_path)
 
-    create_cmd = backend._build_command("hello", use_resume=False, session=session)
-    assert "--session-id" in create_cmd
-    assert "--resume" not in create_cmd
-    assert "--dangerously-skip-permissions" in create_cmd
-    assert create_cmd[-1] == "hello"
-    assert create_cmd.index("--dangerously-skip-permissions") < len(create_cmd) - 1
+    cmd = backend._build_command(cwd=tmp_path)
 
-    resume_cmd = backend._build_command("hello again", use_resume=True, session=session)
-    assert "--resume" in resume_cmd
-    assert "--session-id" not in resume_cmd
-    assert "--dangerously-skip-permissions" in resume_cmd
-    assert "claude-opus-4-5-20251101" in resume_cmd
-    assert resume_cmd[-1] == "hello again"
-    assert resume_cmd.index("--dangerously-skip-permissions") < len(resume_cmd) - 1
+    assert "--output-format" in cmd
+    assert "--input-format" in cmd
+    assert "--permission-mode" in cmd
+    assert "bypassPermissions" in cmd
+    assert "-p" not in cmd
+    assert "--resume" not in cmd
+    assert "--session-id" not in cmd
+    assert "--dangerously-skip-permissions" not in cmd
+
+
+def test_run_turn_reuses_persistent_sdk_client(tmp_path: Path, monkeypatch) -> None:
+    FakeClaudeSDKClient.reset()
+    monkeypatch.setattr("claude_backend.ClaudeSDKClient", FakeClaudeSDKClient)
+    monkeypatch.setattr("claude_backend.ClaudeCodeOptions", FakeOptions)
+
+    backend = ClaudeBackend(
+        workspace=tmp_path,
+        state_dir=tmp_path / "state",
+        on_response=lambda msg: None,
+    )
+
+    async def exercise() -> tuple[CommandResult, CommandResult]:
+        persistent = await backend._persistent_client_for_channel("123", tmp_path)
+        session_id = persistent.session.session_id or "missing"
+        FakeClaudeSDKClient.responses_queue = [
+            [FakeAssistantMessage("done"), FakeResultMessage(session_id=session_id)],
+            [FakeAssistantMessage("again"), FakeResultMessage(session_id=session_id)],
+        ]
+        first = await backend._run_turn("hello", cwd=tmp_path, persistent=persistent)
+        second = await backend._run_turn("hello again", cwd=tmp_path, persistent=persistent)
+        return first, second
+
+    first, second = asyncio.run(exercise())
+
+    assert first.returncode == 0
+    assert first.stdout == "done"
+    assert second.returncode == 0
+    assert second.stdout == "again"
+    assert len(FakeClaudeSDKClient.instances) == 1
+    query_session_ids = [session_id for _, session_id in FakeClaudeSDKClient.instances[0].queries]
+    assert FakeClaudeSDKClient.instances[0].queries == [("hello", query_session_ids[0]), ("hello again", query_session_ids[1])]
+    assert query_session_ids[0] == query_session_ids[1]
+    assert FakeClaudeSDKClient.instances[0].options.permission_mode == "bypassPermissions"
+    assert FakeClaudeSDKClient.instances[0].options.cwd == str(tmp_path)
 
 
 def test_process_message_retries_with_fresh_session_on_resume_failure(tmp_path: Path) -> None:
@@ -55,25 +159,27 @@ def test_process_message_retries_with_fresh_session_on_resume_failure(tmp_path: 
         on_status=statuses.append,
     )
     session = backend._session_for_channel("123", tmp_path)
+    original_session_id = session.session_id
     session.initialized = True
     session._save()
 
-    calls: list[bool] = []
+    calls: list[tuple[bool, str | None]] = []
 
-    def fake_run_turn(prompt: str, *, use_resume: bool, cwd: Path, session: ClaudeSession) -> CommandResult:
-        calls.append(use_resume)
-        if use_resume:
+    async def fake_run_turn(prompt: str, *, cwd: Path, persistent) -> CommandResult:
+        used_resume = persistent.session.initialized
+        calls.append((used_resume, persistent.session.session_id))
+        if used_resume:
             return CommandResult(
-                args=["claude", "--resume", session.session_id],
+                args=["claude", "--input-format", "stream-json"],
                 returncode=1,
                 stdout="",
                 stderr="Session not found",
                 used_resume=True,
             )
         return CommandResult(
-            args=["claude", "--session-id", session.session_id],
+            args=["claude", "--input-format", "stream-json"],
             returncode=0,
-            stdout='{"type":"result","result":"done"}\n',
+            stdout="done",
             stderr="",
             used_resume=False,
         )
@@ -81,20 +187,80 @@ def test_process_message_retries_with_fresh_session_on_resume_failure(tmp_path: 
     backend._run_turn = fake_run_turn  # type: ignore[method-assign]
     backend.start = lambda: True  # type: ignore[method-assign]
 
-    ok = backend.process_message(
-        InboundMessage(
-            channel_type=ChannelType.DISCORD,
-            channel_id="123",
-            sender_id="u1",
-            sender_name="user",
-            content="fix it",
+    ok = asyncio.run(
+        backend.process_message(
+            InboundMessage(
+                channel_type=ChannelType.DISCORD,
+                channel_id="123",
+                sender_id="u1",
+                sender_name="user",
+                content="fix it",
+            )
         )
     )
 
     assert ok is True
-    assert calls == [True, False]
+    assert calls[0] == (True, original_session_id)
+    assert calls[1][0] is False
+    assert calls[1][1] != calls[0][1]
     assert responses == ["done"]
     assert any("stale" in status.lower() for status in statuses)
+
+
+def test_process_message_retries_with_fresh_session_on_session_id_collision(tmp_path: Path) -> None:
+    responses: list[str] = []
+    statuses: list[str] = []
+    backend = ClaudeBackend(
+        workspace=tmp_path,
+        state_dir=tmp_path / "state",
+        on_response=lambda msg: responses.append(msg.content),
+        on_status=statuses.append,
+    )
+    session = backend._session_for_channel("123", tmp_path)
+    original_session_id = session.session_id
+
+    calls: list[tuple[bool, str | None]] = []
+
+    async def fake_run_turn(prompt: str, *, cwd: Path, persistent) -> CommandResult:
+        used_resume = persistent.session.initialized
+        calls.append((used_resume, persistent.session.session_id))
+        if len(calls) == 1:
+            return CommandResult(
+                args=["claude", "--input-format", "stream-json"],
+                returncode=1,
+                stdout="",
+                stderr=f"Error: Session ID {persistent.session.session_id} is already in use.",
+                used_resume=used_resume,
+            )
+        return CommandResult(
+            args=["claude", "--input-format", "stream-json"],
+            returncode=0,
+            stdout="done after fresh session",
+            stderr="",
+            used_resume=used_resume,
+        )
+
+    backend._run_turn = fake_run_turn  # type: ignore[method-assign]
+    backend.start = lambda: True  # type: ignore[method-assign]
+
+    ok = asyncio.run(
+        backend.process_message(
+            InboundMessage(
+                channel_type=ChannelType.DISCORD,
+                channel_id="123",
+                sender_id="u1",
+                sender_name="user",
+                content="fix it",
+            )
+        )
+    )
+
+    assert ok is True
+    assert calls[0] == (False, original_session_id)
+    assert calls[1][0] is False
+    assert calls[1][1] != original_session_id
+    assert responses == ["done after fresh session"]
+    assert any("recreating session" in status.lower() for status in statuses)
 
 
 def test_process_message_retries_once_when_claude_returns_no_text(tmp_path: Path) -> None:
@@ -107,41 +273,46 @@ def test_process_message_retries_once_when_claude_returns_no_text(tmp_path: Path
         on_status=statuses.append,
     )
 
-    calls: list[bool] = []
+    calls: list[tuple[bool, str | None]] = []
 
-    def fake_run_turn(prompt: str, *, use_resume: bool, cwd: Path, session: ClaudeSession) -> CommandResult:
-        calls.append(use_resume)
+    async def fake_run_turn(prompt: str, *, cwd: Path, persistent) -> CommandResult:
+        used_resume = persistent.session.initialized
+        calls.append((used_resume, persistent.session.session_id))
         if len(calls) == 1:
             return CommandResult(
-                args=["claude", "--session-id", session.session_id],
+                args=["claude", "--input-format", "stream-json"],
                 returncode=0,
-                stdout='{"type":"result","result":""}\n',
+                stdout="",
                 stderr="",
-                used_resume=use_resume,
+                used_resume=used_resume,
             )
         return CommandResult(
-            args=["claude", "--session-id", session.session_id],
+            args=["claude", "--input-format", "stream-json"],
             returncode=0,
-            stdout='{"type":"result","result":"done after retry"}\n',
+            stdout="done after retry",
             stderr="",
-            used_resume=use_resume,
+            used_resume=used_resume,
         )
 
     backend._run_turn = fake_run_turn  # type: ignore[method-assign]
     backend.start = lambda: True  # type: ignore[method-assign]
 
-    ok = backend.process_message(
-        InboundMessage(
-            channel_type=ChannelType.DISCORD,
-            channel_id="123",
-            sender_id="u1",
-            sender_name="user",
-            content="fix it",
+    ok = asyncio.run(
+        backend.process_message(
+            InboundMessage(
+                channel_type=ChannelType.DISCORD,
+                channel_id="123",
+                sender_id="u1",
+                sender_name="user",
+                content="fix it",
+            )
         )
     )
 
     assert ok is True
-    assert calls == [False, False]
+    assert calls[0][0] is False
+    assert calls[1][0] is False
+    assert calls[1][1] != calls[0][1]
     assert responses == ["done after retry"]
     assert any("retrying once" in status.lower() for status in statuses)
 
@@ -179,13 +350,26 @@ def test_format_prompt_includes_durable_context_and_caveman_rules(tmp_path: Path
     assert "Current relay effort policy for this turn: high." in prompt
 
 
-def test_start_records_process_restart_event(tmp_path: Path, monkeypatch) -> None:
+def test_extract_response_text_accepts_plain_sdk_output(tmp_path: Path) -> None:
     backend = ClaudeBackend(
         workspace=tmp_path,
         state_dir=tmp_path / "state",
         on_response=lambda msg: None,
     )
+
+    assert backend._extract_response_text("done") == "done"
+
+
+def test_start_records_process_restart_event(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("claude_backend.ClaudeSDKClient", object)
+    monkeypatch.setattr("claude_backend.ClaudeCodeOptions", object)
     monkeypatch.setattr("claude_backend.claude_code_version", lambda: "claude 1.0.0")
+
+    backend = ClaudeBackend(
+        workspace=tmp_path,
+        state_dir=tmp_path / "state",
+        on_response=lambda msg: None,
+    )
 
     assert backend.runtime.count_recent_restarts() == 0
 
@@ -207,28 +391,30 @@ def test_process_message_writes_durable_memory_and_handoff(tmp_path: Path) -> No
         on_status=statuses.append,
     )
 
-    def fake_run_turn(prompt: str, *, use_resume: bool, cwd: Path, session: ClaudeSession) -> CommandResult:
+    async def fake_run_turn(prompt: str, *, cwd: Path, persistent) -> CommandResult:
         assert "Durable runtime context:" in prompt
         assert "Current verified status:" in prompt
         assert cwd == workspace
         return CommandResult(
-            args=["claude", "-p", "--session-id", session.session_id],
+            args=["claude", "--input-format", "stream-json"],
             returncode=0,
-            stdout='{"type":"result","result":"done\\nNext step: run the validation pass"}\n',
+            stdout="done\nNext step: run the validation pass",
             stderr="",
-            used_resume=use_resume,
+            used_resume=persistent.session.initialized,
         )
 
     backend._run_turn = fake_run_turn  # type: ignore[method-assign]
     backend.start = lambda: True  # type: ignore[method-assign]
 
-    ok = backend.process_message(
-        InboundMessage(
-            channel_type=ChannelType.DISCORD,
-            channel_id="456",
-            sender_id="u1",
-            sender_name="Finn",
-            content="Implement durable relay memory.",
+    ok = asyncio.run(
+        backend.process_message(
+            InboundMessage(
+                channel_type=ChannelType.DISCORD,
+                channel_id="456",
+                sender_id="u1",
+                sender_name="Finn",
+                content="Implement durable relay memory.",
+            )
         )
     )
 
@@ -253,7 +439,7 @@ def test_session_rebinds_from_runtime_thread_when_session_file_is_missing(tmp_pa
         on_response=lambda msg: None,
     )
 
-    backend.runtime.bind_thread("999", thread_id="session-rebound", backend="claude-print-resume", status="active")
+    backend.runtime.bind_thread("999", thread_id="session-rebound", backend="claude-sdk-client", status="active")
     session = backend._session_for_channel("999", workspace)
 
     assert session.session_id == "session-rebound"
@@ -280,7 +466,6 @@ def test_lightweight_message_detection(tmp_path: Path) -> None:
         on_response=lambda msg: None,
     )
 
-    # Lightweight coordination messages
     assert backend._is_lightweight_message("yes") is True
     assert backend._is_lightweight_message("no") is True
     assert backend._is_lightweight_message("ok") is True
@@ -291,11 +476,10 @@ def test_lightweight_message_detection(tmp_path: Path) -> None:
     assert backend._is_lightweight_message("Yes!") is True
     assert backend._is_lightweight_message("OK.") is True
 
-    # Substantive messages should NOT be lightweight
     assert backend._is_lightweight_message("fix the relay dedup bug") is False
     assert backend._is_lightweight_message("implement durable restart tracking") is False
     assert backend._is_lightweight_message("what is the status of the project?") is False
-    assert backend._is_lightweight_message("a" * 60) is False  # Too long
+    assert backend._is_lightweight_message("a" * 60) is False
 
 
 def test_format_prompt_uses_lightweight_path_for_short_messages(tmp_path: Path) -> None:
@@ -311,7 +495,6 @@ def test_format_prompt_uses_lightweight_path_for_short_messages(tmp_path: Path) 
         on_response=lambda msg: None,
     )
 
-    # Lightweight message uses minimal prompt
     lightweight_prompt = backend._format_prompt(
         InboundMessage(
             channel_type=ChannelType.DISCORD,
@@ -324,10 +507,9 @@ def test_format_prompt_uses_lightweight_path_for_short_messages(tmp_path: Path) 
         "context bundle",
     )
     assert "lightweight coordination message" in lightweight_prompt
-    assert "AGENTS.md" not in lightweight_prompt  # Full agents not included in lightweight
+    assert "AGENTS.md" not in lightweight_prompt
     assert "Be brief" in lightweight_prompt
 
-    # Full message uses complete prompt
     full_prompt = backend._format_prompt(
         InboundMessage(
             channel_type=ChannelType.DISCORD,
