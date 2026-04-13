@@ -584,7 +584,9 @@ class ClaudeBackend:
 
     def _extract_response_text(self, stdout: str) -> str:
         delta_parts: list[str] = []
-        final_parts: list[str] = []
+        result_text: str = ""
+        assistant_text: str = ""
+        error_text: str = ""
 
         for raw_line in stdout.splitlines():
             line = raw_line.strip()
@@ -604,21 +606,29 @@ class ClaudeBackend:
                 text = delta.get("text", "")
                 if text:
                     delta_parts.append(text)
-            # Collect final message/result separately
-            elif event_type in ("assistant", "result"):
+            # Keep only the LAST of each final event type (don't concatenate)
+            elif event_type == "result":
                 text = self._extract_text_from_event(event)
                 if text:
-                    final_parts.append(text)
+                    result_text = text  # Overwrite, don't append
+            elif event_type == "assistant":
+                text = self._extract_text_from_event(event)
+                if text:
+                    assistant_text = text  # Overwrite, don't append
             elif event_type == "error":
                 text = self._extract_text_from_event(event)
                 if text:
-                    final_parts.append(text)
+                    error_text = text
 
-        # Prefer deltas if we have them, otherwise use final message
+        # Priority: deltas > result > assistant > error
         if delta_parts:
             return "".join(delta_parts).strip()
-        if final_parts:
-            return "".join(final_parts).strip()
+        if result_text:
+            return result_text.strip()
+        if assistant_text:
+            return assistant_text.strip()
+        if error_text:
+            return error_text.strip()
         return ""
 
     def _extract_text_from_event(self, event: dict) -> str:
