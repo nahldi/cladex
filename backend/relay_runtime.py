@@ -166,6 +166,59 @@ def _extract_bullets(text: str, patterns: tuple[str, ...], *, limit: int = 6) ->
     return results
 
 
+def _normalize_compare_text(value: str) -> str:
+    return re.sub(r"\s+", " ", value.strip().lower()).strip(" .")
+
+
+def _iter_markdown_entries(text: str) -> list[str]:
+    entries: list[list[str]] = []
+    current: list[str] = []
+    for raw_line in text.splitlines():
+        if raw_line.startswith("## "):
+            if current:
+                entries.append(current)
+            current = [raw_line]
+            continue
+        if current:
+            current.append(raw_line)
+    if current:
+        entries.append(current)
+    return ["\n".join(lines).strip() for lines in entries if any(line.strip() for line in lines)]
+
+
+def _extract_latest_handoff_highlights(text: str, *, limit: int = 6) -> list[str]:
+    generic_next_steps = {
+        "continue from status.md",
+        "continue from status.md and handoff.md",
+        "continue from status.md and the latest handoff",
+        "continue the current task using repo memory as source of truth",
+    }
+    for entry in _iter_markdown_entries(text):
+        results: list[str] = []
+        seen_values: set[str] = set()
+        for raw_line in entry.splitlines():
+            cleaned = raw_line.strip().lstrip("-* ").strip()
+            if not cleaned or ":" not in cleaned:
+                continue
+            label, _, value = cleaned.partition(":")
+            label_normalized = _normalize_compare_text(label)
+            value_normalized = _normalize_compare_text(value)
+            if not value_normalized:
+                continue
+            if label_normalized == "exact next step" and value_normalized in generic_next_steps:
+                continue
+            if value_normalized in seen_values:
+                continue
+            if label_normalized in {"result", "blocker", "exact next step", "changed files"}:
+                results.append(cleaned)
+                seen_values.add(value_normalized)
+            if len(results) >= limit:
+                break
+        if results:
+            return results
+    return []
+
+
 def _extract_preferences_and_constraints(text: str) -> tuple[list[str], list[str]]:
     preferences: list[str] = []
     constraints: list[str] = []
@@ -851,7 +904,11 @@ class RuntimeStore:
     def list_tasks(self, channel_id: str) -> list[dict[str, Any]]:
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT * FROM task_leases WHERE channel_id = ? ORDER BY started_at DESC",
+                """
+                SELECT * FROM task_leases
+                WHERE channel_id = ?
+                ORDER BY CASE WHEN status = 'claimed' THEN 0 ELSE 1 END, heartbeat_at DESC, started_at DESC
+                """,
                 (channel_id,),
             ).fetchall()
         return [dict(row) for row in rows]
@@ -1383,6 +1440,7 @@ class DurableRuntime:
                 owner_agent=self.agent_name,
                 target_files=[],
                 validation=[],
+                supersede_active=True,
             )
             self._sync_status(
                 binding,
@@ -1452,17 +1510,22 @@ class DurableRuntime:
         owner_agent: str,
         target_files: list[str],
         validation: list[str],
+        supersede_active: bool = False,
     ) -> dict[str, Any]:
         binding = self.ensure_binding(channel_key)
         active = self.store.active_task(channel_key)
         if active is not None:
-            self.store.heartbeat_task(str(active["task_id"]))
-            self._write_tasks_file(binding)
-            return {
-                "id": str(active["task_id"]),
-                "title": str(active["title"]),
-                "owner": str(active["owner_agent"]),
-            }
+            if supersede_active and _normalize_compare_text(str(active["title"])) != _normalize_compare_text(title):
+                self.store.release_task(str(active["task_id"]))
+                self._write_tasks_file(binding)
+            else:
+                self.store.heartbeat_task(str(active["task_id"]))
+                self._write_tasks_file(binding)
+                return {
+                    "id": str(active["task_id"]),
+                    "title": str(active["title"]),
+                    "owner": str(active["owner_agent"]),
+                }
         task_id = self.store.claim_task(
             channel_id=channel_key,
             project_id=binding.project_id,
@@ -1554,7 +1617,7 @@ class DurableRuntime:
             lines.append("")
             lines.append("Recent decisions:")
             lines.extend(f"- {item}" for item in decision_highlights[:6])
-        handoff_highlights = _extract_bullets(handoff, ("next step", "result", "blocker", "changed files"))
+        handoff_highlights = _extract_latest_handoff_highlights(handoff, limit=6)
         if handoff_highlights:
             lines.append("")
             lines.append("Latest handoff:")
@@ -1802,15 +1865,19 @@ class DurableRuntime:
         blocker: str,
         next_step: str,
     ) -> None:
+        result_text = result.strip() or "none"
+        next_step_text = next_step.strip()
+        if next_step_text and _normalize_compare_text(next_step_text) == _normalize_compare_text(result_text):
+            next_step_text = "Continue from STATUS.md."
         entry = "\n".join(
             [
                 f"## {_now_iso()}",
                 f"- task id: {task_id}",
                 f"- changed files: {', '.join(_normalize_paths(changed_files)) or 'none'}",
                 f"- commands/tests run: {', '.join(commands_run) or 'none captured'}",
-                f"- result: {result or 'none'}",
+                f"- result: {result_text}",
                 f"- blocker: {blocker or 'none'}",
-                f"- exact next step: {next_step or 'Continue from STATUS.md.'}",
+                f"- exact next step: {next_step_text or 'Continue from STATUS.md.'}",
             ]
         )
         _append_markdown_entry(binding.worktree_path / MEMORY_DIR_NAME / "HANDOFF.md", "HANDOFF", entry, prepend=True)

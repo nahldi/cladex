@@ -7,6 +7,7 @@ import json
 import shutil
 import sys
 import tempfile
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 
@@ -145,6 +146,48 @@ def test_durable_context_budget_trims_lightweight_coordination_turns() -> None:
         )
         == 6000
     )
+
+
+def test_channel_turn_input_prioritizes_latest_human_instruction() -> None:
+    bot = _load_bot_module()
+    bot.client = SimpleNamespace(user=SimpleNamespace(id=999))
+    bot.DURABLE_RUNTIME = SimpleNamespace(build_context_bundle=lambda *args, **kwargs: "Durable runtime context.")
+
+    message = SimpleNamespace(
+        id=42,
+        created_at=datetime.now(timezone.utc),
+        content="status?",
+        attachments=[],
+        embeds=[],
+        mentions=[],
+        stickers=[],
+        webhook_id=None,
+        reference=None,
+        author=SimpleNamespace(id=123, bot=True, name="Forge", display_name="Forge", global_name=None),
+        channel=SimpleNamespace(id=77),
+        guild=object(),
+    )
+    bootstrap_prompt = asyncio.run(
+        bot._channel_turn_input(
+            message,
+            new_thread=True,
+            directive=bot.RelayDirective(kind="teammate_question", authoritative=True, reply_required=True, reason=""),
+            latest_authoritative_instruction="Only answer yes or no.",
+        )
+    )
+    update_prompt = asyncio.run(
+        bot._channel_turn_input(
+            message,
+            new_thread=False,
+            directive=bot.RelayDirective(kind="teammate_question", authoritative=True, reply_required=True, reason=""),
+            latest_authoritative_instruction="Only answer yes or no.",
+        )
+    )
+
+    assert "The latest authoritative human instruction is the task to execute now." in bootstrap_prompt
+    assert "Use this update only insofar as it helps satisfy the latest authoritative human instruction." in update_prompt
+    assert "continuing the same underlying work" not in bootstrap_prompt
+    assert "continuing the same underlying work" not in update_prompt
 
 
 def test_open_visible_terminal_uses_dangerous_resume_flag(monkeypatch, tmp_path) -> None:

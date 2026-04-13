@@ -2106,7 +2106,8 @@ async def _channel_turn_input(
         lines.extend(
             [
                 "",
-                "Continue the real underlying task unless this message clearly redirects it.",
+                "The latest authoritative human instruction is the task to execute now.",
+                "If this message is a new human instruction, treat it as a redirect unless it explicitly says otherwise.",
                 "Only reply in Discord when a reply materially helps coordination, reports substantive progress, or finishes the task.",
             ]
         )
@@ -2140,7 +2141,7 @@ async def _channel_turn_input(
         lines.extend(
             [
                 "",
-                "Use this update immediately while continuing the same underlying work.",
+                "Use this update only insofar as it helps satisfy the latest authoritative human instruction.",
                 "Reply in Discord when a substantive response is actually useful.",
             ]
         )
@@ -2148,7 +2149,7 @@ async def _channel_turn_input(
         lines.extend(
             [
                 "",
-                "Use this authoritative update immediately while continuing the same underlying work.",
+                "Use this authoritative update only insofar as it helps satisfy the latest authoritative human instruction.",
                 "Do not send a Discord reply solely because this message arrived.",
                 "Only reply in Discord if you have substantive progress, a blocker, or a final result that materially helps coordination.",
             ]

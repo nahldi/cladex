@@ -153,6 +153,77 @@ def test_runtime_updates_status_and_handoff_after_turn_result(tmp_path: Path) ->
     assert "task-" in tasks
 
 
+def test_runtime_new_human_message_supersedes_existing_active_task(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    state = tmp_path / "state"
+    _init_git_repo(repo)
+
+    runtime = DurableRuntime(state_dir=state, repo_path=repo, state_namespace="test", agent_name="codex")
+    runtime.observe_incoming_message(
+        channel_key="channel-redirect",
+        author_name="Finn",
+        author_id=1,
+        author_is_bot=False,
+        text="Keep working on the tunnel task.",
+    )
+    runtime.observe_incoming_message(
+        channel_key="channel-redirect",
+        author_name="Finn",
+        author_id=1,
+        author_is_bot=False,
+        text="Only answer yes or no.",
+    )
+
+    binding = runtime.ensure_binding("channel-redirect")
+    active = runtime.store.active_task("channel-redirect")
+    tasks = json.loads((binding.worktree_path / "memory" / "TASKS.json").read_text(encoding="utf-8"))
+
+    assert active is not None
+    assert active["title"] == "Only answer yes or no."
+    assert tasks["tasks"][0]["title"] == "Only answer yes or no."
+    assert any(task["status"] == "released" for task in tasks["tasks"])
+
+
+def test_runtime_context_bundle_uses_latest_distinct_handoff_highlights(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    state = tmp_path / "state"
+    _init_git_repo(repo)
+
+    runtime = DurableRuntime(state_dir=state, repo_path=repo, state_namespace="test", agent_name="claude")
+    runtime.bind_thread("channel-handoff", thread_id="thread-1", backend="claude-print-resume", status="active")
+    runtime.record_turn_result(
+        channel_key="channel-handoff",
+        thread_id="thread-1",
+        turn_id="turn-old",
+        summary="Old stale reply.",
+        files_changed=[],
+        commands_run=[],
+        validations=[],
+        next_step="Old stale reply.",
+    )
+    runtime.record_turn_result(
+        channel_key="channel-handoff",
+        thread_id="thread-1",
+        turn_id="turn-new",
+        summary="Yes.",
+        files_changed=[],
+        commands_run=[],
+        validations=[],
+        next_step="Yes.",
+    )
+
+    binding = runtime.ensure_binding("channel-handoff")
+    handoff_text = (binding.worktree_path / "memory" / "HANDOFF.md").read_text(encoding="utf-8")
+    bundle = runtime.build_context_bundle("channel-handoff")
+
+    assert "- result: Yes." in handoff_text
+    assert "- exact next step: Continue from STATUS.md." in handoff_text
+    assert "Old stale reply." in handoff_text
+    assert "- result: Yes." in bundle
+    assert "Old stale reply." not in bundle
+    assert "- exact next step: Continue from STATUS.md." not in bundle
+
+
 def test_runtime_records_compaction_and_preserves_continuity(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     state = tmp_path / "state"
