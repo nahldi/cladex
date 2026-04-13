@@ -325,6 +325,46 @@ def _backend_script_path(name: str) -> str:
     return str(Path(__file__).parent / name)
 
 
+def _python_supports_module(python_exe: str | Path, module_name: str) -> bool:
+    probe = _windowless_run([str(python_exe), "-c", f"import {module_name}"])
+    return probe.returncode == 0
+
+
+def _runtime_pip_install(python_exe: str | Path, requirement: str) -> None:
+    env = os.environ.copy()
+    env["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
+    command = [str(python_exe), "-m", "pip", "install", "--upgrade", requirement]
+    kwargs: dict[str, Any] = {
+        "env": env,
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+        "check": False,
+        "close_fds": True,
+    }
+    if os.name == "nt":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    result = subprocess.run(command, **kwargs)
+    if result.returncode != 0:
+        message = ((result.stdout or "") + (result.stderr or "")).strip()
+        raise RuntimeError(message or f"Failed to install `{requirement}` into the CLADEX runtime.")
+
+
+def _ensure_claude_background_runtime() -> None:
+    runtime_python = relayctl.install_plugin.runtime_python_path()
+    if not runtime_python.exists():
+        source = relayctl.install_plugin._install_source()
+        runtime_python = relayctl.install_plugin._ensure_runtime(source=source)
+    if not _python_supports_module(runtime_python, "claude_code_sdk"):
+        _runtime_pip_install(runtime_python, "claude-code-sdk>=0.0.25,<0.1")
+    if not _python_supports_module(runtime_python, "claude_code_sdk"):
+        raise RuntimeError(
+            "CLADEX background runtime is missing `claude-code-sdk` after refresh. "
+            "Run `py -m pip install -e backend` or reinstall/update the shared runtime."
+        )
+
+
 def start_profile(profile: dict[str, Any]) -> None:
     relay_type = str(profile.get("_relay_type", "")).strip().lower()
     if relay_type == "codex":
@@ -332,6 +372,7 @@ def start_profile(profile: dict[str, Any]) -> None:
         return
     if relay_type != "claude":
         raise RuntimeError(f"Unknown relay type: {relay_type}")
+    _ensure_claude_background_runtime()
 
     # Load env from env_file
     env_file = profile.get("env_file", "")

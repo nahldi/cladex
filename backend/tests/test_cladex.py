@@ -41,6 +41,120 @@ def test_start_codex_profile_delegates_to_relayctl(monkeypatch) -> None:
     assert calls == [profile]
 
 
+def test_start_claude_profile_refreshes_runtime_when_sdk_missing(tmp_path: Path, monkeypatch) -> None:
+    env_file = tmp_path / "forge.env"
+    env_file.write_text("DISCORD_BOT_TOKEN=test\n", encoding="utf-8")
+    workspace = tmp_path / "forge"
+    workspace.mkdir()
+    runtime_python = tmp_path / "runtime" / "Scripts" / "python.exe"
+    runtime_python.parent.mkdir(parents=True)
+    runtime_python.write_text("", encoding="utf-8")
+    state_dir = tmp_path / "state"
+    runtime_installs: list[tuple[str, str]] = []
+    launches: list[list[str]] = []
+
+    def fake_supports_module(python_exe, module_name: str) -> bool:
+        return bool(runtime_installs)
+
+    monkeypatch.setattr(cladex, "_python_supports_module", fake_supports_module)
+    monkeypatch.setattr(cladex.relayctl.install_plugin, "runtime_python_path", lambda: runtime_python)
+    monkeypatch.setattr(cladex.relayctl.install_plugin, "_ensure_runtime", lambda source=None: runtime_python)
+    monkeypatch.setattr(cladex, "_runtime_pip_install", lambda python_exe, requirement: runtime_installs.append((str(python_exe), requirement)))
+    monkeypatch.setattr(cladex, "_claude_state_dir", lambda profile: state_dir)
+    monkeypatch.setattr(cladex, "_load_claude_env", lambda profile: {"DISCORD_BOT_TOKEN": "test"})
+    monkeypatch.setattr(cladex.relayctl, "_background_python_windowless_executable", lambda: "pythonw.exe")
+    monkeypatch.setattr(
+        cladex.subprocess,
+        "Popen",
+        lambda command, **kwargs: launches.append(command) or SimpleNamespace(pid=321),
+    )
+
+    profile = {
+        "name": "forge-ce0eef1b-09de",
+        "_relay_type": "claude",
+        "workspace": str(workspace),
+        "env_file": str(env_file),
+        "state_namespace": "forge-ce0eef1b",
+    }
+
+    cladex.start_profile(profile)
+
+    assert runtime_installs == [(str(runtime_python), "claude-code-sdk>=0.0.25,<0.1")]
+    assert launches == [["pythonw.exe", cladex._backend_script_path("claude_bot.py")]]
+    assert (state_dir / "relay.pid").read_text(encoding="utf-8") == "321"
+
+
+def test_start_claude_profile_raises_when_runtime_still_missing_sdk(tmp_path: Path, monkeypatch) -> None:
+    env_file = tmp_path / "forge.env"
+    env_file.write_text("DISCORD_BOT_TOKEN=test\n", encoding="utf-8")
+    workspace = tmp_path / "forge"
+    workspace.mkdir()
+    runtime_python = tmp_path / "runtime" / "Scripts" / "python.exe"
+    runtime_python.parent.mkdir(parents=True)
+    runtime_python.write_text("", encoding="utf-8")
+
+    monkeypatch.setattr(cladex, "_python_supports_module", lambda python_exe, module_name: False)
+    monkeypatch.setattr(cladex.relayctl.install_plugin, "runtime_python_path", lambda: runtime_python)
+    monkeypatch.setattr(cladex.relayctl.install_plugin, "_ensure_runtime", lambda source=None: runtime_python)
+    monkeypatch.setattr(cladex, "_runtime_pip_install", lambda python_exe, requirement: None)
+
+    profile = {
+        "name": "forge-ce0eef1b-09de",
+        "_relay_type": "claude",
+        "workspace": str(workspace),
+        "env_file": str(env_file),
+        "state_namespace": "forge-ce0eef1b",
+    }
+
+    try:
+        cladex.start_profile(profile)
+    except RuntimeError as exc:
+        assert "claude-code-sdk" in str(exc)
+    else:
+        raise AssertionError("Expected RuntimeError when runtime still lacks claude-code-sdk")
+
+
+def test_start_claude_profile_bootstraps_runtime_when_missing(tmp_path: Path, monkeypatch) -> None:
+    env_file = tmp_path / "forge.env"
+    env_file.write_text("DISCORD_BOT_TOKEN=test\n", encoding="utf-8")
+    workspace = tmp_path / "forge"
+    workspace.mkdir()
+    runtime_python = tmp_path / "runtime" / "Scripts" / "python.exe"
+    state_dir = tmp_path / "state"
+    ensured: list[str | None] = []
+    launches: list[list[str]] = []
+
+    monkeypatch.setattr(cladex.relayctl.install_plugin, "runtime_python_path", lambda: runtime_python)
+    monkeypatch.setattr(cladex.relayctl.install_plugin, "_install_source", lambda: "C:/repo/cladex")
+    monkeypatch.setattr(
+        cladex.relayctl.install_plugin,
+        "_ensure_runtime",
+        lambda source=None: ensured.append(source) or runtime_python,
+    )
+    monkeypatch.setattr(cladex, "_python_supports_module", lambda python_exe, module_name: True)
+    monkeypatch.setattr(cladex, "_claude_state_dir", lambda profile: state_dir)
+    monkeypatch.setattr(cladex, "_load_claude_env", lambda profile: {"DISCORD_BOT_TOKEN": "test"})
+    monkeypatch.setattr(cladex.relayctl, "_background_python_windowless_executable", lambda: "pythonw.exe")
+    monkeypatch.setattr(
+        cladex.subprocess,
+        "Popen",
+        lambda command, **kwargs: launches.append(command) or SimpleNamespace(pid=654),
+    )
+
+    profile = {
+        "name": "forge-ce0eef1b-09de",
+        "_relay_type": "claude",
+        "workspace": str(workspace),
+        "env_file": str(env_file),
+        "state_namespace": "forge-ce0eef1b",
+    }
+
+    cladex.start_profile(profile)
+
+    assert ensured == ["C:/repo/cladex"]
+    assert launches == [["pythonw.exe", cladex._backend_script_path("claude_bot.py")]]
+
+
 def test_stop_codex_profile_delegates_to_relayctl(monkeypatch) -> None:
     calls: list[dict] = []
     monkeypatch.setattr(cladex.relayctl, "_stop_profile", lambda profile: calls.append(profile) or 0)
@@ -102,30 +216,27 @@ def test_claude_runtime_state_reads_status_json(tmp_path: Path, monkeypatch) -> 
     assert state["effort"] == "high"
 
 
-def test_start_claude_profile_uses_windowless_launch(monkeypatch) -> None:
-    calls: list[tuple[list[str], str]] = []
-    monkeypatch.setattr(cladex, "_claude_discord_bin", lambda: "claude-discord.cmd")
-    monkeypatch.setattr(cladex, "_windowless_popen", lambda command, cwd=None: calls.append((command, str(cwd))) or SimpleNamespace())
-
-    profile = {"name": "claude-one", "_relay_type": "claude", "workspace": "C:/claude"}
-    cladex.start_profile(profile)
-
-    assert calls == [(["claude-discord.cmd", "run"], "C:/claude")]
-
-
-def test_stop_claude_profile_prefers_cli_stop(monkeypatch) -> None:
-    run_calls: list[tuple[list[str], str]] = []
-    monkeypatch.setattr(cladex, "_claude_discord_bin", lambda: "claude-discord.cmd")
+def test_python_supports_module_uses_windowless_run(monkeypatch) -> None:
+    commands: list[list[str]] = []
     monkeypatch.setattr(
         cladex,
         "_windowless_run",
-        lambda command, cwd=None: run_calls.append((command, str(cwd))) or SimpleNamespace(returncode=0, stdout="", stderr=""),
+        lambda command, cwd=None: commands.append(command) or SimpleNamespace(returncode=0, stdout="", stderr=""),
     )
 
-    profile = {"name": "claude-one", "_relay_type": "claude", "workspace": "C:/claude"}
+    assert cladex._python_supports_module("python.exe", "claude_code_sdk") is True
+    assert commands == [["python.exe", "-c", "import claude_code_sdk"]]
+
+
+def test_stop_claude_profile_terminates_pid(monkeypatch) -> None:
+    killed: list[int] = []
+    monkeypatch.setattr(cladex, "_claude_profile_runtime_state", lambda profile: {"pid": 4321})
+    monkeypatch.setattr(cladex.relayctl, "terminate_process_tree", lambda pid: killed.append(pid) or True)
+
+    profile = {"name": "claude-one", "_relay_type": "claude", "workspace": "C:/claude", "state_namespace": "ns"}
     cladex.stop_profile(profile)
 
-    assert run_calls == [(["claude-discord.cmd", "stop"], "C:/claude")]
+    assert killed == [4321]
 
 
 def test_load_claude_registry_is_tolerant(tmp_path: Path, monkeypatch) -> None:
