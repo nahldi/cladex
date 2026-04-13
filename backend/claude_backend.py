@@ -555,10 +555,12 @@ class ClaudeBackend:
             sections.append(f"[{relative_path}]\n{content}")
         return "\n\n".join(sections)
 
-    def _build_command(self, *, cwd: Path) -> list[str]:
-        """Build Claude CLI command for --print mode."""
+    def _build_persistent_command(self, *, cwd: Path, session_id: str | None = None) -> list[str]:
+        """Build Claude CLI command for persistent streaming mode."""
         cmd = [
             claude_code_bin(),
+            "--input-format",
+            "stream-json",
             "--output-format",
             "stream-json",
             "--verbose",
@@ -567,8 +569,9 @@ class ClaudeBackend:
             "--permission-mode",
             "bypassPermissions",
         ]
-        # Note: Do NOT use --input-format stream-json with --print mode
-        # --print takes prompt as CLI argument, not via stdin
+        # Resume existing session if we have one
+        if session_id:
+            cmd.extend(["--resume", session_id])
         return cmd
 
     async def _persistent_process_for_channel(self, channel_key: str, prompt_workspace: Path) -> PersistentClaudeProcess:
@@ -588,24 +591,30 @@ class ClaudeBackend:
             await self._terminate_process(persistent)
         return persistent
 
-    async def _start_process(self, persistent: PersistentClaudeProcess) -> asyncio.subprocess.Process:
-        """Start a new Claude subprocess with stream-json format."""
+    async def _ensure_persistent_process(self, persistent: PersistentClaudeProcess) -> asyncio.subprocess.Process:
+        """Ensure a persistent Claude subprocess is running for the channel."""
         current_loop_id = id(asyncio.get_running_loop())
-        if persistent.process is not None and persistent.process.returncode is None and persistent.loop_id == current_loop_id:
+
+        # Check if existing process is still valid
+        if (
+            persistent.process is not None
+            and persistent.process.returncode is None
+            and persistent.loop_id == current_loop_id
+        ):
             return persistent.process
+
+        # Need to start a new process
         if persistent.process is not None:
             await self._terminate_process(persistent)
 
-        cmd = self._build_command(cwd=persistent.worktree)
-        # Add --print flag for non-interactive mode with stream-json
-        cmd.append("--print")
-        # Add session resume if we have a session
-        if persistent.session.initialized and persistent.session.session_id:
-            cmd.extend(["--resume", persistent.session.session_id])
+        session_id = persistent.session.session_id if persistent.session.initialized else None
+        cmd = self._build_persistent_command(cwd=persistent.worktree, session_id=session_id)
 
         env = os.environ.copy()
         env["CLADEX_ACTIVE_WORKTREE"] = str(persistent.worktree)
         env["CLAUDE_CODE_ENTRYPOINT"] = "cladex-relay"
+
+        logger.info("Starting persistent Claude process: %s", " ".join(cmd[:6]) + "...")
 
         process = await asyncio.create_subprocess_exec(
             *cmd,
@@ -619,6 +628,14 @@ class ClaudeBackend:
         persistent.process = process
         persistent.loop_id = current_loop_id
         persistent.closing = False
+
+        # Clear the response queue for fresh session
+        while not persistent.response_queue.empty():
+            try:
+                persistent.response_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
         return process
 
     async def _terminate_process(self, persistent: PersistentClaudeProcess) -> None:
@@ -660,71 +677,123 @@ class ClaudeBackend:
                 logger.exception("Failed to terminate Claude subprocess")
 
     async def _run_turn(self, prompt: str, *, cwd: Path, persistent: PersistentClaudeProcess) -> CommandResult:
-        """Run a single turn by starting a new Claude process for each message.
+        """Run a turn using a persistent Claude CLI session.
 
-        Unlike SDK mode, we start a fresh process per turn using --print mode
-        with stream-json format. This avoids terminal spam by using
-        CREATE_NO_WINDOW on Windows.
+        Uses stream-json input/output for bidirectional communication.
+        The persistent process stays alive between turns.
         """
-        cmd = self._build_command(cwd=cwd)
         used_resume = persistent.session.initialized
+        session_id = persistent.session.session_id if persistent.session.initialized else None
+        cmd_display = self._build_persistent_command(cwd=cwd, session_id=session_id)
+
         async with persistent.lock:
             persistent.worktree = cwd
 
-            # Build command for this turn
-            turn_cmd = list(cmd)
-            turn_cmd.append("--print")
-            if persistent.session.initialized and persistent.session.session_id:
-                turn_cmd.extend(["--resume", persistent.session.session_id])
-            # Add the prompt as the final argument
-            turn_cmd.extend(["--", prompt])
-
-            env = os.environ.copy()
-            env["CLADEX_ACTIVE_WORKTREE"] = str(cwd)
-            env["CLAUDE_CODE_ENTRYPOINT"] = "cladex-relay"
-
             try:
-                process = await asyncio.create_subprocess_exec(
-                    *turn_cmd,
-                    stdin=asyncio.subprocess.DEVNULL,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    cwd=str(cwd),
-                    env=env,
-                    **_windows_hidden_subprocess_kwargs(),
-                )
+                process = await self._ensure_persistent_process(persistent)
 
-                stdout_data, stderr_data = await asyncio.wait_for(
-                    process.communicate(),
-                    timeout=600.0,  # 10 minute timeout
-                )
-                stdout = stdout_data.decode("utf-8", errors="replace")
-                stderr = stderr_data.decode("utf-8", errors="replace")
-                returncode = process.returncode or 0
+                if process.stdin is None or process.stdout is None:
+                    raise RuntimeError("Process stdin/stdout not available")
 
-                # Extract session ID from output if present
-                final_session_id = self._extract_session_id_from_output(stdout)
+                # Send the prompt as a stream-json user message
+                user_message = {
+                    "type": "user",
+                    "message": {"role": "user", "content": prompt},
+                }
+                message_line = json.dumps(user_message) + "\n"
+                process.stdin.write(message_line.encode("utf-8"))
+                await process.stdin.drain()
+
+                # Read responses until we get a result or error
+                stdout_lines: list[str] = []
+                stderr_parts: list[str] = []
+                returncode = 0
+                final_session_id: str | None = None
+
+                # Read with timeout
+                try:
+                    async with asyncio.timeout(600.0):  # 10 minute timeout
+                        while True:
+                            # Check if process died
+                            if process.returncode is not None:
+                                returncode = process.returncode
+                                break
+
+                            # Try to read a line
+                            try:
+                                line_bytes = await asyncio.wait_for(
+                                    process.stdout.readline(),
+                                    timeout=60.0,  # 1 minute per line
+                                )
+                            except asyncio.TimeoutError:
+                                # No output for 60s, check if still alive
+                                if process.returncode is not None:
+                                    returncode = process.returncode
+                                    break
+                                continue
+
+                            if not line_bytes:
+                                # EOF - process ended
+                                returncode = process.returncode or 0
+                                break
+
+                            line = line_bytes.decode("utf-8", errors="replace").strip()
+                            if not line:
+                                continue
+
+                            stdout_lines.append(line)
+
+                            # Parse the JSON event
+                            try:
+                                event = json.loads(line)
+                                event_type = event.get("type", "")
+
+                                # Check for result (turn complete)
+                                if event_type == "result":
+                                    final_session_id = event.get("session_id")
+                                    if event.get("is_error"):
+                                        returncode = 1
+                                    break
+
+                                # Check for error
+                                if event_type == "error":
+                                    returncode = 1
+                                    break
+
+                            except json.JSONDecodeError:
+                                # Non-JSON output goes to stderr
+                                stderr_parts.append(line)
+
+                except asyncio.TimeoutError:
+                    return CommandResult(
+                        args=cmd_display,
+                        returncode=1,
+                        stdout="\n".join(stdout_lines),
+                        stderr="Claude turn timed out after 10 minutes",
+                        used_resume=used_resume,
+                    )
+
+                # Update session if we got a new ID
                 if final_session_id and final_session_id != persistent.session.session_id:
                     persistent.session.adopt(final_session_id, initialized=returncode == 0)
 
+                stdout = "\n".join(stdout_lines)
+                stderr = "\n".join(stderr_parts)
+
                 return CommandResult(
-                    args=turn_cmd,
+                    args=cmd_display,
                     returncode=returncode,
                     stdout=stdout,
                     stderr=stderr,
                     used_resume=used_resume,
                 )
-            except asyncio.TimeoutError:
-                return CommandResult(
-                    args=turn_cmd,
-                    returncode=1,
-                    stdout="",
-                    stderr="Claude turn timed out after 10 minutes",
-                    used_resume=used_resume,
-                )
+
             except Exception as exc:
+                logger.exception("Claude turn failed")
+                # Kill the process on error so next turn starts fresh
+                await self._terminate_process(persistent)
                 return CommandResult(
-                    args=turn_cmd,
+                    args=cmd_display,
                     returncode=1,
                     stdout="",
                     stderr=str(exc),

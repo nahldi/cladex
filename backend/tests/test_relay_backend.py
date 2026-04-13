@@ -22,51 +22,51 @@ def test_session_persists_initialized_state(tmp_path: Path) -> None:
     assert reloaded.last_success_at
 
 
-def test_build_command_uses_print_mode_flags(tmp_path: Path) -> None:
-    """Verify _build_command produces correct flags for --print mode."""
+def test_build_persistent_command_uses_stream_json(tmp_path: Path) -> None:
+    """Verify _build_persistent_command produces correct flags for persistent mode."""
     backend = ClaudeBackend(
         workspace=tmp_path,
         state_dir=tmp_path / "state",
         on_response=lambda msg: None,
     )
 
-    cmd = backend._build_command(cwd=tmp_path)
-
+    # Without session
+    cmd = backend._build_persistent_command(cwd=tmp_path)
+    assert "--input-format" in cmd
     assert "--output-format" in cmd
     assert "stream-json" in cmd
     assert "--permission-mode" in cmd
     assert "bypassPermissions" in cmd
-    # Should NOT have --input-format since we use --print with CLI argument
-    assert "--input-format" not in cmd
-    assert "-p" not in cmd  # --print is added separately in _run_turn
     assert "--resume" not in cmd
-    assert "--session-id" not in cmd
-    assert "--dangerously-skip-permissions" not in cmd
+    assert "-p" not in cmd  # No --print - we use stdin/stdout
+
+    # With session
+    cmd_with_session = backend._build_persistent_command(cwd=tmp_path, session_id="test-session")
+    assert "--resume" in cmd_with_session
+    assert "test-session" in cmd_with_session
 
 
-def test_run_turn_creates_subprocess_with_correct_flags(tmp_path: Path) -> None:
-    """Verify _run_turn creates subprocess with correct command and flags."""
+def test_run_turn_uses_persistent_stream_json(tmp_path: Path) -> None:
+    """Verify _run_turn uses persistent stdin/stdout streaming."""
     backend = ClaudeBackend(
         workspace=tmp_path,
         state_dir=tmp_path / "state",
         on_response=lambda msg: None,
     )
 
-    # Mock _run_turn to capture the command that would be executed
+    # Mock _run_turn to verify command structure
     captured_cmds: list[list[str]] = []
 
     async def mock_run_turn(prompt: str, *, cwd: Path, persistent) -> CommandResult:
         # Build the command as the real method would
-        cmd = backend._build_command(cwd=cwd)
-        cmd.append("--print")
-        if persistent.session.initialized and persistent.session.session_id:
-            cmd.extend(["--resume", persistent.session.session_id])
-        cmd.extend(["--", prompt])
+        session_id = persistent.session.session_id if persistent.session.initialized else None
+        cmd = backend._build_persistent_command(cwd=cwd, session_id=session_id)
         captured_cmds.append(cmd)
+        # Return a proper response with assistant content
         return CommandResult(
             args=cmd,
             returncode=0,
-            stdout="done",
+            stdout='{"type":"assistant","message":{"role":"assistant","content":"done"}}\n{"type":"result","session_id":"test-123"}',
             stderr="",
             used_resume=persistent.session.initialized,
         )
@@ -89,15 +89,15 @@ def test_run_turn_creates_subprocess_with_correct_flags(tmp_path: Path) -> None:
     assert ok is True
     assert len(captured_cmds) == 1
     cmd = captured_cmds[0]
-    # Verify command has correct flags
+    # Verify persistent mode flags (not --print mode)
+    assert "--input-format" in cmd
     assert "--output-format" in cmd
     assert "stream-json" in cmd
-    assert "--print" in cmd
     assert "--permission-mode" in cmd
     assert "bypassPermissions" in cmd
-    # Prompt should be at the end after "--"
-    assert "--" in cmd
-    assert "fix it" in cmd[-1] or any("fix it" in part for part in cmd)
+    # No --print flag - uses stdin/stdout
+    assert "--print" not in cmd
+    assert "-p" not in cmd
 
 
 def test_process_message_retries_with_fresh_session_on_resume_failure(tmp_path: Path) -> None:
