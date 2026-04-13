@@ -4,8 +4,17 @@
 
 ### Option 1: Use the packaged desktop app
 
-1. Open `release\CLADEX Setup 2.0.10.exe` and install it.
-2. Or run `release\win-unpacked\CLADEX.exe` directly.
+1. Install Python 3.10+ first.
+2. Install the AI CLI you plan to use:
+   - `codex` for Codex relays
+   - `claude` for Claude relays
+3. Open `release\CLADEX Setup 2.0.10.exe` and install it.
+4. Or run `release\CLADEX 2.0.10.exe` or `release\win-unpacked\CLADEX.exe` directly.
+5. In CLADEX, choose `Add Relay`, then enter:
+   - a workspace folder
+   - a Discord bot token
+   - the allowed channel id
+6. Start the saved relay and wait for `Ready`.
 
 ### Option 2: Run from source
 
@@ -37,3 +46,5 @@ claude-discord
 - The desktop app uses a local API on loopback by default: `127.0.0.1:3001`
 - The desktop app name is `CLADEX`
 - The Python package name remains `discord-codex-relay` for compatibility with existing relay commands
+- The packaged app bundles the CLADEX UI and backend files, but not Python itself or the external `codex` / `claude` CLIs
+- If the packaged app opens but the runtime does not start, first verify that Python is installed and then verify the required AI CLI command is available on PATH

@@ -42,6 +42,12 @@ That gives you the desktop manager plus the Python relay commands:
 
 ### Desktop App
 
+Important for packaged users: the `.exe` bundles the CLADEX UI and bundled backend files, but it does not bundle Python or the external AI CLIs. You still need:
+- Python 3.10+
+- `codex` for Codex relays
+- `claude` for Claude relays
+- a Discord bot token and target channel id
+
 ```bash
 npm install
 npm run app
@@ -67,6 +73,13 @@ Packaged launchers produced by the build:
 - `release\CLADEX Setup 2.0.10.exe`
 - `release\CLADEX 2.0.10.exe`
 - `release\win-unpacked\CLADEX.exe`
+
+Portable/installer first run:
+1. Install Python 3.10+.
+2. Install the AI CLI you want to use: `codex`, `claude`, or both.
+3. Launch `CLADEX.exe`.
+4. In the app, choose `Add Relay`, then enter the workspace path, Discord bot token, and allowed channel id.
+5. Start the profile and verify it reaches `Ready` before testing in Discord.
 
 ### Backend CLI
 
@@ -150,6 +163,7 @@ codex-discord stop
 - Release builds are written to `release/`.
 - The Python backend package name stays `discord-codex-relay` for command/package compatibility.
 - The desktop product name remains `CLADEX`.
+- The packaged desktop app uses a loopback-only local API. It is meant to manage relays on the same machine, not expose a remote control surface.
 
 ## License
 

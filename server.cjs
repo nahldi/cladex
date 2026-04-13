@@ -12,11 +12,46 @@ const API_HOST = process.env.API_HOST || '127.0.0.1';
 const API_PORT = Number(process.env.API_PORT || 3001);
 let serverInstance = null;
 
-app.use(express.json());
+app.disable('x-powered-by');
+app.use(express.json({ limit: '1mb' }));
+
+function isLoopbackOrigin(origin) {
+  if (!origin || origin === 'null') {
+    return true;
+  }
+  try {
+    const parsed = new URL(origin);
+    if (parsed.protocol === 'file:') {
+      return true;
+    }
+    return ['127.0.0.1', 'localhost', '::1', '[::1]'].includes(parsed.hostname);
+  } catch {
+    return false;
+  }
+}
+
 app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Headers', 'Content-Type');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE');
+  const origin = String(req.headers.origin || '').trim();
+  const allowed = isLoopbackOrigin(origin);
+  res.header('Vary', 'Origin');
+  res.header('X-Content-Type-Options', 'nosniff');
+  if (origin && allowed) {
+    res.header('Access-Control-Allow-Origin', origin === 'null' ? 'null' : origin);
+    res.header('Access-Control-Allow-Headers', 'Content-Type');
+    res.header('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
+  }
+  if (req.method === 'OPTIONS') {
+    if (origin && !allowed) {
+      res.status(403).end();
+      return;
+    }
+    res.status(204).end();
+    return;
+  }
+  if (origin && !allowed) {
+    res.status(403).json({ error: 'Origin not allowed' });
+    return;
+  }
   next();
 });
 
@@ -493,6 +528,15 @@ app.delete('/api/projects/:name', async (req, res) => {
     return;
   }
   res.json({ success: true });
+});
+
+app.use('/api', (_req, res) => {
+  res.status(404).json({ error: 'Not found' });
+});
+
+app.use((err, _req, res, _next) => {
+  console.error(err);
+  res.status(500).json({ error: 'Internal server error' });
 });
 
 function startServer(options = {}) {

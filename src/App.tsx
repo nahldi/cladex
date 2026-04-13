@@ -138,6 +138,19 @@ declare global {
 
 const API_BASE = 'http://127.0.0.1:3001/api';
 const CLADEX_LOGO = new URL('../assets/icon.png', import.meta.url).href;
+const FIRST_RUN_REQUIREMENTS = [
+  'Python 3.10+ installed and reachable from PATH.',
+  'At least one AI CLI installed: `codex` for Codex relays and/or `claude` for Claude relays.',
+  'A Discord bot token plus the channel id you want the relay to watch.',
+  'A local workspace folder for the relay to use.',
+];
+const FIRST_RUN_STEPS = [
+  'Open Add Relay.',
+  'Choose Claude or Codex.',
+  'Pick the workspace folder and paste the Discord bot token.',
+  'Set the allowed Discord channel id, then save the profile.',
+  'Start the relay and confirm it reaches Ready.',
+];
 
 async function chooseWorkspaceFolder(currentValue = ''): Promise<string> {
   try {
@@ -340,6 +353,7 @@ export default function App() {
             <motion.div key="relays" initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -12 }}>
               <RelayDashboard
                 profiles={profiles}
+                runtimeInfo={runtimeInfo}
                 loading={loading}
                 bootPending={bootPending}
                 busyKey={busyKey}
@@ -403,6 +417,7 @@ export default function App() {
 
 function RelayDashboard({
   profiles,
+  runtimeInfo,
   loading,
   bootPending,
   busyKey,
@@ -416,6 +431,7 @@ function RelayDashboard({
   onLogs,
 }: {
   profiles: Profile[];
+  runtimeInfo: RuntimeInfo | null;
   loading: boolean;
   bootPending: boolean;
   busyKey: string | null;
@@ -437,9 +453,20 @@ function RelayDashboard({
           compact={false}
         />
       ) : errorText && profiles.length === 0 ? (
-        <EmptyState title="CLADEX could not reach the local relay API." detail="Use Refresh once the packaged backend is up. This is a runtime startup error, not an empty relay list." actionLabel="Refresh" onAction={onRefresh} />
+        <div className="space-y-6">
+          <EmptyState
+            title="CLADEX could not reach the local relay runtime."
+            detail="If this is a fresh portable install, make sure Python 3.10+ is installed, then restart CLADEX. You also still need the `codex` and/or `claude` CLI for the relay type you want to run."
+            actionLabel="Refresh"
+            onAction={onRefresh}
+          />
+          <FirstRunGuide packaged={runtimeInfo?.packaged ?? true} includeTroubleshooting />
+        </div>
       ) : profiles.length === 0 ? (
-        <EmptyState title="No relays configured yet." detail="Choose Add Relay and register a Claude or Codex workspace." />
+        <div className="space-y-6">
+          <EmptyState title="No relays configured yet." detail="Choose Add Relay and register a Claude or Codex workspace. The desktop app manages local relays, but it does not bundle Python or the Codex/Claude CLIs for you." />
+          <FirstRunGuide packaged={runtimeInfo?.packaged ?? false} />
+        </div>
       ) : (
         <div className="grid auto-rows-fr gap-6 md:grid-cols-2 xl:grid-cols-3">
           {profiles.map((profile) => (
@@ -1160,6 +1187,18 @@ function SettingsModal({ runtimeInfo, onClose, onStopAll }: { runtimeInfo: Runti
             <li>Bot labels, trigger mode, model choice, and DM access are managed per relay profile.</li>
           </ul>
         </div>
+        <div className="rounded-2xl border border-slate-200/80 bg-white/70 p-4 text-sm text-slate-600 dark:border-white/10 dark:bg-black/30 dark:text-gray-400">
+          <div className="mb-2 text-[10px] font-bold uppercase tracking-[0.22em] text-slate-500 dark:text-gray-500">First Run Checklist</div>
+          <ul className="space-y-2">
+            <li>CLADEX manages local relays, but it still needs Python 3.10+ on the machine.</li>
+            <li>Install `codex` if you want Codex relays, `claude` if you want Claude relays, or both.</li>
+            <li>Create a relay profile with a workspace path, Discord bot token, and allowed channel id.</li>
+            <li>Start the profile from the Relays view and confirm it reaches Ready before testing in Discord.</li>
+          </ul>
+          <div className="mt-3 text-xs text-slate-500 dark:text-gray-500">
+            Packaging: {runtimeInfo?.packaged ? 'This is a packaged desktop build. The bundled backend is included, but Python and the AI CLIs are still external dependencies.' : 'This is a source build. Run from the repo root after installing dependencies.'}
+          </div>
+        </div>
         <div className="flex justify-end gap-3">
           <SecondaryButton label="Close" onClick={onClose} />
           <ActionButton label="Stop All" icon={<PauseCircle size={16} />} tone="danger" onClick={onStopAll} />
@@ -1214,6 +1253,33 @@ function MetaPill({ label, mono = false }: { label: string; mono?: boolean }) {
 
 function EmptyState({ title, detail, compact = false, actionLabel, onAction }: { title: string; detail: string; compact?: boolean; actionLabel?: string; onAction?: () => void }) {
   return <div className={`flex flex-col items-center justify-center rounded-2xl border border-slate-200/80 bg-white/70 px-6 text-center dark:border-white/10 dark:bg-white/[0.03] ${compact ? 'h-48 py-8' : 'h-64 py-12'}`}><Activity size={compact ? 28 : 40} className="mb-4 text-slate-400 dark:text-gray-600" /><div className="text-lg font-semibold text-slate-900 dark:text-white">{title}</div><div className="mt-2 max-w-xl text-sm text-slate-500 dark:text-gray-500">{detail}</div>{actionLabel && onAction ? <button onClick={onAction} className="mt-5 rounded-2xl bg-indigo-600 px-4 py-2 text-sm font-semibold text-white transition-colors hover:bg-indigo-500">{actionLabel}</button> : null}</div>;
+}
+
+function FirstRunGuide({ packaged, includeTroubleshooting = false }: { packaged: boolean; includeTroubleshooting?: boolean }) {
+  return (
+    <div className="grid gap-4 lg:grid-cols-[1.2fr_1fr]">
+      <div className="rounded-[28px] border border-slate-200/80 bg-white/70 p-5 dark:border-white/10 dark:bg-white/[0.03]">
+        <div className="text-[10px] font-bold uppercase tracking-[0.22em] text-slate-500 dark:text-gray-500">Requirements</div>
+        <div className="mt-3 text-sm text-slate-600 dark:text-gray-400">
+          {packaged ? 'The packaged desktop build includes the CLADEX UI and bundled backend files. It does not bundle Python or the external AI CLIs.' : 'The source build expects local development dependencies and the external AI CLIs to already be installed.'}
+        </div>
+        <ul className="mt-4 space-y-2 text-sm text-slate-700 dark:text-gray-300">
+          {FIRST_RUN_REQUIREMENTS.map((item) => <li key={item}>- {item}</li>)}
+        </ul>
+      </div>
+      <div className="rounded-[28px] border border-slate-200/80 bg-white/70 p-5 dark:border-white/10 dark:bg-white/[0.03]">
+        <div className="text-[10px] font-bold uppercase tracking-[0.22em] text-slate-500 dark:text-gray-500">Get Started</div>
+        <ol className="mt-4 space-y-2 text-sm text-slate-700 dark:text-gray-300">
+          {FIRST_RUN_STEPS.map((item, index) => <li key={item}>{index + 1}. {item}</li>)}
+        </ol>
+        {includeTroubleshooting ? (
+          <div className="mt-4 rounded-2xl border border-amber-300/30 bg-amber-500/10 px-3 py-3 text-sm text-amber-100">
+            If the runtime will not start, the most common cause is missing Python. After that, check whether the `codex` or `claude` command is installed for the relay type you are trying to create.
+          </div>
+        ) : null}
+      </div>
+    </div>
+  );
 }
 
 function InfoRow({ label, value, mono = false }: { label: string; value: string; mono?: boolean }) {
