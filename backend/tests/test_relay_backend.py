@@ -32,16 +32,17 @@ def test_build_persistent_command_uses_stream_json(tmp_path: Path) -> None:
 
     # Without session
     cmd = backend._build_persistent_command(cwd=tmp_path)
+    assert "-p" in cmd
     assert "--input-format" in cmd
     assert "--output-format" in cmd
     assert "stream-json" in cmd
     assert "--permission-mode" in cmd
     assert "bypassPermissions" in cmd
     assert "--resume" not in cmd
-    assert "-p" not in cmd  # No --print - we use stdin/stdout
 
     # With session
     cmd_with_session = backend._build_persistent_command(cwd=tmp_path, session_id="test-session")
+    assert "-p" in cmd_with_session
     assert "--resume" in cmd_with_session
     assert "test-session" in cmd_with_session
 
@@ -90,14 +91,12 @@ def test_run_turn_uses_persistent_stream_json(tmp_path: Path) -> None:
     assert len(captured_cmds) == 1
     cmd = captured_cmds[0]
     # Verify persistent mode flags (not --print mode)
+    assert "-p" in cmd
     assert "--input-format" in cmd
     assert "--output-format" in cmd
     assert "stream-json" in cmd
     assert "--permission-mode" in cmd
     assert "bypassPermissions" in cmd
-    # No --print flag - uses stdin/stdout
-    assert "--print" not in cmd
-    assert "-p" not in cmd
 
 
 def test_process_message_retries_with_fresh_session_on_resume_failure(tmp_path: Path) -> None:
@@ -309,6 +308,25 @@ def test_extract_response_text_accepts_plain_sdk_output(tmp_path: Path) -> None:
     )
 
     assert backend._extract_response_text("done") == "done"
+
+
+def test_extract_response_text_ignores_system_and_rate_limit_events(tmp_path: Path) -> None:
+    backend = ClaudeBackend(
+        workspace=tmp_path,
+        state_dir=tmp_path / "state",
+        on_response=lambda msg: None,
+    )
+
+    stdout = "\n".join(
+        [
+            '{"type":"system","subtype":"init","session_id":"abc"}',
+            '{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"internal"},{"type":"text","text":"yes"}]}}',
+            '{"type":"rate_limit_event","rate_limit_info":{"status":"allowed"},"session_id":"abc"}',
+            '{"type":"result","subtype":"success","is_error":false,"result":"yes","session_id":"abc"}',
+        ]
+    )
+
+    assert backend._extract_response_text(stdout) == "yes"
 
 
 def test_start_records_process_restart_event(tmp_path: Path, monkeypatch) -> None:

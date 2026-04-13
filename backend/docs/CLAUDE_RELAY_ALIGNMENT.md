@@ -14,19 +14,22 @@ Claude support is now built into this repo and uses the same durable runtime as 
 
 ## Verified Runtime Contract
 
-The current Claude CLI transport used here is the Python Claude Code SDK client in
-streaming control-protocol mode. The spawned Claude process looks like:
+The current Claude CLI transport used here is a persistent Claude CLI print-mode
+subprocess using JSON stdin/stdout. The spawned Claude process looks like:
 
 - persistent process transport:
-  - `claude --output-format stream-json --verbose --input-format stream-json --model claude-opus-4-5-20251101 --permission-mode bypassPermissions`
+  - `claude -p --input-format stream-json --output-format stream-json --verbose --model claude-opus-4-5-20251101 --permission-mode bypassPermissions`
 - per-message session behavior:
-  - Discord messages are sent into the existing per-channel Claude session id over the live SDK connection.
-  - A fresh Claude session id is created only for explicit recovery cases such as stale/broken session state.
+  - Discord/operator messages are written into the existing per-channel Claude process over stdin as stream-json `user` messages.
+  - The same process can handle multiple turns before shutdown.
+  - A fresh Claude session id/process is created only for explicit recovery cases such as stale/broken session state.
 
 The permission bypass remains part of the spawned Claude CLI command. It is not
 injected into chat content or sent as a separate preflight message.
 
-That replaced the earlier one-shot `claude -p` / `--resume` relay transport.
+This is still distinct from the older one-shot `claude -p -- ...prompt` relay
+transport because the current backend keeps stdin open and streams multiple turns
+through the same CLI process.
 
 ## Durable Runtime Integration
 
@@ -41,7 +44,7 @@ Claude now inherits the same durable memory lifecycle as Codex:
 
 ## Remaining Differences from Codex
 
-- Claude uses a persistent SDK-managed Claude CLI connection, not Codex app-server
+- Claude uses a persistent Claude CLI print-mode subprocess, not Codex app-server
 - No SQLite state (uses file-based durable memory only)
 - Still needs longer-run soak testing under restart/recovery scenarios
 

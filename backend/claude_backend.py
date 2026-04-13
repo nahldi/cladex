@@ -2,11 +2,11 @@
 """
 Discord Claude Relay - Backend
 
-Runs Claude Code through a persistent subprocess in streaming JSON mode.
+Runs Claude Code through a persistent print-mode subprocess in streaming JSON mode.
 
 Why this shape:
 - One persistent Claude CLI subprocess per relay channel/worktree
-- Uses stream-json input/output for bidirectional communication
+- Uses `-p` plus stream-json stdin/stdout for supported multi-turn transport
 - Subprocess runs with CREATE_NO_WINDOW on Windows to prevent terminal spam
 - Each Discord turn is sent into the persistent session for that channel
 - Durable continuity comes from session persistence and resume flags
@@ -556,9 +556,10 @@ class ClaudeBackend:
         return "\n\n".join(sections)
 
     def _build_persistent_command(self, *, cwd: Path, session_id: str | None = None) -> list[str]:
-        """Build Claude CLI command for persistent streaming mode."""
+        """Build Claude CLI command for persistent multi-turn streaming mode."""
         cmd = [
             claude_code_bin(),
+            "-p",
             "--input-format",
             "stream-json",
             "--output-format",
@@ -695,10 +696,12 @@ class ClaudeBackend:
                 if process.stdin is None or process.stdout is None:
                     raise RuntimeError("Process stdin/stdout not available")
 
-                # Send the prompt as a stream-json user message
+                # Send the prompt as a stream-json user message.
+                # Claude's supported multi-turn JSON stdin shape uses print mode
+                # plus structured content parts rather than a trailing CLI arg.
                 user_message = {
                     "type": "user",
-                    "message": {"role": "user", "content": prompt},
+                    "message": {"role": "user", "content": [{"type": "text", "text": prompt}]},
                 }
                 message_line = json.dumps(user_message) + "\n"
                 process.stdin.write(message_line.encode("utf-8"))
@@ -710,59 +713,65 @@ class ClaudeBackend:
                 returncode = 0
                 final_session_id: str | None = None
 
-                # Read with timeout
+                # Read with a Python-3.10-compatible overall deadline.
+                deadline = time.monotonic() + 600.0
                 try:
-                    async with asyncio.timeout(600.0):  # 10 minute timeout
-                        while True:
-                            # Check if process died
+                    while True:
+                        # Check if process died
+                        if process.returncode is not None:
+                            returncode = process.returncode
+                            break
+
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise asyncio.TimeoutError
+
+                        # Try to read a line
+                        try:
+                            line_bytes = await asyncio.wait_for(
+                                process.stdout.readline(),
+                                timeout=min(60.0, remaining),
+                            )
+                        except asyncio.TimeoutError:
+                            # No output before the current deadline slice; if the
+                            # process is still alive, keep waiting until the total
+                            # turn deadline expires.
                             if process.returncode is not None:
                                 returncode = process.returncode
                                 break
+                            continue
 
-                            # Try to read a line
-                            try:
-                                line_bytes = await asyncio.wait_for(
-                                    process.stdout.readline(),
-                                    timeout=60.0,  # 1 minute per line
-                                )
-                            except asyncio.TimeoutError:
-                                # No output for 60s, check if still alive
-                                if process.returncode is not None:
-                                    returncode = process.returncode
-                                    break
-                                continue
+                        if not line_bytes:
+                            # EOF - process ended
+                            returncode = process.returncode or 0
+                            break
 
-                            if not line_bytes:
-                                # EOF - process ended
-                                returncode = process.returncode or 0
+                        line = line_bytes.decode("utf-8", errors="replace").strip()
+                        if not line:
+                            continue
+
+                        stdout_lines.append(line)
+
+                        # Parse the JSON event
+                        try:
+                            event = json.loads(line)
+                            event_type = event.get("type", "")
+
+                            # Check for result (turn complete)
+                            if event_type == "result":
+                                final_session_id = event.get("session_id")
+                                if event.get("is_error"):
+                                    returncode = 1
                                 break
 
-                            line = line_bytes.decode("utf-8", errors="replace").strip()
-                            if not line:
-                                continue
+                            # Check for error
+                            if event_type == "error":
+                                returncode = 1
+                                break
 
-                            stdout_lines.append(line)
-
-                            # Parse the JSON event
-                            try:
-                                event = json.loads(line)
-                                event_type = event.get("type", "")
-
-                                # Check for result (turn complete)
-                                if event_type == "result":
-                                    final_session_id = event.get("session_id")
-                                    if event.get("is_error"):
-                                        returncode = 1
-                                    break
-
-                                # Check for error
-                                if event_type == "error":
-                                    returncode = 1
-                                    break
-
-                            except json.JSONDecodeError:
-                                # Non-JSON output goes to stderr
-                                stderr_parts.append(line)
+                        except json.JSONDecodeError:
+                            # Non-JSON output goes to stderr
+                            stderr_parts.append(line)
 
                 except asyncio.TimeoutError:
                     return CommandResult(
@@ -842,6 +851,9 @@ class ClaudeBackend:
                 text = delta.get("text", "")
                 if text:
                     delta_parts.append(text)
+            # Supported metadata-only events should not affect text extraction.
+            elif event_type in {"system", "rate_limit_event"}:
+                continue
             # Keep only the LAST of each final event type (don't concatenate)
             elif event_type == "result":
                 text = self._extract_text_from_event(event)
