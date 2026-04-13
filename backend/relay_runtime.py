@@ -17,6 +17,7 @@ from relay_common import atomic_write_json, atomic_write_text, slugify, workspac
 
 
 MEMORY_DIR_NAME = "memory"
+RELAY_PROJECT_ROOT = Path(__file__).resolve().parent.parent
 STATUS_SECTIONS = (
     "Current objective",
     "Active task",
@@ -1284,6 +1285,7 @@ class DurableRuntime:
                 "# AGENTS",
                 "",
                 "- Discord messages are transport, not source of truth.",
+                f"- For relay implementation, runtime, packaging, or audit questions, the source of truth is `{RELAY_PROJECT_ROOT}`; the active worktree is only the source of truth for workspace/project code.",
                 "- Before editing files or answering factual repo questions, read `memory/STATUS.md`, `memory/TASKS.json`, `memory/DECISIONS.md`, `memory/HANDOFF.md`, and relevant code/tests.",
                 "- Verify claims from other agents against files, git diff, tests, or docs before accepting them.",
                 "- Claim a task before editing files.",
@@ -1577,6 +1579,8 @@ class DurableRuntime:
         lines = [
             "Durable runtime context.",
             "Discord is transport, not memory.",
+            f"Relay implementation source of truth: {RELAY_PROJECT_ROOT}",
+            "Use the active worktree as source of truth for workspace code/tasks, but use the CLADEX repo and live relay status/logs for relay audits and relay bug claims.",
             f"Project id: {binding.project_id}",
             f"Repo path: {binding.repo_path}",
             f"Worktree path: {binding.worktree_path}",

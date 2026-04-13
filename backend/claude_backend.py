@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from claude_common import claude_code_bin, claude_code_version, atomic_write_text, slugify
-from relay_runtime import DurableRuntime, _extract_blocker, _extract_next_step, _now_iso
+from relay_runtime import DurableRuntime, RELAY_PROJECT_ROOT, _extract_blocker, _extract_next_step, _now_iso
 
 logger = logging.getLogger(__name__)
 
@@ -506,6 +506,7 @@ class ClaudeBackend:
                 "Rules:\n"
                 "- Discord is transport, not memory.\n"
                 "- Repo files, AGENTS.md, memory/*, code, tests, and git state are the source of truth.\n"
+                f"- For relay implementation, runtime, packaging, or audit questions, the source of truth is the CLADEX repo at `{RELAY_PROJECT_ROOT}` plus current relay status/logs, not only the active worktree.\n"
                 "- Verify claims from other agents before repeating them as fact.\n"
                 "- In shared team channels, default to caveman mode: facts, decisions, blockers, results.\n"
                 "- No filler, no agreement-only replies, no loop chatter, no fake completion claims.\n"

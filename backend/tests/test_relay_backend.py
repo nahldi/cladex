@@ -294,6 +294,7 @@ def test_format_prompt_includes_durable_context_and_caveman_rules(tmp_path: Path
 
     assert "caveman mode" in prompt
     assert "Discord is transport, not memory." in prompt
+    assert "For relay implementation, runtime, packaging, or audit questions" in prompt
     assert "[AGENTS.md]" in prompt
     assert "[memory/STATUS.md]" in prompt
     assert "User message:\nfix the relay" in prompt

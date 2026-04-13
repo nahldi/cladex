@@ -26,11 +26,14 @@ def test_runtime_binding_creates_worktree_and_memory_contract(tmp_path: Path) ->
 
     runtime = DurableRuntime(state_dir=state, repo_path=repo, state_namespace="test", agent_name="codex")
     binding = runtime.ensure_binding("channel-123")
+    agents_text = (binding.worktree_path / "AGENTS.md").read_text(encoding="utf-8")
 
     assert binding.worktree_path.exists()
     assert (binding.worktree_path / "AGENTS.md").exists()
     assert (binding.worktree_path / "memory" / "STATUS.md").exists()
     assert (state / "durable-runtime.sqlite3").exists()
+    assert "For relay implementation, runtime, packaging, or audit questions" in agents_text
+    assert str(Path(__file__).resolve().parents[2]) in agents_text
 
 
 def test_runtime_persists_primary_thread_mapping(tmp_path: Path) -> None:
@@ -222,6 +225,19 @@ def test_runtime_context_bundle_uses_latest_distinct_handoff_highlights(tmp_path
     assert "- result: Yes." in bundle
     assert "Old stale reply." not in bundle
     assert "- exact next step: Continue from STATUS.md." not in bundle
+
+
+def test_runtime_context_bundle_includes_relay_source_of_truth(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    state = tmp_path / "state"
+    _init_git_repo(repo)
+
+    runtime = DurableRuntime(state_dir=state, repo_path=repo, state_namespace="test", agent_name="codex")
+    bundle = runtime.build_context_bundle("channel-relay-audit")
+
+    assert "Relay implementation source of truth:" in bundle
+    assert "Use the active worktree as source of truth for workspace code/tasks" in bundle
+    assert str(Path(__file__).resolve().parents[2]) in bundle
 
 
 def test_runtime_records_compaction_and_preserves_continuity(tmp_path: Path) -> None:
