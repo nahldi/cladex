@@ -4096,6 +4096,10 @@ class CodexSession:
             self._complete_tracked_turn(turn, result=reply_text)
             return
 
+        if not turn.reply_required:
+            self._complete_tracked_turn(turn, result=NO_REPLY_NEEDED_SENTINEL)
+            return
+
         self._complete_tracked_turn(turn, result=MISSING_REPLY_SENTINEL)
 
     async def _handle_payload(self, payload: dict) -> None:

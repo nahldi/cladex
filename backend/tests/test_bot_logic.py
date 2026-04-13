@@ -750,6 +750,39 @@ def test_finalize_turn_after_grace_uses_missing_reply_sentinel() -> None:
     asyncio.run(_run())
 
 
+def test_finalize_turn_after_grace_uses_no_reply_needed_for_no_reply_turns() -> None:
+    bot = _load_bot_module()
+
+    async def _run() -> None:
+        session = bot.CodexSession("channel-42")
+        loop = asyncio.get_running_loop()
+        turn = bot.ActiveTurn(
+            turn_id="turn-1",
+            started_at=0.0,
+            last_activity_at=0.0,
+            latest_message=_message(channel_id=42, author_id=7, content="<@999> take over the audit", mentions=[SimpleNamespace(id=999)]),
+            completion=loop.create_future(),
+            directive_kind="teammate_handoff",
+            reply_required=False,
+        )
+        session.tracked_turns[turn.turn_id] = turn
+        session.active_turn = turn
+        captured: dict[str, object] = {}
+        original_complete = session._complete_tracked_turn
+        original_best = session._best_turn_text
+        session._complete_tracked_turn = lambda turn, result=None, exc=None: captured.update({"result": result, "exc": exc})
+        session._best_turn_text = lambda turn: ""
+        try:
+            await session._finalize_turn_after_grace(turn.turn_id, delay_seconds=0)
+        finally:
+            session._complete_tracked_turn = original_complete
+            session._best_turn_text = original_best
+        assert captured["result"] == bot.NO_REPLY_NEEDED_SENTINEL
+        assert captured["exc"] is None
+
+    asyncio.run(_run())
+
+
 def test_bot_handoff_does_not_overwrite_latest_human_instruction() -> None:
     bot = _load_bot_module()
 
