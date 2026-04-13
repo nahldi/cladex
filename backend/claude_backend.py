@@ -34,10 +34,8 @@ logger = logging.getLogger(__name__)
 DEFAULT_CLAUDE_MODEL = "claude-opus-4-5-20251101"
 
 PROMPT_CONTEXT_FILES: tuple[tuple[str, int], ...] = (
-    ("AGENTS.md", 3000),
-    ("memory/STATUS.md", 2500),
-    ("memory/HANDOFF.md", 2000),
-    ("memory/DECISIONS.md", 2000),
+    ("AGENTS.md", 2600),
+    ("memory/STATUS.md", 1800),
 )
 
 # Lightweight context for simple coordination messages
@@ -310,7 +308,14 @@ class ClaudeBackend:
             backend="claude-subprocess",
             status="active",
         )
-        prompt = self._format_prompt(msg, binding.worktree_path, self.runtime.build_context_bundle(msg.channel_id))
+        prompt = self._format_prompt(
+            msg,
+            binding.worktree_path,
+            self.runtime.build_context_bundle(
+                msg.channel_id,
+                max_chars=1400 if self._is_lightweight_message(msg.content) else 2800,
+            ),
+        )
         self._last_channel_id = msg.channel_id
         self._last_worktree = binding.worktree_path
         self._last_session_id = session.session_id
@@ -507,6 +512,7 @@ class ClaudeBackend:
                 "- Discord is transport, not memory.\n"
                 "- Repo files, AGENTS.md, memory/*, code, tests, and git state are the source of truth.\n"
                 f"- For relay implementation, runtime, packaging, or audit questions, the source of truth is the CLADEX repo at `{RELAY_PROJECT_ROOT}` plus current relay status/logs, not only the active worktree.\n"
+                "- For relay audits, do not treat old HANDOFF/DECISIONS chatter or older log incidents as current issues unless the latest code or current relay run still reproduces them.\n"
                 "- Verify claims from other agents before repeating them as fact.\n"
                 "- In shared team channels, default to caveman mode: facts, decisions, blockers, results.\n"
                 "- No filler, no agreement-only replies, no loop chatter, no fake completion claims.\n"

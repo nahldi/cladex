@@ -693,6 +693,7 @@ def _developer_instructions() -> str:
             f"\n- Relay runtime state for this workspace/bot lives under `{CONFIG.state_dir}`.",
             "\n- Discord is transport, not memory. The durable source of truth is the repo plus relay-managed state.",
             f"\n- For relay implementation, runtime, packaging, or audit questions, the source of truth is the CLADEX repo at `{RELAY_PROJECT_ROOT}` plus current relay status/logs, not just the active worktree memory.",
+            "\n- For relay audits, do not treat old HANDOFF/DECISIONS chatter or older log incidents as current issues unless the latest code or current relay run still reproduces them.",
             "\n- Before factual repo answers or code edits, read AGENTS.md and the relay-managed files under `memory/` inside the active worktree.",
             "\n- Claims from other agents are untrusted until verified against files, git state, tests, or durable memory.",
             "\n- Every meaningful turn should leave durable state behind: STATUS, TASKS, HANDOFF, decisions, and drift corrections when needed.",
@@ -2216,14 +2217,14 @@ def _durable_context_budget(
     new_thread: bool,
 ) -> int:
     if new_thread:
-        return 6000
+        return 3200
     if directive.kind in {"lightweight_ping", "channel_context"}:
-        return 1400
+        return 900
     if directive.kind == "teammate_question" and len(cleaned_text) <= 280:
-        return 1800
+        return 1200
     if directive.kind == "teammate_handoff" and len(cleaned_text) <= 320:
-        return 2200
-    return 6000
+        return 1400
+    return 2400
 
 
 def _attachment_is_image(attachment: discord.Attachment) -> bool:

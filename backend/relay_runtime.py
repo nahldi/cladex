@@ -227,6 +227,8 @@ def _extract_preferences_and_constraints(text: str) -> tuple[list[str], list[str
         sentence = re.sub(r"\s+", " ", raw_sentence.strip())
         if not sentence:
             continue
+        if _is_transient_constraint_candidate(sentence):
+            continue
         lowered = sentence.lower()
         if any(token in lowered for token in ("prefer ", "default ", "usually ", "by default", "keep it ")):
             if sentence not in preferences:
@@ -235,6 +237,70 @@ def _extract_preferences_and_constraints(text: str) -> tuple[list[str], list[str
             if sentence not in constraints:
                 constraints.append(sentence)
     return preferences[:8], constraints[:12]
+
+
+def _is_transient_constraint_candidate(text: str) -> bool:
+    sentence = re.sub(r"\s+", " ", text.strip())
+    lowered = sentence.lower()
+    if not sentence:
+        return True
+    if len(sentence) > 240:
+        return True
+    if sentence.endswith("?"):
+        return True
+    transient_markers = (
+        "reply with",
+        "reply only",
+        "reply in one",
+        "respond with",
+        "answer with",
+        "only answer",
+        "just say",
+        "say yes",
+        "say no",
+        "do nothing else",
+        "only the path",
+        "for relay audits",
+        "what repo is source of truth",
+        "standing by",
+        "awaiting ",
+        "ready to work",
+        "no blocker",
+        "audit complete",
+        "both audits complete",
+        "same on my side",
+        "how we feelin",
+        "hows the relays",
+        "sage?",
+        "forge?",
+    )
+    if any(marker in lowered for marker in transient_markers):
+        return True
+    if re.match(r"^[a-z0-9_-]{2,24}\s+(are|r|why|what|when|where|how|do|did|will|can|could|should)\b", lowered):
+        return True
+    if any(token in sentence for token in ("OBSERVE ", "-> exit", "C:\\", ".exe", "Get-Content", "powershell.exe", "cmd /c")):
+        return True
+    return False
+
+
+def _prune_known_facts_payload(facts: dict[str, Any]) -> dict[str, Any]:
+    cleaned = {"preferences": [], "constraints": [], "facts": []}
+    for key, limit in (("preferences", 8), ("constraints", 12), ("facts", 24)):
+        seen: set[str] = set()
+        for raw_item in facts.get(key, []) or []:
+            item = re.sub(r"\s+", " ", str(raw_item).strip())
+            if not item:
+                continue
+            if key in {"preferences", "constraints"} and _is_transient_constraint_candidate(item):
+                continue
+            normalized = _normalize_compare_text(item)
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            cleaned[key].append(item)
+            if len(cleaned[key]) >= limit:
+                break
+    return cleaned
 
 
 def _extract_next_step(text: str) -> str:
@@ -1398,8 +1464,10 @@ class DurableRuntime:
         binding = self.ensure_binding(channel_key)
         sender_type = "other-ai" if author_is_bot else "user"
         content = text.strip()
-        preferences, constraints = _extract_preferences_and_constraints(content)
-        facts = _read_json(binding.worktree_path / MEMORY_DIR_NAME / "KNOWN_FACTS.json", {"preferences": [], "constraints": [], "facts": []})
+        preferences, constraints = _extract_preferences_and_constraints(content) if author_is_bot else ([], [])
+        facts = _prune_known_facts_payload(
+            _read_json(binding.worktree_path / MEMORY_DIR_NAME / "KNOWN_FACTS.json", {"preferences": [], "constraints": [], "facts": []})
+        )
         for item in preferences:
             if item not in facts["preferences"]:
                 facts["preferences"].append(item)
@@ -1420,7 +1488,7 @@ class DurableRuntime:
                     content=item,
                     source=f"{sender_type}:{author_name}",
                 )
-        atomic_write_json(binding.worktree_path / MEMORY_DIR_NAME / "KNOWN_FACTS.json", facts)
+        atomic_write_json(binding.worktree_path / MEMORY_DIR_NAME / "KNOWN_FACTS.json", _prune_known_facts_payload(facts))
         if sender_type == "user" and content:
             self._upsert_memory_fact(
                 binding,
@@ -1567,13 +1635,16 @@ class DurableRuntime:
         self._write_tasks_file(binding)
         self._sync_status(binding, active_task="none", blocker="none")
 
-    def build_context_bundle(self, channel_key: str, *, max_chars: int = 6000) -> str:
+    def build_context_bundle(self, channel_key: str, *, max_chars: int = 3200) -> str:
         binding = self.ensure_binding(channel_key)
         memory_dir = binding.worktree_path / MEMORY_DIR_NAME
         status = _read_text(memory_dir / "STATUS.md").strip()
         decisions = _read_text(memory_dir / "DECISIONS.md")
         handoff = _read_text(memory_dir / "HANDOFF.md")
-        facts = _read_json(memory_dir / "KNOWN_FACTS.json", {"preferences": [], "constraints": [], "facts": []})
+        raw_facts = _read_json(memory_dir / "KNOWN_FACTS.json", {"preferences": [], "constraints": [], "facts": []})
+        facts = _prune_known_facts_payload(raw_facts)
+        if facts != raw_facts:
+            atomic_write_json(memory_dir / "KNOWN_FACTS.json", facts)
         unresolved = self.store.unresolved_claims(binding.project_id)
         active = self.store.active_task(channel_key)
         lines = [
@@ -1581,6 +1652,7 @@ class DurableRuntime:
             "Discord is transport, not memory.",
             f"Relay implementation source of truth: {RELAY_PROJECT_ROOT}",
             "Use the active worktree as source of truth for workspace code/tasks, but use the CLADEX repo and live relay status/logs for relay audits and relay bug claims.",
+            "For relay audits, treat historical HANDOFF/DECISIONS entries and older log events as background only; report them as current issues only if the latest code or current run still reproduces them.",
             f"Project id: {binding.project_id}",
             f"Repo path: {binding.repo_path}",
             f"Worktree path: {binding.worktree_path}",
@@ -1612,24 +1684,24 @@ class DurableRuntime:
         if facts.get("preferences") or facts.get("constraints"):
             lines.append("")
             lines.append("Stable constraints:")
-            for item in facts.get("constraints", [])[:8]:
+            for item in facts.get("constraints", [])[:4]:
                 lines.append(f"- {item}")
-            for item in facts.get("preferences", [])[:6]:
+            for item in facts.get("preferences", [])[:3]:
                 lines.append(f"- prefer: {item}")
         decision_highlights = _extract_bullets(decisions, ("decision", "rationale", "evidence"))
         if decision_highlights:
             lines.append("")
             lines.append("Recent decisions:")
-            lines.extend(f"- {item}" for item in decision_highlights[:6])
-        handoff_highlights = _extract_latest_handoff_highlights(handoff, limit=6)
+            lines.extend(f"- {item}" for item in decision_highlights[:3])
+        handoff_highlights = _extract_latest_handoff_highlights(handoff, limit=3)
         if handoff_highlights:
             lines.append("")
             lines.append("Latest handoff:")
-            lines.extend(f"- {item}" for item in handoff_highlights[:6])
+            lines.extend(f"- {item}" for item in handoff_highlights[:3])
         if unresolved:
             lines.append("")
             lines.append("Unresolved claims needing verification:")
-            for item in unresolved[:6]:
+            for item in unresolved[:3]:
                 lines.append(f"- {item['source_agent']}: {item['claim_text']}")
         lines.append("")
         lines.append("Do not rely on Discord transcript recall when repo memory already captures the truth.")

@@ -237,7 +237,55 @@ def test_runtime_context_bundle_includes_relay_source_of_truth(tmp_path: Path) -
 
     assert "Relay implementation source of truth:" in bundle
     assert "Use the active worktree as source of truth for workspace code/tasks" in bundle
+    assert "older log events as background only" in bundle
     assert str(Path(__file__).resolve().parents[2]) in bundle
+
+
+def test_runtime_does_not_promote_human_turn_instructions_into_stable_constraints(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    state = tmp_path / "state"
+    _init_git_repo(repo)
+
+    runtime = DurableRuntime(state_dir=state, repo_path=repo, state_namespace="test", agent_name="codex")
+    binding = runtime.observe_incoming_message(
+        channel_key="channel-facts",
+        author_name="Finn",
+        author_id=1,
+        author_is_bot=False,
+        text="Reply with only the path.",
+    )
+    facts = json.loads((binding.worktree_path / "memory" / "KNOWN_FACTS.json").read_text(encoding="utf-8"))
+
+    assert facts["constraints"] == []
+    assert facts["preferences"] == []
+
+
+def test_runtime_prunes_transient_constraints_from_known_facts(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    state = tmp_path / "state"
+    _init_git_repo(repo)
+
+    runtime = DurableRuntime(state_dir=state, repo_path=repo, state_namespace="test", agent_name="codex")
+    binding = runtime.ensure_binding("channel-facts-prune")
+    facts_path = binding.worktree_path / "memory" / "KNOWN_FACTS.json"
+    facts_path.write_text(
+        json.dumps(
+            {
+                "preferences": ["Keep it concise."],
+                "constraints": ["Reply with only the path.", "Do not ship broken code.", "sage why are you only saying yes."],
+                "facts": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    bundle = runtime.build_context_bundle("channel-facts-prune")
+    facts = json.loads(facts_path.read_text(encoding="utf-8"))
+
+    assert "Reply with only the path." not in bundle
+    assert "Reply with only the path." not in facts["constraints"]
+    assert "sage why are you only saying yes." not in facts["constraints"]
+    assert "Do not ship broken code." in facts["constraints"]
 
 
 def test_runtime_records_compaction_and_preserves_continuity(tmp_path: Path) -> None:

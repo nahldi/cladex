@@ -120,7 +120,7 @@ def test_durable_context_budget_trims_lightweight_coordination_turns() -> None:
             cleaned_text="ping",
             new_thread=False,
         )
-        == 1400
+        == 900
     )
     assert (
         bot._durable_context_budget(
@@ -128,7 +128,7 @@ def test_durable_context_budget_trims_lightweight_coordination_turns() -> None:
             cleaned_text="yes or no?",
             new_thread=False,
         )
-        == 1800
+        == 1200
     )
     assert (
         bot._durable_context_budget(
@@ -136,7 +136,7 @@ def test_durable_context_budget_trims_lightweight_coordination_turns() -> None:
             cleaned_text="take over the audit and verify the restart logs",
             new_thread=False,
         )
-        == 2200
+        == 1400
     )
     assert (
         bot._durable_context_budget(
@@ -144,7 +144,7 @@ def test_durable_context_budget_trims_lightweight_coordination_turns() -> None:
             cleaned_text="yes or no?",
             new_thread=True,
         )
-        == 6000
+        == 3200
     )
 
 

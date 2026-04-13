@@ -492,3 +492,33 @@ def test_format_prompt_uses_lightweight_path_for_short_messages(tmp_path: Path) 
     assert "lightweight coordination message" not in full_prompt
     assert "caveman mode" in full_prompt
     assert "AGENTS.md" in full_prompt or "Relevant repo documents:" in full_prompt
+
+
+def test_full_prompt_does_not_embed_raw_handoff_or_decisions_files(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    (workspace / "memory").mkdir(parents=True)
+    (workspace / "AGENTS.md").write_text("# AGENTS\nDo not drift.", encoding="utf-8")
+    (workspace / "memory" / "STATUS.md").write_text("## Current objective\nShip it", encoding="utf-8")
+    (workspace / "memory" / "HANDOFF.md").write_text("# HANDOFF\n## 2026-01-01\n- result: noisy handoff", encoding="utf-8")
+    (workspace / "memory" / "DECISIONS.md").write_text("# DECISIONS\n## 2026-01-01\n- Decision: noisy decision", encoding="utf-8")
+
+    backend = ClaudeBackend(
+        workspace=workspace,
+        state_dir=tmp_path / "state",
+        on_response=lambda msg: None,
+    )
+    prompt = backend._format_prompt(
+        InboundMessage(
+            channel_type=ChannelType.DISCORD,
+            channel_id="123",
+            sender_id="u1",
+            sender_name="Finn",
+            content="implement the relay fix",
+        ),
+        workspace,
+        backend.runtime.build_context_bundle("123"),
+    )
+
+    assert "[memory/HANDOFF.md]" not in prompt
+    assert "[memory/DECISIONS.md]" not in prompt
+    assert "[memory/STATUS.md]" in prompt
