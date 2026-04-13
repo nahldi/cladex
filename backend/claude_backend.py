@@ -556,18 +556,19 @@ class ClaudeBackend:
         return "\n\n".join(sections)
 
     def _build_command(self, *, cwd: Path) -> list[str]:
+        """Build Claude CLI command for --print mode."""
         cmd = [
             claude_code_bin(),
             "--output-format",
             "stream-json",
             "--verbose",
-            "--input-format",
-            "stream-json",
             "--model",
             self.model,
             "--permission-mode",
             "bypassPermissions",
         ]
+        # Note: Do NOT use --input-format stream-json with --print mode
+        # --print takes prompt as CLI argument, not via stdin
         return cmd
 
     async def _persistent_process_for_channel(self, channel_key: str, prompt_workspace: Path) -> PersistentClaudeProcess:

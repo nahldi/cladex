@@ -22,7 +22,8 @@ def test_session_persists_initialized_state(tmp_path: Path) -> None:
     assert reloaded.last_success_at
 
 
-def test_build_command_uses_streaming_sdk_flags(tmp_path: Path) -> None:
+def test_build_command_uses_print_mode_flags(tmp_path: Path) -> None:
+    """Verify _build_command produces correct flags for --print mode."""
     backend = ClaudeBackend(
         workspace=tmp_path,
         state_dir=tmp_path / "state",
@@ -32,10 +33,12 @@ def test_build_command_uses_streaming_sdk_flags(tmp_path: Path) -> None:
     cmd = backend._build_command(cwd=tmp_path)
 
     assert "--output-format" in cmd
-    assert "--input-format" in cmd
+    assert "stream-json" in cmd
     assert "--permission-mode" in cmd
     assert "bypassPermissions" in cmd
-    assert "-p" not in cmd
+    # Should NOT have --input-format since we use --print with CLI argument
+    assert "--input-format" not in cmd
+    assert "-p" not in cmd  # --print is added separately in _run_turn
     assert "--resume" not in cmd
     assert "--session-id" not in cmd
     assert "--dangerously-skip-permissions" not in cmd
