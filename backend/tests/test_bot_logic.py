@@ -879,6 +879,27 @@ def test_bot_handoff_does_not_overwrite_latest_human_instruction() -> None:
     asyncio.run(_run())
 
 
+def test_memory_context_block_trims_teammate_and_reply_cache_noise() -> None:
+    bot = _load_bot_module()
+    memory = bot.RelayMemory(
+        latest_authoritative_instruction="ship it",
+        recent_user_messages=["Finn: ship it"],
+        recent_teammate_messages=["Forge: audit done"],
+        recent_context_messages=["background one", "background two", "background three"],
+        recent_relay_replies=["reply one"],
+        last_error="none",
+    )
+
+    block = bot._memory_context_block(memory)
+
+    assert "Latest authoritative instruction" in block
+    assert "Recent human directives:" in block
+    assert "Recent teammate handoffs:" not in block
+    assert "Recent relay replies:" not in block
+    assert "background three" in block
+    assert "background one" not in block
+
+
 def test_soul_markdown_matches_repo_file() -> None:
     bot = _load_bot_module()
     expected = (bot.Path(bot.__file__).with_name("SOUL.md")).read_text(encoding="utf-8").strip()

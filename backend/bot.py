@@ -518,6 +518,7 @@ STDIO_STREAM_LIMIT_BYTES = 64 * 1024 * 1024
 TYPING_INDICATOR_MAX_SECONDS = 45
 TURN_STALL_TIMEOUT_SECONDS = 10 * 60
 TURN_WATCHDOG_POLL_SECONDS = 15
+TASK_HEARTBEAT_INTERVAL_SECONDS = 60
 IDLE_CONNECTION_CLOSE_DELAY_SECONDS = 5
 READY_MARKER_PATH = CONFIG.state_dir / ".ready"
 AUTH_FAILURE_MARKER_PATH = CONFIG.state_dir / ".auth_failed"
@@ -951,6 +952,7 @@ class ActiveTurn:
     runner_task: asyncio.Task | None = None
     finalize_task: asyncio.Task | None = None
     watchdog_task: asyncio.Task | None = None
+    lease_heartbeat_task: asyncio.Task | None = None
     final_item_id: str | None = None
     streamed_text: str = ""
     final_text: str = ""
@@ -1385,15 +1387,9 @@ def _memory_context_block(memory: RelayMemory) -> str:
     if memory.recent_user_messages:
         lines.append("Recent human directives:")
         lines.extend(f"- {item}" for item in memory.recent_user_messages[-4:])
-    if memory.recent_teammate_messages:
-        lines.append("Recent teammate handoffs:")
-        lines.extend(f"- {item}" for item in memory.recent_teammate_messages[-4:])
     if memory.recent_context_messages:
         lines.append("Recent background context:")
-        lines.extend(f"- {item}" for item in memory.recent_context_messages[-3:])
-    if memory.recent_relay_replies:
-        lines.append("Recent relay replies:")
-        lines.extend(f"- {item}" for item in memory.recent_relay_replies[-3:])
+        lines.extend(f"- {item}" for item in memory.recent_context_messages[-2:])
     if memory.last_error:
         lines.append("Last relay/runtime issue: " + json.dumps(memory.last_error))
     if memory.silenced:
@@ -2366,6 +2362,17 @@ def _touch_turn(turn: ActiveTurn) -> None:
     turn.last_activity_at = time.time()
 
 
+async def _lease_heartbeat_updater(turn: ActiveTurn, channel_key: str) -> None:
+    while not turn.completion.done():
+        try:
+            await asyncio.sleep(TASK_HEARTBEAT_INTERVAL_SECONDS)
+        except asyncio.CancelledError:
+            return
+        if turn.completion.done():
+            return
+        DURABLE_RUNTIME.heartbeat_active_task(channel_key)
+
+
 async def _progress_updater(turn: ActiveTurn) -> None:
     if turn.progress_message is None:
         return
@@ -2836,6 +2843,7 @@ class CodexSession:
         _log_observer_event("input", _observer_turn_summary(message, directive))
         _log_observer_event("working", "Working on the current Discord turn.")
         turn.watchdog_task = asyncio.create_task(_turn_watchdog(turn))
+        turn.lease_heartbeat_task = asyncio.create_task(_lease_heartbeat_updater(turn, self.key))
         if message.guild is None:
             if turn.progress_message is None:
                 try:
@@ -3213,6 +3221,8 @@ class CodexSession:
                     turn.finalize_task.cancel()
                 if turn.watchdog_task is not None:
                     turn.watchdog_task.cancel()
+                if turn.lease_heartbeat_task is not None:
+                    turn.lease_heartbeat_task.cancel()
                 if not turn.completion.done():
                     turn.completion.set_exception(SessionResetError("Context cleared."))
             self.tracked_turns.clear()
@@ -3251,6 +3261,8 @@ class CodexSession:
                     turn.finalize_task.cancel()
                 if turn.watchdog_task is not None:
                     turn.watchdog_task.cancel()
+                if turn.lease_heartbeat_task is not None:
+                    turn.lease_heartbeat_task.cancel()
             self.tracked_turns.clear()
             self.active_turn = None
             self.thread_attached = False
@@ -3272,6 +3284,8 @@ class CodexSession:
                     turn.finalize_task.cancel()
                 if turn.watchdog_task is not None:
                     turn.watchdog_task.cancel()
+                if turn.lease_heartbeat_task is not None:
+                    turn.lease_heartbeat_task.cancel()
                 if not turn.completion.done():
                     turn.completion.set_exception(RelayError("Relay shutting down."))
             self.tracked_turns.clear()
@@ -3936,6 +3950,8 @@ class CodexSession:
                     turn.finalize_task.cancel()
                 if turn.watchdog_task is not None:
                     turn.watchdog_task.cancel()
+                if turn.lease_heartbeat_task is not None:
+                    turn.lease_heartbeat_task.cancel()
                 if not turn.completion.done():
                     turn.completion.set_exception(exit_error)
             self.tracked_turns.clear()
@@ -4065,6 +4081,9 @@ class CodexSession:
         if turn.watchdog_task is not None:
             turn.watchdog_task.cancel()
             turn.watchdog_task = None
+        if turn.lease_heartbeat_task is not None:
+            turn.lease_heartbeat_task.cancel()
+            turn.lease_heartbeat_task = None
         self.tracked_turns.pop(turn.turn_id, None)
         if self.active_turn is turn:
             self.active_turn = None
@@ -4468,7 +4487,7 @@ def _get_session(key: str) -> CodexSession:
 
 
 async def _stop_turn_feedback_tasks(turn: ActiveTurn) -> None:
-    for task in (turn.progress_task, turn.typing_task):
+    for task in (turn.progress_task, turn.typing_task, turn.lease_heartbeat_task):
         if task is None:
             continue
         task.cancel()

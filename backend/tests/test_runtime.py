@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 import pytest
+import relay_runtime
 
 from relay_runtime import DurableRuntime, TaskLeaseConflictError
 
@@ -356,6 +357,31 @@ def test_runtime_tasks_file_prunes_old_released_history(tmp_path: Path) -> None:
     assert len(tasks) == 24
     assert "task 0" not in titles
     assert "task 29" in titles
+
+
+def test_runtime_heartbeat_active_task_refreshes_current_lease(tmp_path: Path, monkeypatch) -> None:
+    repo = tmp_path / "repo"
+    state = tmp_path / "state"
+    _init_git_repo(repo)
+
+    now = 1_700_000_000.0
+    monkeypatch.setattr(relay_runtime.time, "time", lambda: now)
+    runtime = DurableRuntime(state_dir=state, repo_path=repo, state_namespace="test", agent_name="codex")
+    runtime.claim_task(
+        channel_key="channel-heartbeat",
+        title="keep lease fresh",
+        owner_agent="codex",
+        target_files=[],
+        validation=[],
+    )
+    tasks_path = runtime.ensure_binding("channel-heartbeat").worktree_path / "memory" / "TASKS.json"
+    before = json.loads(tasks_path.read_text(encoding="utf-8"))["tasks"][0]["heartbeat_at"]
+
+    now += 61.0
+    assert runtime.heartbeat_active_task("channel-heartbeat") is True
+    after = json.loads(tasks_path.read_text(encoding="utf-8"))["tasks"][0]["heartbeat_at"]
+
+    assert after != before
 
 
 def test_runtime_records_compaction_and_preserves_continuity(tmp_path: Path) -> None:

@@ -41,6 +41,7 @@ from relay_common import (
     tail_lines,
     terminate_process_tree,
     token_fingerprint,
+    prune_directory_files,
     truncate_file_tail,
 )
 
@@ -75,6 +76,9 @@ ENV_KEY_ORDER = [
     "OPEN_VISIBLE_TERMINAL",
     "RELAY_ATTACH_CHANNEL_ID",
 ]
+
+BAD_SESSION_MAX_FILES = 24
+BAD_SESSION_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
 
 STALE_PROFILE_KEYS = {
     "RELAY_PROVIDER",
@@ -1399,6 +1403,12 @@ def _quarantine_stale_session_bindings(state_dir: Path, workspace: Path | None =
         target = bad_dir / f"{session_file.stem}.{timestamp}.json"
         session_file.replace(target)
         moved += 1
+    bad_dir = state_dir / "bad-sessions"
+    prune_directory_files(
+        bad_dir,
+        older_than_seconds=BAD_SESSION_MAX_AGE_SECONDS,
+        max_files=BAD_SESSION_MAX_FILES,
+    )
     return moved
 
 

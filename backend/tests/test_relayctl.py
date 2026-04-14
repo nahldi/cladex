@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import json
 import threading
+import time
 
 import install_plugin
 import relay_common
@@ -182,6 +183,31 @@ def test_quarantine_stale_session_bindings_uses_relay_codex_home(tmp_path: Path,
     assert moved == 0
     assert session_file.exists()
     assert not (state_dir / "bad-sessions").exists()
+
+
+def test_quarantine_stale_session_bindings_prunes_bad_session_history(tmp_path: Path, monkeypatch) -> None:
+    state_dir = tmp_path / "state"
+    session_dir = state_dir / "sessions"
+    session_dir.mkdir(parents=True)
+    session_file = session_dir / "channel-1.json"
+    session_file.write_text('{"thread_id":"thread-stale"}\n', encoding="utf-8")
+
+    bad_dir = state_dir / "bad-sessions"
+    bad_dir.mkdir(parents=True)
+    for index in range(relayctl.BAD_SESSION_MAX_FILES + 5):
+        path = bad_dir / f"old-{index}.json"
+        path.write_text("{}", encoding="utf-8")
+        stale_mtime = time.time() - index
+        os.utime(path, (stale_mtime, stale_mtime))
+
+    relay_home = tmp_path / "relay-home"
+    (relay_home / "sessions").mkdir(parents=True)
+    monkeypatch.setattr(relayctl, "prepare_relay_codex_home", lambda workspace: relay_home)
+
+    moved = relayctl._quarantine_stale_session_bindings(state_dir, tmp_path / "workspace")
+
+    assert moved == 1
+    assert len(list(bad_dir.glob("*.json"))) == relayctl.BAD_SESSION_MAX_FILES
 
 
 def test_load_env_file_tolerates_utf8_bom(tmp_path: Path) -> None:

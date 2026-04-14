@@ -14,6 +14,7 @@ Why this shape:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -30,6 +31,7 @@ from claude_common import claude_code_bin, claude_code_version, atomic_write_tex
 from relay_runtime import DurableRuntime, RELAY_PROJECT_ROOT, _extract_blocker, _extract_next_step, _now_iso
 
 logger = logging.getLogger(__name__)
+TASK_HEARTBEAT_INTERVAL_SECONDS = 60
 
 DEFAULT_CLAUDE_MODEL = "claude-opus-4-5-20251101"
 
@@ -322,6 +324,7 @@ class ClaudeBackend:
         before_changes = self._git_status(binding.worktree_path)
         started_at = _now_iso()
         self._active_channel_id = msg.channel_id
+        lease_heartbeat_task = asyncio.create_task(self._lease_heartbeat_loop(msg.channel_id))
         try:
             self.on_status(
                 f"Claude working on {msg.channel_type.value} message from {msg.sender_name} in {binding.worktree_path.name} (effort: {self._effort_for_message(msg.content)})."
@@ -463,7 +466,18 @@ class ClaudeBackend:
             self.on_status("Claude turn complete.")
             return True
         finally:
+            lease_heartbeat_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await lease_heartbeat_task
             self._active_channel_id = None
+
+    async def _lease_heartbeat_loop(self, channel_key: str) -> None:
+        while self._running:
+            try:
+                await asyncio.sleep(TASK_HEARTBEAT_INTERVAL_SECONDS)
+            except asyncio.CancelledError:
+                return
+            self.runtime.heartbeat_active_task(channel_key)
 
     def claim_inbound_discord_message(self, channel_key: str, message_id: str | int | None) -> bool:
         return self.runtime.claim_inbound_discord_message(channel_key, message_id)

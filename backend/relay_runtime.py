@@ -1659,6 +1659,15 @@ class DurableRuntime:
         self._write_tasks_file(binding)
         self._sync_status(binding, active_task="none", blocker="none")
 
+    def heartbeat_active_task(self, channel_key: str, *, lease_seconds: int = 1800) -> bool:
+        binding = self.ensure_binding(channel_key)
+        active = self.store.active_task(channel_key)
+        if active is None:
+            return False
+        self.store.heartbeat_task(str(active["task_id"]), lease_seconds=lease_seconds)
+        self._write_tasks_file(binding)
+        return True
+
     def build_context_bundle(self, channel_key: str, *, max_chars: int = 3200) -> str:
         binding = self.ensure_binding(channel_key)
         memory_dir = binding.worktree_path / MEMORY_DIR_NAME

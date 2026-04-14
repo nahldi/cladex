@@ -34,6 +34,16 @@ logger = logging.getLogger(__name__)
 OPERATOR_HISTORY_LIMIT = 80
 
 
+class _DiscordVoiceWarningFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        if "voice will NOT be supported" in message and (
+            "PyNaCl is not installed" in message or "davey is not installed" in message
+        ):
+            return False
+        return True
+
+
 @dataclass
 class BotConfig:
     """Bot configuration."""
@@ -408,6 +418,7 @@ def main() -> int:
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
+    logging.getLogger("discord.client").addFilter(_DiscordVoiceWarningFilter())
 
     workspace = Path(os.environ.get("CLAUDE_WORKDIR", os.getcwd())).resolve()
     namespace = os.environ.get("STATE_NAMESPACE", "default")
