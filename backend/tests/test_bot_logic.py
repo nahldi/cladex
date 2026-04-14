@@ -711,6 +711,33 @@ def test_auth_failure_marker_is_written() -> None:
     assert "auth broke" in written
 
 
+def test_complete_tracked_turn_clears_auth_failure_marker() -> None:
+    bot = _load_bot_module()
+
+    async def _run() -> None:
+        bot._record_auth_failure_marker("auth broke")
+        session = bot.CodexSession("channel-42")
+        turn = bot.ActiveTurn(
+            turn_id="turn-1",
+            started_at=0.0,
+            last_activity_at=0.0,
+            latest_message=_message(channel_id=42, author_id=7, content="hey"),
+            completion=asyncio.get_running_loop().create_future(),
+        )
+        session.tracked_turns[turn.turn_id] = turn
+        session.active_turn = turn
+        session._complete_tracked_turn(turn, result="done")
+        if session.idle_disconnect_task is not None:
+            session.idle_disconnect_task.cancel()
+            try:
+                await session.idle_disconnect_task
+            except asyncio.CancelledError:
+                pass
+        assert not bot.AUTH_FAILURE_MARKER_PATH.exists()
+
+    asyncio.run(_run())
+
+
 def test_developer_instructions_include_soul() -> None:
     bot = _load_bot_module()
     instructions = bot._developer_instructions()

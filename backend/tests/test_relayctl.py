@@ -963,6 +963,47 @@ def test_profile_runtime_state_clears_stale_ready_and_lock_files(tmp_path: Path)
     assert not (state_dir / ".ready").exists()
 
 
+def test_profile_runtime_state_clears_stale_auth_failure_marker_when_login_is_healthy(tmp_path: Path) -> None:
+    env_file = tmp_path / "profile.env"
+    env_file.write_text(
+        "\n".join(
+            [
+                "DISCORD_BOT_TOKEN=token-value",
+                f"CODEX_WORKDIR={tmp_path}",
+                "STATE_NAMESPACE=test-stale-auth-marker",
+                "CODEX_APP_SERVER_TRANSPORT=stdio",
+                "CODEX_APP_SERVER_PORT=9999",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    profile = {"env_file": str(env_file), "workspace": str(tmp_path)}
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    auth_failed_path = state_dir / ".auth_failed"
+    auth_failed_path.write_text('{"failed_at": 1, "message": "auth broke"}\n', encoding="utf-8")
+
+    original_state_dir_for_profile = relayctl._state_dir_for_profile
+    original_read_pid_file = relayctl._read_pid_file
+    original_pid_exists = relayctl.pid_exists
+    original_codex_login_status = relayctl._codex_login_status
+    relayctl._state_dir_for_profile = lambda _profile, env=None: state_dir
+    relayctl._read_pid_file = lambda path: None
+    relayctl.pid_exists = lambda pid: False
+    relayctl._codex_login_status = lambda workspace: (True, "Logged in using ChatGPT")
+    try:
+        state = relayctl._profile_runtime_state(profile)
+    finally:
+        relayctl._state_dir_for_profile = original_state_dir_for_profile
+        relayctl._read_pid_file = original_read_pid_file
+        relayctl.pid_exists = original_pid_exists
+        relayctl._codex_login_status = original_codex_login_status
+
+    assert state["auth_failed"] is False
+    assert not auth_failed_path.exists()
+
+
 def test_run_profile_waits_for_existing_launch_when_lock_is_held(tmp_path: Path) -> None:
     env_file = tmp_path / "profile.env"
     env_file.write_text(

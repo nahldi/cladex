@@ -764,6 +764,10 @@ def _record_auth_failure_marker(message: str) -> None:
     )
 
 
+def _clear_auth_failure_marker() -> None:
+    AUTH_FAILURE_MARKER_PATH.unlink(missing_ok=True)
+
+
 def _load_app_server_pid_map() -> dict[str, int]:
     if not APP_SERVER_PID_PATH.exists():
         return {}
@@ -832,7 +836,7 @@ def _record_startup_notice() -> None:
 
 async def _mark_relay_state(*, ready: bool, shutdown_client: bool = False) -> None:
     if ready:
-        AUTH_FAILURE_MARKER_PATH.unlink(missing_ok=True)
+        _clear_auth_failure_marker()
         _write_ready_marker()
     else:
         READY_MARKER_PATH.unlink(missing_ok=True)
@@ -4072,6 +4076,7 @@ class CodexSession:
                 turn.completion.set_exception(exc)
             return
         self.saw_successful_turn = True
+        _clear_auth_failure_marker()
         final_preview = _short_observer_text((result or "").strip(), limit=240)
         if final_preview:
             self._maybe_log_turn_preview(turn, force=True)
@@ -5006,7 +5011,7 @@ async def _codex_healthcheck() -> None:
         await session.shutdown()
         _clear_saved_session_state(session.key)
         _clear_relay_memory(session.key)
-        AUTH_FAILURE_MARKER_PATH.unlink(missing_ok=True)
+        _clear_auth_failure_marker()
 
 
 async def _startup_preflight() -> None:
@@ -5104,7 +5109,7 @@ async def on_message(message: discord.Message) -> None:
 
 
 async def _run() -> None:
-    AUTH_FAILURE_MARKER_PATH.unlink(missing_ok=True)
+    _clear_auth_failure_marker()
     await _startup_preflight()
     try:
         async with client:
@@ -5127,7 +5132,7 @@ async def _run() -> None:
 
 def main() -> None:
     _acquire_instance_lock()
-    AUTH_FAILURE_MARKER_PATH.unlink(missing_ok=True)
+    _clear_auth_failure_marker()
     READY_MARKER_PATH.unlink(missing_ok=True)
     prune_directory_files(
         ATTACHMENTS_DIR,

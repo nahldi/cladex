@@ -1006,7 +1006,7 @@ class RuntimeStore:
                 """
                 SELECT * FROM task_leases
                 WHERE channel_id = ? AND status = 'claimed'
-                ORDER BY heartbeat_at DESC
+                ORDER BY heartbeat_at DESC, rowid DESC
                 LIMIT 1
                 """,
                 (channel_id,),
@@ -1019,7 +1019,7 @@ class RuntimeStore:
                 """
                 SELECT * FROM task_leases
                 WHERE channel_id = ?
-                ORDER BY CASE WHEN status = 'claimed' THEN 0 ELSE 1 END, heartbeat_at DESC, started_at DESC
+                ORDER BY CASE WHEN status = 'claimed' THEN 0 ELSE 1 END, heartbeat_at DESC, started_at DESC, rowid DESC
                 """,
                 (channel_id,),
             ).fetchall()

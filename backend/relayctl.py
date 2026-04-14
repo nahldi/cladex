@@ -1114,6 +1114,25 @@ def _auth_failure_marker_path(state_dir: Path) -> Path:
     return state_dir / ".auth_failed"
 
 
+def _reconcile_auth_failure_marker(profile: dict, auth_failure_marker_path: Path) -> bool:
+    if not auth_failure_marker_path.exists():
+        return False
+    workspace_text = str(profile.get("workspace") or "").strip()
+    if not workspace_text:
+        return True
+    try:
+        logged_in, _status_text = _codex_login_status(Path(workspace_text))
+    except Exception:
+        return True
+    if not logged_in:
+        return True
+    try:
+        auth_failure_marker_path.unlink(missing_ok=True)
+    except OSError:
+        return True
+    return False
+
+
 def _startup_notice_marker_path(state_dir: Path) -> Path:
     return state_dir / ".startup_notice"
 
@@ -1309,7 +1328,7 @@ def _profile_runtime_state(profile: dict) -> dict:
     relay_pid = relay_pids[0] if relay_pids else relay_pid
     relay_running = bool(relay_pids) or lock_held
     ready = ready_marker_path.exists() and relay_running
-    auth_failed = auth_failure_marker_path.exists()
+    auth_failed = _reconcile_auth_failure_marker(profile, auth_failure_marker_path)
     session_threads: dict[str, str] = {}
     if session_dir.exists():
         for session_file in sorted(session_dir.glob("*.json")):
