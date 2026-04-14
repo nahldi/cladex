@@ -5,12 +5,14 @@ const fs = require('fs/promises');
 const path = require('path');
 const fsSync = require('fs');
 const os = require('os');
+const crypto = require('crypto');
 
 const execFileAsync = promisify(execFile);
 const app = express();
 const API_HOST = process.env.API_HOST || '127.0.0.1';
 const API_PORT = Number(process.env.API_PORT || 3001);
 let serverInstance = null;
+let remoteAccessTokenCache = null;
 
 app.disable('x-powered-by');
 app.use(express.json({ limit: '1mb' }));
@@ -34,9 +36,21 @@ function isLoopbackHost(host) {
   return ['127.0.0.1', 'localhost', '::1', '[::1]'].includes(String(host || '').trim());
 }
 
+function isSameOriginRequest(req, origin) {
+  if (!origin) {
+    return true;
+  }
+  try {
+    const parsed = new URL(origin);
+    return parsed.host === String(req.headers.host || '').trim();
+  } catch {
+    return false;
+  }
+}
+
 app.use((req, res, next) => {
   const origin = String(req.headers.origin || '').trim();
-  const allowed = isLoopbackOrigin(origin);
+  const allowed = isLoopbackOrigin(origin) || isSameOriginRequest(req, origin);
   res.header('Vary', 'Origin');
   res.header('X-Content-Type-Options', 'nosniff');
   if (origin && allowed) {
@@ -59,6 +73,14 @@ app.use((req, res, next) => {
   next();
 });
 
+app.use('/api', (req, res, next) => {
+  if (!requiresRemoteAccessToken(req) || hasValidRemoteAccessToken(req)) {
+    next();
+    return;
+  }
+  res.status(401).json({ error: 'CLADEX remote access token required', authRequired: true });
+});
+
 function resolveBackendDir() {
   const bundledBackend = path.join(process.resourcesPath || '', 'backend');
   if (bundledBackend && fsSync.existsSync(bundledBackend)) {
@@ -68,6 +90,83 @@ function resolveBackendDir() {
 }
 
 const BACKEND_DIR = resolveBackendDir();
+
+function resolveFrontendDir() {
+  const bundledDist = path.join(process.resourcesPath || '', 'dist');
+  if (bundledDist && fsSync.existsSync(bundledDist)) {
+    return bundledDist;
+  }
+  return path.join(__dirname, 'dist');
+}
+
+const FRONTEND_DIR = resolveFrontendDir();
+
+function remoteTokenStatePath() {
+  const localAppData = process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local');
+  return path.join(localAppData, 'cladex', 'remote-access-token.json');
+}
+
+function getRemoteAccessToken() {
+  if (remoteAccessTokenCache) {
+    return remoteAccessTokenCache;
+  }
+  const envToken = String(process.env.CLADEX_REMOTE_ACCESS_TOKEN || '').trim();
+  if (envToken) {
+    remoteAccessTokenCache = envToken;
+    return remoteAccessTokenCache;
+  }
+  const statePath = remoteTokenStatePath();
+  try {
+    if (fsSync.existsSync(statePath)) {
+      const parsed = JSON.parse(fsSync.readFileSync(statePath, 'utf8'));
+      const saved = String(parsed.token || '').trim();
+      if (saved) {
+        remoteAccessTokenCache = saved;
+        return remoteAccessTokenCache;
+      }
+    }
+  } catch {}
+  const generated = crypto.randomBytes(18).toString('base64url');
+  remoteAccessTokenCache = generated;
+  try {
+    fsSync.mkdirSync(path.dirname(statePath), { recursive: true });
+    fsSync.writeFileSync(statePath, JSON.stringify({ token: generated }, null, 2) + '\n', 'utf8');
+  } catch {}
+  return remoteAccessTokenCache;
+}
+
+function requestHost(req) {
+  const forwarded = String(req.headers['x-forwarded-host'] || '').trim();
+  if (forwarded) {
+    return forwarded.split(',')[0].trim().replace(/:\d+$/, '');
+  }
+  const raw = String(req.headers.host || '').trim();
+  return raw.replace(/:\d+$/, '');
+}
+
+function requestBase(req) {
+  const forwardedProto = String(req.headers['x-forwarded-proto'] || '').trim();
+  const proto = (forwardedProto ? forwardedProto.split(',')[0].trim() : req.protocol || 'http') || 'http';
+  const forwardedHost = String(req.headers['x-forwarded-host'] || '').trim();
+  const host = (forwardedHost ? forwardedHost.split(',')[0].trim() : String(req.get('host') || '').trim())
+    || `${API_HOST}:${API_PORT}`;
+  return `${proto}://${host}`;
+}
+
+function isLoopbackRequest(req) {
+  const host = requestHost(req);
+  const origin = String(req.headers.origin || '').trim();
+  return (!host || isLoopbackHost(host)) && (!origin || isLoopbackOrigin(origin));
+}
+
+function requiresRemoteAccessToken(req) {
+  return !isLoopbackRequest(req);
+}
+
+function hasValidRemoteAccessToken(req) {
+  const provided = String(req.headers['x-cladex-access-token'] || '').trim();
+  return Boolean(provided) && provided === getRemoteAccessToken();
+}
 
 function resolvePythonLaunchers() {
   const launchers = [];
@@ -185,13 +284,62 @@ async function runJson(args, cwd = BACKEND_DIR) {
   return JSON.parse(result.stdout || '{}');
 }
 
-app.get('/api/runtime-info', async (_req, res) => {
-  res.json({
-    apiBase: `http://${API_HOST}:${API_PORT}`,
+function listDirectoryRoots() {
+  if (process.platform === 'win32') {
+    const roots = [];
+    for (const letter of 'ABCDEFGHIJKLMNOPQRSTUVWXYZ') {
+      const drive = `${letter}:\\`;
+      if (fsSync.existsSync(drive)) {
+        roots.push({ name: drive, path: drive });
+      }
+    }
+    return roots;
+  }
+  return [{ name: '/', path: '/' }];
+}
+
+app.get('/api/runtime-info', async (req, res) => {
+  const payload = {
+    apiBase: `${requestBase(req)}/api`,
     backendDir: BACKEND_DIR,
+    frontendDir: FRONTEND_DIR,
     packaged: process.env.NODE_ENV === 'production' || !!process.resourcesPath,
     appVersion: process.env.npm_package_version || '2.0.10',
-  });
+    remoteAccessProtected: true,
+  };
+  if (isLoopbackRequest(req)) {
+    payload.remoteAccessToken = getRemoteAccessToken();
+  }
+  res.json(payload);
+});
+
+app.get('/api/fs/list', async (req, res) => {
+  const raw = String(req.query.path || '').trim();
+  if (!raw) {
+    res.json({ currentPath: '', parentPath: '', directories: listDirectoryRoots() });
+    return;
+  }
+  const target = path.resolve(raw);
+  try {
+    const stats = await fs.stat(target);
+    if (!stats.isDirectory()) {
+      res.status(400).json({ error: 'Path is not a directory' });
+      return;
+    }
+    const entries = await fs.readdir(target, { withFileTypes: true });
+    const directories = entries
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => ({ name: entry.name, path: path.join(target, entry.name) }))
+      .sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }));
+    const parentPath = path.dirname(target);
+    res.json({
+      currentPath: target,
+      parentPath: parentPath && parentPath !== target ? parentPath : '',
+      directories,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error?.message || 'Failed to list directories' });
+  }
 });
 
 app.get('/api/profiles', async (_req, res) => {
@@ -542,6 +690,17 @@ app.use((err, _req, res, _next) => {
   console.error(err);
   res.status(500).json({ error: 'Internal server error' });
 });
+
+if (fsSync.existsSync(FRONTEND_DIR)) {
+  app.use(express.static(FRONTEND_DIR, { index: 'index.html' }));
+  app.get('*', (req, res, next) => {
+    if (req.path.startsWith('/api/')) {
+      next();
+      return;
+    }
+    res.sendFile(path.join(FRONTEND_DIR, 'index.html'));
+  });
+}
 
 function startServer(options = {}) {
   const host = options.host || API_HOST;

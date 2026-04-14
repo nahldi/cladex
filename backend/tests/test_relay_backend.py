@@ -1,4 +1,5 @@
 import asyncio
+import os
 from pathlib import Path
 
 from claude_backend import ClaudeBackend, ClaudeSession, CommandResult, InboundMessage, ChannelType
@@ -155,6 +156,31 @@ def test_process_message_retries_with_fresh_session_on_resume_failure(tmp_path: 
     assert calls[1][1] != calls[0][1]
     assert responses == ["done"]
     assert any("stale" in status.lower() for status in statuses)
+
+
+def test_backend_start_uses_launcher_restart_reason_from_env(tmp_path: Path, monkeypatch) -> None:
+    backend = ClaudeBackend(
+        workspace=tmp_path,
+        state_dir=tmp_path / "state",
+        on_response=lambda msg: None,
+    )
+    recorded: list[str] = []
+
+    monkeypatch.setattr("claude_backend.claude_code_version", lambda: "1.0.0")
+    monkeypatch.setattr(backend.runtime, "record_restart_event", lambda reason="normal": recorded.append(reason))
+    monkeypatch.setattr(backend.runtime, "is_restart_churn", lambda threshold=5, window_seconds=300: False)
+
+    previous = os.environ.get("CLADEX_START_REASON")
+    os.environ["CLADEX_START_REASON"] = "operator-restart"
+    try:
+        assert backend.start() is True
+    finally:
+        if previous is None:
+            os.environ.pop("CLADEX_START_REASON", None)
+        else:
+            os.environ["CLADEX_START_REASON"] = previous
+
+    assert recorded == ["operator-restart"]
 
 
 def test_process_message_retries_with_fresh_session_on_session_id_collision(tmp_path: Path) -> None:

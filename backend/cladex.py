@@ -364,7 +364,7 @@ def _ensure_claude_background_runtime() -> None:
         runtime_python = relayctl.install_plugin._ensure_runtime(source=source)
 
 
-def start_profile(profile: dict[str, Any]) -> None:
+def start_profile(profile: dict[str, Any], *, start_reason: str = "operator-start") -> None:
     relay_type = str(profile.get("_relay_type", "")).strip().lower()
     if relay_type == "codex":
         relayctl._run_profile(profile)
@@ -391,6 +391,7 @@ def start_profile(profile: dict[str, Any]) -> None:
     run_env.update(env)
     run_env["CLAUDE_WORKDIR"] = workspace
     run_env["STATE_NAMESPACE"] = state_namespace
+    run_env["CLADEX_START_REASON"] = start_reason
 
     # Log file
     log_file = state_dir / "relay.log"
@@ -443,7 +444,7 @@ def stop_profile(profile: dict[str, Any]) -> None:
 
 def restart_profile(profile: dict[str, Any]) -> None:
     stop_profile(profile)
-    start_profile(profile)
+    start_profile(profile, start_reason="operator-restart")
 
 
 def _filter_profiles(name: str | None = None, relay_type: str | None = None) -> list[dict[str, Any]]:

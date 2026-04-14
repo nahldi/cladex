@@ -7,6 +7,7 @@ let mainWindow = null;
 let apiServer = null;
 const API_PORT = Number(process.env.API_PORT || 3001);
 const API_HOST = process.env.API_HOST || '127.0.0.1';
+let activeApiPort = API_PORT;
 
 const singleInstanceLock = app.requestSingleInstanceLock();
 if (!singleInstanceLock) {
@@ -35,42 +36,64 @@ async function startApiServer() {
   logDesktop(`Starting API from ${serverModulePath}`);
   // eslint-disable-next-line global-require, import/no-dynamic-require
   const serverModule = require(serverModulePath);
-  try {
-    apiServer = await serverModule.startServer({ host: API_HOST, port: API_PORT, quiet: false });
-    logDesktop(`API started on ${API_HOST}:${API_PORT}`);
-  } catch (error) {
-    if (error && error.code === 'EADDRINUSE') {
-      logDesktop(`API port ${API_PORT} already in use, waiting for existing server`);
-      await waitForApi();
-      return null;
+  for (let port = API_PORT; port < API_PORT + 20; port += 1) {
+    try {
+      apiServer = await serverModule.startServer({ host: API_HOST, port, quiet: false });
+      activeApiPort = port;
+      logDesktop(`API started on ${API_HOST}:${activeApiPort}`);
+      return apiServer;
+    } catch (error) {
+      if (error && error.code === 'EADDRINUSE') {
+        const claDexRuntime = await readRuntimeInfo(port).catch(() => null);
+        if (claDexRuntime) {
+          activeApiPort = port;
+          logDesktop(`API port ${port} already in use by CLADEX, reusing existing server`);
+          await waitForApi(port);
+          return null;
+        }
+        logDesktop(`API port ${port} already in use by a different service, trying next port`);
+        continue;
+      }
+      logDesktop(`API start failed: ${error && error.stack ? error.stack : error}`);
+      throw error;
     }
-    logDesktop(`API start failed: ${error && error.stack ? error.stack : error}`);
-    throw error;
   }
-  return apiServer;
+  throw new Error(`No usable CLADEX API port found starting at ${API_PORT}`);
 }
 
-function waitForApi(timeoutMs = 8000) {
+function readRuntimeInfo(port, timeoutMs = 1000) {
+  return new Promise((resolve, reject) => {
+    const request = http.get({ host: API_HOST, port, path: '/api/runtime-info', timeout: timeoutMs }, (response) => {
+      const chunks = [];
+      response.on('data', (chunk) => chunks.push(chunk));
+      response.on('end', () => {
+        try {
+          const payload = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
+          if (payload && payload.appVersion && Object.prototype.hasOwnProperty.call(payload, 'backendDir')) {
+            resolve(payload);
+            return;
+          }
+        } catch {}
+        reject(new Error('Not a CLADEX runtime-info response'));
+      });
+    });
+    request.on('error', reject);
+    request.on('timeout', () => {
+      request.destroy();
+      reject(new Error('timeout'));
+    });
+  });
+}
+
+function waitForApi(port = activeApiPort, timeoutMs = 8000) {
   const startedAt = Date.now();
   return new Promise((resolve, reject) => {
     const attempt = () => {
-      const request = http.get({ host: API_HOST, port: API_PORT, path: '/api/runtime-info', timeout: 1000 }, (response) => {
-        response.resume();
-        if (response.statusCode && response.statusCode >= 200 && response.statusCode < 500) {
-          resolve();
-          return;
-        }
-        retry();
-      });
-      request.on('error', retry);
-      request.on('timeout', () => {
-        request.destroy();
-        retry();
-      });
+      readRuntimeInfo(port, 1000).then(() => resolve()).catch(retry);
     };
     const retry = () => {
       if (Date.now() - startedAt > timeoutMs) {
-        reject(new Error(`CLADEX API server did not become ready on ${API_HOST}:${API_PORT}`));
+        reject(new Error(`CLADEX API server did not become ready on ${API_HOST}:${port}`));
         return;
       }
       setTimeout(attempt, 250);
@@ -122,7 +145,7 @@ function createWindow() {
   // Load built files (production mode)
   const indexPath = path.join(__dirname, '..', 'dist', 'index.html');
   console.log('Loading:', indexPath);
-  mainWindow.loadFile(indexPath);
+  mainWindow.loadFile(indexPath, { query: { apiBase: `http://${API_HOST}:${activeApiPort}/api` } });
 
   // Open external links in browser
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {

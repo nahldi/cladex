@@ -251,7 +251,7 @@ class ClaudeBackend:
             logger.error("Claude Code CLI not found")
             self.on_status("ERROR: Claude Code CLI not found")
             return False
-        self.runtime.record_restart_event(reason="process-startup")
+        self.runtime.record_restart_event(reason=os.environ.get("CLADEX_START_REASON", "process-startup").strip() or "process-startup")
         self._running = True
         # Check for restart churn
         if self.runtime.is_restart_churn():

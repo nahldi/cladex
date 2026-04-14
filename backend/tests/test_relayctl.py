@@ -566,13 +566,14 @@ def test_launch_bot_worker_uses_local_script_entrypoint(tmp_path: Path) -> None:
     relayctl._background_python_windowless_executable = lambda: "python-bg"
     relayctl.subprocess.Popen = lambda command, **kwargs: captured.update(command=command, kwargs=kwargs) or _FakeProcess()
     try:
-        process = relayctl._launch_bot_worker(env_file, workspace)
+        process = relayctl._launch_bot_worker(env_file, workspace, start_reason="worker-restart")
     finally:
         relayctl._background_python_windowless_executable = original_background_python_windowless_executable
         relayctl.subprocess.Popen = original_popen
 
     assert process.pid == 1234
     assert captured["command"] == ["python-bg", "-u", relayctl._backend_script_path("bot.py")]
+    assert captured["kwargs"]["env"]["CLADEX_START_REASON"] == "worker-restart"
 
 
 def test_internal_serve_command_is_hidden_from_help() -> None:

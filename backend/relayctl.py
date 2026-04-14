@@ -1540,13 +1540,20 @@ def _codex_login_status(workspace: Path) -> tuple[bool, str]:
     return result.returncode == 0 and "logged in" in output.lower(), output
 
 
-def _launch_bot_worker(env_file: Path, workspace: Path, *, log_path: Path | None = None) -> subprocess.Popen:
+def _launch_bot_worker(
+    env_file: Path,
+    workspace: Path,
+    *,
+    log_path: Path | None = None,
+    start_reason: str = "process-startup",
+) -> subprocess.Popen:
     env_data = _load_env_file(env_file)
     env_data.setdefault("CODEX_WORKDIR", str(workspace))
     env = _normalized_profile_env(env_data)
     child_env = relay_codex_env(workspace, os.environ.copy())
     child_env["ENV_FILE"] = str(env_file)
     child_env["PYTHONUNBUFFERED"] = "1"
+    child_env["CLADEX_START_REASON"] = start_reason
     popen_kwargs: dict[str, object] = {
         "cwd": str(workspace),
         "env": child_env,
@@ -1607,6 +1614,7 @@ def _run_profile_foreground(profile: dict) -> int:
         child_env = relay_codex_env(Path(profile["workspace"]), os.environ.copy())
         child_env["ENV_FILE"] = profile["env_file"]
         child_env["PYTHONUNBUFFERED"] = "1"
+        child_env["CLADEX_START_REASON"] = os.environ.get("CLADEX_START_REASON", "operator-start").strip() or "operator-start"
         print(f"Running relay for `{profile['name']}` in the current terminal.")
         print(f"workspace: {profile['workspace']}")
         print(f"log: {runtime['log_path']}")
@@ -1644,6 +1652,7 @@ def _run_profile(profile: dict) -> int:
         launch_env = relay_codex_env(Path(profile["workspace"]), os.environ.copy())
         launch_env["ENV_FILE"] = profile["env_file"]
         launch_env["PYTHONUNBUFFERED"] = "1"
+        launch_env["CLADEX_START_REASON"] = os.environ.get("CLADEX_START_REASON", "operator-start").strip() or "operator-start"
         logged_in, login_status = _codex_login_status(Path(profile["workspace"]))
         if not logged_in:
             raise SystemExit(
@@ -3419,7 +3428,15 @@ def cmd_serve(args: argparse.Namespace) -> int:
                 truncate_file_tail(state_dir / "logs" / "app-server.log", max_bytes=5 * 1024 * 1024, keep_bytes=1024 * 1024)
                 child_started_at = time.time()
                 print(f"Supervisor starting relay worker for {workspace}")
-                child_process = _launch_bot_worker(env_file, workspace, log_path=state_dir / "logs" / "relay.log")
+                reason = os.environ.get("CLADEX_START_REASON", "operator-start").strip() or "operator-start"
+                if failure_timestamps:
+                    reason = "worker-restart"
+                child_process = _launch_bot_worker(
+                    env_file,
+                    workspace,
+                    log_path=state_dir / "logs" / "relay.log",
+                    start_reason=reason,
+                )
 
                 while not stop_requested[0]:
                     try:

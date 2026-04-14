@@ -68,8 +68,17 @@ interface Profile {
 interface RuntimeInfo {
   apiBase: string;
   backendDir: string;
+  frontendDir?: string;
   packaged: boolean;
   appVersion: string;
+  remoteAccessProtected?: boolean;
+  remoteAccessToken?: string;
+}
+
+interface DirectoryListResponse {
+  currentPath: string;
+  parentPath: string;
+  directories: Array<{ name: string; path: string }>;
 }
 
 interface ProjectRecord {
@@ -136,7 +145,11 @@ declare global {
   }
 }
 
-const API_BASE = 'http://127.0.0.1:3001/api';
+const ACCESS_TOKEN_STORAGE_KEY = 'cladex-remote-access-token';
+const FILE_MODE_API_BASE = typeof window !== 'undefined' ? new URLSearchParams(window.location.search).get('apiBase') || '' : '';
+const API_BASE = typeof window !== 'undefined'
+  ? (window.location.protocol !== 'file:' ? `${window.location.origin}/api` : (FILE_MODE_API_BASE || 'http://127.0.0.1:3001/api'))
+  : 'http://127.0.0.1:3001/api';
 const CLADEX_LOGO = new URL('../assets/icon.png', import.meta.url).href;
 const FIRST_RUN_REQUIREMENTS = [
   'Python 3.10+ installed and reachable from PATH.',
@@ -151,6 +164,31 @@ const FIRST_RUN_STEPS = [
   'Set the allowed Discord channel id, then save the profile.',
   'Start the relay and confirm it reaches Ready.',
 ];
+
+class RemoteAccessTokenError extends Error {
+  constructor(message = 'CLADEX remote access token required.') {
+    super(message);
+    this.name = 'RemoteAccessTokenError';
+  }
+}
+
+function getStoredAccessToken(): string {
+  try {
+    return window.localStorage.getItem(ACCESS_TOKEN_STORAGE_KEY) || '';
+  } catch {
+    return '';
+  }
+}
+
+function storeAccessToken(token: string) {
+  try {
+    if (token.trim()) {
+      window.localStorage.setItem(ACCESS_TOKEN_STORAGE_KEY, token.trim());
+    } else {
+      window.localStorage.removeItem(ACCESS_TOKEN_STORAGE_KEY);
+    }
+  } catch {}
+}
 
 async function chooseWorkspaceFolder(currentValue = ''): Promise<string> {
   try {
@@ -214,9 +252,17 @@ function humanize(value: string): string {
 }
 
 async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(url, init);
+  const headers = new Headers(init?.headers || {});
+  const accessToken = getStoredAccessToken();
+  if (accessToken) {
+    headers.set('X-CLADEX-Access-Token', accessToken);
+  }
+  const response = await fetch(url, { ...init, headers });
   if (!response.ok) {
     const payload = await response.json().catch(() => null);
+    if (response.status === 401 && payload?.authRequired) {
+      throw new RemoteAccessTokenError(payload?.error || 'CLADEX remote access token required.');
+    }
     throw new Error(payload?.error || 'Request failed');
   }
   return response.json();
@@ -243,6 +289,7 @@ const api = {
   startProject: (name: string) => fetchJson(`${API_BASE}/projects/${encodeURIComponent(name)}/start`, { method: 'POST' }),
   stopProject: (name: string) => fetchJson(`${API_BASE}/projects/${encodeURIComponent(name)}/stop`, { method: 'POST' }),
   removeProject: (name: string) => fetchJson(`${API_BASE}/projects/${encodeURIComponent(name)}`, { method: 'DELETE' }),
+  listDirectories: (currentPath = '') => fetchJson<DirectoryListResponse>(`${API_BASE}/fs/list${currentPath ? `?path=${encodeURIComponent(currentPath)}` : ''}`),
 };
 
 export default function App() {
@@ -256,6 +303,8 @@ export default function App() {
   const [busyKey, setBusyKey] = useState<string | null>(null);
   const [errorText, setErrorText] = useState('');
   const [bootPending, setBootPending] = useState(true);
+  const [remoteAuthRequired, setRemoteAuthRequired] = useState(false);
+  const [remoteAccessTokenDraft, setRemoteAccessTokenDraft] = useState(() => getStoredAccessToken());
   const bootFailureCount = useRef(0);
   const isDark = true;
 
@@ -273,10 +322,17 @@ export default function App() {
       setProfiles(profileRows);
       setProjects(projectRows);
       setRuntimeInfo(runtime);
+      setRemoteAuthRequired(false);
       bootFailureCount.current = 0;
       setBootPending(false);
       setErrorText('');
     } catch (error) {
+      if (error instanceof RemoteAccessTokenError) {
+        setRemoteAuthRequired(true);
+        setBootPending(false);
+        setErrorText('');
+        return;
+      }
       const message = error instanceof Error ? error.message : 'Failed to refresh CLADEX state.';
       const nextFailures = bootFailureCount.current + 1;
       bootFailureCount.current = nextFailures;
@@ -329,18 +385,18 @@ export default function App() {
     <div className={`relative min-h-screen overflow-hidden font-sans transition-colors duration-500 selection:bg-indigo-500/30 ${isDark ? 'bg-[#050505] text-gray-100' : 'bg-[#f2efe7] text-slate-900'}`}>
       <CladexBackground isDark={isDark} />
       <div className={`pointer-events-none absolute inset-0 z-0 transition-opacity duration-500 ${isDark ? 'bg-[radial-gradient(circle_at_top,rgba(249,115,22,0.12),transparent_28%),radial-gradient(circle_at_bottom_right,rgba(16,185,129,0.12),transparent_32%)] opacity-100' : 'bg-[radial-gradient(circle_at_top,rgba(212,115,94,0.16),transparent_30%),radial-gradient(circle_at_bottom_right,rgba(125,181,165,0.18),transparent_34%)] opacity-80'}`} />
-      <main className="relative z-10 flex min-h-screen flex-col overflow-y-auto pb-28">
-        <header className="mx-auto flex w-full max-w-7xl items-start justify-between gap-6 px-8 pb-2 pt-7">
+      <main className="relative z-10 flex min-h-screen flex-col overflow-y-auto pb-24 sm:pb-28">
+        <header className="mx-auto flex w-full max-w-7xl flex-col gap-4 px-4 pb-2 pt-5 sm:px-8 sm:pt-7 lg:flex-row lg:items-start lg:justify-between lg:gap-6">
           <div className="flex items-center gap-4">
             <div className={`relative h-12 w-12 overflow-hidden rounded-[18px] border shadow-[0_0_28px_rgba(99,102,241,0.16)] ${isDark ? 'border-white/10 bg-white/5' : 'border-black/10 bg-white/70 shadow-[0_0_30px_rgba(212,115,94,0.12)]'}`}>
               <img src={CLADEX_LOGO} alt="CLADEX" className="h-full w-full object-cover" />
             </div>
             <div>
-              <h1 className={`text-[2.15rem] leading-none font-black tracking-tight ${isDark ? 'text-white' : 'text-slate-900'}`}>ClaDex</h1>
+              <h1 className={`text-[1.9rem] leading-none font-black tracking-tight sm:text-[2.15rem] ${isDark ? 'text-white' : 'text-slate-900'}`}>ClaDex</h1>
               <p className={`mt-1.5 font-mono text-[11px] uppercase tracking-[0.32em] ${isDark ? 'text-orange-300/85' : 'text-[#b15f4e]'}`}>Unified Relay Network</p>
             </div>
           </div>
-          <div className="flex gap-2 self-start pt-4">
+          <div className="flex gap-2 self-start lg:pt-4">
             <MiniIconButton label="Refresh" icon={<RefreshCw size={15} />} onClick={() => void loadAll()} />
             <MiniIconButton label="Stop All" icon={<PauseCircle size={15} />} tone="danger" onClick={() => void runAction('stop-all', api.stopAll)} />
           </div>
@@ -393,8 +449,8 @@ export default function App() {
         </AnimatePresence>
       </main>
 
-      <div className="fixed bottom-6 left-1/2 z-50 -translate-x-1/2">
-        <div className={`flex items-center gap-2 rounded-2xl border p-2 backdrop-blur-xl shadow-2xl transition-colors duration-500 ${isDark ? 'border-white/10 bg-white/5 shadow-black/50' : 'border-slate-300/70 bg-white/80 shadow-slate-300/50'}`}>
+      <div className="fixed inset-x-3 bottom-3 z-50 sm:inset-x-auto sm:bottom-6 sm:left-1/2 sm:-translate-x-1/2">
+        <div className={`flex items-center justify-between gap-1 overflow-x-auto rounded-2xl border p-2 backdrop-blur-xl shadow-2xl transition-colors duration-500 sm:gap-2 ${isDark ? 'border-white/10 bg-white/5 shadow-black/50' : 'border-slate-300/70 bg-white/80 shadow-slate-300/50'}`}>
           <DockButton icon={<LayoutGrid />} label="Relays" active={view === 'relays'} onClick={() => setView('relays')} light={!isDark} />
           <DockButton icon={<FolderKanban />} label="Workgroups" active={view === 'workgroups'} onClick={() => setView('workgroups')} light={!isDark} />
           <DockButton icon={<MessageSquare />} label="Live Console" active={view === 'live'} onClick={() => setView('live')} light={!isDark} />
@@ -405,6 +461,16 @@ export default function App() {
       </div>
 
       <AnimatePresence>
+        {remoteAuthRequired ? (
+          <RemoteAccessModal
+            token={remoteAccessTokenDraft}
+            onChangeToken={setRemoteAccessTokenDraft}
+            onSubmit={async () => {
+              storeAccessToken(remoteAccessTokenDraft);
+              await loadAll();
+            }}
+          />
+        ) : null}
         {activeModal === 'add' ? <AddProfileModal onClose={() => setActiveModal(null)} onSubmit={async (data) => { await runAction('create-profile', () => api.createProfile(data)); setActiveModal(null); }} /> : null}
         {activeModal === 'edit' && selectedProfile ? <EditProfileModal profile={selectedProfile} onClose={() => setActiveModal(null)} onSubmit={async (data) => { await runAction(`update-${selectedProfile.id}`, () => api.updateProfile(selectedProfile.id, selectedProfile.relayType, data)); setActiveModal(null); }} /> : null}
         {activeModal === 'logs' && selectedProfile ? <LogsModal profile={selectedProfile} onClose={() => setActiveModal(null)} /> : null}
@@ -445,7 +511,7 @@ function RelayDashboard({
   onLogs: (profile: Profile) => void;
 }) {
   return (
-    <div className="mx-auto flex w-full max-w-7xl flex-1 flex-col px-8 pb-10 pt-4">
+    <div className="mx-auto flex w-full max-w-7xl flex-1 flex-col px-4 pb-10 pt-4 sm:px-8">
       {loading ? (
         <EmptyState
           title={bootPending ? 'Starting the local CLADEX runtime...' : 'Loading relay state...'}
@@ -468,7 +534,7 @@ function RelayDashboard({
           <FirstRunGuide packaged={runtimeInfo?.packaged ?? false} />
         </div>
       ) : (
-        <div className="grid auto-rows-fr gap-6 md:grid-cols-2 xl:grid-cols-3">
+        <div className="grid auto-rows-fr gap-4 sm:gap-6 md:grid-cols-2 xl:grid-cols-3">
           {profiles.map((profile) => (
             <React.Fragment key={profile.id}>
               <RelayCard
@@ -540,7 +606,7 @@ function RelayCard({
       onMouseLeave={resetPointer}
       style={{ rotateX, rotateY, transformStyle: 'preserve-3d' }}
       whileHover={{ scale: 1.01 }}
-      className="group relative h-[276px] [perspective:1200px]"
+      className="group relative h-[262px] sm:h-[276px] [perspective:1200px]"
     >
       <div className="absolute inset-0 rounded-[32px] bg-black/25 blur-2xl dark:bg-black/35" />
       <div className="relative h-full overflow-hidden rounded-[28px] border border-slate-200/70 bg-white/70 p-5 shadow-[0_18px_44px_rgba(15,23,42,0.12)] backdrop-blur-xl transition-colors duration-500 dark:border-white/10 dark:bg-[#09090b]/90 dark:shadow-2xl">
@@ -548,13 +614,13 @@ function RelayCard({
         <motion.div className="pointer-events-none absolute inset-0 rounded-[28px] opacity-0 transition-opacity duration-300 group-hover:opacity-100" style={{ background: spotlight }} />
         <div className="pointer-events-none absolute -right-14 top-8 h-24 w-24 rounded-full blur-3xl" style={{ background: `${accent}28` }} />
         <div className="relative z-10 flex h-full flex-col">
-        <div className="flex items-start justify-between gap-4">
+        <div className="flex items-start justify-between gap-3 sm:gap-4">
           <div>
             <div className={`inline-flex rounded-full border px-2.5 py-1 text-[10px] font-bold uppercase tracking-[0.24em] ${isClaude ? 'border-orange-500/30 bg-orange-500/10 text-orange-700 dark:text-orange-200' : 'border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-200'}`}>{profile.type}</div>
-            <h3 className="mt-3 text-[1.9rem] leading-none font-bold tracking-tight text-slate-900 dark:text-white">{labelFor(profile)}</h3>
+            <h3 className="mt-3 text-[1.55rem] leading-none font-bold tracking-tight text-slate-900 sm:text-[1.9rem] dark:text-white">{labelFor(profile)}</h3>
             <p className="mt-2 text-sm text-slate-500 dark:text-gray-400"># {workspaceFor(profile)}</p>
           </div>
-          <div className="flex gap-2">
+          <div className="flex gap-1.5 sm:gap-2">
             <MiniIconButton label="Logs" icon={<FileText size={14} />} onClick={onLogs} />
             <MiniIconButton label="Edit" icon={<Pencil size={14} />} onClick={onEdit} />
             <MiniIconButton label="Remove" icon={<Trash2 size={14} />} tone="danger" onClick={onDelete} />
@@ -631,8 +697,8 @@ function WorkgroupsView({
   onRemove: (name: string) => void;
 }) {
   return (
-    <div className="mx-auto flex w-full max-w-7xl flex-1 flex-col px-8 pb-8 pt-8">
-      <div className="mb-8 flex items-end justify-between gap-4">
+    <div className="mx-auto flex w-full max-w-7xl flex-1 flex-col px-4 pb-8 pt-6 sm:px-8 sm:pt-8">
+      <div className="mb-6 flex flex-col gap-4 sm:mb-8 sm:flex-row sm:items-end sm:justify-between">
         <div>
           <div className="text-[10px] font-bold uppercase tracking-[0.24em] text-slate-500 dark:text-gray-500">Saved workgroups</div>
           <h2 className="mt-2 text-3xl font-black tracking-tight text-slate-900 dark:text-white">Start or stop related relays together.</h2>
@@ -799,9 +865,9 @@ function LiveFeed({
   }
 
   return (
-    <div className="mx-auto flex w-full max-w-6xl flex-1 flex-col px-8 pb-8 pt-8">
+    <div className="mx-auto flex w-full max-w-6xl flex-1 flex-col px-4 pb-8 pt-6 sm:px-8 sm:pt-8">
       <div className="overflow-hidden rounded-[32px] border border-slate-200/80 bg-[#fbfaf6] shadow-[0_22px_60px_rgba(15,23,42,0.12)] dark:border-white/10 dark:bg-[#0a0a0c] dark:shadow-2xl">
-        <div className="flex flex-wrap items-center gap-2 border-b border-slate-200 bg-white/60 px-5 py-4 dark:border-white/5 dark:bg-white/[0.03]">
+        <div className="flex gap-2 overflow-x-auto border-b border-slate-200 bg-white/60 px-4 py-4 sm:flex-wrap sm:px-5 dark:border-white/5 dark:bg-white/[0.03]">
           {workspaces.map((workspace) => (
             <button key={workspace} onClick={() => setActiveWorkspace(workspace)} className={`rounded-2xl px-4 py-2 text-sm font-medium transition-colors ${activeWorkspace === workspace ? 'border border-indigo-500/30 bg-indigo-500/15 text-indigo-700 dark:text-indigo-200' : 'text-slate-500 hover:bg-black/5 hover:text-slate-900 dark:text-gray-500 dark:hover:bg-white/5 dark:hover:text-gray-200'}`}>
               {workspace.split(/[\\/]/).filter(Boolean).pop() || workspace}
@@ -809,7 +875,7 @@ function LiveFeed({
           ))}
         </div>
         <div className="grid min-h-[640px] grid-cols-1 xl:grid-cols-[260px_minmax(0,1fr)_320px]">
-          <div className="border-r border-slate-200 bg-white/30 p-5 dark:border-white/5 dark:bg-black/20">
+          <div className="border-b border-slate-200 bg-white/30 p-4 xl:border-b-0 xl:border-r xl:p-5 dark:border-white/5 dark:bg-black/20">
             <div className="text-[10px] font-bold uppercase tracking-[0.22em] text-slate-500 dark:text-gray-500">Relays in this workspace</div>
             <div className="mt-4 space-y-3">
               {workspaceProfiles.map((profile) => (
@@ -826,8 +892,8 @@ function LiveFeed({
             </div>
           </div>
 
-          <div className="border-r border-slate-200 dark:border-white/5">
-            <div className="border-b border-slate-200 bg-white/60 px-6 py-5 dark:border-white/5 dark:bg-white/[0.03]">
+          <div className="border-b border-slate-200 xl:border-b-0 xl:border-r dark:border-white/5">
+            <div className="border-b border-slate-200 bg-white/60 px-4 py-5 sm:px-6 dark:border-white/5 dark:bg-white/[0.03]">
               {activeProfile ? (
                 <>
                   <div className="text-[10px] font-bold uppercase tracking-[0.22em] text-slate-500 dark:text-gray-500">Local operator chat</div>
@@ -840,8 +906,8 @@ function LiveFeed({
                 <div className="text-slate-500 dark:text-gray-500">Select a relay to inspect it.</div>
               )}
             </div>
-            <div className="flex h-[560px] flex-col bg-[#f7f3ea]/70 dark:bg-black/30">
-              <div className="flex-1 overflow-y-auto p-6">
+            <div className="flex h-[520px] sm:h-[560px] flex-col bg-[#f7f3ea]/70 dark:bg-black/30">
+              <div className="flex-1 overflow-y-auto p-4 sm:p-6">
               {!activeProfile ? (
                 <EmptyState title="No relay selected." detail="Pick a relay on the left to inspect its feed." compact />
               ) : loading && !messages.length ? (
@@ -867,7 +933,7 @@ function LiveFeed({
               )}
               </div>
               <div className="border-t border-slate-200 bg-white/70 p-4 dark:border-white/5 dark:bg-white/[0.03]">
-                <div className="flex gap-3">
+                <div className="flex flex-col gap-3 sm:flex-row">
                   <textarea
                     value={draft}
                     onChange={(event) => setDraft(event.target.value)}
@@ -884,7 +950,7 @@ function LiveFeed({
                   <button
                     onClick={() => void sendMessage()}
                     disabled={!activeProfile || !draft.trim() || sending}
-                    className="inline-flex min-w-[120px] items-center justify-center gap-2 self-end rounded-[22px] bg-indigo-600 px-4 py-3 text-sm font-semibold text-white transition-colors hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-50"
+                    className="inline-flex min-w-[120px] items-center justify-center gap-2 self-stretch rounded-[22px] bg-indigo-600 px-4 py-3 text-sm font-semibold text-white transition-colors hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-50 sm:self-end"
                   >
                     {sending ? <Loader2 size={16} className="animate-spin" /> : <MessageSquare size={16} />}
                     Send
@@ -894,7 +960,7 @@ function LiveFeed({
             </div>
           </div>
 
-          <div className="bg-white/40 p-6 dark:bg-white/[0.03]">
+          <div className="bg-white/40 p-4 sm:p-6 dark:bg-white/[0.03]">
             <div className="text-[10px] font-bold uppercase tracking-[0.22em] text-slate-500 dark:text-gray-500">Relay details</div>
             {activeProfile ? (
               <div className="mt-4 space-y-4">
@@ -944,7 +1010,7 @@ function AddProfileModal({ onClose, onSubmit }: { onClose: () => void; onSubmit:
   return (
     <ModalShell title="Add Relay" onClose={onClose} wide>
       <div className="space-y-6">
-        <div className="grid grid-cols-2 gap-4">
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 sm:gap-4">
           <TypeButton active={type === 'Claude'} label="Claude Code" icon={<Bot size={18} />} onClick={() => setType('Claude')} tone="orange" />
           <TypeButton active={type === 'Codex'} label="Codex" icon={<Terminal size={18} />} onClick={() => setType('Codex')} tone="emerald" />
         </div>
@@ -988,7 +1054,7 @@ function AddProfileModal({ onClose, onSubmit }: { onClose: () => void; onSubmit:
           </FormSection>
         ) : null}
 
-        <div className="flex justify-end gap-3 pt-2">
+        <div className="flex flex-col-reverse justify-end gap-3 pt-2 sm:flex-row">
           <SecondaryButton label="Cancel" onClick={onClose} />
           <PrimaryButton label={saving ? 'Saving...' : 'Save relay'} icon={saving ? <Loader2 size={16} className="animate-spin" /> : <Plus size={16} />} onClick={async () => {
             if (!name || !workspace || !discordToken || !channelId) return;
@@ -1087,7 +1153,7 @@ function EditProfileModal({ profile, onClose, onSubmit }: { profile: Profile; on
           </FormSection>
         ) : null}
 
-        <div className="flex justify-end gap-3 pt-2">
+        <div className="flex flex-col-reverse justify-end gap-3 pt-2 sm:flex-row">
           <SecondaryButton label="Cancel" onClick={onClose} />
           <PrimaryButton label={saving ? 'Saving...' : 'Save changes'} icon={saving ? <Loader2 size={16} className="animate-spin" /> : <Pencil size={16} />} onClick={async () => {
             setSaving(true);
@@ -1152,7 +1218,7 @@ function WorkgroupModal({
             ))}
           </div>
         </div>
-        <div className="flex justify-end gap-3 pt-2">
+        <div className="flex flex-col-reverse justify-end gap-3 pt-2 sm:flex-row">
           <SecondaryButton label="Cancel" onClick={onClose} />
           <PrimaryButton label={saving ? 'Saving...' : 'Save workgroup'} icon={saving ? <Loader2 size={16} className="animate-spin" /> : <FolderKanban size={16} />} onClick={async () => {
             const members = profiles.filter((profile) => selectedIds[profile.id]).map((profile) => ({ id: profile.id, relayType: profile.relayType }));
@@ -1174,11 +1240,13 @@ function SettingsModal({ runtimeInfo, onClose, onStopAll }: { runtimeInfo: Runti
   return (
     <ModalShell title="CLADEX Runtime" onClose={onClose} wide>
       <div className="space-y-6">
-        <p className="text-sm leading-relaxed text-slate-600 dark:text-gray-400">This panel shows the real desktop runtime. Profile behavior lives with each relay, not in fake global settings.</p>
+        <p className="text-sm leading-relaxed text-slate-600 dark:text-gray-400">This panel shows the real runtime state. Profile behavior lives with each relay, not in fake global settings.</p>
         <InspectorRow label="API base" value={runtimeInfo?.apiBase || 'Loading...'} mono />
         <InspectorRow label="Backend path" value={runtimeInfo?.backendDir || 'Loading...'} mono />
+        {runtimeInfo?.frontendDir ? <InspectorRow label="Frontend path" value={runtimeInfo.frontendDir} mono /> : null}
         <InspectorRow label="App version" value={runtimeInfo?.appVersion || 'Loading...'} />
         <InspectorRow label="Packaging" value={runtimeInfo?.packaged ? 'Packaged desktop build' : 'Source build'} />
+        {runtimeInfo?.remoteAccessToken ? <InspectorRow label="Remote token" value={runtimeInfo.remoteAccessToken} mono /> : null}
         <div className="rounded-2xl border border-slate-200/80 bg-white/70 p-4 text-sm text-slate-600 dark:border-white/10 dark:bg-black/30 dark:text-gray-400">
           <div className="mb-2 text-[10px] font-bold uppercase tracking-[0.22em] text-slate-500 dark:text-gray-500">Runtime notes</div>
           <ul className="space-y-2">
@@ -1199,7 +1267,7 @@ function SettingsModal({ runtimeInfo, onClose, onStopAll }: { runtimeInfo: Runti
             Packaging: {runtimeInfo?.packaged ? 'This is a packaged desktop build. The bundled backend is included, but Python and the AI CLIs are still external dependencies.' : 'This is a source build. Run from the repo root after installing dependencies.'}
           </div>
         </div>
-        <div className="flex justify-end gap-3">
+        <div className="flex flex-col-reverse justify-end gap-3 sm:flex-row">
           <SecondaryButton label="Close" onClick={onClose} />
           <ActionButton label="Stop All" icon={<PauseCircle size={16} />} tone="danger" onClick={onStopAll} />
         </div>
@@ -1295,20 +1363,31 @@ function FormInput({ label, value, onChange, placeholder, mono = false, type = '
 }
 
 function BrowseField({ label, value, onChange, placeholder }: { label: string; value: string; onChange: (value: string) => void; placeholder: string }) {
+  const [browserOpen, setBrowserOpen] = useState(false);
+  const desktopPickerAvailable = Boolean(window.cladexDesktop?.chooseDirectory);
   return (
+    <>
     <label className="block">
       <div className="mb-2 text-[10px] font-bold uppercase tracking-[0.22em] text-slate-500 dark:text-gray-500">{label}</div>
-      <div className="flex gap-3">
+      <div className="flex flex-col gap-3 sm:flex-row">
         <input value={value} onChange={(event) => onChange(event.target.value)} placeholder={placeholder} className="min-w-0 flex-1 rounded-2xl border border-slate-200 bg-white/80 px-4 py-3 text-sm text-slate-900 outline-none focus:border-indigo-500 dark:border-white/10 dark:bg-black/40 dark:text-white" />
         <button
           type="button"
-          onClick={async () => onChange(await chooseWorkspaceFolder(value))}
+          onClick={async () => {
+            if (desktopPickerAvailable) {
+              onChange(await chooseWorkspaceFolder(value));
+              return;
+            }
+            setBrowserOpen(true);
+          }}
           className="rounded-2xl border border-slate-200 bg-white/80 px-4 py-3 text-sm font-semibold text-slate-700 transition-colors hover:bg-slate-100 dark:border-white/10 dark:bg-white/[0.03] dark:text-gray-200 dark:hover:bg-white/[0.08]"
         >
-          Browse
+          {desktopPickerAvailable ? 'Browse' : 'Browse server'}
         </button>
       </div>
     </label>
+    {browserOpen ? <DirectoryBrowserModal initialPath={value} onClose={() => setBrowserOpen(false)} onPick={(nextPath) => { onChange(nextPath); setBrowserOpen(false); }} /> : null}
+    </>
   );
 }
 
@@ -1336,8 +1415,110 @@ function TypeButton({ active, label, icon, onClick, tone }: { active: boolean; l
   return <button onClick={onClick} className={`flex items-center justify-center gap-3 rounded-2xl border px-4 py-4 font-semibold transition-colors ${active ? activeStyles : 'border-white/10 bg-white/[0.03] text-gray-400 hover:bg-white/[0.06]'}`}>{icon}{label}</button>;
 }
 
+function RemoteAccessModal({
+  token,
+  onChangeToken,
+  onSubmit,
+}: {
+  token: string;
+  onChangeToken: (value: string) => void;
+  onSubmit: () => Promise<void>;
+}) {
+  const [submitting, setSubmitting] = useState(false);
+  return (
+    <ModalShell title="Remote Access Token" onClose={() => undefined}>
+      <div className="space-y-4">
+        <p className="text-sm leading-relaxed text-slate-600 dark:text-gray-400">
+          This CLADEX instance is being opened from a non-local origin. Enter the CLADEX remote access token from the local Runtime panel to continue.
+        </p>
+        <FormInput label="Access token" value={token} onChange={onChangeToken} placeholder="Paste the CLADEX remote access token" mono type="password" />
+        <div className="flex flex-col-reverse justify-end gap-3 sm:flex-row">
+          <SecondaryButton label="Clear saved token" onClick={() => { storeAccessToken(''); onChangeToken(''); }} />
+          <PrimaryButton label={submitting ? 'Connecting...' : 'Unlock CLADEX'} icon={submitting ? <Loader2 size={16} className="animate-spin" /> : <Settings size={16} />} onClick={async () => {
+            setSubmitting(true);
+            try {
+              await onSubmit();
+            } finally {
+              setSubmitting(false);
+            }
+          }} />
+        </div>
+      </div>
+    </ModalShell>
+  );
+}
+
+function DirectoryBrowserModal({
+  initialPath,
+  onClose,
+  onPick,
+}: {
+  initialPath: string;
+  onClose: () => void;
+  onPick: (value: string) => void;
+}) {
+  const [currentPath, setCurrentPath] = useState(initialPath);
+  const [currentListing, setCurrentListing] = useState<DirectoryListResponse | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [errorText, setErrorText] = useState('');
+
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      setLoading(true);
+      setErrorText('');
+      try {
+        const listing = await api.listDirectories(currentPath);
+        if (!cancelled) {
+          setCurrentListing(listing);
+          setCurrentPath(listing.currentPath || currentPath);
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setErrorText(error instanceof Error ? error.message : 'Failed to load folders.');
+        }
+      } finally {
+        if (!cancelled) {
+          setLoading(false);
+        }
+      }
+    };
+    void load();
+    return () => {
+      cancelled = true;
+    };
+  }, [currentPath]);
+
+  return (
+    <ModalShell title="Browse Workspace Folder" onClose={onClose} wide>
+      <div className="space-y-4">
+        <FormInput label="Current path" value={currentPath} onChange={setCurrentPath} placeholder="C:\\Projects" mono />
+        {currentListing?.parentPath ? <SecondaryButton label="Up one level" onClick={() => setCurrentPath(currentListing.parentPath)} /> : null}
+        <div className="rounded-2xl border border-slate-200/80 bg-white/70 p-3 dark:border-white/10 dark:bg-black/20">
+          <div className="mb-3 text-[10px] font-bold uppercase tracking-[0.22em] text-slate-500 dark:text-gray-500">Folders</div>
+          <div className="max-h-[45vh] space-y-2 overflow-y-auto">
+            {loading ? <div className="flex items-center gap-2 text-sm text-slate-500 dark:text-gray-400"><Loader2 size={14} className="animate-spin" /> Loading folders...</div> : null}
+            {!loading && errorText ? <div className="text-sm text-amber-600 dark:text-amber-300">{errorText}</div> : null}
+            {!loading && !errorText && currentListing?.directories.length === 0 ? <div className="text-sm text-slate-500 dark:text-gray-400">No subfolders here.</div> : null}
+            {!loading && !errorText ? currentListing?.directories.map((entry) => (
+              <button key={entry.path} type="button" onClick={() => setCurrentPath(entry.path)} className="flex w-full items-center justify-between rounded-2xl border border-slate-200 bg-white/80 px-3 py-3 text-left text-sm text-slate-800 transition-colors hover:bg-slate-100 dark:border-white/10 dark:bg-white/[0.03] dark:text-gray-200 dark:hover:bg-white/[0.08]">
+                <span className="truncate">{entry.name}</span>
+                <FolderKanban size={16} className="ml-3 shrink-0 text-slate-400 dark:text-gray-500" />
+              </button>
+            )) : null}
+          </div>
+        </div>
+        <div className="flex flex-col-reverse justify-end gap-3 sm:flex-row">
+          <SecondaryButton label="Cancel" onClick={onClose} />
+          <PrimaryButton label="Use this folder" icon={<FolderKanban size={16} />} onClick={() => onPick(currentPath)} />
+        </div>
+      </div>
+    </ModalShell>
+  );
+}
+
 function ModalShell({ title, children, onClose, wide = false }: { title: string; children: React.ReactNode; onClose: () => void; wide?: boolean }) {
-  return <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="fixed inset-0 z-[100] flex items-start justify-center overflow-y-auto bg-black/60 p-6 pt-12 backdrop-blur-sm" onClick={onClose}><motion.div initial={{ scale: 0.94, y: 18 }} animate={{ scale: 1, y: 0 }} exit={{ scale: 0.94, y: 18 }} onClick={(event) => event.stopPropagation()} className={`mb-12 w-full overflow-hidden rounded-2xl border border-slate-200/80 bg-[#f8f6f0] shadow-[0_28px_80px_rgba(15,23,42,0.22)] dark:border-white/10 dark:bg-[#0a0a0c] dark:shadow-2xl ${wide ? 'max-w-2xl' : 'max-w-md'}`}><div className="flex items-center justify-between border-b border-slate-200 bg-white/50 px-5 py-4 dark:border-white/5 dark:bg-white/[0.03]"><div><div className="text-[9px] font-bold uppercase tracking-[0.2em] text-slate-500 dark:text-gray-500">CLADEX</div><div className="mt-0.5 text-lg font-semibold text-slate-900 dark:text-white">{title}</div></div><button onClick={onClose} className="rounded-full bg-slate-200/70 p-1.5 text-slate-500 transition-colors hover:bg-slate-300 hover:text-slate-900 dark:bg-white/5 dark:text-gray-400 dark:hover:bg-white/10 dark:hover:text-white"><X size={14} /></button></div><div className="p-5">{children}</div></motion.div></motion.div>;
+  return <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="fixed inset-0 z-[100] flex items-end justify-center overflow-y-auto bg-black/60 p-3 pt-8 backdrop-blur-sm sm:items-start sm:p-6 sm:pt-12" onClick={onClose}><motion.div initial={{ scale: 0.94, y: 18 }} animate={{ scale: 1, y: 0 }} exit={{ scale: 0.94, y: 18 }} onClick={(event) => event.stopPropagation()} className={`mb-3 max-h-[calc(100vh-1.5rem)] w-full overflow-hidden rounded-2xl border border-slate-200/80 bg-[#f8f6f0] shadow-[0_28px_80px_rgba(15,23,42,0.22)] sm:mb-12 dark:border-white/10 dark:bg-[#0a0a0c] dark:shadow-2xl ${wide ? 'max-w-2xl' : 'max-w-md'}`}><div className="flex items-center justify-between border-b border-slate-200 bg-white/50 px-4 py-4 sm:px-5 dark:border-white/5 dark:bg-white/[0.03]"><div><div className="text-[9px] font-bold uppercase tracking-[0.2em] text-slate-500 dark:text-gray-500">CLADEX</div><div className="mt-0.5 text-lg font-semibold text-slate-900 dark:text-white">{title}</div></div><button onClick={onClose} className="rounded-full bg-slate-200/70 p-1.5 text-slate-500 transition-colors hover:bg-slate-300 hover:text-slate-900 dark:bg-white/5 dark:text-gray-400 dark:hover:bg-white/10 dark:hover:text-white"><X size={14} /></button></div><div className="max-h-[calc(100vh-6.5rem)] overflow-y-auto p-4 sm:p-5">{children}</div></motion.div></motion.div>;
 }
 
 function DockButton({ icon, label, active, onClick, light = false }: { icon: React.ReactNode; label: string; active?: boolean; onClick: () => void; light?: boolean }) {

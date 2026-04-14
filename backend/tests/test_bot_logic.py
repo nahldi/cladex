@@ -900,6 +900,18 @@ def test_memory_context_block_trims_teammate_and_reply_cache_noise() -> None:
     assert "background one" not in block
 
 
+def test_low_value_context_preview_is_not_persisted() -> None:
+    bot = _load_bot_module()
+
+    async def _run() -> None:
+        session = bot.CodexSession("channel-42")
+        low_value = _message(channel_id=42, author_id=7, content="hello?")
+        session._remember_message(low_value, authoritative=False)
+        assert session.memory.recent_context_messages == []
+
+    asyncio.run(_run())
+
+
 def test_soul_markdown_matches_repo_file() -> None:
     bot = _load_bot_module()
     expected = (bot.Path(bot.__file__).with_name("SOUL.md")).read_text(encoding="utf-8").strip()

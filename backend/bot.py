@@ -1287,6 +1287,33 @@ def _append_memory_entry(items: list[str], value: str, *, limit: int = 6) -> lis
     return updated[-limit:]
 
 
+def _is_low_value_context_preview(text: str) -> bool:
+    cleaned = re.sub(r"\s+", " ", str(text or "").strip()).strip(" .!?").lower()
+    if ":" in cleaned:
+        _, _, remainder = cleaned.partition(":")
+        if remainder.strip():
+            cleaned = remainder.strip()
+    if not cleaned:
+        return True
+    if len(cleaned) <= 12 and cleaned in {
+        "hi",
+        "hello",
+        "hey",
+        "yo",
+        "sup",
+        "ping",
+        "pong",
+        "sage",
+        "forge",
+        "sage?",
+        "forge?",
+    }:
+        return True
+    if len(cleaned) <= 24 and re.fullmatch(r"(hi|hello|hey)\b.*", cleaned):
+        return True
+    return False
+
+
 def _load_saved_session_state(key: str) -> dict:
     path = _session_state_path(key)
     if not path.exists():
@@ -1340,7 +1367,7 @@ def _load_relay_memory(key: str) -> RelayMemory:
         recent_context_messages=[
             str(item).strip()
             for item in (data.get("recent_context_messages") or [])
-            if str(item).strip()
+            if str(item).strip() and not _is_low_value_context_preview(str(item))
         ][-6:],
         recent_relay_replies=[
             str(item).strip()
@@ -2585,7 +2612,8 @@ class CodexSession:
                     limit=6,
                 )
         else:
-            self.memory.recent_context_messages = _append_memory_entry(self.memory.recent_context_messages, preview, limit=4)
+            if not _is_low_value_context_preview(preview):
+                self.memory.recent_context_messages = _append_memory_entry(self.memory.recent_context_messages, preview, limit=4)
         self._persist_memory()
 
     def _remember_reply(self, reply_text: str) -> None:
@@ -5034,7 +5062,7 @@ async def _codex_healthcheck() -> None:
 
 
 async def _startup_preflight() -> None:
-    DURABLE_RUNTIME.record_restart_event(reason="process-startup")
+    DURABLE_RUNTIME.record_restart_event(reason=os.environ.get("CLADEX_START_REASON", "process-startup").strip() or "process-startup")
     logged_in, status_text = _native_codex_login_status()
     print(f"Native {RUNTIME_NAME} login: {'ok' if logged_in else 'missing'}")
     if status_text:

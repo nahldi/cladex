@@ -152,6 +152,17 @@ def _prune_markdown_history(path: Path, title: str, *, keep_entries: int, max_ch
     payload = header + "\n"
     if kept_entries:
         payload += "\n" + "\n\n".join(kept_entries).rstrip() + "\n"
+    if max_chars is not None and len(payload) > max_chars:
+        overflow = len(payload) - max_chars
+        if kept_entries:
+            trimmed_last = kept_entries[-1]
+            keep_len = max(len(trimmed_last) - overflow - 15, 0)
+            kept_entries[-1] = trimmed_last[:keep_len].rstrip() + " ...[truncated]"
+            payload = header + "\n"
+            if kept_entries:
+                payload += "\n" + "\n\n".join(kept_entries).rstrip() + "\n"
+        if len(payload) > max_chars:
+            payload = payload[:max_chars].rstrip() + "\n"
     atomic_write_text(path, payload)
 
 
