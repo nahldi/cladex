@@ -128,6 +128,33 @@ def _append_markdown_entry(path: Path, title: str, body: str, *, prepend: bool =
     atomic_write_text(path, payload.rstrip() + "\n")
 
 
+def _prune_markdown_history(path: Path, title: str, *, keep_entries: int, max_chars: int | None = None) -> None:
+    existing = _read_text(path).strip()
+    header = f"# {title}"
+    if not existing:
+        atomic_write_text(path, header + "\n")
+        return
+    body = existing[len(header) :].lstrip("\n") if existing.startswith(header) else existing
+    entries = _iter_markdown_entries(body)
+    kept_entries: list[str] = []
+    char_budget = None if max_chars is None else max(max_chars - len(header) - 2, 0)
+    used_chars = 0
+    for entry in entries[:keep_entries]:
+        entry_len = len(entry) + (2 if kept_entries else 0)
+        if char_budget is not None and kept_entries and used_chars + entry_len > char_budget:
+            break
+        if char_budget is not None and not kept_entries and len(entry) > char_budget:
+            kept_entries.append(entry[: max(char_budget - 15, 0)].rstrip() + " ...[truncated]")
+            used_chars = len(kept_entries[0])
+            break
+        kept_entries.append(entry)
+        used_chars += entry_len
+    payload = header + "\n"
+    if kept_entries:
+        payload += "\n" + "\n\n".join(kept_entries).rstrip() + "\n"
+    atomic_write_text(path, payload)
+
+
 def _normalize_paths(files: list[str]) -> list[str]:
     cleaned: list[str] = []
     for item in files:
@@ -169,6 +196,24 @@ def _extract_bullets(text: str, patterns: tuple[str, ...], *, limit: int = 6) ->
 
 def _normalize_compare_text(value: str) -> str:
     return re.sub(r"\s+", " ", value.strip().lower()).strip(" .")
+
+
+def _trim_command_entry(command: str, *, limit: int = 180) -> str:
+    text = re.sub(r"\s+", " ", command.strip())
+    if len(text) <= limit:
+        return text
+    return text[: limit - 15].rstrip() + " ...[truncated]"
+
+
+def _summarize_commands(commands_run: list[str], *, limit: int = 8) -> list[str]:
+    cleaned: list[str] = []
+    for command in commands_run:
+        text = _trim_command_entry(command)
+        if text and text not in cleaned:
+            cleaned.append(text)
+        if len(cleaned) >= limit:
+            break
+    return cleaned
 
 
 def _iter_markdown_entries(text: str) -> list[str]:
@@ -1464,30 +1509,9 @@ class DurableRuntime:
         binding = self.ensure_binding(channel_key)
         sender_type = "other-ai" if author_is_bot else "user"
         content = text.strip()
-        preferences, constraints = _extract_preferences_and_constraints(content) if author_is_bot else ([], [])
         facts = _prune_known_facts_payload(
             _read_json(binding.worktree_path / MEMORY_DIR_NAME / "KNOWN_FACTS.json", {"preferences": [], "constraints": [], "facts": []})
         )
-        for item in preferences:
-            if item not in facts["preferences"]:
-                facts["preferences"].append(item)
-                self.store.add_memory_entry(
-                    project_id=binding.project_id,
-                    entry_type="preference",
-                    key=slugify(item)[:48],
-                    content=item,
-                    source=f"{sender_type}:{author_name}",
-                )
-        for item in constraints:
-            if item not in facts["constraints"]:
-                facts["constraints"].append(item)
-                self.store.add_memory_entry(
-                    project_id=binding.project_id,
-                    entry_type="constraint",
-                    key=slugify(item)[:48],
-                    content=item,
-                    source=f"{sender_type}:{author_name}",
-                )
         atomic_write_json(binding.worktree_path / MEMORY_DIR_NAME / "KNOWN_FACTS.json", _prune_known_facts_payload(facts))
         if sender_type == "user" and content:
             self._upsert_memory_fact(
@@ -1950,17 +1974,21 @@ class DurableRuntime:
                 f"## {_now_iso()}",
                 f"- task id: {task_id}",
                 f"- changed files: {', '.join(_normalize_paths(changed_files)) or 'none'}",
-                f"- commands/tests run: {', '.join(commands_run) or 'none captured'}",
+                f"- commands/tests run: {', '.join(_summarize_commands(commands_run)) or 'none captured'}",
                 f"- result: {result_text}",
                 f"- blocker: {blocker or 'none'}",
                 f"- exact next step: {next_step_text or 'Continue from STATUS.md.'}",
             ]
         )
         _append_markdown_entry(binding.worktree_path / MEMORY_DIR_NAME / "HANDOFF.md", "HANDOFF", entry, prepend=True)
+        _prune_markdown_history(binding.worktree_path / MEMORY_DIR_NAME / "HANDOFF.md", "HANDOFF", keep_entries=20, max_chars=8000)
 
     def _write_tasks_file(self, binding: ChannelBinding) -> None:
+        task_rows = self.store.list_tasks(binding.channel_id)
+        claimed = [row for row in task_rows if row["status"] == "claimed"]
+        history = [row for row in task_rows if row["status"] != "claimed"][:24]
         tasks = []
-        for row in self.store.list_tasks(binding.channel_id):
+        for row in claimed + history:
             tasks.append(
                 {
                     "id": row["task_id"],

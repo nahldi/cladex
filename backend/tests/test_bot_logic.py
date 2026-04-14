@@ -8,6 +8,7 @@ import shutil
 import sys
 import tempfile
 from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 
 
@@ -16,7 +17,8 @@ def _load_bot_module():
     os.environ["HOME"] = temp_root
     os.environ["XDG_CONFIG_HOME"] = temp_root
     os.environ["XDG_DATA_HOME"] = temp_root
-    os.environ.setdefault("DISCORD_BOT_TOKEN", "test-token")
+    os.environ["ENV_FILE"] = str(Path(temp_root) / "test.env")
+    os.environ["DISCORD_BOT_TOKEN"] = "test-token"
     os.environ["CODEX_WORKDIR"] = os.getcwd()
     os.environ["STATE_NAMESPACE"] = "test-bot-logic"
     sys.modules.pop("bot", None)

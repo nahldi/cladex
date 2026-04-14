@@ -288,6 +288,76 @@ def test_runtime_prunes_transient_constraints_from_known_facts(tmp_path: Path) -
     assert "Do not ship broken code." in facts["constraints"]
 
 
+def test_runtime_does_not_promote_other_ai_messages_into_stable_constraints(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    state = tmp_path / "state"
+    _init_git_repo(repo)
+
+    runtime = DurableRuntime(state_dir=state, repo_path=repo, state_namespace="test", agent_name="codex")
+    binding = runtime.observe_incoming_message(
+        channel_key="channel-other-ai",
+        author_name="Forge",
+        author_id=42,
+        author_is_bot=True,
+        text="Do not use purple defaults. Only answer in one sentence.",
+    )
+    facts = json.loads((binding.worktree_path / "memory" / "KNOWN_FACTS.json").read_text(encoding="utf-8"))
+
+    assert facts["constraints"] == []
+    assert facts["preferences"] == []
+
+
+def test_runtime_prunes_handoff_history_and_command_noise(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    state = tmp_path / "state"
+    _init_git_repo(repo)
+
+    runtime = DurableRuntime(state_dir=state, repo_path=repo, state_namespace="test", agent_name="codex")
+    binding = runtime.ensure_binding("channel-handoff-prune")
+    for index in range(24):
+        runtime.write_handoff(
+            binding,
+            task_id=f"task-{index}",
+            changed_files=[],
+            commands_run=[f"powershell.exe -Command \"{'x' * 260}\""],
+            result=f"result {index}",
+            blocker="",
+            next_step="Continue from STATUS.md.",
+        )
+
+    handoff_text = (binding.worktree_path / "memory" / "HANDOFF.md").read_text(encoding="utf-8")
+
+    assert handoff_text.count("## ") == 20
+    assert len(handoff_text) <= 8000
+    assert "...[truncated]" in handoff_text
+    assert "result 23" in handoff_text
+    assert "result 0" not in handoff_text
+
+
+def test_runtime_tasks_file_prunes_old_released_history(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    state = tmp_path / "state"
+    _init_git_repo(repo)
+
+    runtime = DurableRuntime(state_dir=state, repo_path=repo, state_namespace="test", agent_name="codex")
+    for index in range(30):
+        task = runtime.claim_task(
+            channel_key="channel-task-prune",
+            title=f"task {index}",
+            owner_agent="codex",
+            target_files=[],
+            validation=[],
+        )
+        runtime.release_task(channel_key="channel-task-prune", task_id=task["id"])
+
+    tasks = json.loads((runtime.ensure_binding("channel-task-prune").worktree_path / "memory" / "TASKS.json").read_text(encoding="utf-8"))["tasks"]
+    titles = {task["title"] for task in tasks}
+
+    assert len(tasks) == 24
+    assert "task 0" not in titles
+    assert "task 29" in titles
+
+
 def test_runtime_records_compaction_and_preserves_continuity(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     state = tmp_path / "state"
