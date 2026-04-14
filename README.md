@@ -7,6 +7,7 @@ A desktop app and CLI for managing Discord relays to both Claude Code and Codex 
 The shipped product is local-first:
 - the desktop app talks to a local API server on loopback only
 - readable bot labels are surfaced ahead of technical profile ids
+- non-loopback API binding is blocked by default unless `CLADEX_ALLOW_REMOTE_API=1` is set deliberately
 
 ## Features
 
@@ -80,6 +81,13 @@ Portable/installer first run:
 3. Launch `CLADEX.exe`.
 4. In the app, choose `Add Relay`, then enter the workspace path, Discord bot token, and allowed channel id.
 5. Start the profile and verify it reaches `Ready` before testing in Discord.
+
+## Security
+
+- CLADEX is intended for same-machine use. Do not expose the local API directly to your LAN or the public internet.
+- Relay profile env files and relay logs can contain secrets and sensitive workspace metadata. Keep them local.
+- Use least-privilege Discord allowlists: `ALLOWED_CHANNEL_IDS`, `ALLOWED_USER_IDS`, `ALLOWED_BOT_IDS`, and related fields should stay as narrow as possible.
+- See [SECURITY.md](SECURITY.md) for the expected operating model and secret-handling guidance.
 
 ### Backend CLI
 
@@ -164,6 +172,7 @@ codex-discord stop
 - The Python backend package name stays `discord-codex-relay` for command/package compatibility.
 - The desktop product name remains `CLADEX`.
 - The packaged desktop app uses a loopback-only local API. It is meant to manage relays on the same machine, not expose a remote control surface.
+- If you intentionally override the loopback-only API guard, you must provide your own authentication and network controls.
 
 ## License
 

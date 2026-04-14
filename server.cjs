@@ -30,6 +30,10 @@ function isLoopbackOrigin(origin) {
   }
 }
 
+function isLoopbackHost(host) {
+  return ['127.0.0.1', 'localhost', '::1', '[::1]'].includes(String(host || '').trim());
+}
+
 app.use((req, res, next) => {
   const origin = String(req.headers.origin || '').trim();
   const allowed = isLoopbackOrigin(origin);
@@ -543,9 +547,14 @@ function startServer(options = {}) {
   const host = options.host || API_HOST;
   const port = Number(options.port || API_PORT);
   const quiet = Boolean(options.quiet);
+  const allowRemoteApi = process.env.CLADEX_ALLOW_REMOTE_API === '1';
 
   if (serverInstance) {
     return Promise.resolve(serverInstance);
+  }
+
+  if (!allowRemoteApi && !isLoopbackHost(host)) {
+    return Promise.reject(new Error(`Refusing to bind CLADEX API to non-loopback host ${host}. Set CLADEX_ALLOW_REMOTE_API=1 to override.`));
   }
 
   return new Promise((resolve, reject) => {
