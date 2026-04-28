@@ -585,13 +585,39 @@ def _scan_file_snapshot(workspace: Path) -> dict[str, str]:
 def _workspace_change_snapshot(workspace: Path) -> dict[str, Any]:
     dirty = _git_dirty_paths(workspace)
     if dirty is not None:
-        return {"kind": "git", "paths": dirty}
+        # Hash every dirty path's contents so a worker editing an
+        # already-dirty file (path stays in the git status set) is still
+        # detected. Pure path-set comparison missed those edits.
+        dirty_hashes: dict[str, str] = {}
+        for rel_path in dirty:
+            full_path = workspace / rel_path
+            try:
+                if full_path.is_file() and not full_path.is_symlink():
+                    dirty_hashes[rel_path] = _hash_file(full_path)
+                else:
+                    dirty_hashes[rel_path] = "__missing__"
+            except OSError:
+                dirty_hashes[rel_path] = "__error__"
+        return {"kind": "git", "paths": dirty, "hashes": dirty_hashes}
     return {"kind": "scan", "files": _scan_file_snapshot(workspace)}
 
 
 def _workspace_touched_files(before: dict[str, Any], after: dict[str, Any]) -> set[str]:
     if before.get("kind") == "git" and after.get("kind") == "git":
-        return set(after.get("paths") or set()) - set(before.get("paths") or set())
+        before_paths = set(before.get("paths") or set())
+        after_paths = set(after.get("paths") or set())
+        before_hashes = before.get("hashes") if isinstance(before.get("hashes"), dict) else {}
+        after_hashes = after.get("hashes") if isinstance(after.get("hashes"), dict) else {}
+        touched = after_paths - before_paths
+        # Detect content edits to files that were already dirty (path stays
+        # in both sets but its content hash changed).
+        for path in before_paths & after_paths:
+            if before_hashes.get(path) != after_hashes.get(path):
+                touched.add(path)
+        # Files that left the dirty set (e.g. the worker reverted them) also
+        # count as touched so reverted unrelated edits are caught.
+        touched.update(before_paths - after_paths)
+        return touched
     before_files = before.get("files") if isinstance(before.get("files"), dict) else {}
     after_files = after.get("files") if isinstance(after.get("files"), dict) else {}
     touched = {

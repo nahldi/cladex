@@ -229,11 +229,17 @@ function socketRemoteAddress(req) {
 }
 
 function hasForwardedHeaders(req) {
+  // Any signal that the request transited a proxy. Once we see one, treat as
+  // remote even if the socket peer is loopback, because a local reverse
+  // proxy can be relaying an off-host caller.
   return Boolean(
     String(req.headers['x-forwarded-for'] || '').trim() ||
     String(req.headers['x-forwarded-host'] || '').trim() ||
     String(req.headers['x-forwarded-proto'] || '').trim() ||
-    String(req.headers['forwarded'] || '').trim()
+    String(req.headers['forwarded'] || '').trim() ||
+    String(req.headers['cf-connecting-ip'] || '').trim() ||
+    String(req.headers['x-real-ip'] || '').trim() ||
+    String(req.headers['true-client-ip'] || '').trim()
   );
 }
 
@@ -243,6 +249,15 @@ function isLoopbackRequest(req) {
     return false;
   }
   if (hasForwardedHeaders(req)) {
+    return false;
+  }
+  // A loopback socket isn't enough on its own; a local tunnel/reverse proxy
+  // can forward an external caller to 127.0.0.1 without populating any of
+  // the X-Forwarded-* headers above. Require the Host header to also be
+  // loopback so /api/runtime-info never returns the remote token to a
+  // remote caller proxied through localhost.
+  const rawHost = String(req.headers.host || '').trim();
+  if (rawHost && !isLoopbackHost(rawHost.replace(/:\d+$/, ''))) {
     return false;
   }
   const origin = String(req.headers.origin || '').trim();
@@ -571,7 +586,7 @@ app.get('/api/runtime-info', async (req, res) => {
     backendDir: BACKEND_DIR,
     frontendDir: FRONTEND_DIR,
     packaged: process.env.NODE_ENV === 'production' || !!process.resourcesPath,
-    appVersion: process.env.npm_package_version || '2.3.0',
+    appVersion: process.env.npm_package_version || '2.3.1',
     remoteAccessProtected: true,
   };
   if (isLoopbackRequest(req)) {

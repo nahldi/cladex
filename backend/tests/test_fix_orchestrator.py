@@ -130,6 +130,31 @@ def test_fix_task_success_is_rejected_when_worker_edits_outside_assigned_files(t
     assert task["changedFiles"] == ["other.py"]
 
 
+def test_workspace_touched_detects_edits_to_already_dirty_files(tmp_path: Path) -> None:
+    """F0013/F0014: a worker editing an already-dirty file outside its
+    assignment must still be detected. Pure path-set diff misses these
+    edits because the path stays in `git status` before and after."""
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    subprocess = __import__("subprocess")
+    subprocess.run(["git", "init"], cwd=workspace, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=workspace, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "T"], cwd=workspace, check=True, capture_output=True)
+    (workspace / "tracked.py").write_text("v=1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "tracked.py"], cwd=workspace, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=workspace, check=True, capture_output=True)
+    # Make `tracked.py` already dirty before the snapshot.
+    (workspace / "tracked.py").write_text("v=2\n", encoding="utf-8")
+
+    before = fix_orchestrator._workspace_change_snapshot(workspace)
+    # A worker (incorrectly) edits the already-dirty unrelated file.
+    (workspace / "tracked.py").write_text("v=3 # worker drift\n", encoding="utf-8")
+    after = fix_orchestrator._workspace_change_snapshot(workspace)
+
+    touched = fix_orchestrator._workspace_touched_files(before, after)
+    assert "tracked.py" in touched, "edits to already-dirty paths must be detected via content hash"
+
+
 def test_claude_fix_task_sends_large_prompt_through_stdin(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     review = _review_with_findings(tmp_path, monkeypatch)
     run = fix_orchestrator.start_fix_run(review["id"], launch=False)

@@ -185,6 +185,32 @@ def test_register_rejects_allow_dms_without_user_allowlist(tmp_path: Path, monke
         raise AssertionError("cmd_register must reject --allow-dms without an allowlist")
 
 
+def test_relay_codex_env_strips_inherited_secrets(tmp_path: Path, monkeypatch) -> None:
+    """F0015: Codex CLI subprocesses must not inherit relay secrets such as
+    Discord bot tokens, the CLADEX remote token, cloud creds, or anything
+    matching common credential suffixes."""
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    monkeypatch.setattr(relay_common, "prepare_relay_codex_home", lambda *args, **kwargs: tmp_path / "codex-home")
+    base_env = {
+        "PATH": "/usr/bin",
+        "DISCORD_BOT_TOKEN": "secret-discord",
+        "CLADEX_REMOTE_ACCESS_TOKEN": "secret-cladex",
+        "ANTHROPIC_API_KEY": "secret-anthropic",
+        "AWS_SECRET_ACCESS_KEY": "secret-aws",
+        "MY_CUSTOM_TOKEN": "secret-custom",
+        "MY_CUSTOM_PASSWORD": "secret-pass",
+        "MY_CUSTOM_API_KEY": "secret-api",
+        "REGULAR_VAR": "fine",
+    }
+    sanitized = relay_common.relay_codex_env(workspace, base_env)
+    for blocked in ("DISCORD_BOT_TOKEN", "CLADEX_REMOTE_ACCESS_TOKEN", "ANTHROPIC_API_KEY", "AWS_SECRET_ACCESS_KEY", "MY_CUSTOM_TOKEN", "MY_CUSTOM_PASSWORD", "MY_CUSTOM_API_KEY"):
+        assert blocked not in sanitized, f"{blocked} should be stripped"
+    assert sanitized.get("PATH") == "/usr/bin"
+    assert sanitized.get("REGULAR_VAR") == "fine"
+    assert sanitized.get("CODEX_HOME") == str(tmp_path / "codex-home")
+
+
 def test_register_rejects_protected_cladex_workspace(monkeypatch) -> None:
     parser = relayctl.build_parser()
     args = parser.parse_args(

@@ -2,6 +2,25 @@
 
 Items that started life on `ROADMAP.md` and have shipped. Newest tranches first. The active work-in-progress list lives in [ROADMAP.md](ROADMAP.md); release-by-release narrative lives in [DEVELOPMENT_LOG.md](DEVELOPMENT_LOG.md).
 
+## Completed For 2.3.1
+
+Audit closeout for the 2.3.0 push, driven by re-running the project's own review swarm on itself.
+
+- **Phase A — six bugs the 2.3.0 push left open:**
+  - F0003: `cladex.py` Claude profile updates called undefined `_save_registry` and crashed on every Claude profile edit. Added `_save_claude_registry`.
+  - F0018: `_verify_test_claim` shelled out via `cmd /c` / `sh -lc` with bot-supplied claim text → real command-injection surface. Replaced with shlex-based argv allowlist + no-shell exec.
+  - F0034: Codex `register --allow-dms` accepted empty user allowlists. Now requires `--allowed-user-id` when `--allow-dms` is set.
+  - F0060: Claude bot rejected DMs whenever a guild channel allowlist was set. Channel gate now only applies to non-DM messages.
+  - F0083: Discord bot tokens passed through subprocess argv (visible in `tasklist`/`ps`). Tokens now flow via `CLADEX_REGISTER_DISCORD_BOT_TOKEN` env; consumed-and-unset.
+  - F0014: Codex CLI degraded fallback used unbounded `process.communicate()`. Bounded read with timeout (`CLADEX_CODEX_FALLBACK_TIMEOUT`) and output cap (`CLADEX_CODEX_FALLBACK_MAX_OUTPUT_BYTES`).
+- **Phase B — fixes from the verification review:**
+  - F0012: `claude_relay.interactive_setup` could create overexposed relays (DMs default-on, empty allowlists). Setup now defaults DMs off, requires numeric operator id, refuses empty-channel + empty-operator + DMs.
+  - F0013/F0014 fix-scope: `_workspace_change_snapshot` now content-hashes already-dirty paths so a worker editing a pre-existing dirty file is detected by the assigned-file enforcement.
+  - F0015: `relay_codex_env` strips inherited credentials (Discord bot token, CLADEX remote token, AWS/Anthropic/OpenAI/etc. keys, generic `*_TOKEN`/`*_KEY`/`*_SECRET`) before passing env to the Codex CLI subprocess.
+  - F0038: review swarms now run a `_scratch_disk_preflight` that estimates `bytes × (1 + agent_count)` and refuses runs that exceed `CLADEX_REVIEW_SCRATCH_MAX_BYTES` (default 16 GiB).
+  - F0040/F0041: `fix_orchestrator.py` and its tests now in `LINE_PATTERN_SKIP_FILENAMES` so the line scanner doesn't flag intentional rule-fixture eval/exec calls.
+  - F0044: `isLoopbackRequest` now also requires the Host header to be loopback and treats `cf-connecting-ip`/`x-real-ip`/`true-client-ip` as proxy signals so a local reverse proxy can't leak the remote token.
+
 ## Completed For 2.3.0
 
 - Added guarded **Fix Review** runs. Completed review jobs can now start a durable fix run with a mandatory source backup, generated task plan, phase validation, cancellation, markdown report, and structured `fix_run.json` state under the local CLADEX data directory.

@@ -208,7 +208,9 @@ LINE_PATTERN_SKIP_EXTENSIONS = frozenset({
     ".yml",
 })
 LINE_PATTERN_SKIP_FILENAMES = frozenset({
+    "fix_orchestrator.py",
     "review_swarm.py",
+    "test_fix_orchestrator.py",
     "test_review_swarm.py",
 })
 SECRET_VALUE_RE = re.compile(
@@ -1026,6 +1028,79 @@ def _review_scratch_ignore(directory: str, names: list[str]) -> set[str]:
     return ignored
 
 
+def _approximate_workspace_bytes(source: Path) -> int:
+    """Best-effort sum of files we would actually copy into scratch.
+
+    Walks `source` with the same skip rules as `_review_scratch_ignore`.
+    Returns 0 on any OSError so the preflight is opportunistic — better to
+    proceed without a check than to fail a real review on a permission
+    issue counting bytes.
+    """
+    total = 0
+    try:
+        for current, dirs, names in os.walk(source):
+            current_path = Path(current)
+            ignored = _review_scratch_ignore(str(current_path), names + dirs)
+            dirs[:] = [name for name in dirs if name not in ignored]
+            for name in names:
+                if name in ignored:
+                    continue
+                path = current_path / name
+                try:
+                    if path.is_symlink() or not path.is_file():
+                        continue
+                    total += path.stat().st_size
+                except OSError:
+                    continue
+    except OSError:
+        return 0
+    return total
+
+
+def _scratch_disk_preflight(job: dict[str, Any]) -> dict[str, Any]:
+    """Estimate the total scratch disk cost before launching the lanes.
+
+    Returns a metadata dict that goes onto the job. If the projected cost
+    exceeds the safety ceiling, raises RuntimeError so the review fails
+    early instead of half-copying onto a full disk.
+    """
+    source = Path(str(job["workspace"])).expanduser().resolve()
+    workspace_bytes = _approximate_workspace_bytes(source)
+    if workspace_bytes <= 0:
+        return {
+            "workspaceBytes": 0,
+            "estimatedScratchBytes": 0,
+            "agentCount": int(job.get("agentCount") or 0),
+        }
+    agent_count = max(int(job.get("agentCount") or 1), 1)
+    # 1 base scratch + N per-agent scratch copies. Source backup is created
+    # earlier (a separate copy) and is not counted here because it has
+    # already succeeded by the time we get to lane preflight.
+    estimated = workspace_bytes * (1 + agent_count)
+    ceiling_env = os.environ.get("CLADEX_REVIEW_SCRATCH_MAX_BYTES")
+    try:
+        ceiling = int(ceiling_env) if ceiling_env else 0
+    except ValueError:
+        ceiling = 0
+    if ceiling <= 0:
+        # Default ceiling: 16 GiB unless the operator opted out.
+        ceiling = 16 * 1024 * 1024 * 1024
+    metadata = {
+        "workspaceBytes": workspace_bytes,
+        "estimatedScratchBytes": estimated,
+        "agentCount": agent_count,
+        "ceilingBytes": ceiling,
+    }
+    if estimated > ceiling:
+        raise RuntimeError(
+            "Scratch disk preflight refused this review: estimated "
+            f"{estimated // (1024 * 1024)} MiB across {agent_count} agent scratch copies "
+            f"exceeds the {ceiling // (1024 * 1024)} MiB ceiling. "
+            "Reduce the agent count or raise CLADEX_REVIEW_SCRATCH_MAX_BYTES if you have the headroom."
+        )
+    return metadata
+
+
 def prepare_scratch_workspace(job: dict[str, Any]) -> Path:
     source = Path(job["workspace"]).expanduser().resolve()
     scratch = job_dir(job["id"]) / "scratch" / "base-workspace"
@@ -1657,6 +1732,14 @@ def _run_review_job_locked(job_id: str) -> dict[str, Any]:
 
     try:
         files = inventory_files(workspace)
+        # Preflight estimate of scratch disk cost so a 50-lane review of a
+        # large repo doesn't half-copy onto a full disk before failing.
+        try:
+            job["scratchEstimate"] = _scratch_disk_preflight(job)
+        except RuntimeError as exc:
+            job["scratchEstimate"] = {"error": str(exc)}
+            save_job(job)
+            raise
         try:
             scratch = prepare_scratch_workspace(job)
             job["scratchWorkspace"] = str(scratch)

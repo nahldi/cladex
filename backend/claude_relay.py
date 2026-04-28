@@ -224,19 +224,31 @@ def interactive_setup(workspace: Path) -> dict:
     print("(Enable Developer Mode in Discord, right-click yourself, Copy ID)")
     operator_id = input("Your Discord user ID: ").strip()
     if not operator_id.isdigit():
-        print("Warning: Invalid user ID, proceeding without operator.")
-        operator_id = ""
+        raise SystemExit(
+            "A valid Discord user ID is required so the relay only responds to a known operator. "
+            "Re-run setup and provide the numeric Discord user ID."
+        )
 
-    # DMs allowed?
-    allow_dms = input("\nAllow DMs? (y/n, default: y): ").strip().lower()
-    allow_dms = allow_dms != "n"
+    # DMs allowed? (Default to off; opening DMs requires deliberate opt-in.)
+    allow_dms_input = input("\nAllow DMs? (y/n, default: n): ").strip().lower()
+    allow_dms = allow_dms_input == "y"
 
-    # Channel ID (optional)
-    print("\nEnter a channel ID to restrict the bot to (optional).")
-    channel_id = input("Channel ID (press Enter to allow all): ").strip()
+    # Channel ID (optional, but required if DMs are off)
+    print("\nEnter a channel ID to restrict the bot to.")
+    print("(Required unless you enabled DMs above.)")
+    channel_id = input("Channel ID: ").strip()
     if channel_id and not channel_id.isdigit():
-        print("Warning: Invalid channel ID, ignoring.")
-        channel_id = ""
+        raise SystemExit("Invalid channel ID; must be a numeric Discord channel id.")
+
+    if not channel_id and not allow_dms:
+        raise SystemExit(
+            "Refusing to register a Claude relay with no allowed channels and DMs disabled. "
+            "Provide a channel ID or enable DMs (with a known operator)."
+        )
+    if not channel_id and allow_dms and not operator_id:
+        raise SystemExit(
+            "DMs require at least one operator/user ID so direct messages are scoped to a known operator."
+        )
 
     env = {
         "DISCORD_BOT_TOKEN": token,

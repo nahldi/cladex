@@ -343,8 +343,61 @@ def prepare_relay_codex_home(
     return relay_home
 
 
+_RELAY_CHILD_SECRET_KEYS = (
+    "DISCORD_BOT_TOKEN",
+    "CLADEX_REGISTER_DISCORD_BOT_TOKEN",
+    "CLADEX_REMOTE_ACCESS_TOKEN",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "OPENAI_API_KEY",
+    "OPENAI_AUTH_TOKEN",
+    "GITHUB_TOKEN",
+    "GH_TOKEN",
+    "GITLAB_TOKEN",
+    "BITBUCKET_TOKEN",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "GOOGLE_API_KEY",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "AZURE_CLIENT_SECRET",
+    "AZURE_TENANT_ID",
+    "DOCKER_AUTH_CONFIG",
+    "NPM_TOKEN",
+    "PYPI_TOKEN",
+    "HUGGINGFACE_TOKEN",
+    "HF_TOKEN",
+    "SLACK_TOKEN",
+    "SLACK_BOT_TOKEN",
+    "DATABASE_URL",
+    "DB_PASSWORD",
+)
+
+
+def _strip_relay_secrets(env: dict[str, str]) -> dict[str, str]:
+    """Drop credential-like env vars from a child subprocess environment.
+
+    The Codex CLI inherits the relay's process environment by default, which
+    includes the Discord bot token and any cloud credentials the user has on
+    PATH. The CLI-driven model can leak those into command output or shell
+    commands it spawns. Strip the well-known credential names plus any key
+    that looks like a secret based on its suffix.
+    """
+    sanitized: dict[str, str] = {}
+    suffix_blocked = ("_TOKEN", "_KEY", "_SECRET", "_PASSWORD", "_PRIVATE_KEY")
+    for key, value in env.items():
+        upper = key.upper()
+        if upper in _RELAY_CHILD_SECRET_KEYS:
+            continue
+        if any(upper.endswith(suffix) for suffix in suffix_blocked):
+            continue
+        sanitized[key] = value
+    return sanitized
+
+
 def relay_codex_env(workspace: Path, base_env: dict[str, str] | None = None) -> dict[str, str]:
     env = dict((base_env or os.environ).items())
+    env = _strip_relay_secrets(env)
     configured_home = str(env.get("CODEX_HOME", "")).strip()
     if configured_home:
         relay_home = Path(configured_home).expanduser().resolve()

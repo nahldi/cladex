@@ -489,6 +489,29 @@ def test_scan_file_skips_docs_config_and_rule_definition_files(tmp_path: Path) -
     assert any(item["category"] == "command-execution" for item in real_findings)
 
 
+def test_scratch_disk_preflight_refuses_oversized_review(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    project = tmp_path / "target"
+    project.mkdir()
+    (project / "big.bin").write_bytes(b"x" * 1024)
+    monkeypatch.setattr(review_swarm, "REVIEW_DATA_ROOT", tmp_path / "reviews")
+    monkeypatch.setenv("CLADEX_REVIEW_SCRATCH_MAX_BYTES", "100")
+
+    with pytest.raises(RuntimeError, match="Scratch disk preflight"):
+        review_swarm._scratch_disk_preflight({"id": "r", "workspace": str(project), "agentCount": 5})
+
+
+def test_scratch_disk_preflight_passes_under_ceiling(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    project = tmp_path / "target"
+    project.mkdir()
+    (project / "small.txt").write_text("ok\n", encoding="utf-8")
+    monkeypatch.setenv("CLADEX_REVIEW_SCRATCH_MAX_BYTES", "1000000")
+
+    metadata = review_swarm._scratch_disk_preflight({"id": "r", "workspace": str(project), "agentCount": 4})
+    assert metadata["agentCount"] == 4
+    assert metadata["workspaceBytes"] >= 0
+    assert metadata["estimatedScratchBytes"] >= metadata["workspaceBytes"]
+
+
 def test_review_artifact_ignore_skips_local_credential_files_and_dirs(tmp_path: Path) -> None:
     project = tmp_path / "target"
     project.mkdir()

@@ -1,7 +1,7 @@
 {
   "name": "cladex",
   "private": true,
-  "version": "2.3.0",
+  "version": "2.3.1",
   "author": "CLADEX Contributors",
   "description": "Unified desktop and CLI manager for Codex and Claude Discord relays.",
   "type": "module",
