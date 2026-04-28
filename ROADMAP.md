@@ -2,20 +2,21 @@
 
 CLADEX stays focused on Claude Code and OpenAI Codex relays. Shipped work is tracked in [DONE_ROADMAP.md](DONE_ROADMAP.md); release narrative lives in [DEVELOPMENT_LOG.md](DEVELOPMENT_LOG.md).
 
-As of **2.4.0**, the entire April 2026 roadmap is closed — production-blocking AND non-blocking items have either shipped or have an explicit recorded decision.
+As of **2.5.0**, the entire April 2026 roadmap is closed — production-blocking AND non-blocking items have either shipped or have an explicit recorded decision.
 
 - Clone-to-run setup, review swarms, Fix Review orchestration, local security, CI gates, and visible queue/concurrency limits all shipped (2.1.0 through 2.3.3).
 - Provider-native Codex account/rate-limit surfacing is wired into `cladex doctor --json` via the app-server `account/read` and `account/rateLimits/read` RPCs (2.4.0).
 - Claude relay subprocess pooling now ships with idle TTL + LRU cap on per-channel persistent processes (`CLADEX_CLAUDE_WORKER_IDLE_TTL`, `CLADEX_CLAUDE_WORKER_MAX_LIVE`) so a multi-channel relay no longer accumulates processes forever (2.4.0).
 - Interactive review-finding filter (severity, category) + JSON export ship in the desktop Review Project view, backed by `GET /api/reviews/:id/findings` and `cladex review findings <id>` (2.4.0).
 - Claude Code Channels was evaluated and explicitly **not adopted**. Rationale and re-evaluation criteria are documented in [backend/docs/CLAUDE_CHANNELS_EVALUATION.md](backend/docs/CLAUDE_CHANNELS_EVALUATION.md) (2.4.0).
+- Fix Review orchestration is now AI-driven: an upstream Codex/Claude planner subprocess decides how many fix workers to spawn, what type each one should be, and which findings each one owns, with a per-task `dependsOn` graph and a deterministic 1:1 fallback when the planner subprocess fails (2.5.0).
 
 ## Current Production Contract
 
 - Users bring their own locally installed and logged-in `codex` and `claude` CLIs.
 - Relay creation supports either channel-scoped operation or scoped direct-message operation. Codex DM relays require `--allow-dms` plus an approved `--allowed-user-id`; Claude relays require at least a channel or approved user/operator allowlist.
 - Review swarms accept 1-50 requested lanes and queue them behind the configured machine/account worker limit. `CLADEX_REVIEW_MAX_PARALLEL` controls reviewer subprocess parallelism.
-- Fix Review creates a mandatory backup, converts review findings into fix tasks, runs provider workers against the selected project, records validation results, and exposes the exact CLI restore command on failure.
+- Fix Review creates a mandatory backup, runs an AI orchestrator that decides how many fix workers to spawn and which provider (Codex vs Claude) handles each task, records the orchestrator plan + per-task rationale + dependency graph alongside the run, runs provider workers against the selected project, records validation results, and exposes the exact CLI restore command on failure.
 - Fix Review is idempotent for active runs: repeated starts for the same review return the active run instead of launching duplicate write workers.
 - CLADEX self-review/self-fix remains explicit. Normal relays and review/fix jobs are still blocked from targeting the CLADEX runtime repo unless the operator opts into CLADEX development mode; write-capable self-fix requires a separate self-fix approval after self-review.
 - Per-channel Claude subprocesses are evicted by idle TTL and capped by an LRU live-process limit so a multi-channel relay does not accumulate processes forever.

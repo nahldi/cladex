@@ -2,6 +2,30 @@
 
 This file is tracked on purpose. It gives future Claude/Codex agents a concise source of truth for what has been done, what is in progress, and what still needs care. Runtime-only memory files under `memory/` are useful locally, but GitHub users and new agents need this public handoff too.
 
+## 2.5.0 Fix Review AI Orchestrator (2026-04-28)
+
+**Why.** The previous Fix Review path was a deterministic 1:1 mapping: every finding became its own task, all using the same provider as the upstream review. The user explicitly called this out: "the fix button should spawn an orchestrator that decides how many, what type, and where each agent goes." 2.5.0 makes that real.
+
+**Design.**
+- `backend/fix_orchestrator.py` now runs an AI planner before tasks are constructed. It:
+  1. Walks the workspace into a small inventory (languages, sample files, has-tests).
+  2. Renders a planner prompt that bundles the inventory, the full findings list, the provider strengths guide, and the JSON schema the planner must satisfy (`FIX_PLAN_SCHEMA`).
+  3. Calls one of two planners depending on the upstream review provider:
+     - `_run_codex_planner` → `codex --sandbox read-only --ask-for-approval never exec --ephemeral --skip-git-repo-check -`
+     - `_run_claude_planner` → `claude -p --tools "" --disallowedTools Bash,Edit,MultiEdit,Write,NotebookEdit --permission-mode dontAsk --json-schema <schema>`
+  4. Validates the returned JSON, groups findings into tasks, assigns each task its own `provider`, `reasoningEffort`, `phase`, `dependsOn`, and `rationale`. A residual catch-all task is added if the planner ever silently drops a finding.
+  5. Honors `min(operator_max_agents, recommended_count)` so the orchestrator's recommended_count caps parallelism unless the operator chose lower.
+- The deterministic 1:1 builder still exists as `_deterministic_fix_tasks` and is the fallback when the planner subprocess fails or is disabled, so existing behavior is preserved on regression.
+- Tests must never burn live planner calls. `backend/tests/conftest.py` sets `CLADEX_FIX_PLANNER_DISABLE=1` by default; the three new orchestrator-specific tests opt back in via `monkeypatch.delenv`.
+- Frontend: new `FixRunPlan` type + `plan`/`requestedMaxAgents` fields on `FixRun`, a new `FixRunPlanSection` block in `FixRunCard` that shows the planner source, recommended-agent count, summary, rationale, and fallback reason, plus a richer `FixTaskTile` that surfaces per-task provider, effort, phase, severity/category badges, rationale, and dependency chain.
+
+**Tests.** `pytest backend/tests` → 268 passing. New cases:
+- `test_ai_planner_groups_findings_and_picks_provider`
+- `test_ai_planner_falls_back_to_deterministic_when_provider_returns_nothing`
+- `test_ai_planner_adds_residual_task_for_skipped_findings`
+
+**Frontend.** `npm run lint` (tsc --noEmit) and `npm run build` both clean.
+
 ## 2.4.0 Roadmap Closeout — Non-Blocking Items (2026-04-28)
 
 The "Non-Blocking Future Work" section that has lived on the roadmap since 2.2.x is now empty. Each item shipped or has an explicit recorded decision.

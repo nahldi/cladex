@@ -771,3 +771,44 @@ def test_ai_review_defaults_to_bounded_parallelism(tmp_path: Path, monkeypatch: 
     assert finished["maxParallel"] == review_swarm.DEFAULT_AI_MAX_PARALLEL
     assert finished["progress"]["maxParallel"] == review_swarm.DEFAULT_AI_MAX_PARALLEL
     assert any("12 lanes requested" in warning for warning in finished["limitWarnings"])
+
+
+def test_extract_json_payload_handles_trailing_log_lines() -> None:
+    """The Codex CLI emits the orchestrator JSON followed by `tokens used` log
+    lines. The greedy `rfind` candidate alone is enough for that case, but the
+    new balanced-brace fallback must keep working when the trailer also
+    contains a stray `}` character.
+    """
+    text = (
+        '{"summary":"x","recommendedAgentCount":2,"tasks":[{"id":"t1","phase":1}]}\n'
+        "tokens used }\n"
+        "10,690 }\n"
+    )
+    payload = review_swarm._extract_json_payload(text)
+    assert isinstance(payload, dict)
+    assert payload["recommendedAgentCount"] == 2
+    assert payload["tasks"][0]["id"] == "t1"
+
+
+def test_extract_json_payload_skips_string_braces() -> None:
+    """Brace counter must respect string literals so `}` inside a JSON string
+    does not close the object early.
+    """
+    text = '{"summary":"close brace } in string","tasks":[{"id":"t1"}]}'
+    payload = review_swarm._extract_json_payload(text)
+    assert isinstance(payload, dict)
+    assert payload["summary"].endswith("in string")
+
+
+def test_extract_json_payload_prefers_largest_balanced_object() -> None:
+    """When multiple balanced objects exist, prefer the larger one — that is
+    typically the orchestrator plan, not a small log object.
+    """
+    text = (
+        '{"step":"prep"}\n'
+        '{"summary":"main","tasks":[{"id":"t1"}]}\n'
+        '{"step":"done"}\n'
+    )
+    payload = review_swarm._extract_json_payload(text)
+    assert isinstance(payload, dict)
+    assert payload.get("summary") == "main"

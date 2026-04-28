@@ -130,6 +130,195 @@ def test_fix_task_success_is_rejected_when_worker_edits_outside_assigned_files(t
     assert task["changedFiles"] == ["other.py"]
 
 
+def test_ai_planner_groups_findings_and_picks_provider(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The orchestrator AI step must take findings + project shape and return
+    a structured plan: per-task provider choice, agent-count recommendation,
+    and at least one finding id per task."""
+    monkeypatch.delenv("CLADEX_FIX_PLANNER_DISABLE", raising=False)
+    project = tmp_path / "target"
+    project.mkdir()
+    (project / "src").mkdir()
+    (project / "src" / "app.py").write_text("eval(user)\n", encoding="utf-8")
+    (project / "src" / "lib.py").write_text("# TODO\n", encoding="utf-8")
+    (project / "package.json").write_text('{"scripts":{"lint":"echo"}}', encoding="utf-8")
+
+    findings = [
+        {"id": "F0001", "severity": "high", "category": "unsafe-execution", "path": "src/app.py", "line": 1, "title": "Dynamic eval", "recommendation": "Replace eval", "detail": ""},
+        {"id": "F0002", "severity": "low", "category": "maintenance", "path": "src/lib.py", "line": 1, "title": "TODO", "recommendation": "Resolve", "detail": ""},
+    ]
+    plan_payload = {
+        "summary": "Replace eval and resolve the TODO.",
+        "rationale": "Group code-grounded refactors on Codex; keep doc-style cleanup on Claude.",
+        "recommendedAgentCount": 2,
+        "tasks": [
+            {
+                "title": "Replace eval with safe parser",
+                "provider": "codex",
+                "reasoningEffort": "high",
+                "findingIds": ["F0001"],
+                "files": ["src/app.py"],
+                "phase": 1,
+                "category": "unsafe-execution",
+                "severity": "high",
+                "recommendation": "Use ast.parse + safe ops",
+                "rationale": "Surgical local change with shell validation",
+            },
+            {
+                "title": "Resolve TODO marker",
+                "provider": "claude",
+                "reasoningEffort": "medium",
+                "findingIds": ["F0002"],
+                "files": ["src/lib.py"],
+                "phase": 3,
+                "category": "maintenance",
+                "severity": "low",
+                "recommendation": "Replace TODO with explicit follow-up issue",
+                "rationale": "Doc-style cleanup",
+                "dependsOn": ["task-0001"],
+            },
+        ],
+    }
+
+    captured: dict[str, str] = {}
+
+    def fake_codex_planner(prompt: str, account_home):
+        captured["prompt_len"] = len(prompt)
+        captured["account_home"] = account_home or ""
+        return plan_payload
+
+    def fake_claude_planner(prompt: str, account_home):
+        # Should NOT be called when review provider is codex.
+        captured["claude_called"] = "yes"
+        return None
+
+    monkeypatch.setattr(fix_orchestrator, "_run_codex_planner", fake_codex_planner)
+    monkeypatch.setattr(fix_orchestrator, "_run_claude_planner", fake_claude_planner)
+
+    review_job = {"id": "review-x", "workspace": str(project), "provider": "codex", "accountHome": ""}
+    tasks, metadata = fix_orchestrator._build_tasks(review_job, findings, workspace=project, use_ai_planner=True)
+
+    assert "claude_called" not in captured
+    assert metadata["source"] == "ai"
+    assert metadata["recommendedAgentCount"] == 2
+    assert len(tasks) == 2
+    assert tasks[0]["provider"] == "codex"
+    assert tasks[0]["reasoningEffort"] == "high"
+    assert tasks[0]["findingIds"] == ["F0001"]
+    assert tasks[1]["provider"] == "claude"
+    assert tasks[1]["dependsOn"] == ["task-0001"]
+
+
+def test_ai_planner_falls_back_to_deterministic_when_provider_returns_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If the planner subprocess fails, returns garbage, or gets cancelled,
+    Fix Review must NEVER block. It falls back to the deterministic
+    1-task-per-finding plan and records the fallback reason."""
+    monkeypatch.delenv("CLADEX_FIX_PLANNER_DISABLE", raising=False)
+    project = tmp_path / "target"
+    project.mkdir()
+    findings = [
+        {"id": "F0001", "severity": "high", "path": "src/app.py", "title": "boom", "recommendation": "fix"},
+    ]
+    monkeypatch.setattr(fix_orchestrator, "_run_codex_planner", lambda prompt, home: None)
+    monkeypatch.setattr(fix_orchestrator, "_run_claude_planner", lambda prompt, home: None)
+
+    review_job = {"id": "review-x", "workspace": str(project), "provider": "codex"}
+    tasks, metadata = fix_orchestrator._build_tasks(review_job, findings, workspace=project, use_ai_planner=True)
+
+    assert metadata["source"] == "deterministic"
+    assert "fallbackReason" in metadata
+    assert len(tasks) == 1
+    assert tasks[0]["provider"] == "codex"
+
+
+def test_ai_planner_adds_residual_task_for_skipped_findings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """If the AI planner silently drops some findings, the orchestrator must
+    add a catch-all task so nothing reaches production unfixed."""
+    monkeypatch.delenv("CLADEX_FIX_PLANNER_DISABLE", raising=False)
+    project = tmp_path / "target"
+    project.mkdir()
+    findings = [
+        {"id": "F0001", "severity": "high", "path": "a.py", "title": "a", "recommendation": "fix a"},
+        {"id": "F0002", "severity": "high", "path": "b.py", "title": "b", "recommendation": "fix b"},
+        {"id": "F0003", "severity": "low", "path": "c.py", "title": "c", "recommendation": "fix c"},
+    ]
+    plan_payload = {
+        "summary": "skip last",
+        "recommendedAgentCount": 1,
+        "tasks": [
+            {"title": "fix a+b", "provider": "codex", "findingIds": ["F0001", "F0002"], "files": ["a.py", "b.py"], "phase": 1},
+        ],
+    }
+    monkeypatch.setattr(fix_orchestrator, "_run_codex_planner", lambda prompt, home: plan_payload)
+
+    review_job = {"id": "review-x", "workspace": str(project), "provider": "codex"}
+    tasks, metadata = fix_orchestrator._build_tasks(review_job, findings, workspace=project, use_ai_planner=True)
+
+    assert metadata["source"] == "ai"
+    assert any(t.get("category") == "planner-residual" for t in tasks)
+    residual = next(t for t in tasks if t.get("category") == "planner-residual")
+    assert "F0003" in residual["findingIds"]
+
+
+def test_ai_planner_remaps_planner_named_dependencies_to_canonical_task_ids(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The planner is allowed to invent its own task ids (e.g. `fix-001`,
+    `update-readme`). CLADEX rewrites every task id to the canonical
+    `task-NNNN` shape, so any `dependsOn` referencing the planner's own
+    naming must be remapped onto the canonical IDs — otherwise the dep
+    graph silently breaks and phase-2 tasks would launch before phase-1.
+    """
+    monkeypatch.delenv("CLADEX_FIX_PLANNER_DISABLE", raising=False)
+    project = tmp_path / "target"
+    project.mkdir()
+    findings = [
+        {"id": "F1", "severity": "high", "path": "a.py", "title": "a", "recommendation": "fix a"},
+        {"id": "F2", "severity": "low", "path": "README.md", "title": "docs", "recommendation": "doc"},
+    ]
+    plan_payload = {
+        "summary": "Two-step plan",
+        "recommendedAgentCount": 1,
+        "tasks": [
+            {
+                "id": "fix-the-code",  # planner-invented id
+                "title": "Fix code",
+                "provider": "codex",
+                "findingIds": ["F1"],
+                "files": ["a.py"],
+                "phase": 1,
+            },
+            {
+                "id": "update-readme",
+                "title": "Update README",
+                "provider": "claude",
+                "findingIds": ["F2"],
+                "files": ["README.md"],
+                "phase": 3,
+                # dependsOn references the planner's own id, not task-0001
+                "dependsOn": ["fix-the-code"],
+            },
+        ],
+    }
+    monkeypatch.setattr(fix_orchestrator, "_run_codex_planner", lambda prompt, home: plan_payload)
+
+    review_job = {"id": "review-x", "workspace": str(project), "provider": "codex"}
+    tasks, metadata = fix_orchestrator._build_tasks(
+        review_job, findings, workspace=project, use_ai_planner=True
+    )
+
+    assert metadata["source"] == "ai"
+    code_task = next(t for t in tasks if t["findingIds"] == ["F1"])
+    docs_task = next(t for t in tasks if t["findingIds"] == ["F2"])
+    assert code_task["id"] == "task-0001"
+    assert docs_task["id"] == "task-0002"
+    # The planner's `dependsOn: ["fix-the-code"]` must be rewritten to
+    # `["task-0001"]` so Fix Review's phase scheduler waits for the code
+    # task before launching the docs task.
+    assert docs_task["dependsOn"] == ["task-0001"]
+
+
 def test_workspace_touched_detects_edits_to_already_dirty_files(tmp_path: Path) -> None:
     """F0013/F0014: a worker editing an already-dirty file outside its
     assignment must still be detected. Pure path-set diff misses these

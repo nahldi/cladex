@@ -183,6 +183,16 @@ interface FixTaskRecord {
   status: 'queued' | 'running' | 'done' | 'completed' | 'completed_with_warnings' | 'failed' | 'cancelled';
   detail?: string;
   files?: string[];
+  provider?: string;
+  reasoningEffort?: string;
+  rationale?: string;
+  dependsOn?: string[];
+  findingIds?: string[];
+  phase?: number;
+  severity?: string;
+  category?: string;
+  recommendation?: string;
+  error?: string;
 }
 
 interface FixRun {
@@ -211,10 +221,22 @@ interface FixRun {
   maxParallel?: number;
   maxWorkers?: number;
   maxAgents?: number;
+  requestedMaxAgents?: number;
+  plan?: FixRunPlan;
   limitWarnings?: string[];
   warnings?: string[];
   limits?: LimitMetadata;
   error?: string;
+}
+
+interface FixRunPlan {
+  source?: 'ai' | 'deterministic' | string;
+  provider?: string;
+  summary?: string;
+  rationale?: string;
+  recommendedAgentCount?: number;
+  taskCount?: number;
+  fallbackReason?: string;
 }
 
 interface BackupRecord {
@@ -1365,6 +1387,8 @@ function FixRunCard({
 
       <LimitNotice record={run} requested={progress.total || taskTotal || total} />
 
+      <FixRunPlanSection plan={run.plan} requestedMaxAgents={run.requestedMaxAgents} maxAgents={run.maxAgents} />
+
       <div className="mt-5 grid gap-3 lg:grid-cols-2">
         <InspectorRow label="Run" value={run.id} mono />
         <InspectorRow label="Report" value={run.reportPath || 'Pending'} mono />
@@ -1378,16 +1402,99 @@ function FixRunCard({
       {run.tasks?.length ? (
         <div className="mt-5 grid gap-2 md:grid-cols-2">
           {run.tasks.slice(0, 8).map((task) => (
-            <div key={task.id} className="rounded-2xl border border-slate-200/80 bg-white/70 px-3 py-3 dark:border-white/5 dark:bg-black/30">
-              <div className="flex items-center justify-between gap-3">
-                <div className="min-w-0 truncate font-mono text-xs text-slate-700 dark:text-gray-300">{task.title || task.id}</div>
-                <div className="shrink-0 text-[10px] font-bold uppercase tracking-[0.18em] text-slate-500 dark:text-gray-500">{statusLabel(task.status)}</div>
-              </div>
-              {task.detail ? <div className="mt-1 line-clamp-2 text-xs text-slate-500 dark:text-gray-500">{task.detail}</div> : null}
-            </div>
+            <FixTaskTile key={task.id} task={task} />
           ))}
+          {run.tasks.length > 8 ? (
+            <div className="rounded-2xl border border-dashed border-slate-200/80 bg-slate-50/40 px-3 py-3 text-xs text-slate-500 dark:border-white/10 dark:bg-black/20 dark:text-gray-400">
+              +{run.tasks.length - 8} more task{run.tasks.length - 8 === 1 ? '' : 's'} not shown — see report for full list.
+            </div>
+          ) : null}
         </div>
       ) : null}
+    </div>
+  );
+}
+
+function FixRunPlanSection({
+  plan,
+  requestedMaxAgents,
+  maxAgents,
+}: {
+  plan?: FixRunPlan;
+  requestedMaxAgents?: number;
+  maxAgents?: number;
+}) {
+  if (!plan) {
+    return null;
+  }
+  const isAi = (plan.source || '').toLowerCase() === 'ai';
+  const tone = isAi
+    ? 'border-emerald-400/40 bg-emerald-500/[0.06] dark:border-emerald-400/20 dark:bg-emerald-500/[0.05]'
+    : 'border-amber-400/40 bg-amber-500/[0.05] dark:border-amber-400/20 dark:bg-amber-500/[0.04]';
+  const labelTone = isAi ? 'text-emerald-700 dark:text-emerald-300' : 'text-amber-700 dark:text-amber-300';
+  const recommended = typeof plan.recommendedAgentCount === 'number' && plan.recommendedAgentCount > 0 ? plan.recommendedAgentCount : null;
+  return (
+    <div className={`mt-5 rounded-2xl border px-4 py-4 ${tone}`}>
+      <div className="flex flex-wrap items-center gap-2">
+        <span className={`text-[10px] font-bold uppercase tracking-[0.22em] ${labelTone}`}>
+          {isAi ? 'AI orchestrator' : 'Deterministic plan'}
+        </span>
+        {plan.provider ? <MetaPill label={plan.provider} mono /> : null}
+        {recommended !== null ? <MetaPill label={`${recommended} agent${recommended === 1 ? '' : 's'} recommended`} mono /> : null}
+        {typeof plan.taskCount === 'number' && plan.taskCount > 0 ? <MetaPill label={`${plan.taskCount} task${plan.taskCount === 1 ? '' : 's'}`} mono /> : null}
+        {typeof requestedMaxAgents === 'number' && typeof maxAgents === 'number' && maxAgents !== requestedMaxAgents ? (
+          <MetaPill label={`capped to ${maxAgents} of ${requestedMaxAgents}`} />
+        ) : null}
+      </div>
+      {plan.summary ? (
+        <div className="mt-2 text-sm font-semibold text-slate-900 dark:text-white">{plan.summary}</div>
+      ) : null}
+      {plan.rationale ? (
+        <div className="mt-1 text-xs text-slate-600 dark:text-gray-400">{plan.rationale}</div>
+      ) : null}
+      {!isAi && plan.fallbackReason ? (
+        <div className="mt-2 text-[11px] uppercase tracking-[0.18em] text-amber-700 dark:text-amber-300">
+          Fallback reason: <span className="font-mono normal-case tracking-normal">{plan.fallbackReason}</span>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function FixTaskTile({ task }: { task: FixTaskRecord }) {
+  const provider = (task.provider || '').toLowerCase();
+  const providerTone =
+    provider === 'claude'
+      ? 'border-violet-400/40 text-violet-700 dark:border-violet-400/30 dark:text-violet-200'
+      : provider === 'codex'
+        ? 'border-sky-400/40 text-sky-700 dark:border-sky-400/30 dark:text-sky-200'
+        : 'border-slate-300/60 text-slate-600 dark:border-white/10 dark:text-gray-300';
+  const effort = (task.reasoningEffort || '').trim();
+  const phase = typeof task.phase === 'number' ? task.phase : null;
+  const dependsOn = task.dependsOn?.filter(Boolean) ?? [];
+  return (
+    <div className="rounded-2xl border border-slate-200/80 bg-white/70 px-3 py-3 dark:border-white/5 dark:bg-black/30">
+      <div className="flex items-center justify-between gap-3">
+        <div className="min-w-0 truncate font-mono text-xs text-slate-700 dark:text-gray-300">{task.title || task.id}</div>
+        <div className="shrink-0 text-[10px] font-bold uppercase tracking-[0.18em] text-slate-500 dark:text-gray-500">{statusLabel(task.status)}</div>
+      </div>
+      <div className="mt-2 flex flex-wrap items-center gap-1.5">
+        {provider ? (
+          <span className={`rounded-full border px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.18em] ${providerTone}`}>{provider}</span>
+        ) : null}
+        {effort ? <MetaPill label={`effort: ${effort}`} /> : null}
+        {phase !== null ? <MetaPill label={`phase ${phase}`} /> : null}
+        {task.severity ? <MetaPill label={task.severity} /> : null}
+        {task.category ? <MetaPill label={task.category} /> : null}
+      </div>
+      {task.rationale ? <div className="mt-2 line-clamp-2 text-xs text-slate-600 dark:text-gray-400">{task.rationale}</div> : null}
+      {task.detail && !task.rationale ? <div className="mt-2 line-clamp-2 text-xs text-slate-500 dark:text-gray-500">{task.detail}</div> : null}
+      {dependsOn.length ? (
+        <div className="mt-2 text-[10px] uppercase tracking-[0.18em] text-slate-500 dark:text-gray-500">
+          depends on <span className="font-mono normal-case tracking-normal text-slate-600 dark:text-gray-400">{dependsOn.join(', ')}</span>
+        </div>
+      ) : null}
+      {task.error ? <div className="mt-2 line-clamp-2 text-xs text-red-600 dark:text-red-300">{task.error}</div> : null}
     </div>
   );
 }

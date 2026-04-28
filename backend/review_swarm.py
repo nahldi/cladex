@@ -1516,6 +1516,11 @@ def _extract_json_payload(text: str) -> dict[str, Any] | None:
     last = stripped.rfind("}")
     if first >= 0 and last > first:
         candidates.append(stripped[first : last + 1])
+    # Brace-balanced scan: walk every `{` in the text and try to find its matching `}`
+    # via a string-aware brace counter. This rescues cases where stdout has the
+    # planner JSON followed by stderr lines that contain stray `}` characters
+    # (which would otherwise confuse the greedy rfind candidate above).
+    candidates.extend(_balanced_json_objects(stripped))
     for candidate in candidates:
         try:
             payload = json.loads(candidate)
@@ -1524,6 +1529,53 @@ def _extract_json_payload(text: str) -> dict[str, Any] | None:
         if isinstance(payload, dict):
             return payload
     return None
+
+
+def _balanced_json_objects(text: str) -> list[str]:
+    """Return every brace-balanced `{...}` substring in `text`.
+
+    Aware of double-quoted strings and backslash escapes so a `}` inside a
+    string literal does not close the object early. Used as a fallback for
+    extracting JSON that is mixed with surrounding plain-text logs.
+    """
+    out: list[str] = []
+    n = len(text)
+    i = 0
+    while i < n:
+        if text[i] != "{":
+            i += 1
+            continue
+        depth = 0
+        in_string = False
+        escape = False
+        j = i
+        while j < n:
+            ch = text[j]
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+            else:
+                if ch == '"':
+                    in_string = True
+                elif ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        out.append(text[i : j + 1])
+                        break
+            j += 1
+        # Whether we closed or fell off the end, advance past this `{` so we
+        # also catch sibling objects that follow.
+        i += 1
+    # Prefer the largest objects first — the orchestrator plan is the biggest
+    # JSON document Codex emits.
+    out.sort(key=len, reverse=True)
+    return out
 
 
 def _relativize_finding_path(raw_path: str, *, workspace: Path, scratch: Path | None) -> str:

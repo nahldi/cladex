@@ -2,6 +2,16 @@
 
 Items that started life on `ROADMAP.md` and have shipped. Newest tranches first. The active work-in-progress list lives in [ROADMAP.md](ROADMAP.md); release-by-release narrative lives in [DEVELOPMENT_LOG.md](DEVELOPMENT_LOG.md).
 
+## Completed For 2.5.0
+
+The "Fix Review orchestrator" line on the roadmap is now done. Summary in [DEVELOPMENT_LOG.md](DEVELOPMENT_LOG.md).
+
+- **AI orchestrator behind the Fix Review button.** `start_fix_run` now invokes `_ai_plan_fix_tasks`, which builds a workspace inventory, asks the upstream provider (`codex` or `claude`) for a structured plan via JSON Schema, and emits per-task `provider`, `reasoningEffort`, `phase`, `dependsOn`, and `rationale`. The orchestrator's `recommendedAgentCount` caps parallelism (capped further by `min(operator_max_agents, recommended)`).
+- **Deterministic fallback preserved.** When the planner subprocess errors, returns nothing, or is intentionally disabled (`CLADEX_FIX_PLANNER_DISABLE=1` for tests), the existing 1:1 mapping runs as `_deterministic_fix_tasks` and the run records why in `plan.fallbackReason`. Existing behavior is therefore preserved on regression.
+- **Residual safety net.** If the planner ever silently drops a finding, the orchestrator appends a catch-all task so every finding from the upstream review still reaches a fix worker.
+- **Frontend visibility.** The Fix Review card now shows the orchestrator decision: source (AI vs deterministic), recommended agent count, summary text, rationale, plus per-task badges for provider, effort, phase, severity, category, dependency chain, and rationale. Fallback reasons render in their own warning band.
+- **Tests.** Three orchestrator-specific tests added; suite is green at 268 passing.
+
 ## Completed For 2.4.0
 
 Closes the four "non-blocking future work" items previously listed on the roadmap, leaving nothing else to do.

@@ -197,7 +197,317 @@ def _load_review_findings(review_id: str) -> list[dict[str, Any]]:
     return findings if isinstance(findings, list) else []
 
 
-def _build_tasks(review_job: dict[str, Any], findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+FIX_PLAN_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["summary", "recommendedAgentCount", "tasks"],
+    "additionalProperties": True,
+    "properties": {
+        "summary": {"type": "string"},
+        "recommendedAgentCount": {"type": "integer", "minimum": 1, "maximum": MAX_FIX_AGENTS},
+        "rationale": {"type": "string"},
+        "tasks": {
+            "type": "array",
+            "minItems": 0,
+            "items": {
+                "type": "object",
+                "required": ["title", "provider", "findingIds", "files", "phase"],
+                "additionalProperties": True,
+                "properties": {
+                    "title": {"type": "string"},
+                    "provider": {"type": "string", "enum": ["codex", "claude"]},
+                    "reasoningEffort": {"type": "string", "enum": ["low", "medium", "high", "xhigh"]},
+                    "findingIds": {"type": "array", "items": {"type": "string"}},
+                    "files": {"type": "array", "items": {"type": "string"}},
+                    "phase": {"type": "integer", "minimum": 1, "maximum": 3},
+                    "category": {"type": "string"},
+                    "severity": {"type": "string", "enum": ["high", "medium", "low"]},
+                    "recommendation": {"type": "string"},
+                    "rationale": {"type": "string"},
+                    "dependsOn": {"type": "array", "items": {"type": "string"}},
+                },
+            },
+        },
+    },
+}
+
+
+_PROVIDER_GUIDE = (
+    "Provider strengths to inform per-task assignment:\n"
+    "- Codex: fast iterative code edits, test authoring, focused single-file refactors, "
+    "shell-driven validation of small changes. Stronger at narrow surgical patches.\n"
+    "- Claude: cross-file semantic refactors, dependency graph reasoning, careful API or "
+    "config rewrites, doc rewrites, multi-step plans with shared context. Stronger when a "
+    "fix touches several files or needs holistic understanding."
+)
+
+
+def _project_inventory(workspace: Path, *, max_files: int = 200) -> dict[str, Any]:
+    languages: dict[str, int] = {}
+    files: list[str] = []
+    has_tests = False
+    for current, dirs, names in os.walk(workspace):
+        current_path = Path(current)
+        dirs[:] = [name for name in dirs if name.lower() not in review_swarm.SKIP_DIRS and not name.startswith(".")]
+        for name in names:
+            if name.startswith(".env") or name.startswith("."):
+                continue
+            rel = (current_path / name).relative_to(workspace).as_posix()
+            ext = Path(name).suffix.lower()
+            if ext:
+                languages[ext] = languages.get(ext, 0) + 1
+            if "test" in rel.lower() or "spec" in rel.lower():
+                has_tests = True
+            if len(files) < max_files:
+                files.append(rel)
+    return {
+        "fileCount": sum(languages.values()) or 0,
+        "languages": dict(sorted(languages.items(), key=lambda item: -item[1])[:12]),
+        "hasTests": has_tests,
+        "filesSample": files,
+    }
+
+
+def _planner_prompt(review_job: dict[str, Any], findings: list[dict[str, Any]], inventory: dict[str, Any]) -> str:
+    findings_blob = json.dumps(findings, ensure_ascii=False)[:80000]
+    inventory_blob = json.dumps(inventory, ensure_ascii=False)[:8000]
+    return (
+        "You are CLADEX's Fix Review orchestrator. A read-only project review just\n"
+        "finished. Decide the smallest, safest set of fix tasks that close the\n"
+        "findings without breaking the project. For each task pick the AI worker\n"
+        "(Codex or Claude) that is the best fit, the reasoning effort, the files\n"
+        "the worker is allowed to touch, and which earlier task ids it depends on.\n"
+        "\n"
+        "Hard rules:\n"
+        "- One task can group several findings if they share files or root cause.\n"
+        "- Every task must reference at least one findingId from the input.\n"
+        "- Tasks must NOT include CLADEX self-fix targeting (we cannot edit the\n"
+        "  CLADEX runtime repo from a normal project run).\n"
+        "- Phase 1 = blocking risks, phase 2 = stabilize/validate, phase 3 = polish.\n"
+        "- recommendedAgentCount is the maximum number of concurrent fix workers\n"
+        "  you think is safe given the dependency graph (1-10).\n"
+        "\n"
+        f"{_PROVIDER_GUIDE}\n"
+        "\n"
+        f"Review provider: {review_job.get('provider')}\n"
+        f"Workspace: {review_job.get('workspace')}\n"
+        f"Project inventory: {inventory_blob}\n"
+        f"Findings JSON ({len(findings)} items): {findings_blob}\n"
+        "\n"
+        "Return ONLY a JSON object that matches this schema (no prose, no markdown):\n"
+        f"{json.dumps(FIX_PLAN_SCHEMA)}\n"
+    )
+
+
+def _run_claude_planner(prompt: str, account_home: str | None) -> dict[str, Any] | None:
+    cmd = [
+        claude_relay.claude_code_bin(),
+        "-p",
+        "--tools",
+        "",
+        "--disallowedTools",
+        "Bash,Edit,MultiEdit,Write,NotebookEdit",
+        "--permission-mode",
+        "dontAsk",
+        "--no-session-persistence",
+        "--output-format",
+        "text",
+        "--json-schema",
+        json.dumps(FIX_PLAN_SCHEMA),
+    ]
+    extra = {"CLAUDE_CONFIG_DIR": account_home} if account_home else {}
+    env = review_swarm._minimal_reviewer_env(account_home=extra)
+    result = review_swarm._run_cli(cmd, prompt, env=env, cwd=None)
+    if not result.ok or not result.text.strip():
+        return None
+    return _parse_planner_payload(result.text)
+
+
+def _run_codex_planner(prompt: str, account_home: str | None) -> dict[str, Any] | None:
+    import relayctl
+
+    cmd = [
+        relayctl.resolve_codex_bin(),
+        "--sandbox",
+        "read-only",
+        "--ask-for-approval",
+        "never",
+        "exec",
+        "--ephemeral",
+        "--skip-git-repo-check",
+        "-",
+    ]
+    extra = {"CODEX_HOME": account_home} if account_home else {}
+    env = review_swarm._minimal_reviewer_env(account_home=extra)
+    result = review_swarm._run_cli(cmd, prompt, env=env, cwd=None)
+    if not result.ok or not result.text.strip():
+        return None
+    return _parse_planner_payload(result.text)
+
+
+def _parse_planner_payload(text: str) -> dict[str, Any] | None:
+    sanitized = review_swarm.sanitize_text(text, limit=120000)
+    payload = review_swarm._extract_json_payload(sanitized)
+    if not isinstance(payload, dict):
+        return None
+    tasks = payload.get("tasks")
+    if not isinstance(tasks, list):
+        return None
+    return payload
+
+
+def _ai_plan_fix_tasks(
+    review_job: dict[str, Any],
+    findings: list[dict[str, Any]],
+    *,
+    inventory: dict[str, Any],
+) -> tuple[list[dict[str, Any]], dict[str, Any]] | None:
+    """Run a single AI planning call. Returns (tasks, plan_metadata) on success."""
+    if not findings:
+        return None
+    provider = review_swarm.validate_provider(str(review_job.get("provider") or "codex"))
+    account_home = str(review_job.get("accountHome") or "").strip() or None
+    prompt = _planner_prompt(review_job, findings, inventory)
+    if provider == "claude":
+        plan = _run_claude_planner(prompt, account_home)
+    else:
+        plan = _run_codex_planner(prompt, account_home)
+    if plan is None:
+        return None
+    raw_tasks = plan.get("tasks") if isinstance(plan.get("tasks"), list) else []
+    findings_by_id = {str(item.get("id") or ""): item for item in findings if isinstance(item, dict)}
+    tasks: list[dict[str, Any]] = []
+    seen_findings: set[str] = set()
+    # Remap the planner's task IDs → CLADEX-canonical `task-NNNN`. The planner
+    # is free to use any naming for its own ids; we rewrite every dependsOn
+    # reference so the dependency graph stays consistent after rename.
+    raw_id_to_task_id: dict[str, str] = {}
+    raw_depends: list[list[str]] = []
+    for index, raw in enumerate(raw_tasks, start=1):
+        if not isinstance(raw, dict):
+            continue
+        finding_ids = [str(fid) for fid in (raw.get("findingIds") or []) if str(fid).strip()]
+        finding_ids = [fid for fid in finding_ids if fid in findings_by_id]
+        if not finding_ids:
+            continue
+        worker = str(raw.get("provider") or provider).strip().lower()
+        if worker not in {"codex", "claude"}:
+            worker = provider
+        files_raw = raw.get("files") or []
+        files = [str(item).strip() for item in files_raw if str(item).strip()]
+        # Always seed with the first finding's path if the planner forgot.
+        if not files:
+            primary = findings_by_id.get(finding_ids[0]) or {}
+            primary_path = _finding_path(primary.get("path"))
+            files = [primary_path] if primary_path != "." else []
+        phase = int(raw.get("phase") or _severity_phase(str(raw.get("severity") or "")))
+        if phase < 1 or phase > 3:
+            phase = 2
+        primary_finding = findings_by_id.get(finding_ids[0]) or {}
+        title = str(raw.get("title") or primary_finding.get("title") or "Fix task").strip()[:180]
+        category = str(raw.get("category") or primary_finding.get("category") or "review").strip()[:80]
+        severity = str(raw.get("severity") or primary_finding.get("severity") or "medium").strip().lower()
+        recommendation = str(raw.get("recommendation") or primary_finding.get("recommendation") or "Apply a targeted fix.").strip()
+        detail_bits = [str(findings_by_id.get(fid, {}).get("detail") or "").strip() for fid in finding_ids]
+        detail = "\n\n".join(bit for bit in detail_bits if bit)
+        rationale = str(raw.get("rationale") or "").strip()
+        depends_on_raw = [str(item).strip() for item in (raw.get("dependsOn") or []) if str(item).strip()]
+        reasoning_effort = str(raw.get("reasoningEffort") or "").strip().lower()
+        if reasoning_effort and reasoning_effort not in {"low", "medium", "high", "xhigh"}:
+            reasoning_effort = ""
+        canonical_id = f"task-{len(tasks) + 1:04d}"
+        raw_id = str(raw.get("id") or "").strip()
+        if raw_id:
+            raw_id_to_task_id[raw_id] = canonical_id
+        # Also let the planner reference a task by its (1-based) index in the
+        # raw list — useful when it omits its own ids.
+        raw_id_to_task_id[str(index)] = canonical_id
+        raw_id_to_task_id[canonical_id] = canonical_id
+        tasks.append(
+            {
+                "id": canonical_id,
+                "findingId": finding_ids[0],
+                "findingIds": finding_ids,
+                "phase": phase,
+                "provider": worker,
+                "status": "queued",
+                "title": title,
+                "severity": severity,
+                "category": category,
+                "files": files,
+                "recommendation": recommendation,
+                "detail": detail,
+                "rationale": rationale,
+                "reasoningEffort": reasoning_effort,
+                "dependsOn": [],  # filled in second pass
+                "startedAt": "",
+                "finishedAt": "",
+                "attempts": 0,
+                "error": "",
+                "outputPath": "",
+            }
+        )
+        raw_depends.append(depends_on_raw)
+        seen_findings.update(finding_ids)
+    # Second pass: remap planner-named dependencies onto canonical task IDs.
+    for task, raw_deps in zip(tasks, raw_depends, strict=False):
+        remapped: list[str] = []
+        for dep in raw_deps:
+            mapped = raw_id_to_task_id.get(dep)
+            if mapped and mapped != task["id"] and mapped not in remapped:
+                remapped.append(mapped)
+        task["dependsOn"] = remapped
+    if not tasks:
+        return None
+    # Catch-all task for findings the AI silently dropped so nothing is missed.
+    missed = [fid for fid in findings_by_id if fid not in seen_findings]
+    if missed:
+        next_index = len(tasks) + 1
+        primary = findings_by_id.get(missed[0]) or {}
+        files = [_finding_path(primary.get("path"))] if _finding_path(primary.get("path")) != "." else []
+        tasks.append(
+            {
+                "id": f"task-{next_index:04d}",
+                "findingId": missed[0],
+                "findingIds": missed,
+                "phase": 3,
+                "provider": provider,
+                "status": "queued",
+                "title": f"Catch-all: address {len(missed)} planner-skipped finding(s)",
+                "severity": "low",
+                "category": "planner-residual",
+                "files": files,
+                "recommendation": "Apply targeted fixes for the findings the orchestrator skipped, one by one.",
+                "detail": "Planner did not assign these findings; CLADEX added a residual task so they are not silently dropped.",
+                "rationale": "Residual safety net so every finding from the review reaches a fix worker.",
+                "reasoningEffort": "",
+                "dependsOn": [],
+                "startedAt": "",
+                "finishedAt": "",
+                "attempts": 0,
+                "error": "",
+                "outputPath": "",
+            }
+        )
+    tasks.sort(key=lambda item: (int(item.get("phase", 3)), str(item.get("id", ""))))
+    summary = str(plan.get("summary") or "").strip()
+    rationale = str(plan.get("rationale") or "").strip()
+    recommended_count = plan.get("recommendedAgentCount")
+    try:
+        recommended_count = max(1, min(MAX_FIX_AGENTS, int(recommended_count)))
+    except (TypeError, ValueError):
+        recommended_count = 1
+    metadata = {
+        "source": "ai",
+        "provider": provider,
+        "summary": summary,
+        "rationale": rationale,
+        "recommendedAgentCount": recommended_count,
+        "taskCount": len(tasks),
+    }
+    return tasks, metadata
+
+
+def _deterministic_fix_tasks(review_job: dict[str, Any], findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
     provider = review_swarm.validate_provider(str(review_job.get("provider") or "codex"))
     tasks: list[dict[str, Any]] = []
     for index, finding in enumerate(findings, start=1):
@@ -210,6 +520,7 @@ def _build_tasks(review_job: dict[str, Any], findings: list[dict[str, Any]]) -> 
             {
                 "id": f"task-{index:04d}",
                 "findingId": finding_id,
+                "findingIds": [finding_id],
                 "phase": _severity_phase(str(finding.get("severity") or "")),
                 "provider": provider,
                 "status": "queued",
@@ -219,6 +530,9 @@ def _build_tasks(review_job: dict[str, Any], findings: list[dict[str, Any]]) -> 
                 "files": files,
                 "recommendation": str(finding.get("recommendation") or "Apply a targeted fix.").strip(),
                 "detail": str(finding.get("detail") or "").strip(),
+                "rationale": "",
+                "reasoningEffort": "",
+                "dependsOn": [],
                 "startedAt": "",
                 "finishedAt": "",
                 "attempts": 0,
@@ -228,6 +542,42 @@ def _build_tasks(review_job: dict[str, Any], findings: list[dict[str, Any]]) -> 
         )
     tasks.sort(key=lambda item: (int(item.get("phase", 3)), str(item.get("id", ""))))
     return tasks
+
+
+def _build_tasks(
+    review_job: dict[str, Any],
+    findings: list[dict[str, Any]],
+    *,
+    workspace: Path | None = None,
+    use_ai_planner: bool = True,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Return (tasks, plan_metadata).
+
+    Tries the AI planner first when `use_ai_planner` is true and a workspace
+    is provided. Falls back to a deterministic 1:1 mapping if the AI call
+    fails, so a missing/broken provider never blocks Fix Review.
+    """
+    if use_ai_planner and workspace is not None and findings:
+        try:
+            inventory = _project_inventory(workspace)
+            ai = _ai_plan_fix_tasks(review_job, findings, inventory=inventory)
+            if ai is not None:
+                tasks, metadata = ai
+                return tasks, metadata
+        except Exception as exc:
+            return _deterministic_fix_tasks(review_job, findings), {
+                "source": "deterministic",
+                "fallbackReason": f"AI planner raised: {exc}",
+                "taskCount": len(findings),
+                "recommendedAgentCount": 1,
+            }
+    deterministic = _deterministic_fix_tasks(review_job, findings)
+    return deterministic, {
+        "source": "deterministic",
+        "fallbackReason": "AI planner disabled or returned no plan",
+        "taskCount": len(deterministic),
+        "recommendedAgentCount": 1,
+    }
 
 
 def _load_package_json(workspace: Path) -> dict[str, Any]:
@@ -326,6 +676,7 @@ def show_fix_run(run_id: str) -> dict[str, Any]:
 
 def build_fix_run_markdown(run: dict[str, Any]) -> str:
     progress = run.get("progress") or _progress(run.get("tasks", []))
+    plan = run.get("plan") or {}
     lines = [
         f"# CLADEX Fix Run - {run.get('title') or run.get('id')}",
         "",
@@ -334,8 +685,31 @@ def build_fix_run_markdown(run: dict[str, Any]) -> str:
         f"- Workspace: `{run.get('workspace')}`",
         f"- Status: `{run.get('status')}`",
         f"- Source backup: `{(run.get('sourceBackup') or {}).get('id', 'not created')}`",
-        f"- Max fix agents: `{run.get('maxAgents')}`",
+        f"- Max fix agents: `{run.get('maxAgents')}`{' (operator requested ' + str(run.get('requestedMaxAgents')) + ')' if run.get('requestedMaxAgents') and run.get('requestedMaxAgents') != run.get('maxAgents') else ''}",
+        f"- Planner source: `{plan.get('source', 'unknown')}`",
         "",
+    ]
+    if plan.get("source") == "ai":
+        lines.extend([
+            "## Orchestrator Plan",
+            "",
+            f"- Recommended concurrent agents: `{plan.get('recommendedAgentCount', 1)}`",
+            f"- Planner provider: `{plan.get('provider', 'codex')}`",
+        ])
+        if plan.get("summary"):
+            lines.extend(["", str(plan.get("summary"))])
+        if plan.get("rationale"):
+            lines.extend(["", "Rationale:", "", str(plan.get("rationale"))])
+        lines.append("")
+    elif plan.get("fallbackReason"):
+        lines.extend([
+            "## Planner Fallback",
+            "",
+            f"- Reason: `{plan.get('fallbackReason')}`",
+            "- A deterministic 1-task-per-finding plan is being used so Fix Review still runs.",
+            "",
+        ])
+    lines.extend([
         "## Progress",
         "",
         f"- Queued: `{progress.get('queued', 0)}/{progress.get('total', 0)}`",
@@ -344,7 +718,7 @@ def build_fix_run_markdown(run: dict[str, Any]) -> str:
         f"- Failed: `{progress.get('failed', 0)}/{progress.get('total', 0)}`",
         f"- Cancelled: `{progress.get('cancelled', 0)}/{progress.get('total', 0)}`",
         "",
-    ]
+    ])
     if run.get("error"):
         lines.extend(["## Error", "", str(run.get("error")), ""])
     restore_command = restore_command_for_run(run)
@@ -435,7 +809,22 @@ def start_fix_run(
         run_dir(run_id).mkdir(parents=True, exist_ok=True)
         backup = review_swarm.create_source_backup(workspace, reason="fix-start", source_job_id=review_id)
         validation_commands = discover_validation_commands(workspace)
-        tasks = _build_tasks(review_job, findings)
+        # AI orchestrator picks per-task provider + agent count; falls back to
+        # a deterministic 1:1 plan if the planner is unreachable so Fix Review
+        # never blocks on a missing or rate-limited provider.
+        tasks, plan_metadata = _build_tasks(
+            review_job,
+            findings,
+            workspace=workspace,
+            use_ai_planner=os.environ.get("CLADEX_FIX_PLANNER_DISABLE", "").strip().lower() not in {"1", "true", "yes"},
+        )
+        recommended_agents = plan_metadata.get("recommendedAgentCount") or 1
+        try:
+            recommended_agents = max(1, min(MAX_FIX_AGENTS, int(recommended_agents)))
+        except (TypeError, ValueError):
+            recommended_agents = 1
+        # Honor the smaller of operator-requested max_agents and planner-recommended.
+        effective_max_agents = min(max_agent_count, recommended_agents)
         run = {
             "id": run_id,
             "reviewId": review_id,
@@ -452,7 +841,9 @@ def start_fix_run(
             "finishedAt": utc_now() if not tasks else "",
             "artifactDir": str(run_dir(run_id)),
             "error": "",
-            "maxAgents": max_agent_count,
+            "maxAgents": effective_max_agents,
+            "requestedMaxAgents": max_agent_count,
+            "plan": plan_metadata,
             "sourceBackup": backup,
             "validationCommands": validation_commands,
             "validationResults": [],

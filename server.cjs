@@ -611,7 +611,7 @@ app.get('/api/runtime-info', async (req, res) => {
     backendDir: BACKEND_DIR,
     frontendDir: FRONTEND_DIR,
     packaged: process.env.NODE_ENV === 'production' || !!process.resourcesPath,
-    appVersion: process.env.npm_package_version || '2.4.0',
+    appVersion: process.env.npm_package_version || '2.5.0',
     remoteAccessProtected: true,
   };
   if (isLoopbackRequest(req)) {

@@ -6,6 +6,7 @@ coverage/
 /AGENTS.md
 /memory/
 /.claude/
+/tmp/
 .DS_Store
 *.log
 .env*

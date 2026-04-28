@@ -8,8 +8,8 @@
 2. Install the AI CLI you plan to use:
    - `codex` for Codex relays
    - `claude` for Claude relays
-3. Open `release\CLADEX Setup 2.4.0.exe` and install it.
-4. Or run `release\CLADEX 2.4.0.exe` or `release\win-unpacked\CLADEX.exe` directly.
+3. Open `release\CLADEX Setup 2.5.0.exe` and install it.
+4. Or run `release\CLADEX 2.5.0.exe` or `release\win-unpacked\CLADEX.exe` directly.
 5. In CLADEX, choose `Add Relay`, then enter:
    - a workspace folder
    - a Discord bot token
