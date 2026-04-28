@@ -217,7 +217,29 @@ declare global {
 }
 
 const ACCESS_TOKEN_STORAGE_KEY = 'cladex-remote-access-token';
-const FILE_MODE_API_BASE = typeof window !== 'undefined' ? new URLSearchParams(window.location.search).get('apiBase') || '' : '';
+const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1', '[::1]']);
+
+function isTrustedApiOrigin(value: string): boolean {
+  if (!value) return false;
+  try {
+    const parsed = new URL(value);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      return false;
+    }
+    return LOOPBACK_HOSTS.has(parsed.hostname);
+  } catch {
+    return false;
+  }
+}
+
+function readFileModeApiBase(): string {
+  if (typeof window === 'undefined') return '';
+  const raw = new URLSearchParams(window.location.search).get('apiBase') || '';
+  if (!raw) return '';
+  return isTrustedApiOrigin(raw) ? raw : '';
+}
+
+const FILE_MODE_API_BASE = readFileModeApiBase();
 const API_BASE = typeof window !== 'undefined'
   ? (window.location.protocol !== 'file:' ? `${window.location.origin}/api` : (FILE_MODE_API_BASE || 'http://127.0.0.1:3001/api'))
   : 'http://127.0.0.1:3001/api';
@@ -329,10 +351,24 @@ function humanize(value: string): string {
     .join(' ') || 'Relay';
 }
 
+function fetchTargetIsTrusted(url: string): boolean {
+  if (typeof window === 'undefined') return true;
+  if (url.startsWith('/')) return true;
+  try {
+    const parsed = new URL(url, window.location.origin);
+    if (window.location.protocol !== 'file:' && parsed.origin === window.location.origin) {
+      return true;
+    }
+    return isTrustedApiOrigin(parsed.origin);
+  } catch {
+    return false;
+  }
+}
+
 async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers || {});
   const accessToken = getStoredAccessToken();
-  if (accessToken) {
+  if (accessToken && fetchTargetIsTrusted(url)) {
     headers.set('X-CLADEX-Access-Token', accessToken);
   }
   const response = await fetch(url, { ...init, headers });
@@ -880,9 +916,15 @@ function ReviewProjectView({
   const [title, setTitle] = useState('');
   const [provider, setProvider] = useState<ReviewProvider>('codex');
   const [agents, setAgents] = useState(8);
-  const [accountHome, setAccountHome] = useState('');
+  const [codexAccountHome, setCodexAccountHome] = useState('');
+  const [claudeAccountHome, setClaudeAccountHome] = useState('');
   const [allowSelfReview, setAllowSelfReview] = useState(false);
   const [backupBeforeReview, setBackupBeforeReview] = useState(true);
+  const accountHome = provider === 'codex' ? codexAccountHome : claudeAccountHome;
+  const setAccountHome = provider === 'codex' ? setCodexAccountHome : setClaudeAccountHome;
+  const reviewBusy = busyKey === 'review-start';
+  const backupBusy = busyKey === 'backup-create';
+  const workspaceFilled = workspace.trim().length > 0;
   const activeJobs = jobs.filter((job) => job.status === 'queued' || job.status === 'running').length;
 
   return (
@@ -923,23 +965,30 @@ function ReviewProjectView({
                   className="w-full accent-indigo-500"
                 />
               </label>
-              <BrowseField label={provider === 'codex' ? 'Codex account home' : 'Claude config folder'} value={accountHome} onChange={setAccountHome} placeholder="Optional account home for this review run" />
+              <BrowseField
+                label={provider === 'codex' ? 'Codex account home' : 'Claude config folder'}
+                value={accountHome}
+                onChange={setAccountHome}
+                placeholder="Optional account home for this review run"
+              />
               <ToggleRow checked={backupBeforeReview} onChange={setBackupBeforeReview} label="Save a source snapshot before review" />
               <ToggleRow checked={allowSelfReview} onChange={setAllowSelfReview} label="Allow explicit CLADEX self-review" />
             </FormSection>
 
             <PrimaryButton
-              label={busyKey === 'review-start' ? 'Starting...' : 'Review Project'}
-              icon={busyKey === 'review-start' ? <Loader2 size={16} className="animate-spin" /> : <SearchCheck size={16} />}
+              label={reviewBusy ? 'Starting...' : 'Review Project'}
+              icon={reviewBusy ? <Loader2 size={16} className="animate-spin" /> : <SearchCheck size={16} />}
+              busy={reviewBusy || backupBusy || !workspaceFilled}
               onClick={() => {
-                if (!workspace.trim()) return;
+                if (!workspaceFilled || reviewBusy || backupBusy) return;
                 onStart({ workspace, provider, agents, title, accountHome, allowSelfReview, backupBeforeReview });
               }}
             />
             <SecondaryButton
-              label={busyKey === 'backup-create' ? 'Saving snapshot...' : 'Save snapshot only'}
+              label={backupBusy ? 'Saving snapshot...' : 'Save snapshot only'}
+              busy={backupBusy || reviewBusy || !workspaceFilled}
               onClick={() => {
-                if (!workspace.trim()) return;
+                if (!workspaceFilled || reviewBusy || backupBusy) return;
                 onCreateBackup(workspace);
               }}
             />
@@ -1915,12 +1964,31 @@ function ActionButton({ label, icon, onClick, busy = false, tone = 'default', li
   return <button onClick={onClick} disabled={busy} className={`inline-flex items-center gap-2 rounded-2xl border px-4 py-2 text-sm font-semibold transition-colors disabled:opacity-50 ${tone === 'danger' ? 'border-red-500/25 bg-red-500/10 text-red-700 hover:bg-red-500/20 dark:text-red-200' : light ? 'border-slate-300 bg-white text-slate-800 hover:bg-slate-100' : 'border-white/10 bg-white/[0.04] text-white hover:bg-white/[0.08]'}`}>{busy ? <Loader2 size={16} className="animate-spin" /> : icon}{label}</button>;
 }
 
-function PrimaryButton({ label, icon, onClick }: { label: string; icon: React.ReactNode; onClick: () => void }) {
-  return <button onClick={onClick} className="inline-flex items-center gap-2 rounded-2xl bg-indigo-600 px-4 py-2 text-sm font-semibold text-white transition-colors hover:bg-indigo-500">{icon}{label}</button>;
+function PrimaryButton({ label, icon, onClick, busy = false }: { label: string; icon: React.ReactNode; onClick: () => void; busy?: boolean }) {
+  return (
+    <button
+      onClick={onClick}
+      disabled={busy}
+      aria-busy={busy || undefined}
+      className="inline-flex w-full items-center justify-center gap-2 rounded-2xl bg-indigo-600 px-4 py-2 text-sm font-semibold text-white transition-colors hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-60 disabled:hover:bg-indigo-600"
+    >
+      {icon}
+      {label}
+    </button>
+  );
 }
 
-function SecondaryButton({ label, onClick }: { label: string; onClick: () => void }) {
-  return <button onClick={onClick} className="rounded-2xl border border-slate-200 bg-white/70 px-4 py-2 text-sm font-semibold text-slate-700 transition-colors hover:bg-slate-100 dark:border-white/10 dark:bg-white/[0.03] dark:text-gray-300 dark:hover:bg-white/[0.08]">{label}</button>;
+function SecondaryButton({ label, onClick, busy = false }: { label: string; onClick: () => void; busy?: boolean }) {
+  return (
+    <button
+      onClick={onClick}
+      disabled={busy}
+      aria-busy={busy || undefined}
+      className="w-full rounded-2xl border border-slate-200 bg-white/70 px-4 py-2 text-sm font-semibold text-slate-700 transition-colors hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-60 disabled:hover:bg-white/70 dark:border-white/10 dark:bg-white/[0.03] dark:text-gray-300 dark:hover:bg-white/[0.08] dark:disabled:hover:bg-white/[0.03]"
+    >
+      {label}
+    </button>
+  );
 }
 
 function MiniIconButton({ label, icon, onClick, tone = 'default' }: { label: string; icon: React.ReactNode; onClick: () => void; tone?: 'default' | 'danger' }) {

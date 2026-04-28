@@ -704,7 +704,7 @@ def test_build_channel_history_scans_past_initial_raw_slice_for_relevant_message
     assert [item.content for item in history] == ["older relevant 1", "older relevant 2"]
 
 
-def test_build_channel_history_supports_unlimited_relevant_scan() -> None:
+def test_build_channel_history_supports_unlimited_relevant_scan(monkeypatch) -> None:
     bot = _load_bot_module()
     relay_user = SimpleNamespace(id=999)
     bot.client = SimpleNamespace(user=relay_user)
@@ -712,6 +712,7 @@ def test_build_channel_history_supports_unlimited_relevant_scan() -> None:
     bot.CONFIG.allowed_channel_author_ids = {7}
     bot.CONFIG.channel_history_limit = 0
     bot.CONFIG.trigger_mode = "mention_or_dm"
+    monkeypatch.setenv("RELAY_UNLIMITED_HISTORY_SCAN", "1")
 
     messages = [
         SimpleNamespace(
@@ -744,6 +745,30 @@ def test_build_channel_history_supports_unlimited_relevant_scan() -> None:
     history = asyncio.run(bot._build_channel_history_for_channel(FakeChannel()))
 
     assert [item.content for item in history] == ["relevant oldest", "relevant newest"]
+
+
+def test_build_channel_history_caps_default_unlimited_to_finite_default() -> None:
+    bot = _load_bot_module()
+    relay_user = SimpleNamespace(id=999)
+    bot.client = SimpleNamespace(user=relay_user)
+    bot.CONFIG.allowed_channel_ids = {42}
+    bot.CONFIG.allowed_channel_author_ids = {7}
+    bot.CONFIG.channel_history_limit = 0  # legacy "unlimited" without explicit opt-in
+    bot.CONFIG.trigger_mode = "mention_or_dm"
+
+    captured: dict[str, object] = {}
+
+    class FakeChannel:
+        async def history(self, limit=None, oldest_first=False):
+            captured["limit"] = limit
+            if False:
+                yield None  # pragma: no cover - generator no-op
+
+    asyncio.run(bot._build_channel_history_for_channel(FakeChannel()))
+
+    assert captured["limit"] is not None
+    assert isinstance(captured["limit"], int)
+    assert captured["limit"] > 0
 
 
 def test_auth_failure_text_detection() -> None:

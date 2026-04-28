@@ -13,7 +13,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from platformdirs import user_data_dir
 
@@ -160,6 +160,56 @@ REVIEW_EXTENSIONS = {
 }
 SECRET_FILENAME_RE = re.compile(r"(^|[._-])(env|secret|secrets|token|tokens|key|keys|credential|credentials)([._-]|$)", re.I)
 SAFE_TEMPLATE_SEGMENTS = frozenset({"example", "sample", "template", "tmpl", "dist"})
+SECRET_TOKEN_NAMES = frozenset({
+    "env",
+    "secret",
+    "secrets",
+    "token",
+    "tokens",
+    "key",
+    "keys",
+    "credential",
+    "credentials",
+})
+SECRET_PREFIX_NAMES = frozenset({
+    "access",
+    "api",
+    "auth",
+    "aws",
+    "azure",
+    "bot",
+    "client",
+    "discord",
+    "gcp",
+    "github",
+    "google",
+    "id",
+    "openai",
+    "private",
+    "public",
+    "refresh",
+    "service",
+    "session",
+    "ssh",
+    "user",
+})
+LINE_PATTERN_SKIP_EXTENSIONS = frozenset({
+    ".css",
+    ".html",
+    ".json",
+    ".md",
+    ".rst",
+    ".svg",
+    ".toml",
+    ".txt",
+    ".xml",
+    ".yaml",
+    ".yml",
+})
+LINE_PATTERN_SKIP_FILENAMES = frozenset({
+    "review_swarm.py",
+    "test_review_swarm.py",
+})
 SECRET_VALUE_RE = re.compile(
     r"\b(api[_-]?key|auth[_-]?token|client[_-]?secret|discord[_-]?token|password|private[_-]?key|secret|token)\b\s*[:=]",
     re.I,
@@ -394,6 +444,11 @@ def cancel_review(job_id: str) -> dict[str, Any]:
         job["status"] = "cancelled"
         job["finishedAt"] = utc_now()
         job["error"] = job.get("error") or "Cancelled before execution."
+        for agent in job.get("agents", []):
+            if agent.get("status") in {"queued", None, ""}:
+                agent["status"] = "cancelled"
+                agent["detail"] = agent.get("detail") or "Cancelled before launch."
+        _update_progress(job)
     save_job(job)
     return show_review(job_id)
 
@@ -624,13 +679,36 @@ def is_template_secret_filename(name: str) -> bool:
     return any(part in SAFE_TEMPLATE_SEGMENTS for part in name.lower().split("."))
 
 
+def has_secret_token_segment(name: str) -> bool:
+    """Return True only when a filename segment looks like a credential file.
+
+    The legacy `SECRET_FILENAME_RE` matches inside arbitrary hyphenated words
+    (`vite-env.d.ts` → flagged). This stricter check requires either:
+
+      * a dot-separated segment that IS a secret token name (`.env`,
+        `secrets.json`, `tokens`, etc.), or
+      * a hyphen/underscore compound where the trailing word is a secret
+        token name AND it follows a recognized credential prefix
+        (`auth-token`, `api_key`, `private-key`, `discord-token`).
+    """
+    for segment in name.lower().split("."):
+        if segment in SECRET_TOKEN_NAMES:
+            return True
+        for parts in (segment.split("-"), segment.split("_")):
+            if len(parts) < 2:
+                continue
+            if parts[-1] in SECRET_TOKEN_NAMES and parts[-2] in SECRET_PREFIX_NAMES:
+                return True
+    return False
+
+
 def secret_name_findings(workspace: Path) -> list[dict[str, Any]]:
     findings: list[dict[str, Any]] = []
     for current, dirs, filenames in os.walk(workspace):
         current_path = Path(current)
         dirs[:] = [name for name in dirs if not _should_skip_dir(current_path / name)]
         for filename in filenames:
-            if not SECRET_FILENAME_RE.search(filename):
+            if not has_secret_token_segment(filename):
                 continue
             if is_template_secret_filename(filename):
                 continue
@@ -675,6 +753,10 @@ def _finding(
 
 def scan_file(path: Path, workspace: Path) -> list[dict[str, Any]]:
     relative = path.relative_to(workspace).as_posix()
+    if path.suffix.lower() in LINE_PATTERN_SKIP_EXTENSIONS:
+        return []
+    if path.name in LINE_PATTERN_SKIP_FILENAMES:
+        return []
     try:
         lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
@@ -896,13 +978,17 @@ def sanitize_text(text: str, *, limit: int = 6000) -> str:
 
 
 def _review_artifact_ignore(_directory: str, names: list[str]) -> set[str]:
+    """Choose which entries shutil.copytree should skip during snapshot/scratch.
+
+    Skips known-cache directories, .env*/local-credential files and dirs, and
+    anything that matches the secret-filename regex. Symlinks are intentionally
+    NOT auto-skipped so the snapshot keeps them as symlinks (copytree was given
+    `symlinks=True`); restore can then preserve them instead of treating them
+    as removed-from-snapshot files.
+    """
     ignored: set[str] = set()
     for name in names:
         lower = name.lower()
-        path = Path(_directory) / name
-        if path.is_symlink():
-            ignored.add(name)
-            continue
         if (
             lower in SKIP_DIRS
             or lower.startswith(".env")
@@ -968,7 +1054,13 @@ class AIRunResult:
     error: str = ""
 
 
-def _run_codex_ai_review(job: dict[str, Any], agent: dict[str, Any], files: list[Path]) -> AIRunResult:
+def _run_codex_ai_review(
+    job: dict[str, Any],
+    agent: dict[str, Any],
+    files: list[Path],
+    *,
+    cancel_check: Callable[[], bool] | None = None,
+) -> AIRunResult:
     import relayctl
 
     output_path = job_dir(job["id"]) / f"{agent['id']}-codex.md"
@@ -989,13 +1081,19 @@ def _run_codex_ai_review(job: dict[str, Any], agent: dict[str, Any], files: list
         "-",
     ]
     env = _minimal_reviewer_env(account_home={"CODEX_HOME": str(job.get("accountHome"))} if job.get("accountHome") else {})
-    result = _run_cli(command, _ai_prompt(job, agent, files), env=env)
+    result = _run_cli(command, _ai_prompt(job, agent, files), env=env, cancel_check=cancel_check)
     if result.ok and output_path.exists():
         return AIRunResult(text=output_path.read_text(encoding="utf-8", errors="replace"), ok=True)
     return result
 
 
-def _run_claude_ai_review(job: dict[str, Any], agent: dict[str, Any], files: list[Path]) -> AIRunResult:
+def _run_claude_ai_review(
+    job: dict[str, Any],
+    agent: dict[str, Any],
+    files: list[Path],
+    *,
+    cancel_check: Callable[[], bool] | None = None,
+) -> AIRunResult:
     import claude_relay
 
     command = [
@@ -1016,7 +1114,13 @@ def _run_claude_ai_review(job: dict[str, Any], agent: dict[str, Any], files: lis
     if job.get("accountHome"):
         extra_env["CLAUDE_CONFIG_DIR"] = str(job["accountHome"])
     env = _minimal_reviewer_env(account_home=extra_env)
-    return _run_cli(command, "", env=env, cwd=Path(str(job.get("scratchWorkspace") or job["workspace"])))
+    return _run_cli(
+        command,
+        "",
+        env=env,
+        cwd=Path(str(job.get("scratchWorkspace") or job["workspace"])),
+        cancel_check=cancel_check,
+    )
 
 
 _REVIEWER_ENV_PASSTHROUGH = (
@@ -1065,35 +1169,107 @@ def _minimal_reviewer_env(*, account_home: dict[str, str] | None = None) -> dict
     return base
 
 
-def _run_cli(command: list[str], prompt: str, *, env: dict[str, str], cwd: Path | None = None) -> AIRunResult:
+def _terminate_process_tree(process: subprocess.Popen) -> None:
+    """Best-effort termination of a Popen process and any children."""
+    if process.poll() is not None:
+        return
+    try:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(process.pid)],
+                check=False,
+                capture_output=True,
+                timeout=10,
+            )
+        else:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+    except Exception:
+        try:
+            process.kill()
+        except Exception:
+            pass
+
+
+def _run_cli(
+    command: list[str],
+    prompt: str,
+    *,
+    env: dict[str, str],
+    cwd: Path | None = None,
+    cancel_check: Callable[[], bool] | None = None,
+) -> AIRunResult:
     timeout = _safe_int(os.environ.get("CLADEX_REVIEW_AGENT_TIMEOUT"), 1800)
     output_limit = max(_safe_int(os.environ.get("CLADEX_REVIEW_AGENT_OUTPUT_LIMIT"), DEFAULT_AGENT_OUTPUT_LIMIT), 1000)
-    kwargs: dict[str, Any] = {
-        "input": prompt,
-        "capture_output": True,
-        "text": True,
-        "encoding": "utf-8",
-        "errors": "replace",
+    popen_kwargs: dict[str, Any] = {
+        "stdin": subprocess.PIPE,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
         "env": env,
         "cwd": str(cwd) if cwd else None,
-        "timeout": max(timeout, 30),
-        "check": False,
     }
     if os.name == "nt":
-        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
     try:
-        result = subprocess.run(command, **kwargs)
-    except subprocess.TimeoutExpired:
-        return AIRunResult(text="", ok=False, error="AI reviewer timed out before producing a complete result.")
+        process = subprocess.Popen(command, **popen_kwargs)
     except FileNotFoundError as exc:
         return AIRunResult(text="", ok=False, error=f"AI reviewer binary not found: {exc}")
     except Exception as exc:
         return AIRunResult(text="", ok=False, error=f"AI reviewer failed to start: {exc}")
-    text = "\n".join(part for part in (result.stdout, result.stderr) if part)
+
+    if process.stdin and prompt:
+        try:
+            process.stdin.write(prompt.encode("utf-8"))
+        except Exception:
+            pass
+    try:
+        if process.stdin:
+            process.stdin.close()
+    except Exception:
+        pass
+
+    deadline = time.monotonic() + max(timeout, 30)
+    cancelled = False
+    while True:
+        try:
+            stdout, stderr = process.communicate(timeout=1.0)
+            break
+        except subprocess.TimeoutExpired:
+            if cancel_check is not None and cancel_check():
+                cancelled = True
+                _terminate_process_tree(process)
+                try:
+                    stdout, stderr = process.communicate(timeout=5)
+                except Exception:
+                    stdout, stderr = b"", b""
+                break
+            if time.monotonic() >= deadline:
+                _terminate_process_tree(process)
+                try:
+                    stdout, stderr = process.communicate(timeout=5)
+                except Exception:
+                    stdout, stderr = b"", b""
+                return AIRunResult(text="", ok=False, error="AI reviewer timed out before producing a complete result.")
+
+    if cancelled:
+        return AIRunResult(text="", ok=False, error="AI reviewer cancelled by operator.")
+
+    def _decode(value: bytes | str | None) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, bytes):
+            return value.decode("utf-8", errors="replace")
+        return value
+
+    text = "\n".join(part for part in (_decode(stdout), _decode(stderr)) if part)
     if len(text) > output_limit:
         text = text[:output_limit].rstrip() + "\n...[truncated by CLADEX]"
-    if result.returncode != 0:
-        error = text.strip() or f"AI reviewer exited with code {result.returncode}."
+    returncode = process.returncode if process.returncode is not None else 1
+    if returncode != 0:
+        error = text.strip() or f"AI reviewer exited with code {returncode}."
         return AIRunResult(text=text, ok=False, error=error)
     return AIRunResult(text=text, ok=True)
 
@@ -1164,7 +1340,36 @@ def _extract_json_payload(text: str) -> dict[str, Any] | None:
     return None
 
 
-def parse_ai_findings(text: str, *, workspace: Path, agent: dict[str, Any]) -> list[dict[str, Any]]:
+def _relativize_finding_path(raw_path: str, *, workspace: Path, scratch: Path | None) -> str:
+    relative_path = (raw_path or ".").strip() or "."
+    candidate = Path(relative_path)
+    if candidate.is_absolute():
+        bases: list[Path] = [workspace]
+        if scratch is not None and scratch != workspace:
+            bases.append(scratch)
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            return "."
+        for base in bases:
+            try:
+                return resolved.relative_to(base).as_posix()
+            except ValueError:
+                continue
+        return "."
+    parts = candidate.parts
+    if any(part == ".." for part in parts):
+        return "."
+    return candidate.as_posix()
+
+
+def parse_ai_findings(
+    text: str,
+    *,
+    workspace: Path,
+    agent: dict[str, Any],
+    scratch: Path | None = None,
+) -> list[dict[str, Any]]:
     sanitized = sanitize_text(text)
     payload = _extract_json_payload(sanitized)
     parsed = payload.get("findings") if isinstance(payload, dict) else None
@@ -1179,12 +1384,7 @@ def parse_ai_findings(text: str, *, workspace: Path, agent: dict[str, Any]) -> l
             confidence = str(raw.get("confidence") or "medium").strip().lower()
             if confidence not in {"high", "medium", "low"}:
                 confidence = "medium"
-            relative_path = str(raw.get("path") or ".").strip() or "."
-            if Path(relative_path).is_absolute():
-                try:
-                    relative_path = Path(relative_path).resolve().relative_to(workspace).as_posix()
-                except Exception:
-                    relative_path = "."
+            relative_path = _relativize_finding_path(str(raw.get("path") or "."), workspace=workspace, scratch=scratch)
             findings.append(
                 _finding(
                     severity=severity,
@@ -1227,7 +1427,94 @@ def _update_progress(job: dict[str, Any]) -> None:
     }
 
 
+def _job_run_lock_path(job_id: str) -> Path:
+    return job_dir(job_id) / "run.lock"
+
+
+def _acquire_job_run_lock(job_id: str) -> bool:
+    """Try to claim a job for execution. Returns True if we got the lock."""
+    lock_path = _job_run_lock_path(job_id)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        try:
+            existing = lock_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            existing = ""
+        try:
+            existing_pid = int(existing.split(":", 1)[0]) if existing else 0
+        except ValueError:
+            existing_pid = 0
+        if existing_pid and existing_pid != os.getpid() and not _pid_alive(existing_pid):
+            try:
+                lock_path.unlink()
+            except OSError:
+                return False
+            return _acquire_job_run_lock(job_id)
+        return False
+    try:
+        os.write(fd, f"{os.getpid()}:{utc_now()}".encode("utf-8"))
+    finally:
+        os.close(fd)
+    return True
+
+
+def _release_job_run_lock(job_id: str) -> None:
+    lock_path = _job_run_lock_path(job_id)
+    try:
+        lock_path.unlink()
+    except OSError:
+        pass
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            result = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/NH", "/FO", "CSV"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except Exception:
+            return True
+        return str(pid) in (result.stdout or "")
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
 def run_review_job(job_id: str) -> dict[str, Any]:
+    job = load_job(job_id)
+    if job.get("status") in {"completed", "failed", "cancelled"}:
+        return show_review(job_id)
+    if _cancel_requested(job_id):
+        job["status"] = "cancelled"
+        job["finishedAt"] = utc_now()
+        job["error"] = job.get("error") or "Cancelled before execution."
+        save_job(job)
+        return show_review(job_id)
+    if not _acquire_job_run_lock(job_id):
+        # Another worker already claimed this job; surface the live state.
+        return show_review(job_id)
+
+    try:
+        return _run_review_job_locked(job_id)
+    finally:
+        _release_job_run_lock(job_id)
+
+
+def _run_review_job_locked(job_id: str) -> dict[str, Any]:
     job = load_job(job_id)
     lock = threading.Lock()
     workspace = Path(job["workspace"]).expanduser().resolve()
@@ -1244,6 +1531,7 @@ def run_review_job(job_id: str) -> dict[str, Any]:
             job["scratchWorkspace"] = str(scratch)
             job["scratchError"] = ""
         except Exception as exc:
+            scratch = workspace
             job["scratchWorkspace"] = str(workspace)
             job["scratchError"] = f"Could not create scratch workspace; review lanes will use the original workspace with strict no-edit instructions: {exc}"
             if not job.get("preflightOnly"):
@@ -1257,9 +1545,11 @@ def run_review_job(job_id: str) -> dict[str, Any]:
         base_findings = secret_name_findings(workspace) + project_shape_findings(workspace, files)
         findings.extend(_agent_finding_prefix("project", str(job["provider"]), base_findings))
 
+        cancel_check = lambda: _cancel_requested(job["id"])
+
         def process_agent(index: int, shard: list[Path]) -> None:
             agent = job["agents"][index]
-            if _cancel_requested(job["id"]):
+            if cancel_check():
                 with lock:
                     agent["status"] = "cancelled"
                     agent["assignedFiles"] = len(shard)
@@ -1278,18 +1568,25 @@ def run_review_job(job_id: str) -> dict[str, Any]:
             try:
                 for path in shard:
                     agent_findings.extend(scan_file(path, workspace))
-                if not job.get("preflightOnly") and not _cancel_requested(job["id"]):
+                if not job.get("preflightOnly") and not cancel_check():
                     if str(job.get("provider")) == "codex":
-                        ai_result = _run_codex_ai_review(job, agent, shard)
+                        ai_result = _run_codex_ai_review(job, agent, shard, cancel_check=cancel_check)
                     else:
-                        ai_result = _run_claude_ai_review(job, agent, shard)
+                        ai_result = _run_claude_ai_review(job, agent, shard, cancel_check=cancel_check)
                     if not ai_result.ok:
+                        if cancel_check() or "cancelled by operator" in (ai_result.error or "").lower():
+                            with lock:
+                                agent["status"] = "cancelled"
+                                agent["detail"] = ai_result.error or "Cancelled mid-shard."
+                                _update_progress(job)
+                                save_job(job)
+                            return
                         raise RuntimeError(ai_result.error or "AI reviewer failed")
-                    agent_findings.extend(parse_ai_findings(ai_result.text, workspace=workspace, agent=agent))
+                    agent_findings.extend(parse_ai_findings(ai_result.text, workspace=workspace, agent=agent, scratch=scratch))
                 prefixed = _agent_finding_prefix(agent["id"], str(job["provider"]), agent_findings)
                 with lock:
                     findings.extend(prefixed)
-                    if _cancel_requested(job["id"]):
+                    if cancel_check():
                         agent["status"] = "cancelled"
                         agent["findings"] = len(prefixed)
                         agent["detail"] = f"Cancelled mid-shard after {len(prefixed)} preflight finding(s)."
@@ -1326,7 +1623,7 @@ def run_review_job(job_id: str) -> dict[str, Any]:
         for index, finding in enumerate(findings, start=1):
             finding["id"] = f"F{index:04d}"
         _write_json(findings_json_path(job_id), {"jobId": job_id, "findings": findings})
-        _atomic_write_text(report_markdown_path(job_id), build_report(job, findings, files))
+
         statuses = [str(item.get("status")) for item in job["agents"]]
         cancelled = sum(1 for status in statuses if status == "cancelled")
         failed = sum(1 for status in statuses if status == "failed")
@@ -1345,6 +1642,9 @@ def run_review_job(job_id: str) -> dict[str, Any]:
         job["finishedAt"] = utc_now()
         _update_progress(job)
         save_job(job)
+        # Render the report after the final job state is saved so it never
+        # captures a transient `running` snapshot.
+        _atomic_write_text(report_markdown_path(job_id), build_report(job, findings, files))
     except Exception as exc:
         job["status"] = "failed"
         job["finishedAt"] = utc_now()

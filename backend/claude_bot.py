@@ -362,7 +362,52 @@ class ClaudeRelayBot(commands.Bot):
             return self.config.allowed_channel_ids[0]
         return "gui"
 
+    async def _reclaim_orphaned_operator_requests(self) -> None:
+        """Recover .processing files that survived a previous bot crash.
+
+        Without this, requests that started before a crash never get a response
+        and the caller blocks until its client-side timeout. We rename them
+        back to .json so the regular loop picks them up, but if a request has
+        already been retried we mark it as failed so the caller can move on.
+        """
+        try:
+            stale = sorted(self._operator_requests_dir.glob("*.processing"))
+        except OSError:
+            return
+        for processing_path in stale:
+            request_path = processing_path.with_suffix(".json")
+            response_path = self._operator_responses_dir / f"{processing_path.stem}.json"
+            if response_path.exists():
+                # Caller already saw an answer; just clean up the stale lock.
+                try:
+                    processing_path.unlink()
+                except OSError:
+                    pass
+                continue
+            if request_path.exists():
+                # The original request was re-dropped. Drop the orphan so we
+                # don't double-handle the same payload.
+                try:
+                    processing_path.unlink()
+                except OSError:
+                    pass
+                continue
+            try:
+                os.replace(processing_path, request_path)
+            except OSError:
+                # Last resort: surface the orphan as a failure so the caller
+                # stops waiting on a response that will never come.
+                atomic_write_text(
+                    response_path,
+                    json.dumps({"ok": False, "error": "Operator request orphaned by relay restart."}, indent=2),
+                )
+                try:
+                    processing_path.unlink()
+                except OSError:
+                    pass
+
     async def _operator_bridge_loop(self) -> None:
+        await self._reclaim_orphaned_operator_requests()
         while True:
             try:
                 for request_path in sorted(self._operator_requests_dir.glob("*.json")):

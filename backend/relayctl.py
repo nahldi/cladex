@@ -1652,22 +1652,31 @@ def _backend_script_path(name: str) -> str:
 
 
 def _codex_login_status(workspace: Path, profile_env: dict[str, str] | None = None) -> tuple[bool, str]:
-    provider_name = "codex"
     creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
     codex_bin = resolve_codex_bin()
     if not codex_bin:
         return False, "Codex CLI is not installed."
+    if codex_bin == "codex" and not shutil.which("codex"):
+        return False, "Codex CLI is not on PATH."
     base_env = os.environ.copy()
     if profile_env:
         base_env.update(profile_env)
-    result = subprocess.run(
-        [codex_bin, "login", "status"],
-        capture_output=True,
-        text=True,
-        check=False,
-        env=relay_codex_env(workspace, base_env),
-        creationflags=creationflags,
-    )
+    try:
+        result = subprocess.run(
+            [codex_bin, "login", "status"],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=relay_codex_env(workspace, base_env),
+            creationflags=creationflags,
+            timeout=15,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "Codex login status check timed out after 15s."
+    except FileNotFoundError:
+        return False, "Codex CLI executable could not be launched."
+    except OSError as exc:
+        return False, f"Codex login status failed to launch: {exc}"
     output = ((result.stdout or "") + (result.stderr or "")).strip()
     return result.returncode == 0 and "logged in" in output.lower(), output
 

@@ -231,6 +231,57 @@ def test_cancel_review_during_run_stops_subsequent_lanes(tmp_path: Path, monkeyp
     assert finished["progress"]["cancelled"] == 4
 
 
+def test_relativize_finding_path_falls_back_to_scratch(tmp_path: Path) -> None:
+    workspace = tmp_path / "src-original"
+    scratch = tmp_path / "src-scratch"
+    workspace.mkdir()
+    scratch.mkdir()
+    (workspace / "app.py").write_text("ok", encoding="utf-8")
+    (scratch / "app.py").write_text("ok", encoding="utf-8")
+
+    assert review_swarm._relativize_finding_path(
+        str((workspace / "app.py").resolve()), workspace=workspace, scratch=scratch
+    ) == "app.py"
+    assert review_swarm._relativize_finding_path(
+        str((scratch / "app.py").resolve()), workspace=workspace, scratch=scratch
+    ) == "app.py"
+    assert review_swarm._relativize_finding_path("../escape.py", workspace=workspace, scratch=scratch) == "."
+    assert review_swarm._relativize_finding_path("src/app.py", workspace=workspace, scratch=scratch) == "src/app.py"
+
+
+def test_review_report_is_written_after_final_status(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    project = tmp_path / "target"
+    project.mkdir()
+    (project / "app.py").write_text("eval(value)\n# TODO: real comment\n", encoding="utf-8")
+    monkeypatch.setattr(review_swarm, "REVIEW_DATA_ROOT", tmp_path / "reviews")
+
+    job = review_swarm.start_review(project, provider="codex", agents=1, preflight_only=True, launch=False)
+    finished = review_swarm.run_review_job(job["id"])
+
+    report = Path(finished["reportPath"]).read_text(encoding="utf-8")
+    assert finished["status"] == "completed"
+    assert "Status: `completed`" in report
+    assert "Status: `running`" not in report
+    assert "Finished: `not finished`" not in report
+
+
+def test_run_review_job_short_circuits_when_already_finished(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    project = tmp_path / "target"
+    project.mkdir()
+    (project / "app.py").write_text("print('ok')\n", encoding="utf-8")
+    monkeypatch.setattr(review_swarm, "REVIEW_DATA_ROOT", tmp_path / "reviews")
+
+    job = review_swarm.start_review(project, provider="codex", agents=1, preflight_only=True, launch=False)
+    first = review_swarm.run_review_job(job["id"])
+    assert first["status"] == "completed"
+
+    # Second call must not re-run the lanes; it should return the existing
+    # public job state without flipping status back to `running`.
+    second = review_swarm.run_review_job(job["id"])
+    assert second["status"] == "completed"
+    assert second["progress"] == first["progress"]
+
+
 def test_completed_review_cancel_is_noop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     project = tmp_path / "target"
     project.mkdir()
@@ -258,6 +309,45 @@ def test_show_review_includes_severity_counts(tmp_path: Path, monkeypatch: pytes
     assert counts is not None
     assert counts["high"] >= 1
     assert counts["low"] >= 1
+
+
+def test_secret_name_findings_does_not_match_hyphenated_env_words(tmp_path: Path) -> None:
+    project = tmp_path / "target"
+    project.mkdir()
+    (project / "src").mkdir()
+    (project / "src" / "vite-env.d.ts").write_text('/// <reference types="vite/client" />\n', encoding="utf-8")
+    (project / ".env").write_text("REAL=1\n", encoding="utf-8")
+    (project / "auth-token.yaml").write_text("token: abc\n", encoding="utf-8")
+
+    findings = review_swarm.secret_name_findings(project)
+    flagged = sorted(item["path"] for item in findings)
+
+    assert ".env" in flagged
+    assert "auth-token.yaml" in flagged
+    assert "src/vite-env.d.ts" not in flagged
+    assert review_swarm.has_secret_token_segment("vite-env.d.ts") is False
+    assert review_swarm.has_secret_token_segment(".env") is True
+    assert review_swarm.has_secret_token_segment("auth-token.yaml") is True
+
+
+def test_scan_file_skips_docs_config_and_rule_definition_files(tmp_path: Path) -> None:
+    project = tmp_path / "target"
+    project.mkdir()
+    pretend_review = project / "review_swarm.py"
+    pretend_review.write_text("# eval(\"shell=true\")\n# password = 'x'\n", encoding="utf-8")
+    handoff = project / "HANDOFF.md"
+    handoff.write_text("`0.0.0.0` example listen line\neval(value)\npassword = 'x'\n", encoding="utf-8")
+    test_fixture = project / "test_review_swarm.py"
+    test_fixture.write_text("# TODO: real comment marker\n", encoding="utf-8")
+    real_code = project / "app.py"
+    real_code.write_text("# TODO: real comment\nshell=True\n", encoding="utf-8")
+
+    assert review_swarm.scan_file(pretend_review, project) == []
+    assert review_swarm.scan_file(handoff, project) == []
+    assert review_swarm.scan_file(test_fixture, project) == []
+    real_findings = review_swarm.scan_file(real_code, project)
+    assert any(item["category"] == "maintenance" for item in real_findings)
+    assert any(item["category"] == "command-execution" for item in real_findings)
 
 
 def test_review_artifact_ignore_skips_local_credential_files_and_dirs(tmp_path: Path) -> None:
@@ -291,7 +381,7 @@ def test_ai_reviewer_failure_marks_agent_failed_not_completed(tmp_path: Path, mo
     (project / "app.py").write_text("print('ok')\n", encoding="utf-8")
     monkeypatch.setattr(review_swarm, "REVIEW_DATA_ROOT", tmp_path / "reviews")
 
-    def failing_ai(_job: dict, _agent: dict, _files):
+    def failing_ai(_job: dict, _agent: dict, _files, **_kwargs):
         return review_swarm.AIRunResult(text="", ok=False, error="AI reviewer binary not found: codex")
 
     monkeypatch.setattr(review_swarm, "_run_codex_ai_review", failing_ai)
@@ -343,7 +433,7 @@ def test_ai_review_defaults_to_bounded_parallelism(tmp_path: Path, monkeypatch: 
     running = 0
     max_running = 0
 
-    def fake_ai_review(_job: dict, _agent: dict, _files: list[Path]) -> review_swarm.AIRunResult:
+    def fake_ai_review(_job: dict, _agent: dict, _files: list[Path], **_kwargs) -> review_swarm.AIRunResult:
         nonlocal running, max_running
         with lock:
             running += 1

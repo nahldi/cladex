@@ -2,6 +2,18 @@
 
 CLADEX stays focused on Claude Code and OpenAI Codex relays. The current production path is to keep clone-to-run setup clean, keep model/account behavior provider-led, and add scaling only after compatibility and load tests prove the lower layers.
 
+## Completed For 2.2.3
+
+- Frontend security: file-mode `?apiBase=` is now validated against an http(s) loopback allowlist before use, and `X-CLADEX-Access-Token` is only attached to same-origin or loopback fetches.
+- Frontend UX: Review Project tracks Codex/Claude account-home values separately and submits only the one matching the active provider; Review and "Save snapshot only" buttons disable while in flight or when the workspace is empty.
+- Review correctness: report markdown is rendered after the final job state is saved (no more `Status: running` on completed reports), AI-finding paths normalize against both the original workspace and the scratch copy, traversal segments collapse to `.`, and `_review_artifact_ignore` no longer drops symlinks unconditionally so backups round-trip correctly.
+- Review concurrency: `run_review_job` now takes a per-job exclusive run lock (PID-aware reclaim of stale locks), short-circuits if the job is already finished, and runs AI lanes through `Popen` with a 1-second cancel-poll loop so cancellation terminates the in-flight subprocess instead of waiting on the timeout.
+- Review noise: smarter `has_secret_token_segment` only flags credential-prefix + token compounds (`auth-token`, `api-key`) so framework files like `vite-env.d.ts` stop tripping the scanner; line-pattern rules skip docs/config (`.md`, `.toml`, `.yaml`, …) and the rule-definition files (`review_swarm.py`, `test_review_swarm.py`).
+- Backend correctness: `install_plugin._ensure_runtime` always passes `-c constraints.txt` when the file is present so end-user runtime installs match CI; `_codex_login_status` runs with a 15s timeout and surfaces structured errors instead of hanging; Claude profile readiness now requires a non-error `status.json` rather than a bare PID; channel-history bootstrap caps the raw scan at `max(limit*10, 200)` and treats `channel_history_limit=0` as the default 20 unless `RELAY_UNLIMITED_HISTORY_SCAN=1` is explicitly set.
+- API contract: `server.cjs` profile-create no longer forwards the unsupported `--startup-channel-text` flag and no longer mis-maps `startupDmUserIds` to the DM allowlist. Operator/user IDs deduplicate before they reach `relayctl register`.
+- Crash-recovery: `claude_bot` reclaims orphaned `.processing` operator requests at startup so callers never wait for a response a crashed worker will never deliver. `relay_common.replace_directory` rolls back to its backup if the temp swap fails so plugin/asset installs cannot leave the destination missing.
+- CI hardening: `.github/workflows/ci.yml` sets a top-level `permissions: contents: read`. Vite dev server proxies `/api` to the backend port so `npm run dev:stack` works without a `VITE_API_BASE` override.
+
 ## Completed For 2.2.2
 
 - Fixed `claude-discord run` launching the Codex bot (`backend/bot.py`) instead of the Claude bot (`backend/claude_bot.py`). The packaged manager already routed correctly; only the documented direct-CLI path was broken.

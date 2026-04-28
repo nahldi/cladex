@@ -199,9 +199,12 @@ def _claude_profile_runtime_state(profile: dict[str, Any]) -> dict[str, Any]:
             state = "idle"
         elif raw_status:
             state = "idle"
-        ready = running and raw_status not in {"error", "stopped", ""}
+        ready = running and raw_status not in {"error", "stopped", "", "starting"}
     else:
-        ready = running
+        # No status.json yet: the worker has been spawned but has not reached
+        # its ready signal (Discord login + CLI handshake). Treat as
+        # not-ready so polling consumers don't claim the profile is up.
+        ready = False
     return {
         "running": running,
         "ready": ready,

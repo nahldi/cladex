@@ -485,7 +485,7 @@ app.get('/api/runtime-info', async (req, res) => {
     backendDir: BACKEND_DIR,
     frontendDir: FRONTEND_DIR,
     packaged: process.env.NODE_ENV === 'production' || !!process.resourcesPath,
-    appVersion: process.env.npm_package_version || '2.2.2',
+    appVersion: process.env.npm_package_version || '2.2.3',
     remoteAccessProtected: true,
   };
   if (isLoopbackRequest(req)) {
@@ -765,6 +765,15 @@ app.post('/api/profiles', async (req, res) => {
   const absoluteWorkspace = path.resolve(workspace);
   let result;
   if (relayType === 'codex') {
+    if (startupChannelText) {
+      console.warn('CLADEX: ignoring startupChannelText for Codex profile create — relayctl register has no --startup-channel-text yet.');
+    }
+    if (startupDmUserIds) {
+      console.warn('CLADEX: ignoring startupDmUserIds for Codex profile create — relayctl register has no startup-DM recipient flag yet.');
+    }
+    const operatorAndUserIds = [operatorIds, allowedUserIds]
+      .flatMap((value) => value.split(',').map((id) => id.trim()).filter(Boolean));
+    const dedupedUserIds = Array.from(new Set(operatorAndUserIds));
     result = await runPython([
       'relayctl.py',
       'register',
@@ -783,11 +792,9 @@ app.post('/api/profiles', async (req, res) => {
       ...(codexHome ? ['--codex-home', codexHome] : []),
       ...(channelHistoryLimit ? ['--channel-history-limit', channelHistoryLimit] : []),
       ...(startupDmText ? ['--startup-dm-text', startupDmText] : []),
-      ...(startupChannelText ? ['--startup-channel-text', startupChannelText] : []),
-      ...(startupDmUserIds ? startupDmUserIds.split(',').map((id) => id.trim()).filter(Boolean).flatMap((id) => ['--allowed-user-id', id]) : []),
       ...(allowedChannelAuthorIds ? allowedChannelAuthorIds.split(',').map((id) => id.trim()).filter(Boolean).flatMap((id) => ['--allowed-channel-author-id', id]) : []),
       ...(channelNoMentionAuthorIds ? channelNoMentionAuthorIds.split(',').map((id) => id.trim()).filter(Boolean).flatMap((id) => ['--channel-no-mention-author-id', id]) : []),
-      ...[operatorIds, allowedUserIds].flatMap((value) => value.split(',').map((id) => id.trim()).filter(Boolean)).flatMap((id) => ['--allowed-user-id', id]),
+      ...dedupedUserIds.flatMap((id) => ['--allowed-user-id', id]),
       ...(allowedBotIds ? ['--allowed-bot-ids', allowedBotIds] : []),
     ]);
   } else {

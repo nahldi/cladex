@@ -282,6 +282,19 @@ def _install_source() -> str:
     return f"{PACKAGE_NAME}=={version}"
 
 
+def _runtime_constraints_path(install_target: str) -> Path | None:
+    candidate_dirs: list[Path] = []
+    target_path = Path(install_target)
+    if target_path.exists() and target_path.is_dir():
+        candidate_dirs.append(target_path)
+    candidate_dirs.append(REPO_ROOT)
+    for directory in candidate_dirs:
+        candidate = (directory / "constraints.txt").resolve()
+        if candidate.exists():
+            return candidate
+    return None
+
+
 def _ensure_runtime(source: str | None = None) -> Path:
     python_path = runtime_python_path()
     if not python_path.exists():
@@ -304,6 +317,9 @@ def _ensure_runtime(source: str | None = None) -> Path:
     ]
     if force_reinstall:
         command.append("--force-reinstall")
+    constraints_path = _runtime_constraints_path(install_target)
+    if constraints_path is not None:
+        command.extend(["-c", str(constraints_path)])
     command.append(install_target)
     cleanup_runtime_site_packages()
 

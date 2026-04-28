@@ -171,9 +171,26 @@ def replace_directory(source: Path, destination: Path) -> None:
         temp_destination,
         ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
     )
+    moved_to_backup = False
     if destination.exists():
         os.replace(destination, backup_destination)
-    os.replace(temp_destination, destination)
+        moved_to_backup = True
+    try:
+        os.replace(temp_destination, destination)
+    except OSError:
+        # Restore the backup if the swap failed so we never leave the
+        # destination missing.
+        if moved_to_backup and backup_destination.exists() and not destination.exists():
+            try:
+                os.replace(backup_destination, destination)
+            except OSError:
+                pass
+        if temp_destination.exists():
+            try:
+                shutil.rmtree(temp_destination)
+            except OSError:
+                pass
+        raise
     if backup_destination.exists():
         shutil.rmtree(backup_destination)
 

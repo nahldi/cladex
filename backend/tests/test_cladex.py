@@ -144,9 +144,29 @@ def test_claude_running_state_uses_relay_pid(tmp_path: Path, monkeypatch) -> Non
 
     state = cladex._claude_profile_runtime_state({"state_namespace": "ns-one"})
 
+    # PID alone now means "process spawned but not yet ready"; readiness is
+    # confirmed once claude_bot writes its first status.json.
+    assert state["running"] is True
+    assert state["ready"] is False
+    assert state["pid"] == 1234
+
+
+def test_claude_ready_requires_status_json_after_pid_appears(tmp_path: Path, monkeypatch) -> None:
+    data_root = tmp_path / "data"
+    state_dir = data_root / "state" / "ns-ready"
+    state_dir.mkdir(parents=True)
+    (state_dir / "relay.pid").write_text("9999", encoding="utf-8")
+    (state_dir / "status.json").write_text(
+        json.dumps({"status": "ready", "detail": "Claude ready for next turn"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cladex, "CLAUDE_DATA_ROOT", data_root)
+    monkeypatch.setattr(cladex.psutil, "pid_exists", lambda pid: pid == 9999)
+
+    state = cladex._claude_profile_runtime_state({"state_namespace": "ns-ready"})
+
     assert state["running"] is True
     assert state["ready"] is True
-    assert state["pid"] == 1234
 
 
 def test_claude_runtime_state_reads_status_json(tmp_path: Path, monkeypatch) -> None:

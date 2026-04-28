@@ -2028,8 +2028,22 @@ def _message_belongs_in_channel_bootstrap_history(
 async def _collect_relevant_channel_history(channel: discord.abc.Messageable) -> list[discord.Message]:
     history_messages: list[discord.Message] = []
     relevant_limit = CONFIG.channel_history_limit
-    raw_limit = None if relevant_limit <= 0 else None
+    if relevant_limit <= 0:
+        # Unlimited bootstrap is opt-in only; require explicit env override so
+        # the relay never silently scans the entire channel history.
+        unlimited_opt_in = str(os.environ.get("RELAY_UNLIMITED_HISTORY_SCAN") or "").strip().lower() in {"1", "true", "yes", "on"}
+        if not unlimited_opt_in:
+            relevant_limit = 20
+    if relevant_limit <= 0:
+        raw_limit = None
+    else:
+        # Cap the raw scan at a finite multiple of the relevant target so a
+        # busy channel doesn't drain the Discord rate limit looking for
+        # `channel_history_limit` matching messages.
+        raw_limit = max(relevant_limit * 10, 200)
+    scanned = 0
     async for item in channel.history(limit=raw_limit, oldest_first=False):
+        scanned += 1
         if _message_belongs_in_channel_bootstrap_history(item, client.user):
             history_messages.append(item)
             if relevant_limit > 0 and len(history_messages) >= relevant_limit:
