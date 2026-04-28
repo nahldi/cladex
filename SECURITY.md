@@ -74,9 +74,10 @@ CLADEX relays can read and act within the configured workspace through the insta
 - Review jobs read project source and write artifacts only under the local CLADEX data directory.
 - Review jobs can consume the user's local Codex or Claude subscription/account. Use the optional account-home field when a review should use a specific `CODEX_HOME` or `CLAUDE_CONFIG_DIR`.
 - Review lanes are queued behind a bounded default worker pool. Raising `CLADEX_REVIEW_MAX_PARALLEL` should be treated as a resource and account-rate-limit decision.
-- Codex and Claude review lanes run against a scratch workspace with no approval escalation. Claude write/edit tools are disabled; Bash is available only for safe validation commands inside the scratch workspace.
-- Review jobs do not apply fixes. The fix-plan action writes a plan artifact only.
-- CLADEX self-review is blocked by default and requires an explicit opt-in. A source backup is created before self-review starts.
+- Codex and Claude review lanes run against isolated scratch workspaces with no approval escalation. Claude review lanes allow only read/search/list tools; Bash and write/edit tools are disabled for review.
+- Review jobs do not apply fixes. The fix-plan action writes a plan artifact only. The separate Fix Review action creates a mandatory source backup before launching any write-capable fix worker. Active Fix Review starts are idempotent per review so duplicate clicks do not launch duplicate write workers.
+- Fix Review serializes write-capable phases in the shared workspace and rejects a successful task if it touched files outside the task assignment.
+- CLADEX self-review is blocked by default and requires an explicit opt-in. A source backup is created before self-review starts, and Fix Review for the CLADEX repo requires both that completed self-review flag and a separate self-fix approval.
 - Backup restore is CLI-only and requires `--confirm <backup-id>` to avoid accidental source overwrite through the remote UI.
 - Review and backup ids are pattern-validated before filesystem access; restore preserves ignored dependency/cache folders and secret-like local files.
 - Review reports intentionally avoid storing detected credential values. If a finding says a secret-like value exists, rotate the value before publishing.

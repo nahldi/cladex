@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+import claude_relay
 import review_swarm
 
 
@@ -100,6 +101,119 @@ def test_dedup_findings_merges_duplicate_lanes_and_keeps_highest_severity() -> N
     assert sorted(merged["seenByAgents"]) == ["agent-01", "agent-02"]
     assert by_key[("src/app.py", 13, "Marker")]["seenByAgents"] == ["agent-03"]
     assert by_key[("src/app.py", 0, "Hit")]["severity"] == "high"
+    for index, finding in enumerate(deduped, start=1):
+        finding["id"] = f"F{index:04d}"
+    report = review_swarm.build_report(
+        {
+            "id": "review-20260428-120000-abcdef12",
+            "title": "test",
+            "workspace": ".",
+            "provider": "codex",
+            "strategy": review_swarm.REVIEW_STRATEGY,
+            "agentCount": 3,
+            "status": "completed",
+            "createdAt": "",
+            "finishedAt": "",
+            "progress": {},
+            "agents": [],
+        },
+        deduped,
+        [],
+    )
+    assert "Seen by agents: `agent-01, agent-02`" in report
+
+
+def test_review_swarm_writes_coordination_artifact_with_lane_sections(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = tmp_path / "target"
+    project.mkdir()
+    (project / ".gitignore").write_text("node_modules/\n", encoding="utf-8")
+    (project / "app.py").write_text("print('ok')\n", encoding="utf-8")
+    (project / "ui.tsx").write_text("export const ok = true;\n", encoding="utf-8")
+    monkeypatch.setattr(review_swarm, "REVIEW_DATA_ROOT", tmp_path / "reviews")
+
+    job = review_swarm.start_review(project, provider="codex", agents=2, preflight_only=True, launch=False)
+    finished = review_swarm.run_review_job(job["id"])
+
+    coordination_path = Path(finished["coordinationPath"])
+    assert coordination_path.exists()
+    coordination = coordination_path.read_text(encoding="utf-8")
+    assert "## Project Briefing" in coordination
+    assert "## Lane Assignments" in coordination
+    assert "## Agent agent-01 - security" in coordination
+    assert "## Agent agent-02 - runtime" in coordination
+    assert "Treat the target as an unknown project" in coordination
+    assert "`app.py`" in coordination
+
+
+def test_ai_prompt_points_lane_at_coordination_section_and_unknown_project(tmp_path: Path) -> None:
+    project = tmp_path / "target"
+    project.mkdir()
+    file_path = project / "app.py"
+    file_path.write_text("print('ok')\n", encoding="utf-8")
+    job = {
+        "id": "review-20260428-120000-abcdef12",
+        "workspace": str(project),
+        "provider": "codex",
+        "strategy": review_swarm.REVIEW_STRATEGY,
+    }
+    agent = {
+        "id": "agent-01",
+        "focus": "security",
+        "focusPrompt": "Threat model the project.",
+        "scratchWorkspace": str(tmp_path / "scratch" / "agent-01" / "workspace"),
+    }
+
+    prompt = review_swarm._ai_prompt(job, agent, [file_path], scratch=Path(agent["scratchWorkspace"]))
+
+    assert "Treat the target as an unknown project" in prompt
+    assert "Shared coordination artifact:" in prompt
+    assert "Coordination section to use: ## Agent agent-01 - security" in prompt
+    assert "avoid repeating other lanes" in prompt
+
+
+def test_claude_ai_review_sends_large_prompt_through_stdin(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    project = tmp_path / "target"
+    scratch = tmp_path / "scratch" / "agent-01" / "workspace"
+    project.mkdir()
+    scratch.mkdir(parents=True)
+    file_path = project / "app.py"
+    file_path.write_text("print('ok')\n", encoding="utf-8")
+    job = {
+        "id": "review-20260428-120000-abcdef12",
+        "workspace": str(project),
+        "provider": "claude",
+        "strategy": review_swarm.REVIEW_STRATEGY,
+    }
+    agent = {
+        "id": "agent-01",
+        "focus": "security",
+        "focusPrompt": "Threat model the project." * 400,
+        "scratchWorkspace": str(scratch),
+    }
+    captured: dict[str, object] = {}
+
+    def fake_run_cli(command: list[str], prompt: str, **kwargs: object) -> review_swarm.AIRunResult:
+        captured["command"] = command
+        captured["prompt"] = prompt
+        captured["cwd"] = kwargs.get("cwd")
+        return review_swarm.AIRunResult(text='{"findings":[]}', ok=True)
+
+    monkeypatch.setattr(claude_relay, "claude_code_bin", lambda: "claude")
+    monkeypatch.setattr(review_swarm, "_run_cli", fake_run_cli)
+
+    result = review_swarm._run_claude_ai_review(job, agent, [file_path])
+
+    command = captured["command"]
+    prompt = str(captured["prompt"])
+    assert result.ok is True
+    assert isinstance(command, list)
+    assert all("Threat model the project." * 100 not in str(part) for part in command)
+    assert command[-1] == "Read the review instructions from stdin and return only the requested JSON findings."
+    assert "Threat model the project." in prompt
+    assert captured["cwd"] == scratch
 
 
 def test_review_swarm_rejects_invalid_agent_counts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -199,6 +313,31 @@ def test_backup_restore_requires_confirmation_and_preserves_skip_dirs(tmp_path: 
     assert (src / "kept.py").read_text(encoding="utf-8") == "print('kept')\n"
     assert (project / ".env").read_text(encoding="utf-8") == "LOCAL_SECRET=keep\n"
     assert (node_modules / "cache.txt").read_text(encoding="utf-8") == "keep\n"
+
+
+def test_source_backup_includes_template_configs_but_skips_real_local_secrets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = tmp_path / "target"
+    project.mkdir()
+    src = project / "src"
+    src.mkdir()
+    (project / ".env").write_text("REAL_SECRET=skip\n", encoding="utf-8")
+    (project / ".env.local").write_text("REAL_SECRET=skip\n", encoding="utf-8")
+    (project / ".env.example").write_text("PLACEHOLDER=include\n", encoding="utf-8")
+    (project / "auth-token.yaml").write_text("token: skip\n", encoding="utf-8")
+    (src / "vite-env.d.ts").write_text('/// <reference types="vite/client" />\n', encoding="utf-8")
+    monkeypatch.setattr(review_swarm, "BACKUP_DATA_ROOT", tmp_path / "backups")
+
+    backup = review_swarm.create_source_backup(project, reason="test")
+    snapshot = Path(backup["snapshot"])
+
+    assert not (snapshot / ".env").exists()
+    assert not (snapshot / ".env.local").exists()
+    assert not (snapshot / "auth-token.yaml").exists()
+    assert (snapshot / ".env.example").read_text(encoding="utf-8") == "PLACEHOLDER=include\n"
+    assert (snapshot / "src" / "vite-env.d.ts").exists()
 
 
 def test_cancel_review_marks_queued_job_cancelled_immediately(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -375,6 +514,26 @@ def test_review_artifact_ignore_skips_local_credential_files_and_dirs(tmp_path: 
     assert "app.py" not in ignored
 
 
+def test_scratch_workspace_skips_symlinks_to_keep_ai_inside_copy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    project = tmp_path / "target"
+    project.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside\n", encoding="utf-8")
+    link = project / "outside-link.txt"
+    try:
+        link.symlink_to(outside)
+    except OSError:
+        pytest.skip("symlink creation is unavailable in this environment")
+    (project / "app.py").write_text("print('ok')\n", encoding="utf-8")
+    monkeypatch.setattr(review_swarm, "REVIEW_DATA_ROOT", tmp_path / "reviews")
+
+    job = review_swarm.start_review(project, provider="codex", agents=1, preflight_only=True, launch=False)
+    scratch = review_swarm.prepare_scratch_workspace(job)
+
+    assert not (scratch / "outside-link.txt").exists()
+    assert (scratch / "app.py").exists()
+
+
 def test_ai_reviewer_failure_marks_agent_failed_not_completed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     project = tmp_path / "target"
     project.mkdir()
@@ -392,6 +551,142 @@ def test_ai_reviewer_failure_marks_agent_failed_not_completed(tmp_path: Path, mo
     assert finished["status"] == "failed"
     assert all(agent["status"] == "failed" for agent in finished["agents"])
     assert all("AI reviewer binary not found" in agent["detail"] for agent in finished["agents"])
+
+
+def test_partial_ai_lane_failure_completes_with_warnings_and_keeps_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = tmp_path / "target"
+    project.mkdir()
+    (project / ".gitignore").write_text("node_modules/\n", encoding="utf-8")
+    for index in range(3):
+        (project / f"app_{index}.py").write_text(f"print({index})\n", encoding="utf-8")
+    monkeypatch.setattr(review_swarm, "REVIEW_DATA_ROOT", tmp_path / "reviews")
+    monkeypatch.setenv("CLADEX_REVIEW_MAX_PARALLEL", "1")
+
+    def mixed_ai(_job: dict, agent: dict, _files, **_kwargs):
+        if agent["id"] == "agent-02":
+            return review_swarm.AIRunResult(text="", ok=False, error="agent-02 validation failed")
+        return review_swarm.AIRunResult(
+            text=json.dumps(
+                {
+                    "summary": "ok",
+                    "findings": [
+                        {
+                            "severity": "low",
+                            "category": "ai-test",
+                            "path": "app_0.py",
+                            "line": 1,
+                            "title": "Lane finding",
+                            "detail": "Concrete partial finding.",
+                            "recommendation": "Keep report usable.",
+                            "confidence": "high",
+                        }
+                    ],
+                }
+            ),
+            ok=True,
+        )
+
+    monkeypatch.setattr(review_swarm, "_run_codex_ai_review", mixed_ai)
+
+    job = review_swarm.start_review(
+        project,
+        provider="codex",
+        agents=3,
+        preflight_only=False,
+        launch=False,
+        backup_before_review=False,
+    )
+    finished = review_swarm.run_review_job(job["id"])
+    planned = review_swarm.create_fix_plan(finished["id"])
+
+    assert finished["status"] == "completed_with_warnings"
+    assert "1 of 3 reviewer lane(s) failed" in finished["error"]
+    assert [agent["status"] for agent in finished["agents"]].count("failed") == 1
+    assert Path(finished["reportPath"]).exists()
+    assert planned["fixPlanPath"]
+
+
+def test_ai_lanes_use_distinct_scratch_workspaces(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    project = tmp_path / "target"
+    project.mkdir()
+    (project / ".gitignore").write_text("node_modules/\n", encoding="utf-8")
+    (project / "app_0.py").write_text("print(0)\n", encoding="utf-8")
+    (project / "app_1.py").write_text("print(1)\n", encoding="utf-8")
+    monkeypatch.setattr(review_swarm, "REVIEW_DATA_ROOT", tmp_path / "reviews")
+    monkeypatch.setenv("CLADEX_REVIEW_MAX_PARALLEL", "1")
+    seen: dict[str, Path] = {}
+
+    def checking_ai(job: dict, agent: dict, _files, **_kwargs):
+        scratch = Path(agent["scratchWorkspace"])
+        seen[agent["id"]] = scratch
+        assert scratch.exists()
+        assert scratch != Path(job["scratchWorkspace"])
+        assert scratch.parent.name == agent["id"]
+        assert (scratch / "app_0.py").exists()
+        return review_swarm.AIRunResult(text='{"summary":"ok","findings":[]}', ok=True)
+
+    monkeypatch.setattr(review_swarm, "_run_codex_ai_review", checking_ai)
+
+    job = review_swarm.start_review(
+        project,
+        provider="codex",
+        agents=2,
+        preflight_only=False,
+        launch=False,
+        backup_before_review=False,
+    )
+    finished = review_swarm.run_review_job(job["id"])
+
+    assert finished["status"] == "completed"
+    assert sorted(seen) == ["agent-01", "agent-02"]
+    assert seen["agent-01"] != seen["agent-02"]
+
+
+def test_ai_findings_relativize_against_lane_scratch_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    project = tmp_path / "target"
+    project.mkdir()
+    (project / "app.py").write_text("print('ok')\n", encoding="utf-8")
+    monkeypatch.setattr(review_swarm, "REVIEW_DATA_ROOT", tmp_path / "reviews")
+
+    def fake_ai_review(_job: dict, agent: dict, _files: list[Path], **_kwargs) -> review_swarm.AIRunResult:
+        absolute = Path(agent["scratchWorkspace"]) / "app.py"
+        return review_swarm.AIRunResult(
+            text=json.dumps(
+                {
+                    "findings": [
+                        {
+                            "severity": "medium",
+                            "category": "lane-path",
+                            "path": str(absolute),
+                            "line": 1,
+                            "title": "Absolute lane path",
+                            "detail": "Absolute path from lane scratch.",
+                            "recommendation": "Normalize against the lane scratch.",
+                            "confidence": "high",
+                        }
+                    ]
+                }
+            ),
+            ok=True,
+        )
+
+    monkeypatch.setattr(review_swarm, "_run_codex_ai_review", fake_ai_review)
+
+    job = review_swarm.start_review(
+        project,
+        provider="codex",
+        agents=1,
+        preflight_only=False,
+        launch=False,
+        backup_before_review=False,
+    )
+    finished = review_swarm.run_review_job(job["id"])
+    findings = json.loads(Path(finished["findingsPath"]).read_text(encoding="utf-8"))["findings"]
+
+    assert any(item["category"] == "lane-path" and item["path"] == "app.py" for item in findings)
 
 
 def test_minimal_reviewer_env_strips_inherited_secrets(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -450,3 +745,6 @@ def test_ai_review_defaults_to_bounded_parallelism(tmp_path: Path, monkeypatch: 
 
     assert finished["status"] == "completed"
     assert max_running <= review_swarm.DEFAULT_AI_MAX_PARALLEL
+    assert finished["maxParallel"] == review_swarm.DEFAULT_AI_MAX_PARALLEL
+    assert finished["progress"]["maxParallel"] == review_swarm.DEFAULT_AI_MAX_PARALLEL
+    assert any("12 lanes requested" in warning for warning in finished["limitWarnings"])

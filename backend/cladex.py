@@ -20,6 +20,7 @@ from agent_guardrails import assert_workspace_allowed, workspace_protection_viol
 import claude_relay
 import relayctl
 import review_swarm
+import fix_orchestrator
 
 
 CLAUDE_APP_NAME = "discord-claude-relay"
@@ -1216,6 +1217,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             "python -m pip install -e \"backend[dev]\" -c backend/constraints.txt",
             "python backend/relayctl.py privacy-audit --tracked-only .",
             "python -m pytest --tb=short -q",
+            "python backend/cladex.py doctor --json",
             "npm run electron:build",
         ],
     }
@@ -1492,6 +1494,95 @@ def cmd_review_cancel(args: argparse.Namespace) -> int:
         print(json.dumps(record))
     else:
         print(f"Cancellation requested for review `{record.get('id')}` (status: {record.get('status')}).")
+    return 0
+
+
+def cmd_fix_list(args: argparse.Namespace) -> int:
+    records = fix_orchestrator.list_fix_runs()
+    if getattr(args, "json", False):
+        print(json.dumps(records))
+        return 0
+    if not records:
+        print("No fix runs.")
+        return 0
+    for record in records:
+        progress = record.get("progress", {})
+        print(
+            f"{record.get('id')}\t{record.get('status')}\t"
+            f"running {progress.get('running', 0)}/{progress.get('total', 0)}\t"
+            f"done {progress.get('done', 0)}/{progress.get('total', 0)}\t"
+            f"{record.get('workspace')}"
+        )
+    return 0
+
+
+def cmd_fix_start(args: argparse.Namespace) -> int:
+    try:
+        record = fix_orchestrator.start_fix_run(
+            args.review,
+            max_agents=args.max_agents,
+            allow_self_fix=getattr(args, "allow_cladex_self_fix", False),
+            launch=not getattr(args, "no_background", False),
+        )
+    except Exception as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    if getattr(args, "json", False):
+        print(json.dumps(record))
+    else:
+        print(f"Started fix run `{record['id']}`. Report: {record.get('reportPath')}")
+    return 0
+
+
+def cmd_fix_run(args: argparse.Namespace) -> int:
+    try:
+        record = fix_orchestrator.run_fix_run(args.id)
+    except Exception as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    if getattr(args, "json", False):
+        print(json.dumps(record))
+    else:
+        print(f"Fix run `{record['id']}` is {record.get('status')}.")
+    return 0
+
+
+def cmd_fix_show(args: argparse.Namespace) -> int:
+    try:
+        record = fix_orchestrator.show_fix_run(args.id)
+    except Exception as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    if getattr(args, "json", False):
+        print(json.dumps(record))
+    else:
+        print(json.dumps(record, indent=2))
+    return 0
+
+
+def cmd_fix_run_task(args: argparse.Namespace) -> int:
+    try:
+        record = fix_orchestrator.run_fix_task_once(args.id, args.task_id)
+    except Exception as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    if getattr(args, "json", False):
+        print(json.dumps(record))
+    else:
+        print(f"Ran fix task `{args.task_id}` in `{record['id']}`.")
+    return 0
+
+
+def cmd_fix_cancel(args: argparse.Namespace) -> int:
+    try:
+        record = fix_orchestrator.cancel_fix_run(args.id)
+    except Exception as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    if getattr(args, "json", False):
+        print(json.dumps(record))
+    else:
+        print(f"Cancellation requested for fix run `{record.get('id')}` (status: {record.get('status')}).")
     return 0
 
 
@@ -1817,6 +1908,42 @@ def build_parser() -> argparse.ArgumentParser:
     backup_restore_parser.add_argument("--confirm", required=True, help="Must exactly match the backup id.")
     backup_restore_parser.add_argument("--json", action="store_true", help="Output as JSON for automation")
     backup_restore_parser.set_defaults(func=cmd_backup_restore)
+
+    fix_parser = subparsers.add_parser("fix", help="Run guarded Fix Review workflows.")
+    fix_subparsers = fix_parser.add_subparsers(dest="fix_command")
+
+    fix_list_parser = fix_subparsers.add_parser("list", help="List fix runs.")
+    fix_list_parser.add_argument("--json", action="store_true", help="Output as JSON for API")
+    fix_list_parser.set_defaults(func=cmd_fix_list)
+
+    fix_start_parser = fix_subparsers.add_parser("start", help="Start a guarded fix run from a completed review.")
+    fix_start_parser.add_argument("--review", required=True, help="Review job id to fix.")
+    fix_start_parser.add_argument("--max-agents", type=int, default=fix_orchestrator.DEFAULT_FIX_MAX_AGENTS)
+    fix_start_parser.add_argument("--allow-cladex-self-fix", action="store_true", help="Explicitly allow write-capable Fix Review against the CLADEX repo after a completed self-review.")
+    fix_start_parser.add_argument("--no-background", action="store_true", help=argparse.SUPPRESS)
+    fix_start_parser.add_argument("--json", action="store_true", help="Output as JSON for API")
+    fix_start_parser.set_defaults(func=cmd_fix_start)
+
+    fix_run_parser = fix_subparsers.add_parser("run", help=argparse.SUPPRESS)
+    fix_run_parser.add_argument("id")
+    fix_run_parser.add_argument("--json", action="store_true", help="Output as JSON for API")
+    fix_run_parser.set_defaults(func=cmd_fix_run)
+
+    fix_show_parser = fix_subparsers.add_parser("show", help="Show one fix run.")
+    fix_show_parser.add_argument("id")
+    fix_show_parser.add_argument("--json", action="store_true", help="Output as JSON for API")
+    fix_show_parser.set_defaults(func=cmd_fix_show)
+
+    fix_run_task_parser = fix_subparsers.add_parser("run-task", help=argparse.SUPPRESS)
+    fix_run_task_parser.add_argument("id")
+    fix_run_task_parser.add_argument("task_id")
+    fix_run_task_parser.add_argument("--json", action="store_true", help="Output as JSON for API")
+    fix_run_task_parser.set_defaults(func=cmd_fix_run_task)
+
+    fix_cancel_parser = fix_subparsers.add_parser("cancel", help="Cancel a queued or running fix run.")
+    fix_cancel_parser.add_argument("id")
+    fix_cancel_parser.add_argument("--json", action="store_true", help="Output as JSON for API")
+    fix_cancel_parser.set_defaults(func=cmd_fix_cancel)
 
     gui_parser = subparsers.add_parser("gui", help="Open the CLADEX GUI.")
     gui_parser.set_defaults(func=cmd_gui)

@@ -30,6 +30,7 @@ BACKUP_DATA_ROOT = Path(user_data_dir("cladex", False)) / "backups"
 REVIEW_STRATEGY = "ai-review-swarm"
 REVIEW_ID_RE = re.compile(r"^review-\d{8}-\d{6}-[a-f0-9]{8}$")
 BACKUP_ID_RE = re.compile(r"^backup-\d{8}-\d{6}-[a-f0-9]{8}$")
+TERMINAL_REVIEW_STATUSES = {"completed", "completed_with_warnings", "failed", "cancelled"}
 AGENT_SPECIALTIES = (
     (
         "security",
@@ -249,6 +250,10 @@ def report_markdown_path(job_id: str) -> Path:
     return job_dir(job_id) / "CLADEX_PROJECT_REVIEW.md"
 
 
+def coordination_markdown_path(job_id: str) -> Path:
+    return job_dir(job_id) / "CLADEX_REVIEW_COORDINATION.md"
+
+
 def fix_plan_path(job_id: str) -> Path:
     return job_dir(job_id) / "CLADEX_FIX_PLAN.md"
 
@@ -383,7 +388,9 @@ def _public_job(job: dict[str, Any]) -> dict[str, Any]:
     public = dict(job)
     report_path = report_markdown_path(job["id"])
     plan_path = fix_plan_path(job["id"])
+    coordination_path = coordination_markdown_path(job["id"])
     public["reportPath"] = str(report_path) if report_path.exists() else str(report_path)
+    public["coordinationPath"] = str(coordination_path) if coordination_path.exists() else str(coordination_path)
     public["findingsPath"] = str(findings_json_path(job["id"]))
     public["fixPlanPath"] = str(plan_path) if plan_path.exists() else ""
     if report_path.exists():
@@ -434,7 +441,7 @@ def _cancel_requested(job_id: str) -> bool:
 
 def cancel_review(job_id: str) -> dict[str, Any]:
     job = load_job(job_id)
-    if job.get("status") in {"completed", "failed", "cancelled"}:
+    if job.get("status") in TERMINAL_REVIEW_STATUSES:
         return show_review(job_id)
     flag = cancel_flag_path(job_id)
     flag.parent.mkdir(parents=True, exist_ok=True)
@@ -494,14 +501,18 @@ def load_backup(backup_id: str) -> dict[str, Any]:
 
 
 def _preserve_on_restore(name: str) -> bool:
+    return _skip_from_snapshot_or_restore(name)
+
+
+def _skip_from_snapshot_or_restore(name: str) -> bool:
     lower = name.lower()
     if lower in SKIP_DIRS:
         return True
-    if lower.startswith(".env"):
-        return True
     if lower in LOCAL_SECRET_FILE_NAMES or lower in LOCAL_SECRET_DIR_NAMES:
         return True
-    return bool(SECRET_FILENAME_RE.search(name))
+    if lower.startswith(".env") and not is_template_secret_filename(name):
+        return True
+    return has_secret_token_segment(name) and not is_template_secret_filename(name)
 
 
 def restore_backup(backup_id: str, *, confirm: str) -> dict[str, Any]:
@@ -563,6 +574,11 @@ def start_review(
     job_id = f"review-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
     artifact_dir = job_dir(job_id)
     artifact_dir.mkdir(parents=True, exist_ok=True)
+    limit_metadata = _review_limit_metadata(
+        agent_count=agent_count,
+        preflight_only=bool(preflight_only),
+        account_home=str(account_home or "").strip(),
+    )
     job = {
         "id": job_id,
         "title": str(title or "").strip() or _default_title(target),
@@ -578,11 +594,15 @@ def start_review(
         "startedAt": "",
         "finishedAt": "",
         "artifactDir": str(artifact_dir),
-        "progress": {"total": agent_count, "queued": agent_count, "running": 0, "done": 0, "failed": 0},
+        "progress": {"total": agent_count, "queued": agent_count, "running": 0, "done": 0, "failed": 0, "cancelled": 0, "maxParallel": limit_metadata["maxParallel"]},
         "agents": [],
         "error": "",
         "scratchWorkspace": "",
         "scratchError": "",
+        "coordinationPath": str(coordination_markdown_path(job_id)),
+        "maxParallel": limit_metadata["maxParallel"],
+        "limits": limit_metadata,
+        "limitWarnings": limit_metadata["warnings"],
         "allowSelfReview": bool(allow_self_review),
         "selfReview": bool(protection_violation),
         "backupBeforeReview": bool(backup_before_review or protection_violation),
@@ -980,34 +1000,119 @@ def sanitize_text(text: str, *, limit: int = 6000) -> str:
 def _review_artifact_ignore(_directory: str, names: list[str]) -> set[str]:
     """Choose which entries shutil.copytree should skip during snapshot/scratch.
 
-    Skips known-cache directories, .env*/local-credential files and dirs, and
-    anything that matches the secret-filename regex. Symlinks are intentionally
-    NOT auto-skipped so the snapshot keeps them as symlinks (copytree was given
-    `symlinks=True`); restore can then preserve them instead of treating them
-    as removed-from-snapshot files.
+    Skips known-cache directories plus real local credential files and dirs.
+    Template config such as `.env.example` and generated type files such as
+    `vite-env.d.ts` are intentionally kept. Symlinks are not auto-skipped so the
+    snapshot keeps them as symlinks (copytree was given `symlinks=True`);
+    restore can then preserve them instead of treating them as
+    removed-from-snapshot files.
     """
     ignored: set[str] = set()
     for name in names:
-        lower = name.lower()
-        if (
-            lower in SKIP_DIRS
-            or lower.startswith(".env")
-            or lower in LOCAL_SECRET_FILE_NAMES
-            or lower in LOCAL_SECRET_DIR_NAMES
-            or SECRET_FILENAME_RE.search(name)
-        ):
+        if _skip_from_snapshot_or_restore(name):
+            ignored.add(name)
+    return ignored
+
+
+def _review_scratch_ignore(directory: str, names: list[str]) -> set[str]:
+    ignored = _review_artifact_ignore(directory, names)
+    base = Path(directory)
+    for name in names:
+        try:
+            if (base / name).is_symlink():
+                ignored.add(name)
+        except OSError:
             ignored.add(name)
     return ignored
 
 
 def prepare_scratch_workspace(job: dict[str, Any]) -> Path:
     source = Path(job["workspace"]).expanduser().resolve()
-    scratch = job_dir(job["id"]) / "scratch" / "workspace"
+    scratch = job_dir(job["id"]) / "scratch" / "base-workspace"
     if scratch.exists():
         return scratch
     scratch.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(source, scratch, symlinks=True, ignore=_review_artifact_ignore)
+    shutil.copytree(source, scratch, symlinks=True, ignore=_review_scratch_ignore)
     return scratch
+
+
+def agent_scratch_workspace_path(job: dict[str, Any], agent: dict[str, Any]) -> Path:
+    return job_dir(job["id"]) / "scratch" / str(agent["id"]) / "workspace"
+
+
+def prepare_agent_scratch_workspace(job: dict[str, Any], agent: dict[str, Any], base_scratch: Path) -> Path:
+    scratch = agent_scratch_workspace_path(job, agent)
+    if scratch.exists():
+        return scratch
+    scratch.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(base_scratch, scratch, symlinks=True)
+    return scratch
+
+
+def _coordination_agent_heading(agent: dict[str, Any]) -> str:
+    return f"Agent {agent.get('id')} - {agent.get('focus', 'review')}"
+
+
+def _lane_file_list(workspace: Path, shard: list[Path], *, limit: int = 120) -> list[str]:
+    entries = [f"- `{path.relative_to(workspace).as_posix()}`" for path in shard[:limit]]
+    if len(shard) > limit:
+        entries.append(f"- ... {len(shard) - limit} additional assigned file(s)")
+    return entries or ["- No files assigned; inspect project-level metadata and adjacent files relevant to this lane."]
+
+
+def build_coordination_markdown(job: dict[str, Any], files: list[Path], shards: list[list[Path]]) -> str:
+    workspace = Path(job["workspace"]).expanduser().resolve()
+    coordination_path = coordination_markdown_path(job["id"])
+    lines = [
+        f"# CLADEX Review Coordination - {job.get('title') or job.get('id')}",
+        "",
+        "## Project Briefing",
+        "",
+        f"- Job: `{job.get('id')}`",
+        f"- Workspace: `{workspace}`",
+        f"- Provider: `{job.get('provider')}`",
+        f"- Strategy: `{job.get('strategy') or REVIEW_STRATEGY}`",
+        f"- Files inventoried: `{len(files)}`",
+        f"- Shared artifact: `{coordination_path}`",
+        f"- Base scratch snapshot: `{job.get('scratchWorkspace') or 'not created'}`",
+        f"- Source backup: `{(job.get('sourceBackup') or {}).get('id', 'not created')}`",
+        "",
+        "Treat the target as an unknown project. Infer its architecture, build/test workflow, and risk areas from the files in front of you rather than assuming a framework or product identity from the path.",
+        "Reviewer lanes are proposal-only: inspect, run safe read-only or existing validation commands in your lane scratch workspace when useful, and report concrete findings. Do not implement fixes.",
+        "Avoid duplicate work by staying inside your lane assignment first. If evidence crosses lanes, report it with specific paths and explain why it matters.",
+        "Do not reveal credential values. Report only file names, line numbers, and risk.",
+        "",
+        "## Lane Assignments",
+        "",
+    ]
+    for index, agent in enumerate(job.get("agents", [])):
+        shard = shards[index] if index < len(shards) else []
+        agent_scratch = agent.get("scratchWorkspace") or str(agent_scratch_workspace_path(job, agent))
+        lines.append(
+            f"- `{agent.get('id')}` `{agent.get('focus', 'review')}`: {len(shard)} assigned file(s); scratch `{agent_scratch}`."
+        )
+    lines.append("")
+    for index, agent in enumerate(job.get("agents", [])):
+        shard = shards[index] if index < len(shards) else []
+        agent_scratch = agent.get("scratchWorkspace") or str(agent_scratch_workspace_path(job, agent))
+        lines.extend(
+            [
+                f"## {_coordination_agent_heading(agent)}",
+                "",
+                f"- Status: `{agent.get('status', 'queued')}`",
+                f"- Focus: {agent.get('focusPrompt') or agent.get('focus') or 'Review the assigned files.'}",
+                f"- Scratch workspace: `{agent_scratch}`",
+                f"- Assigned file count: `{len(shard)}`",
+                "",
+                "Use this section as your lane brief. Inspect the unknown project enough to understand context, then focus on your assigned risk area and avoid repeating other lane specialties unless you find concrete shared evidence.",
+                "",
+                "Assigned files:",
+                "",
+                *_lane_file_list(workspace, shard),
+                "",
+            ]
+        )
+    return "\n".join(lines)
 
 
 def _json_schema_prompt() -> str:
@@ -1021,17 +1126,20 @@ def _json_schema_prompt() -> str:
     )
 
 
-def _ai_prompt(job: dict[str, Any], agent: dict[str, Any], files: list[Path]) -> str:
+def _ai_prompt(job: dict[str, Any], agent: dict[str, Any], files: list[Path], *, scratch: Path | None = None) -> str:
     workspace = Path(job["workspace"])
-    scratch = Path(str(job.get("scratchWorkspace") or job["workspace"]))
+    lane_scratch = scratch or Path(str(agent.get("scratchWorkspace") or job.get("scratchWorkspace") or job["workspace"]))
+    coordination_path = coordination_markdown_path(job["id"])
+    coordination_heading = _coordination_agent_heading(agent)
     listed = "\n".join(f"- {path.relative_to(workspace).as_posix()}" for path in files[:220])
     if len(files) > 220:
         listed += f"\n- ... {len(files) - 220} additional files in this shard"
     return (
         "You are a read-only CLADEX project review agent.\n"
+        "Treat the target as an unknown project: inspect its files, metadata, tests, scripts, and docs before assuming what it is or how it ships.\n"
         "Go deep. Look for bugs, errors, broken workflows, test failures, smoke-test gaps, stress/scaling risks, security vulnerabilities, stale code, and anything likely to break production.\n"
-        "Your lane has a distinct focus so the swarm does not duplicate itself. Stay focused, but follow evidence wherever it leads.\n"
-        "You may run safe validation commands only inside the scratch workspace. Do not install dependencies, call external networks, delete files, or run destructive commands. Do not edit the original source, do not implement fixes, and do not write outside the scratch workspace or CLADEX job artifacts.\n"
+        "Your lane has a distinct focus so the swarm does not duplicate itself. Use your section in the shared coordination artifact, stay focused, and avoid repeating other lanes unless you have concrete cross-lane evidence.\n"
+        "You may run safe validation commands only inside your lane scratch workspace. Do not install dependencies, call external networks, delete files, or run destructive commands. Do not edit the original source, do not implement fixes, and do not write outside the scratch workspace or CLADEX job artifacts.\n"
         "Do not reveal credential values. If a secret is found, describe only the file, location, and risk.\n"
         "Prioritize concrete, reproducible findings with file paths and recommended fixes.\n\n"
         f"Provider lane: {job['provider']}\n"
@@ -1039,7 +1147,9 @@ def _ai_prompt(job: dict[str, Any], agent: dict[str, Any], files: list[Path]) ->
         f"Agent: {agent['id']}\n"
         f"Agent focus: {agent.get('focus')} - {agent.get('focusPrompt')}\n"
         f"Original workspace: {workspace}\n"
-        f"Scratch workspace for any commands: {scratch}\n"
+        f"Shared coordination artifact: {coordination_path}\n"
+        f"Coordination section to use: ## {coordination_heading}\n"
+        f"Lane scratch workspace for any commands: {lane_scratch}\n"
         "Suggested safe command strategy: inspect files first, then run targeted existing validation commands only when they make sense. Prefer no-install commands. Report commands attempted and failures.\n"
         "Assigned files:\n"
         f"{listed or '- no files assigned'}\n\n"
@@ -1064,7 +1174,7 @@ def _run_codex_ai_review(
     import relayctl
 
     output_path = job_dir(job["id"]) / f"{agent['id']}-codex.md"
-    scratch = Path(str(job.get("scratchWorkspace") or job["workspace"]))
+    scratch = Path(str(agent.get("scratchWorkspace") or job.get("scratchWorkspace") or job["workspace"]))
     command = [
         relayctl.resolve_codex_bin(),
         "--cd",
@@ -1081,7 +1191,7 @@ def _run_codex_ai_review(
         "-",
     ]
     env = _minimal_reviewer_env(account_home={"CODEX_HOME": str(job.get("accountHome"))} if job.get("accountHome") else {})
-    result = _run_cli(command, _ai_prompt(job, agent, files), env=env, cancel_check=cancel_check)
+    result = _run_cli(command, _ai_prompt(job, agent, files, scratch=scratch), env=env, cancel_check=cancel_check)
     if result.ok and output_path.exists():
         return AIRunResult(text=output_path.read_text(encoding="utf-8", errors="replace"), ok=True)
     return result
@@ -1096,6 +1206,7 @@ def _run_claude_ai_review(
 ) -> AIRunResult:
     import claude_relay
 
+    scratch = Path(str(agent.get("scratchWorkspace") or job.get("scratchWorkspace") or job["workspace"]))
     command = [
         claude_relay.claude_code_bin(),
         "-p",
@@ -1108,7 +1219,7 @@ def _run_claude_ai_review(
         "--no-session-persistence",
         "--output-format",
         "text",
-        _ai_prompt(job, agent, files),
+        "Read the review instructions from stdin and return only the requested JSON findings.",
     ]
     extra_env: dict[str, str] = {}
     if job.get("accountHome"):
@@ -1116,9 +1227,9 @@ def _run_claude_ai_review(
     env = _minimal_reviewer_env(account_home=extra_env)
     return _run_cli(
         command,
-        "",
+        _ai_prompt(job, agent, files, scratch=scratch),
         env=env,
-        cwd=Path(str(job.get("scratchWorkspace") or job["workspace"])),
+        cwd=scratch,
         cancel_check=cancel_check,
     )
 
@@ -1425,6 +1536,26 @@ def _update_progress(job: dict[str, Any]) -> None:
         "failed": sum(1 for item in agents if item.get("status") == "failed"),
         "cancelled": sum(1 for item in agents if item.get("status") == "cancelled"),
     }
+    if job.get("maxParallel"):
+        job["progress"]["maxParallel"] = int(job.get("maxParallel") or 0)
+
+
+def _review_limit_metadata(*, agent_count: int, preflight_only: bool, account_home: str = "") -> dict[str, Any]:
+    default_parallel = min(agent_count, 16) if preflight_only else min(agent_count, DEFAULT_AI_MAX_PARALLEL)
+    configured = _safe_int(os.environ.get("CLADEX_REVIEW_MAX_PARALLEL"), default_parallel)
+    max_parallel = max(1, min(configured, agent_count))
+    warnings: list[str] = []
+    if agent_count > max_parallel:
+        warnings.append(
+            f"{agent_count} lanes requested; at most {max_parallel} reviewer process(es) run at once on this machine/account."
+        )
+    if not preflight_only and agent_count > max_parallel and not str(account_home or "").strip():
+        warnings.append(
+            "No provider account home was selected. This run will use the default local provider account, so subscription/rate-limit pressure is shared."
+        )
+    if configured > agent_count:
+        warnings.append("CLADEX_REVIEW_MAX_PARALLEL is above the lane count and was capped to the requested lane count.")
+    return {"maxParallel": max_parallel, "warnings": warnings}
 
 
 def _job_run_lock_path(job_id: str) -> Path:
@@ -1496,7 +1627,7 @@ def _pid_alive(pid: int) -> bool:
 
 def run_review_job(job_id: str) -> dict[str, Any]:
     job = load_job(job_id)
-    if job.get("status") in {"completed", "failed", "cancelled"}:
+    if job.get("status") in TERMINAL_REVIEW_STATUSES:
         return show_review(job_id)
     if _cancel_requested(job_id):
         job["status"] = "cancelled"
@@ -1541,6 +1672,11 @@ def _run_review_job_locked(job_id: str) -> dict[str, Any]:
         shards = [[] for _ in range(validate_agent_count(job.get("agentCount", 1)))]
         for index, path in enumerate(files):
             shards[index % len(shards)].append(path)
+        for agent in job.get("agents", []):
+            agent["scratchWorkspace"] = str(agent_scratch_workspace_path(job, agent))
+        job["coordinationPath"] = str(coordination_markdown_path(job_id))
+        _atomic_write_text(coordination_markdown_path(job_id), build_coordination_markdown(job, files, shards))
+        save_job(job)
 
         base_findings = secret_name_findings(workspace) + project_shape_findings(workspace, files)
         findings.extend(_agent_finding_prefix("project", str(job["provider"]), base_findings))
@@ -1569,6 +1705,11 @@ def _run_review_job_locked(job_id: str) -> dict[str, Any]:
                 for path in shard:
                     agent_findings.extend(scan_file(path, workspace))
                 if not job.get("preflightOnly") and not cancel_check():
+                    lane_scratch = prepare_agent_scratch_workspace(job, agent, scratch)
+                    with lock:
+                        agent["scratchWorkspace"] = str(lane_scratch)
+                        agent["detail"] = "Reviewing assigned shard in isolated scratch workspace."
+                        save_job(job)
                     if str(job.get("provider")) == "codex":
                         ai_result = _run_codex_ai_review(job, agent, shard, cancel_check=cancel_check)
                     else:
@@ -1582,7 +1723,7 @@ def _run_review_job_locked(job_id: str) -> dict[str, Any]:
                                 save_job(job)
                             return
                         raise RuntimeError(ai_result.error or "AI reviewer failed")
-                    agent_findings.extend(parse_ai_findings(ai_result.text, workspace=workspace, agent=agent, scratch=scratch))
+                    agent_findings.extend(parse_ai_findings(ai_result.text, workspace=workspace, agent=agent, scratch=lane_scratch))
                 prefixed = _agent_finding_prefix(agent["id"], str(job["provider"]), agent_findings)
                 with lock:
                     findings.extend(prefixed)
@@ -1606,6 +1747,17 @@ def _run_review_job_locked(job_id: str) -> dict[str, Any]:
         default_parallel = min(len(shards), 16) if job.get("preflightOnly") else min(len(shards), DEFAULT_AI_MAX_PARALLEL)
         max_workers = _safe_int(os.environ.get("CLADEX_REVIEW_MAX_PARALLEL"), default_parallel)
         max_workers = max(1, min(max_workers, len(shards)))
+        limit_metadata = _review_limit_metadata(
+            agent_count=len(shards),
+            preflight_only=bool(job.get("preflightOnly")),
+            account_home=str(job.get("accountHome") or ""),
+        )
+        limit_metadata["maxParallel"] = max_workers
+        job["maxParallel"] = max_workers
+        job["limits"] = limit_metadata
+        job["limitWarnings"] = limit_metadata.get("warnings", [])
+        _update_progress(job)
+        save_job(job)
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = [executor.submit(process_agent, index, shard) for index, shard in enumerate(shards)]
             for future in concurrent.futures.as_completed(futures):
@@ -1633,6 +1785,9 @@ def _run_review_job_locked(job_id: str) -> dict[str, Any]:
         elif failed == len(job["agents"]):
             job["status"] = "failed"
             job["error"] = "All reviewer lanes failed."
+        elif failed:
+            job["status"] = "completed_with_warnings"
+            job["error"] = f"{failed} of {len(job['agents'])} reviewer lane(s) failed; partial findings may be incomplete."
         elif _cancel_requested(job_id) and cancelled:
             job["status"] = "cancelled"
             job["error"] = "Cancelled before all lanes finished."
@@ -1677,6 +1832,7 @@ def build_report(job: dict[str, Any], findings: list[dict[str, Any]], files: lis
         f"- Finished: `{job.get('finishedAt') or 'not finished'}`",
         f"- Files inventoried: `{len(files)}`",
         f"- Scratch workspace: `{job.get('scratchWorkspace') or 'not created yet'}`",
+        f"- Coordination artifact: `{job.get('coordinationPath') or coordination_markdown_path(job['id'])}`",
         f"- Source backup: `{(job.get('sourceBackup') or {}).get('id', 'not created')}`",
         "",
         "Boundary: reviewer lanes do not apply fixes to the selected project. Commands, caches, and experiments belong in the CLADEX scratch workspace for this job.",
@@ -1706,9 +1862,10 @@ def build_report(job: dict[str, Any], findings: list[dict[str, Any]], files: lis
         ]
     )
     for agent in job.get("agents", []):
+        scratch = agent.get("scratchWorkspace") or "not created"
         lines.append(
             f"- `{agent.get('id')}` `{agent.get('focus', 'review')}` {agent.get('status')}: {agent.get('assignedFiles', 0)} file(s), "
-            f"{agent.get('findings', 0)} finding(s). {agent.get('detail', '')}"
+            f"{agent.get('findings', 0)} finding(s), scratch `{scratch}`. {agent.get('detail', '')}"
         )
     lines.extend(["", "## Findings", ""])
     if not findings:
@@ -1719,6 +1876,11 @@ def build_report(job: dict[str, Any], findings: list[dict[str, Any]], files: lis
             line = int(finding.get("line", 0) or 0)
             if line > 0:
                 location = f"{location}:{line}"
+            seen_by = finding.get("seenByAgents")
+            if isinstance(seen_by, list) and seen_by:
+                seen_by_text = ", ".join(str(agent_id) for agent_id in seen_by)
+            else:
+                seen_by_text = str(finding.get("agentId", "-"))
             lines.extend(
                 [
                     f"### {finding.get('id')} - {finding.get('title')}",
@@ -1727,6 +1889,7 @@ def build_report(job: dict[str, Any], findings: list[dict[str, Any]], files: lis
                     f"- Category: `{finding.get('category')}`",
                     f"- Location: `{location}`",
                     f"- Agent: `{finding.get('agentId', '-')}`",
+                    f"- Seen by agents: `{seen_by_text}`",
                     f"- Confidence: `{finding.get('confidence', 'medium')}`",
                     "",
                     str(finding.get("detail", "")).strip(),

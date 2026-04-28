@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { AnimatePresence, motion, useMotionTemplate, useMotionValue, useSpring, useTransform } from 'motion/react';
 import {
   Activity,
+  AlertTriangle,
   Bot,
   FileText,
   FolderKanban,
@@ -20,6 +21,7 @@ import {
   Square,
   Terminal,
   Trash2,
+  Wrench,
   X,
 } from 'lucide-react';
 import CladexBackground from './components/CladexBackground';
@@ -28,6 +30,8 @@ type ViewName = 'relays' | 'workgroups' | 'review' | 'live';
 type ProfileType = 'Claude' | 'Codex';
 type RelayType = 'claude' | 'codex';
 type ReviewProvider = 'codex' | 'claude';
+type ReviewJobStatus = 'queued' | 'running' | 'completed' | 'completed_with_warnings' | 'failed' | 'cancelled';
+type FixRunStatus = 'queued' | 'running' | 'completed' | 'completed_with_warnings' | 'failed' | 'cancelled';
 
 interface Profile {
   id: string;
@@ -99,6 +103,15 @@ interface ReviewProgress {
   done: number;
   failed: number;
   cancelled?: number;
+  maxParallel?: number;
+  maxWorkers?: number;
+}
+
+interface LimitMetadata {
+  maxParallel?: number;
+  maxWorkers?: number;
+  warnings?: string[];
+  accountHomeWarning?: string;
 }
 
 interface SeverityCounts {
@@ -127,7 +140,7 @@ interface ReviewJob {
   selfReview?: boolean;
   agentCount: number;
   accountHome?: string;
-  status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
+  status: ReviewJobStatus;
   cancelRequested?: boolean;
   createdAt: string;
   updatedAt: string;
@@ -142,6 +155,52 @@ interface ReviewJob {
   sourceBackup?: { id?: string; error?: string };
   reportPreview?: string;
   severityCounts?: SeverityCounts;
+  maxParallel?: number;
+  maxWorkers?: number;
+  maxAgents?: number;
+  limitWarnings?: string[];
+  warnings?: string[];
+  limits?: LimitMetadata;
+  error?: string;
+}
+
+interface FixTaskRecord {
+  id: string;
+  title?: string;
+  status: 'queued' | 'running' | 'done' | 'completed' | 'completed_with_warnings' | 'failed' | 'cancelled';
+  detail?: string;
+  files?: string[];
+}
+
+interface FixRun {
+  id: string;
+  reviewId?: string;
+  reviewJobId?: string;
+  title?: string;
+  workspace: string;
+  provider?: ReviewProvider;
+  status: FixRunStatus;
+  cancelRequested?: boolean;
+  createdAt: string;
+  updatedAt: string;
+  startedAt?: string;
+  finishedAt?: string;
+  progress?: ReviewProgress;
+  tasks?: FixTaskRecord[];
+  taskCount?: number;
+  artifactDir?: string;
+  reportPath?: string;
+  sourceBackup?: { id?: string; error?: string };
+  backup?: { id?: string; error?: string };
+  restoreCommand?: string;
+  selfReview?: boolean;
+  selfFix?: boolean;
+  maxParallel?: number;
+  maxWorkers?: number;
+  maxAgents?: number;
+  limitWarnings?: string[];
+  warnings?: string[];
+  limits?: LimitMetadata;
   error?: string;
 }
 
@@ -265,6 +324,16 @@ class RemoteAccessTokenError extends Error {
   }
 }
 
+class ApiRequestError extends Error {
+  status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = 'ApiRequestError';
+    this.status = status;
+  }
+}
+
 function getStoredAccessToken(): string {
   try {
     return window.localStorage.getItem(ACCESS_TOKEN_STORAGE_KEY) || '';
@@ -377,9 +446,20 @@ async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
     if (response.status === 401 && payload?.authRequired) {
       throw new RemoteAccessTokenError(payload?.error || 'CLADEX remote access token required.');
     }
-    throw new Error(payload?.error || 'Request failed');
+    throw new ApiRequestError(payload?.error || 'Request failed', response.status);
   }
   return response.json();
+}
+
+async function fetchOptionalJson<T>(url: string, fallback: T): Promise<T> {
+  try {
+    return await fetchJson<T>(url);
+  } catch (error) {
+    if (error instanceof ApiRequestError && error.status === 404) {
+      return fallback;
+    }
+    throw error;
+  }
 }
 
 const api = {
@@ -404,9 +484,14 @@ const api = {
   stopProject: (name: string) => fetchJson(`${API_BASE}/projects/${encodeURIComponent(name)}/stop`, { method: 'POST' }),
   removeProject: (name: string) => fetchJson(`${API_BASE}/projects/${encodeURIComponent(name)}`, { method: 'DELETE' }),
   reviews: () => fetchJson<ReviewJob[]>(`${API_BASE}/reviews`),
+  fixRuns: () => fetchOptionalJson<FixRun[]>(`${API_BASE}/fix-runs`, []),
+  fixRun: (id: string) => fetchJson<FixRun>(`${API_BASE}/fix-runs/${id}`),
   backups: () => fetchJson<BackupRecord[]>(`${API_BASE}/backups`),
   startReview: (body: { workspace: string; provider: ReviewProvider; agents: number; title?: string; accountHome?: string; allowSelfReview?: boolean; backupBeforeReview?: boolean }) =>
     fetchJson<ReviewJob>(`${API_BASE}/reviews`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }),
+  startFixReview: (id: string, body: { allowSelfFix?: boolean } = {}) =>
+    fetchJson<FixRun>(`${API_BASE}/reviews/${id}/fix`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }),
+  cancelFixRun: (id: string) => fetchJson<FixRun>(`${API_BASE}/fix-runs/${id}/cancel`, { method: 'POST' }),
   createBackup: (body: { workspace: string; reason?: string }) =>
     fetchJson<BackupRecord>(`${API_BASE}/backups`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }),
   createFixPlan: (id: string) => fetchJson<ReviewJob>(`${API_BASE}/reviews/${id}/fix-plan`, { method: 'POST' }),
@@ -419,6 +504,7 @@ export default function App() {
   const [profiles, setProfiles] = useState<Profile[]>([]);
   const [projects, setProjects] = useState<ProjectRecord[]>([]);
   const [reviewJobs, setReviewJobs] = useState<ReviewJob[]>([]);
+  const [fixRuns, setFixRuns] = useState<FixRun[]>([]);
   const [backups, setBackups] = useState<BackupRecord[]>([]);
   const [runtimeInfo, setRuntimeInfo] = useState<RuntimeInfo | null>(null);
   const [selectedProfileId, setSelectedProfileId] = useState<string | null>(null);
@@ -442,16 +528,21 @@ export default function App() {
       setLoading(true);
     }
     try {
-      const [profileRows, projectRows, runtime, reviews, backupRows] = await Promise.all([
+      const [profileRows, projectRows, runtime, reviews, fixRunRows, backupRows] = await Promise.all([
         api.profiles(),
         api.projects(),
         api.runtimeInfo(),
         api.reviews(),
+        api.fixRuns(),
         api.backups(),
       ]);
       setProfiles(profileRows);
       setProjects(projectRows);
       setReviewJobs(reviews);
+      const detailedFixRuns = await Promise.all(
+        fixRunRows.map((run) => (isInFlightStatus(run.status) ? api.fixRun(run.id).catch(() => run) : Promise.resolve(run)))
+      );
+      setFixRuns(detailedFixRuns);
       setBackups(backupRows);
       setRuntimeInfo(runtime);
       setRemoteAuthRequired(false);
@@ -577,11 +668,14 @@ export default function App() {
             <motion.div key="review" initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -12 }}>
               <ReviewProjectView
                 jobs={reviewJobs}
+                fixRuns={fixRuns}
                 backups={backups}
                 busyKey={busyKey}
                 onStart={(body) => void runAction('review-start', () => api.startReview(body))}
                 onFixPlan={(job) => void runAction(`review-fix-${job.id}`, () => api.createFixPlan(job.id))}
+                onFixReview={(job, options) => void runAction(`review-fix-run-${job.id}`, () => api.startFixReview(job.id, options))}
                 onCancel={(job) => void runAction(`review-cancel-${job.id}`, () => api.cancelReview(job.id))}
+                onCancelFixRun={(run) => void runAction(`fix-run-cancel-${run.id}`, () => api.cancelFixRun(run.id))}
                 onCreateBackup={(workspace) => void runAction('backup-create', () => api.createBackup({ workspace, reason: 'manual' }))}
               />
             </motion.div>
@@ -897,19 +991,25 @@ function WorkgroupsView({
 
 function ReviewProjectView({
   jobs,
+  fixRuns,
   backups,
   busyKey,
   onStart,
   onFixPlan,
+  onFixReview,
   onCancel,
+  onCancelFixRun,
   onCreateBackup,
 }: {
   jobs: ReviewJob[];
+  fixRuns: FixRun[];
   backups: BackupRecord[];
   busyKey: string | null;
   onStart: (body: { workspace: string; provider: ReviewProvider; agents: number; title?: string; accountHome?: string; allowSelfReview?: boolean; backupBeforeReview?: boolean }) => void;
   onFixPlan: (job: ReviewJob) => void;
+  onFixReview: (job: ReviewJob, options?: { allowSelfFix?: boolean }) => void;
   onCancel: (job: ReviewJob) => void;
+  onCancelFixRun: (run: FixRun) => void;
   onCreateBackup: (workspace: string) => void;
 }) {
   const [workspace, setWorkspace] = useState('');
@@ -926,6 +1026,7 @@ function ReviewProjectView({
   const backupBusy = busyKey === 'backup-create';
   const workspaceFilled = workspace.trim().length > 0;
   const activeJobs = jobs.filter((job) => job.status === 'queued' || job.status === 'running').length;
+  const activeFixRuns = fixRuns.filter((run) => run.status === 'queued' || run.status === 'running').length;
 
   return (
     <div className="mx-auto flex w-full max-w-7xl flex-1 flex-col px-4 pb-8 pt-6 sm:px-8 sm:pt-8">
@@ -935,7 +1036,10 @@ function ReviewProjectView({
           <h2 className="mt-2 text-3xl font-black tracking-tight text-slate-900 dark:text-white">Send read-only reviewers through a project.</h2>
           <p className="mt-2 max-w-3xl text-sm text-slate-600 dark:text-gray-400">Each lane gets a different focus, explores a separate shard, and merges findings into one report plus a fix plan. Reviewers do not apply source changes.</p>
         </div>
-        <MetaPill label={`${activeJobs} active review${activeJobs === 1 ? '' : 's'}`} />
+        <div className="flex flex-wrap gap-2">
+          <MetaPill label={`${activeJobs} active review${activeJobs === 1 ? '' : 's'}`} />
+          <MetaPill label={`${activeFixRuns} active fix run${activeFixRuns === 1 ? '' : 's'}`} />
+        </div>
       </div>
 
       <div className="grid gap-5 xl:grid-cols-[420px_minmax(0,1fr)]">
@@ -1003,16 +1107,241 @@ function ReviewProjectView({
               <ReviewJobCard
                 key={job.id}
                 job={job}
+                activeFixRun={fixRuns.find((run) => (run.reviewId || run.reviewJobId) === job.id && isInFlightStatus(run.status))}
                 fixPlanBusy={busyKey === `review-fix-${job.id}`}
+                fixReviewBusy={busyKey === `review-fix-run-${job.id}`}
                 cancelBusy={busyKey === `review-cancel-${job.id}`}
                 onFixPlan={() => onFixPlan(job)}
+                onFixReview={(options) => onFixReview(job, options)}
                 onCancel={() => onCancel(job)}
               />
             ))
           )}
+          <FixRunsPanel
+            runs={fixRuns}
+            busyKey={busyKey}
+            onCancel={onCancelFixRun}
+          />
           <BackupListCard backups={backups} />
         </div>
       </div>
+    </div>
+  );
+}
+
+type LimitAwareRecord = {
+  agentCount?: number;
+  taskCount?: number;
+  progress?: ReviewProgress;
+  maxParallel?: number;
+  maxWorkers?: number;
+  maxAgents?: number;
+  limitWarnings?: string[];
+  warnings?: string[];
+  limits?: LimitMetadata;
+};
+
+function isInFlightStatus(status: string): boolean {
+  return status === 'queued' || status === 'running';
+}
+
+function statusLabel(status: string): string {
+  return status.replace(/_/g, ' ');
+}
+
+function statusTone(status: string): string {
+  if (status === 'failed') {
+    return 'text-red-300 bg-red-500/10 border-red-500/25';
+  }
+  if (status === 'completed') {
+    return 'text-emerald-300 bg-emerald-500/10 border-emerald-500/25';
+  }
+  if (status === 'completed_with_warnings') {
+    return 'text-amber-300 bg-amber-500/10 border-amber-500/25';
+  }
+  if (status === 'cancelled') {
+    return 'text-amber-300 bg-amber-500/10 border-amber-500/25';
+  }
+  return 'text-indigo-300 bg-indigo-500/10 border-indigo-500/25';
+}
+
+function firstNumber(...values: Array<number | undefined>): number | null {
+  for (const value of values) {
+    if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
+      return value;
+    }
+  }
+  return null;
+}
+
+function warningList(record: LimitAwareRecord): string[] {
+  return [
+    ...(record.limitWarnings || []),
+    ...(record.warnings || []),
+    ...(record.limits?.warnings || []),
+    ...(record.limits?.accountHomeWarning ? [record.limits.accountHomeWarning] : []),
+  ].filter((item, index, items) => item.trim().length > 0 && items.indexOf(item) === index);
+}
+
+function maxParallelFor(record: LimitAwareRecord): number | null {
+  return firstNumber(record.maxParallel, record.maxWorkers, record.maxAgents, record.progress?.maxParallel, record.progress?.maxWorkers, record.limits?.maxParallel, record.limits?.maxWorkers);
+}
+
+function progressFor(progress: ReviewProgress | undefined, fallbackTotal: number): ReviewProgress {
+  return progress || { total: fallbackTotal, queued: 0, running: 0, done: 0, failed: 0, cancelled: 0 };
+}
+
+function ProgressCounts({ progress, total }: { progress: ReviewProgress; total: number }) {
+  return (
+    <div className="mb-2 flex flex-wrap items-center justify-between gap-2 text-sm text-slate-600 dark:text-gray-400">
+      <span>Queued {progress.queued || 0}/{total}</span>
+      <span>Running {progress.running || 0}/{total}</span>
+      <span>Done {progress.done || 0}/{total}</span>
+      <span>Failed {progress.failed || 0}/{total}</span>
+      <span>Cancelled {progress.cancelled || 0}/{total}</span>
+    </div>
+  );
+}
+
+function LimitNotice({ record, requested }: { record: LimitAwareRecord; requested: number }) {
+  const maxParallel = maxParallelFor(record);
+  const warnings = warningList(record);
+  const shouldShowParallel = maxParallel !== null;
+  if (!shouldShowParallel && warnings.length === 0) {
+    return null;
+  }
+
+  return (
+    <div className="mt-4 rounded-2xl border border-amber-500/25 bg-amber-500/10 px-4 py-3 text-sm text-amber-100">
+      <div className="flex items-start gap-2">
+        <AlertTriangle size={16} className="mt-0.5 shrink-0" />
+        <div>
+          {shouldShowParallel ? (
+            <div>
+              Backend max parallel: <span className="font-mono">{maxParallel}</span>
+              {requested > maxParallel ? <span>. {requested} requested item{requested === 1 ? '' : 's'} will queue behind that limit.</span> : null}
+            </div>
+          ) : null}
+          {warnings.length ? (
+            <ul className={shouldShowParallel ? 'mt-2 space-y-1' : 'space-y-1'}>
+              {warnings.map((warning) => <li key={warning}>{warning}</li>)}
+            </ul>
+          ) : null}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function FixRunsPanel({
+  runs,
+  busyKey,
+  onCancel,
+}: {
+  runs: FixRun[];
+  busyKey: string | null;
+  onCancel: (run: FixRun) => void;
+}) {
+  if (!runs.length) {
+    return null;
+  }
+  const activeRuns = runs.filter((run) => isInFlightStatus(run.status)).length;
+  return (
+    <div className="space-y-3">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <div className="text-[10px] font-bold uppercase tracking-[0.22em] text-slate-500 dark:text-gray-500">Fix runs</div>
+          <div className="mt-1 text-sm font-semibold text-slate-900 dark:text-white">Guarded Review fixes</div>
+        </div>
+        <MetaPill label={`${activeRuns} active`} mono />
+      </div>
+      {runs.map((run) => (
+        <FixRunCard
+          key={run.id}
+          run={run}
+          cancelBusy={busyKey === `fix-run-cancel-${run.id}`}
+          onCancel={() => onCancel(run)}
+        />
+      ))}
+    </div>
+  );
+}
+
+function FixRunCard({
+  run,
+  cancelBusy,
+  onCancel,
+}: {
+  run: FixRun;
+  cancelBusy: boolean;
+  onCancel: () => void;
+}) {
+  const taskTotal = run.taskCount || run.tasks?.length || 0;
+  const progress = progressFor(run.progress, taskTotal);
+  const total = Math.max(progress.total || taskTotal, 1);
+  const finished = (progress.done || 0) + (progress.failed || 0) + (progress.cancelled || 0);
+  const percent = Math.min(100, Math.round((finished / total) * 100));
+  const inFlight = isInFlightStatus(run.status);
+  const reviewId = run.reviewId || run.reviewJobId || '';
+  const backupValue = run.sourceBackup?.id || run.backup?.id || run.sourceBackup?.error || run.backup?.error || 'Pending';
+
+  return (
+    <div className="rounded-[30px] border border-slate-200/80 bg-white/80 p-5 shadow-[0_18px_45px_rgba(15,23,42,0.08)] dark:border-white/10 dark:bg-white/[0.03] dark:shadow-2xl">
+      <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className={`rounded-full border px-2.5 py-1 text-[10px] font-bold uppercase tracking-[0.22em] ${statusTone(run.status)}`}>{statusLabel(run.status)}</span>
+            <MetaPill label="Fix Review" />
+            {run.provider ? <MetaPill label={run.provider} mono /> : null}
+            {reviewId ? <MetaPill label={reviewId} mono /> : null}
+            {run.cancelRequested && inFlight ? <MetaPill label="cancel pending" /> : null}
+          </div>
+          <h3 className="mt-3 text-lg font-bold tracking-tight text-slate-900 dark:text-white">{run.title || run.id}</h3>
+          <div className="mt-2 break-all font-mono text-xs text-slate-500 dark:text-gray-500">{run.workspace}</div>
+        </div>
+        {inFlight ? (
+          <ActionButton
+            label={cancelBusy ? 'Cancelling...' : 'Cancel'}
+            icon={cancelBusy ? <Loader2 size={16} className="animate-spin" /> : <X size={16} />}
+            busy={cancelBusy || run.cancelRequested === true}
+            tone="danger"
+            onClick={onCancel}
+          />
+        ) : null}
+      </div>
+
+      <div className="mt-5">
+        <ProgressCounts progress={progress} total={total} />
+        <div className="h-2 overflow-hidden rounded-full bg-slate-200 dark:bg-white/10">
+          <div className="h-full rounded-full bg-emerald-500 transition-all" style={{ width: `${percent}%` }} />
+        </div>
+      </div>
+
+      <LimitNotice record={run} requested={progress.total || taskTotal || total} />
+
+      <div className="mt-5 grid gap-3 lg:grid-cols-2">
+        <InspectorRow label="Run" value={run.id} mono />
+        <InspectorRow label="Report" value={run.reportPath || 'Pending'} mono />
+        <InspectorRow label="Backup" value={backupValue} mono />
+        {run.restoreCommand ? <InspectorRow label="Restore" value={run.restoreCommand} mono /> : null}
+        <InspectorRow label="Artifacts" value={run.artifactDir || 'Pending'} mono />
+      </div>
+
+      {run.error ? <div className="mt-4 rounded-2xl border border-red-500/25 bg-red-500/10 px-4 py-3 text-sm text-red-100">{run.error}</div> : null}
+
+      {run.tasks?.length ? (
+        <div className="mt-5 grid gap-2 md:grid-cols-2">
+          {run.tasks.slice(0, 8).map((task) => (
+            <div key={task.id} className="rounded-2xl border border-slate-200/80 bg-white/70 px-3 py-3 dark:border-white/5 dark:bg-black/30">
+              <div className="flex items-center justify-between gap-3">
+                <div className="min-w-0 truncate font-mono text-xs text-slate-700 dark:text-gray-300">{task.title || task.id}</div>
+                <div className="shrink-0 text-[10px] font-bold uppercase tracking-[0.18em] text-slate-500 dark:text-gray-500">{statusLabel(task.status)}</div>
+              </div>
+              {task.detail ? <div className="mt-1 line-clamp-2 text-xs text-slate-500 dark:text-gray-500">{task.detail}</div> : null}
+            </div>
+          ))}
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -1057,26 +1386,29 @@ function BackupListCard({ backups }: { backups: BackupRecord[] }) {
 
 function ReviewJobCard({
   job,
+  activeFixRun,
   fixPlanBusy,
+  fixReviewBusy,
   cancelBusy,
   onFixPlan,
+  onFixReview,
   onCancel,
 }: {
   job: ReviewJob;
+  activeFixRun?: FixRun;
   fixPlanBusy: boolean;
+  fixReviewBusy: boolean;
   cancelBusy: boolean;
   onFixPlan: () => void;
+  onFixReview: (options?: { allowSelfFix?: boolean }) => void;
   onCancel: () => void;
 }) {
-  const progress = job.progress || { total: job.agentCount || 0, running: 0, done: 0, failed: 0, queued: 0 };
+  const progress = progressFor(job.progress, job.agentCount || 0);
   const total = Math.max(progress.total || job.agentCount || 0, 1);
   const finished = (progress.done || 0) + (progress.failed || 0) + (progress.cancelled || 0);
   const percent = Math.min(100, Math.round((finished / total) * 100));
-  const statusTone = job.status === 'failed' ? 'text-red-300 bg-red-500/10 border-red-500/25'
-    : job.status === 'completed' ? 'text-emerald-300 bg-emerald-500/10 border-emerald-500/25'
-    : job.status === 'cancelled' ? 'text-amber-300 bg-amber-500/10 border-amber-500/25'
-    : 'text-indigo-300 bg-indigo-500/10 border-indigo-500/25';
-  const inFlight = job.status === 'queued' || job.status === 'running';
+  const inFlight = isInFlightStatus(job.status);
+  const canFixReview = job.status === 'completed' || job.status === 'completed_with_warnings';
   const severity = job.severityCounts || { high: 0, medium: 0, low: 0 };
   const totalFindings = severity.high + severity.medium + severity.low;
 
@@ -1085,7 +1417,7 @@ function ReviewJobCard({
       <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
         <div className="min-w-0">
           <div className="flex flex-wrap items-center gap-2">
-            <span className={`rounded-full border px-2.5 py-1 text-[10px] font-bold uppercase tracking-[0.22em] ${statusTone}`}>{job.status}</span>
+            <span className={`rounded-full border px-2.5 py-1 text-[10px] font-bold uppercase tracking-[0.22em] ${statusTone(job.status)}`}>{statusLabel(job.status)}</span>
             <MetaPill label={`${job.provider} swarm`} mono />
             <MetaPill label={`${job.agentCount} lane${job.agentCount === 1 ? '' : 's'}`} mono />
             {job.selfReview ? <MetaPill label="CLADEX self-review" /> : null}
@@ -1101,6 +1433,21 @@ function ReviewJobCard({
             busy={fixPlanBusy || inFlight}
             onClick={onFixPlan}
           />
+          {canFixReview ? (
+            <ActionButton
+              label={activeFixRun ? 'Fix running' : fixReviewBusy ? 'Starting fix...' : 'Fix Review'}
+              icon={fixReviewBusy ? <Loader2 size={16} className="animate-spin" /> : <Wrench size={16} />}
+              busy={fixReviewBusy || Boolean(activeFixRun)}
+              onClick={() => {
+                const message = job.selfReview
+                  ? 'Start write-capable CLADEX self-fix? This is separate from self-review and creates a source backup before edits.'
+                  : 'Start a guarded Fix Review run? CLADEX will create a source backup before any worker edits.';
+                if (window.confirm(message)) {
+                  onFixReview({ allowSelfFix: job.selfReview === true });
+                }
+              }}
+            />
+          ) : null}
           {inFlight ? (
             <ActionButton
               label={cancelBusy ? 'Cancelling...' : 'Cancel'}
@@ -1122,15 +1469,13 @@ function ReviewJobCard({
       ) : null}
 
       <div className="mt-5">
-        <div className="mb-2 flex flex-wrap items-center justify-between gap-2 text-sm text-slate-600 dark:text-gray-400">
-          <span>Running: {progress.running || 0}/{total}</span>
-          <span>Done {progress.done || 0}/{total}</span>
-          <span>Failed {progress.failed || 0}/{total}</span>
-        </div>
+        <ProgressCounts progress={progress} total={total} />
         <div className="h-2 overflow-hidden rounded-full bg-slate-200 dark:bg-white/10">
           <div className="h-full rounded-full bg-indigo-500 transition-all" style={{ width: `${percent}%` }} />
         </div>
       </div>
+
+      <LimitNotice record={job} requested={job.agentCount || total} />
 
       <div className="mt-5 grid gap-3 lg:grid-cols-2">
         <InspectorRow label="Report" value={job.reportPath || 'Pending'} mono />

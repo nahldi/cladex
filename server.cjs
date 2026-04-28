@@ -48,6 +48,63 @@ function isSameOriginRequest(req, origin) {
   }
 }
 
+function hasOwn(value, key) {
+  return Object.prototype.hasOwnProperty.call(value || {}, key);
+}
+
+function parseIntegerField(body, key, defaultValue) {
+  if (!hasOwn(body, key)) {
+    return defaultValue;
+  }
+  const raw = body[key];
+  if (typeof raw === 'number' && Number.isInteger(raw)) {
+    return raw;
+  }
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim();
+    if (/^\d+$/.test(trimmed)) {
+      return Number(trimmed);
+    }
+  }
+  return NaN;
+}
+
+function parseBooleanField(body, key, defaultValue) {
+  if (!hasOwn(body, key)) {
+    return { ok: true, value: defaultValue };
+  }
+  const raw = body[key];
+  if (typeof raw === 'boolean') {
+    return { ok: true, value: raw };
+  }
+  if (typeof raw === 'string') {
+    const normalized = raw.trim().toLowerCase();
+    if (normalized === 'true') {
+      return { ok: true, value: true };
+    }
+    if (normalized === 'false') {
+      return { ok: true, value: false };
+    }
+  }
+  return { ok: false, error: `${key} must be a boolean` };
+}
+
+function isValidReviewId(value) {
+  return /^review-\d{8}-\d{6}-[a-f0-9]{8}$/.test(String(value || '').trim());
+}
+
+function isValidFixRunId(value) {
+  return /^fix-\d{8}-\d{6}-[a-f0-9]{8}$/.test(String(value || '').trim());
+}
+
+function rejectInvalidReviewId(res, extra = {}) {
+  res.status(400).json({ ...extra, error: 'invalid review id' });
+}
+
+function rejectInvalidFixRunId(res, extra = {}) {
+  res.status(400).json({ ...extra, error: 'invalid fix run id' });
+}
+
 app.use((req, res, next) => {
   const origin = String(req.headers.origin || '').trim();
   const allowed = isLoopbackOrigin(origin) || isSameOriginRequest(req, origin);
@@ -55,7 +112,7 @@ app.use((req, res, next) => {
   res.header('X-Content-Type-Options', 'nosniff');
   if (origin && allowed) {
     res.header('Access-Control-Allow-Origin', origin === 'null' ? 'null' : origin);
-    res.header('Access-Control-Allow-Headers', 'Content-Type');
+    res.header('Access-Control-Allow-Headers', 'Content-Type, X-CLADEX-Access-Token');
     res.header('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
   }
   if (req.method === 'OPTIONS') {
@@ -373,6 +430,34 @@ async function runJson(args, cwd = BACKEND_DIR) {
   return JSON.parse(result.stdout || '{}');
 }
 
+function backendErrorMessage(err, fallback) {
+  return String(err?.message || fallback || 'Backend command failed').trim() || fallback;
+}
+
+function backendErrorStatus(err) {
+  const message = backendErrorMessage(err, '').toLowerCase();
+  if (message.includes('invalid review id') || message.includes('invalid backup id') || message.includes('invalid fix run id')) {
+    return 400;
+  }
+  if (message.includes('no review job found') || message.includes('no cladex backup found') || message.includes('no fix run found')) {
+    return 404;
+  }
+  if (message.includes('workspace does not exist or is not a directory')) {
+    return 400;
+  }
+  if (message.includes('overlaps protected cladex/runtime root')) {
+    return 400;
+  }
+  if (message.includes('review job must be completed') || message.includes('fix agents must be between') || message.includes('self-fix requires explicit')) {
+    return 400;
+  }
+  return 500;
+}
+
+function sendBackendError(res, err, fallback, extra = {}) {
+  res.status(backendErrorStatus(err)).json({ ...extra, error: backendErrorMessage(err, fallback) });
+}
+
 function listDirectoryRoots() {
   if (process.platform === 'win32') {
     const roots = [];
@@ -485,7 +570,7 @@ app.get('/api/runtime-info', async (req, res) => {
     backendDir: BACKEND_DIR,
     frontendDir: FRONTEND_DIR,
     packaged: process.env.NODE_ENV === 'production' || !!process.resourcesPath,
-    appVersion: process.env.npm_package_version || '2.2.3',
+    appVersion: process.env.npm_package_version || '2.3.0',
     remoteAccessProtected: true,
   };
   if (isLoopbackRequest(req)) {
@@ -742,7 +827,7 @@ app.post('/api/profiles', async (req, res) => {
   const codexHome = String(req.body?.codexHome || '').trim();
   const claudeConfigDir = String(req.body?.claudeConfigDir || '').trim();
   const triggerMode = String(req.body?.triggerMode || 'mention_or_dm').trim();
-  const allowDms = Boolean(req.body?.allowDms);
+  const allowDmsInput = parseBooleanField(req.body, 'allowDms', false);
   const operatorIds = String(req.body?.operatorIds || '').trim();
   const allowedUserIds = String(req.body?.allowedUserIds || '').trim();
   const allowedBotIds = String(req.body?.allowedBotIds || '').trim();
@@ -752,6 +837,12 @@ app.post('/api/profiles', async (req, res) => {
   const startupDmUserIds = String(req.body?.startupDmUserIds || '').trim();
   const startupDmText = String(req.body?.startupDmText || '').trim();
   const startupChannelText = String(req.body?.startupChannelText || '').trim();
+
+  if (!allowDmsInput.ok) {
+    res.status(400).json({ success: false, error: allowDmsInput.error });
+    return;
+  }
+  const allowDms = allowDmsInput.value;
 
   if (!name || !workspace || !discordToken || !channelId) {
     res.status(400).json({ success: false, error: 'name, workspace, discordToken, and channelId are required' });
@@ -893,21 +984,25 @@ app.get('/api/reviews', async (_req, res) => {
 });
 
 app.get('/api/reviews/:id', async (req, res) => {
+  if (!isValidReviewId(req.params.id)) {
+    rejectInvalidReviewId(res);
+    return;
+  }
   try {
     res.json(await runJson(['cladex.py', 'review', 'show', req.params.id, '--json']));
   } catch (err) {
-    res.status(500).json({ error: err?.message ?? 'Failed to load review job' });
+    sendBackendError(res, err, 'Failed to load review job');
   }
 });
 
 app.post('/api/reviews', async (req, res) => {
   const workspace = String(req.body?.workspace || '').trim();
   const provider = String(req.body?.provider || 'codex').trim().toLowerCase();
-  const agents = Number(req.body?.agents || 4);
+  const agents = parseIntegerField(req.body, 'agents', 4);
   const title = String(req.body?.title || '').trim();
   const accountHome = String(req.body?.accountHome || '').trim();
-  const allowSelfReview = Boolean(req.body?.allowSelfReview);
-  const backupBeforeReview = req.body?.backupBeforeReview !== false;
+  const allowSelfReviewInput = parseBooleanField(req.body, 'allowSelfReview', false);
+  const backupBeforeReviewInput = parseBooleanField(req.body, 'backupBeforeReview', true);
   if (!workspace) {
     res.status(400).json({ success: false, error: 'workspace is required' });
     return;
@@ -920,6 +1015,16 @@ app.post('/api/reviews', async (req, res) => {
     res.status(400).json({ success: false, error: 'agents must be between 1 and 50' });
     return;
   }
+  if (!allowSelfReviewInput.ok) {
+    res.status(400).json({ success: false, error: allowSelfReviewInput.error });
+    return;
+  }
+  if (!backupBeforeReviewInput.ok) {
+    res.status(400).json({ success: false, error: backupBeforeReviewInput.error });
+    return;
+  }
+  const allowSelfReview = allowSelfReviewInput.value;
+  const backupBeforeReview = backupBeforeReviewInput.value;
   const args = [
     'cladex.py',
     'review',
@@ -939,7 +1044,7 @@ app.post('/api/reviews', async (req, res) => {
   try {
     res.json(await runJson(args));
   } catch (err) {
-    res.status(500).json({ success: false, error: err?.message ?? 'Failed to start review job' });
+    sendBackendError(res, err, 'Failed to start review job', { success: false });
   }
 });
 
@@ -962,23 +1067,84 @@ app.post('/api/backups', async (req, res) => {
   try {
     res.json(await runJson(args));
   } catch (err) {
-    res.status(500).json({ success: false, error: err?.message ?? 'Failed to create source backup' });
+    sendBackendError(res, err, 'Failed to create source backup', { success: false });
+  }
+});
+
+app.get('/api/fix-runs', async (_req, res) => {
+  try {
+    res.json(await runJson(['cladex.py', 'fix', 'list', '--json']));
+  } catch (err) {
+    sendBackendError(res, err, 'Failed to load fix runs');
+  }
+});
+
+app.get('/api/fix-runs/:id', async (req, res) => {
+  if (!isValidFixRunId(req.params.id)) {
+    rejectInvalidFixRunId(res);
+    return;
+  }
+  try {
+    res.json(await runJson(['cladex.py', 'fix', 'show', req.params.id, '--json']));
+  } catch (err) {
+    sendBackendError(res, err, 'Failed to load fix run');
   }
 });
 
 app.post('/api/reviews/:id/fix-plan', async (req, res) => {
+  if (!isValidReviewId(req.params.id)) {
+    rejectInvalidReviewId(res, { success: false });
+    return;
+  }
   try {
     res.json(await runJson(['cladex.py', 'review', 'fix-plan', req.params.id, '--json']));
   } catch (err) {
-    res.status(500).json({ success: false, error: err?.message ?? 'Failed to generate fix plan' });
+    sendBackendError(res, err, 'Failed to generate fix plan', { success: false });
+  }
+});
+
+app.post('/api/reviews/:id/fix', async (req, res) => {
+  if (!isValidReviewId(req.params.id)) {
+    rejectInvalidReviewId(res, { success: false });
+    return;
+  }
+  const allowSelfFixInput = parseBooleanField(req.body, 'allowSelfFix', false);
+  if (!allowSelfFixInput.ok) {
+    res.status(400).json({ success: false, error: allowSelfFixInput.error });
+    return;
+  }
+  const args = ['cladex.py', 'fix', 'start', '--review', req.params.id, '--json'];
+  if (allowSelfFixInput.value) {
+    args.push('--allow-cladex-self-fix');
+  }
+  try {
+    res.json(await runJson(args));
+  } catch (err) {
+    sendBackendError(res, err, 'Failed to start fix run', { success: false });
   }
 });
 
 app.post('/api/reviews/:id/cancel', async (req, res) => {
+  if (!isValidReviewId(req.params.id)) {
+    rejectInvalidReviewId(res, { success: false });
+    return;
+  }
   try {
     res.json(await runJson(['cladex.py', 'review', 'cancel', req.params.id, '--json']));
   } catch (err) {
-    res.status(500).json({ success: false, error: err?.message ?? 'Failed to cancel review job' });
+    sendBackendError(res, err, 'Failed to cancel review job', { success: false });
+  }
+});
+
+app.post('/api/fix-runs/:id/cancel', async (req, res) => {
+  if (!isValidFixRunId(req.params.id)) {
+    rejectInvalidFixRunId(res, { success: false });
+    return;
+  }
+  try {
+    res.json(await runJson(['cladex.py', 'fix', 'cancel', req.params.id, '--json']));
+  } catch (err) {
+    sendBackendError(res, err, 'Failed to cancel fix run', { success: false });
   }
 });
 

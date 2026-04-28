@@ -2,6 +2,25 @@
 
 Items that started life on `ROADMAP.md` and have shipped. Newest tranches first. The active work-in-progress list lives in [ROADMAP.md](ROADMAP.md); release-by-release narrative lives in [DEVELOPMENT_LOG.md](DEVELOPMENT_LOG.md).
 
+## Completed For 2.3.0
+
+- Added guarded **Fix Review** runs. Completed review jobs can now start a durable fix run with a mandatory source backup, generated task plan, phase validation, cancellation, markdown report, and structured `fix_run.json` state under the local CLADEX data directory.
+- Added `backend/fix_orchestrator.py` plus `cladex fix list/start/show/run/run-task/cancel`. Fix tasks map directly to finding ids and use the selected provider account home when launching Codex or Claude workers.
+- Added fix-run API endpoints: `POST /api/reviews/:id/fix`, `GET /api/fix-runs`, `GET /api/fix-runs/:id`, and `POST /api/fix-runs/:id/cancel`.
+- Added the desktop Fix Review surface: completed and completed-with-warning review cards show **Fix Review**, fix runs poll with the rest of the Review Project view, progress includes queued/running/done/failed/cancelled counts, and the UI shows backup/report/artifact paths plus task summaries.
+- Made active Fix Review starts idempotent per review job so duplicate clicks/API calls return the existing active run instead of launching parallel write workers against the same workspace.
+- Serialized write-capable fix phases in the shared workspace and reject successful task runs that edit outside their assigned files. This keeps Fix Review conservative until per-task worktree isolation and merge orchestration are added.
+- Added a per-review `CLADEX_REVIEW_COORDINATION.md` artifact with a project briefing, lane assignments, and per-agent sections. Reviewer prompts now tell lanes to treat the target as an unknown project, use their assigned coordination section, and avoid duplicate work.
+- Isolated AI review lanes into per-agent scratch workspaces and skipped symlinks from AI scratch copies so reviewer commands cannot follow workspace symlinks outside the selected project. Source backups still preserve safe source structure while skipping local credential material.
+- Moved Claude review and fix prompts through stdin with short stable command prompts so large project instructions do not fail on Windows command-line length limits.
+- Changed mixed AI lane failures from silent `completed` to explicit `completed_with_warnings`; all-lane failures still report `failed`. Reports now show `seenByAgents` for deduplicated findings.
+- Added protected CLADEX self-fix gating. A Fix Review run against the CLADEX repo requires the originating review job to have been explicitly started as a CLADEX self-review and a separate `--allow-cladex-self-fix`/UI approval.
+- Added cancellation-aware validation execution for Fix Review and exposed exact restore commands through fix-run API/UI/report output.
+- Added review limit metadata. Jobs now expose `maxParallel`, `limitWarnings`, and `limits` so the UI can explain that 1-50 requested lanes queue behind the configured worker/account limit instead of implying every lane launches at once.
+- Hardened the local API: strict integer parsing keeps `agents: 0` invalid, string booleans are parsed deliberately, invalid/missing review/fix ids return 400/404 style responses, and CORS allows `X-CLADEX-Access-Token` for legitimate token preflights.
+- Hardened release validation and packaging: CI now includes `cladex doctor --json` and Electron packaging jobs; backend package metadata includes `fix_orchestrator`, `README.md`, and `constraints.txt`.
+- Updated release metadata to 2.3.0 across package, backend, plugin manifests, runtime-info fallback, and install docs.
+
 ## Completed For 2.2.3
 
 - Frontend security: file-mode `?apiBase=` is now validated against an http(s) loopback allowlist before use, and `X-CLADEX-Access-Token` is only attached to same-origin or loopback fetches.
