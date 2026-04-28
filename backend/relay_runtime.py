@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import sqlite3
 import subprocess
 import threading
@@ -1257,22 +1258,45 @@ class VerificationEngine:
             if claim_text in haystack:
                 return "verified", f"Matched recent recorded validation in turn {row['turn_id']}"
         command = claim_text.split("->", 1)[0].strip()
-        cheap_prefixes = ("pytest ", "python -m pytest", "npm run lint", "npm run build", "npx tsc --noEmit", "npx vitest run")
-        if not any(command.startswith(prefix) for prefix in cheap_prefixes):
-            return "unresolved", "Validation claim not found in recorded turn artifacts and is too expensive/unsafe to rerun automatically."
-        if os.name == "nt":
-            runner = ["cmd", "/c", command]
-        else:
-            runner = ["sh", "-lc", command]
-        result = subprocess.run(
-            runner,
-            cwd=binding.worktree_path,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=120,
-            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        # Allowlist + argv parse instead of shell exec. Bot turn data feeds
+        # `claim_text`, so anything that touches a shell metacharacter must
+        # short-circuit to "unresolved" instead of running through cmd /c
+        # or sh -lc where `;`, `&&`, `|`, backticks, redirects, etc. would
+        # be re-interpreted as additional commands.
+        if any(ch in command for ch in (";", "&", "|", "`", "$(", ">", "<", "\n", "\r")):
+            return "unresolved", "Validation claim contains shell metacharacters; refusing to rerun automatically."
+        try:
+            argv = shlex.split(command, posix=os.name != "nt")
+        except ValueError:
+            return "unresolved", "Validation claim could not be parsed into argv form; refusing to rerun automatically."
+        if not argv:
+            return "unresolved", "Empty validation claim; refusing to rerun automatically."
+        cheap_argv_heads: tuple[tuple[str, ...], ...] = (
+            ("pytest",),
+            ("python", "-m", "pytest"),
+            ("py", "-m", "pytest"),
+            ("npm", "run", "lint"),
+            ("npm", "run", "build"),
+            ("npx", "tsc", "--noEmit"),
+            ("npx", "vitest", "run"),
         )
+        head_lower = tuple(part.lower() for part in argv)
+        if not any(head_lower[: len(allowed)] == allowed for allowed in cheap_argv_heads):
+            return "unresolved", "Validation claim is not one of the allowlisted cheap validators; refusing to rerun automatically."
+        try:
+            result = subprocess.run(
+                argv,
+                cwd=binding.worktree_path,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=120,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            )
+        except subprocess.TimeoutExpired:
+            return "false", f"Cheap validation rerun timed out: {command}"
+        except (FileNotFoundError, OSError) as exc:
+            return "unresolved", f"Cheap validation rerun could not launch: {exc}"
         if result.returncode == 0:
             return "verified", f"Reran cheap validation successfully: {command}"
         stderr = (result.stderr or result.stdout or "").strip().splitlines()

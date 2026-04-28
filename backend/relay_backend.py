@@ -13,6 +13,13 @@ from typing import Any
 from relay_common import codex_cli_version, relay_codex_env, resolve_codex_bin
 
 
+def _safe_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 @dataclass(slots=True)
 class BackendThread:
     thread_id: str
@@ -397,8 +404,71 @@ class CliResumeCodexBackend(CodexBackend):
             stderr=asyncio.subprocess.STDOUT,
             **self._windows_hidden_subprocess_kwargs(),
         )
-        stdout, _ = await process.communicate(prompt_text.encode("utf-8"))
-        raw_output = stdout.decode("utf-8", errors="replace")
+        # F0014: bound the degraded fallback so a misbehaving Codex CLI
+        # cannot hang forever or balloon disk/memory. The output is also
+        # written line-by-line so a wedged child doesn't pin everything in
+        # RAM until communicate() returns.
+        timeout_seconds = max(_safe_int(os.environ.get("CLADEX_CODEX_FALLBACK_TIMEOUT"), 600), 60)
+        max_output_bytes = max(_safe_int(os.environ.get("CLADEX_CODEX_FALLBACK_MAX_OUTPUT_BYTES"), 8 * 1024 * 1024), 256 * 1024)
+        try:
+            if process.stdin and prompt_text:
+                process.stdin.write(prompt_text.encode("utf-8"))
+                await process.stdin.drain()
+            if process.stdin:
+                process.stdin.close()
+        except (BrokenPipeError, ConnectionError):
+            pass
+        chunks: list[bytes] = []
+        bytes_read = 0
+        truncated = False
+        deadline = asyncio.get_event_loop().time() + timeout_seconds
+        try:
+            while True:
+                remaining = deadline - asyncio.get_event_loop().time()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError
+                try:
+                    chunk = await asyncio.wait_for(process.stdout.read(64 * 1024), timeout=min(remaining, 30.0))
+                except asyncio.TimeoutError:
+                    if process.returncode is not None:
+                        break
+                    continue
+                if not chunk:
+                    break
+                if bytes_read + len(chunk) > max_output_bytes:
+                    take = max(0, max_output_bytes - bytes_read)
+                    if take:
+                        chunks.append(chunk[:take])
+                        bytes_read += take
+                    truncated = True
+                    break
+                chunks.append(chunk)
+                bytes_read += len(chunk)
+        except asyncio.TimeoutError:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            await process.wait()
+            raise BackendUnavailableError(
+                f"Degraded Codex CLI fallback timed out after {timeout_seconds}s."
+            )
+        if truncated:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+        try:
+            await asyncio.wait_for(process.wait(), timeout=10.0)
+        except asyncio.TimeoutError:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            await process.wait()
+        raw_output = b"".join(chunks).decode("utf-8", errors="replace")
+        if truncated:
+            raw_output += "\n[CLADEX: degraded fallback output truncated at limit]"
         events_path.write_text(raw_output, encoding="utf-8")
         thread_id = resume_thread_id or ""
         events: list[dict[str, Any]] = []

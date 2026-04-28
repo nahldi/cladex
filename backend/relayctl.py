@@ -3177,8 +3177,25 @@ def cmd_register(args: argparse.Namespace) -> int:
     allow_cladex_workspace = bool(getattr(args, "allow_cladex_workspace", False))
     if not allow_cladex_workspace:
         _require_workspace_allowed(workspace)
+    discord_bot_token = (args.discord_bot_token or "").strip()
+    if not discord_bot_token:
+        env_token = os.environ.get("CLADEX_REGISTER_DISCORD_BOT_TOKEN", "").strip()
+        if env_token:
+            discord_bot_token = env_token
+            os.environ.pop("CLADEX_REGISTER_DISCORD_BOT_TOKEN", None)
+    if not discord_bot_token:
+        raise SystemExit(
+            "Discord bot token is required. Pass --discord-bot-token or set "
+            "CLADEX_REGISTER_DISCORD_BOT_TOKEN in the environment."
+        )
+    args.discord_bot_token = discord_bot_token
     if not args.allow_dms and not args.allowed_channel_ids:
         raise SystemExit("At least one --allowed-channel-id is required unless --allow-dms is enabled.")
+    if args.allow_dms and not args.allowed_user_ids:
+        raise SystemExit(
+            "--allow-dms requires at least one --allowed-user-id so direct messages are scoped to a known operator. "
+            "Add an allowlist or drop --allow-dms."
+        )
     inferred_trigger_mode = args.trigger_mode or "mention_or_dm"
     env = {
         "DISCORD_BOT_TOKEN": args.discord_bot_token,
@@ -3882,7 +3899,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     register_parser = subparsers.add_parser("register", help="Register the current workspace as a relay profile")
     register_parser.add_argument("--workspace", default=str(Path.cwd()), help="Workspace root to bind this relay profile to")
-    register_parser.add_argument("--discord-bot-token", required=True, help="Discord bot token for this relay profile")
+    register_parser.add_argument(
+        "--discord-bot-token",
+        default=None,
+        help=(
+            "Discord bot token for this relay profile. Prefer setting "
+            "CLADEX_REGISTER_DISCORD_BOT_TOKEN in the environment so the "
+            "token is not visible in process command lines."
+        ),
+    )
     register_parser.add_argument("--bot-name", help="Optional bot identity name used for relay targeting context")
     register_parser.add_argument("--allowed-channel-id", dest="allowed_channel_ids", action="append", default=[], metavar="CHANNEL_ID", help="Main or additional channel IDs this relay may respond in")
     register_parser.add_argument("--allowed-user-id", dest="allowed_user_ids", action="append", default=[], metavar="USER_ID", help="DM user IDs allowed to talk to this relay")

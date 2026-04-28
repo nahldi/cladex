@@ -100,6 +100,91 @@ def test_register_handles_100_isolated_codex_profiles_without_port_or_account_co
     assert "Registered" in capsys.readouterr().out
 
 
+def test_register_reads_discord_token_from_env_and_clears_it(tmp_path: Path, monkeypatch) -> None:
+    """F0083: tokens must not be visible in process command lines. The CLI
+    accepts CLADEX_REGISTER_DISCORD_BOT_TOKEN as an alternative to
+    --discord-bot-token, and the env var is unset after consumption so the
+    value does not flow to grandchild processes."""
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    profiles_dir = tmp_path / "profiles"
+    profiles_dir.mkdir()
+    monkeypatch.setattr(relayctl, "PROFILES_DIR", profiles_dir)
+    monkeypatch.setenv("CLADEX_REGISTER_DISCORD_BOT_TOKEN", "secret-token-from-env")
+    monkeypatch.setattr(relayctl, "_register_profile", lambda profile: None)
+    parser = relayctl.build_parser()
+    args = parser.parse_args(
+        [
+            "register",
+            "--workspace",
+            str(workspace),
+            "--allowed-channel-id",
+            "1234567890",
+        ]
+    )
+
+    rc = relayctl.cmd_register(args)
+    assert rc == 0
+    assert os.environ.get("CLADEX_REGISTER_DISCORD_BOT_TOKEN") in (None, "")
+    env_files = list(profiles_dir.glob("*.env"))
+    assert env_files, "register should write a profile env file"
+    contents = env_files[0].read_text(encoding="utf-8")
+    assert "DISCORD_BOT_TOKEN=secret-token-from-env" in contents
+
+
+def test_register_requires_token_via_arg_or_env(tmp_path: Path, monkeypatch) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    profiles_dir = tmp_path / "profiles"
+    profiles_dir.mkdir()
+    monkeypatch.setattr(relayctl, "PROFILES_DIR", profiles_dir)
+    monkeypatch.delenv("CLADEX_REGISTER_DISCORD_BOT_TOKEN", raising=False)
+    parser = relayctl.build_parser()
+    args = parser.parse_args(
+        [
+            "register",
+            "--workspace",
+            str(workspace),
+            "--allowed-channel-id",
+            "1234567890",
+        ]
+    )
+    try:
+        relayctl.cmd_register(args)
+    except SystemExit as exc:
+        assert "Discord bot token" in str(exc)
+    else:
+        raise AssertionError("cmd_register must require a token")
+
+
+def test_register_rejects_allow_dms_without_user_allowlist(tmp_path: Path, monkeypatch) -> None:
+    """F0034: `--allow-dms` without `--allowed-user-id` would expose the
+    Codex relay to any DM sender. cmd_register must refuse this case."""
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    parser = relayctl.build_parser()
+    args = parser.parse_args(
+        [
+            "register",
+            "--workspace",
+            str(workspace),
+            "--discord-bot-token",
+            "token",
+            "--allow-dms",
+        ]
+    )
+    monkeypatch.setattr(relayctl, "_register_profile", lambda profile: None)
+
+    try:
+        relayctl.cmd_register(args)
+    except SystemExit as exc:
+        message = str(exc)
+        assert "--allow-dms" in message
+        assert "--allowed-user-id" in message
+    else:
+        raise AssertionError("cmd_register must reject --allow-dms without an allowlist")
+
+
 def test_register_rejects_protected_cladex_workspace(monkeypatch) -> None:
     parser = relayctl.build_parser()
     args = parser.parse_args(

@@ -308,6 +308,21 @@ def cmd_register(args: argparse.Namespace) -> int:
     if not allow_cladex_workspace:
         _require_workspace_allowed(workspace)
 
+    discord_bot_token = (args.discord_bot_token or "").strip()
+    if not discord_bot_token:
+        env_token = os.environ.get("CLADEX_REGISTER_DISCORD_BOT_TOKEN", "").strip()
+        if env_token:
+            discord_bot_token = env_token
+            os.environ.pop("CLADEX_REGISTER_DISCORD_BOT_TOKEN", None)
+    if not discord_bot_token:
+        print(
+            "[ERR] Discord bot token is required. Pass --discord-bot-token or set "
+            "CLADEX_REGISTER_DISCORD_BOT_TOKEN in the environment.",
+            file=sys.stderr,
+        )
+        return 2
+    args.discord_bot_token = discord_bot_token
+
     allowed_channel_ids = _parse_csv_ids(args.allowed_channel_id or "")
     allowed_user_ids = _parse_csv_ids(args.allowed_user_ids or args.operator_ids or "")
     allow_dms = bool(args.allow_dms)
@@ -561,7 +576,15 @@ def main() -> int:
     # register
     reg_parser = subparsers.add_parser("register", help="Register workspace")
     reg_parser.add_argument("--workspace", help="Workspace path (defaults to cwd)")
-    reg_parser.add_argument("--discord-bot-token", required=True)
+    reg_parser.add_argument(
+        "--discord-bot-token",
+        default=None,
+        help=(
+            "Discord bot token for this relay profile. Prefer setting "
+            "CLADEX_REGISTER_DISCORD_BOT_TOKEN in the environment so the "
+            "token is not visible in process command lines."
+        ),
+    )
     reg_parser.add_argument("--bot-name")
     reg_parser.add_argument("--operator-ids")
     reg_parser.add_argument("--allowed-user-ids")

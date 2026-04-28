@@ -362,14 +362,15 @@ function bootstrapBackendRuntime() {
   return backendBootstrapPromise;
 }
 
-async function runPython(args, cwd = BACKEND_DIR) {
+async function runPython(args, cwd = BACKEND_DIR, extraEnv = {}) {
   await bootstrapBackendRuntime();
+  const childEnv = { ...process.env, ...extraEnv };
   if (process.platform === 'win32') {
     const pythonwLaunchers = resolvePythonwLaunchers();
     for (const launcher of pythonwLaunchers) {
       try {
         const outputPath = path.join(os.tmpdir(), `cladex-api-${Date.now()}-${Math.random().toString(16).slice(2)}.json`);
-        await execFileAsync(launcher, ['api_runner.py', '--output', outputPath, ...args], { cwd, windowsHide: true });
+        await execFileAsync(launcher, ['api_runner.py', '--output', outputPath, ...args], { cwd, windowsHide: true, env: childEnv });
         const raw = await fs.readFile(outputPath, 'utf-8');
         await fs.unlink(outputPath).catch(() => undefined);
         const payload = JSON.parse(raw || '{}');
@@ -391,7 +392,7 @@ async function runPython(args, cwd = BACKEND_DIR) {
 
   for (const launcher of launchers) {
     try {
-      const result = await execFileAsync(launcher, args, { cwd, windowsHide: true });
+      const result = await execFileAsync(launcher, args, { cwd, windowsHide: true, env: childEnv });
       return { stdout: result.stdout ?? '', stderr: result.stderr ?? '', code: 0 };
     } catch (err) {
       if (err && err.code === 'ENOENT') {
@@ -422,8 +423,8 @@ async function findProfile(id, relayType) {
   return profiles.find((profile) => profile.id === id && (!relayType || profile.relayType === relayType));
 }
 
-async function runJson(args, cwd = BACKEND_DIR) {
-  const result = await runPython(args, cwd);
+async function runJson(args, cwd = BACKEND_DIR, extraEnv = {}) {
+  const result = await runPython(args, cwd, extraEnv);
   if (result.code !== 0) {
     throw new Error(result.stderr || result.stdout || 'Backend command failed');
   }
@@ -702,8 +703,15 @@ app.patch('/api/profiles/:id', async (req, res) => {
     return;
   }
   const args = ['cladex.py', 'update-profile', id, '--type', relayType, '--json'];
+  const updateEnv = {};
   if (Object.prototype.hasOwnProperty.call(req.body, 'workspace')) args.push('--workspace', String(req.body?.workspace || '').trim());
-  if (Object.prototype.hasOwnProperty.call(req.body, 'discordToken')) args.push('--discord-bot-token', String(req.body?.discordToken || '').trim());
+  if (Object.prototype.hasOwnProperty.call(req.body, 'discordToken')) {
+    const tokenValue = String(req.body?.discordToken || '').trim();
+    if (tokenValue) {
+      args.push('--discord-bot-token-env', 'CLADEX_REGISTER_DISCORD_BOT_TOKEN');
+      updateEnv.CLADEX_REGISTER_DISCORD_BOT_TOKEN = tokenValue;
+    }
+  }
   if (Object.prototype.hasOwnProperty.call(req.body, 'botName')) args.push('--bot-name', String(req.body?.botName || '').trim());
   if (Object.prototype.hasOwnProperty.call(req.body, 'model')) args.push('--model', String(req.body?.model || '').trim());
   if (Object.prototype.hasOwnProperty.call(req.body, 'codexHome')) args.push('--codex-home', String(req.body?.codexHome || '').trim());
@@ -722,7 +730,7 @@ app.patch('/api/profiles/:id', async (req, res) => {
   if (Object.prototype.hasOwnProperty.call(req.body, 'startupDmText')) args.push('--startup-dm-text', String(req.body?.startupDmText || '').trim());
   if (Object.prototype.hasOwnProperty.call(req.body, 'startupChannelText')) args.push('--startup-channel-text', String(req.body?.startupChannelText || '').trim());
   try {
-    res.json(await runJson(args));
+    res.json(await runJson(args, BACKEND_DIR, updateEnv));
   } catch (err) {
     res.status(500).json({ success: false, error: err?.message ?? 'Failed to update profile' });
   }
@@ -854,6 +862,9 @@ app.post('/api/profiles', async (req, res) => {
   }
 
   const absoluteWorkspace = path.resolve(workspace);
+  // Tokens flow through CLADEX_REGISTER_DISCORD_BOT_TOKEN so the secret never
+  // appears in subprocess command lines (visible in tasklist/ps output).
+  const tokenEnv = { CLADEX_REGISTER_DISCORD_BOT_TOKEN: discordToken };
   let result;
   if (relayType === 'codex') {
     if (startupChannelText) {
@@ -870,8 +881,6 @@ app.post('/api/profiles', async (req, res) => {
       'register',
       '--workspace',
       absoluteWorkspace,
-      '--discord-bot-token',
-      discordToken,
       '--bot-name',
       name,
       '--allowed-channel-id',
@@ -887,15 +896,13 @@ app.post('/api/profiles', async (req, res) => {
       ...(channelNoMentionAuthorIds ? channelNoMentionAuthorIds.split(',').map((id) => id.trim()).filter(Boolean).flatMap((id) => ['--channel-no-mention-author-id', id]) : []),
       ...dedupedUserIds.flatMap((id) => ['--allowed-user-id', id]),
       ...(allowedBotIds ? ['--allowed-bot-ids', allowedBotIds] : []),
-    ]);
+    ], BACKEND_DIR, tokenEnv);
   } else {
     result = await runPython([
       'claude_relay.py',
       'register',
       '--workspace',
       absoluteWorkspace,
-      '--discord-bot-token',
-      discordToken,
       '--bot-name',
       name,
       '--allowed-channel-id',
@@ -909,7 +916,7 @@ app.post('/api/profiles', async (req, res) => {
       ...(operatorIds ? ['--operator-ids', operatorIds] : []),
       ...(allowedUserIds ? ['--allowed-user-ids', allowedUserIds] : []),
       ...(allowedBotIds ? ['--allowed-bot-ids', allowedBotIds] : []),
-    ]);
+    ], BACKEND_DIR, tokenEnv);
   }
 
   if (result.code !== 0) {

@@ -95,6 +95,62 @@ def test_cmd_register_accepts_channel_allowlist(tmp_path: Path, monkeypatch) -> 
     assert rc == 0
 
 
+def test_claude_bot_should_respond_accepts_dm_with_channel_allowlist(monkeypatch) -> None:
+    """F0060: a profile with `--allow-dms` AND a guild-channel allowlist must
+    still accept DMs from allowed users. The DM channel id is private and
+    will never appear in the guild-channel allowlist, so the channel-allowlist
+    gate has to skip DM channels."""
+    import importlib
+
+    # claude_bot opens a discord.Client at import time; load lazily and stub.
+    import discord
+
+    claude_bot = importlib.import_module("claude_bot")
+
+    bot_user = SimpleNamespace(id=999)
+
+    class FakeBot:
+        def __init__(self) -> None:
+            self.config = SimpleNamespace(
+                allow_dms=True,
+                allowed_user_ids={"7"},
+                allowed_bot_ids=set(),
+                allowed_channel_ids={"42"},
+                operator_ids=set(),
+                trigger_mode="mention_or_dm",
+                prefix="!cladex",
+            )
+            self.user = bot_user
+
+    fake = FakeBot()
+    dm_message = SimpleNamespace(
+        author=SimpleNamespace(id=7, bot=False),
+        channel=discord.DMChannel.__new__(discord.DMChannel),
+        content="hi",
+    )
+    guild_message_in = SimpleNamespace(
+        author=SimpleNamespace(id=7, bot=False),
+        channel=SimpleNamespace(id=42),
+        content=f"<@{bot_user.id}> hi",
+        mentions=[bot_user],
+    )
+    guild_message_out = SimpleNamespace(
+        author=SimpleNamespace(id=7, bot=False),
+        channel=SimpleNamespace(id=999),
+        content="hi",
+        mentions=[],
+    )
+
+    # Make discord.DMChannel introspection match the fake.
+    monkeypatch.setattr(discord, "DMChannel", type(dm_message.channel))
+    bot_user.mentioned_in = lambda message: any(getattr(m, "id", None) == bot_user.id for m in getattr(message, "mentions", []))
+
+    bound_should_respond = claude_bot.ClaudeRelayBot._should_respond.__get__(fake)
+    assert bound_should_respond(dm_message) is True
+    assert bound_should_respond(guild_message_in) is True
+    assert bound_should_respond(guild_message_out) is False
+
+
 def test_profile_from_env_marks_backend(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(claude_relay, "PROFILES_DIR", tmp_path / "profiles")
     env = {

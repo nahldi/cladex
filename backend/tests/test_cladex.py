@@ -133,6 +133,39 @@ def test_stop_codex_profile_delegates_to_relayctl(monkeypatch) -> None:
     assert calls == [profile]
 
 
+def test_update_claude_profile_persists_via_local_save(tmp_path: Path, monkeypatch) -> None:
+    """`_update_claude_profile` historically called a bare `_save_registry`
+    that was undefined in `cladex.py`, so the path crashed at runtime with
+    `NameError`. This regression test exercises a successful Claude profile
+    edit end-to-end against tmp_path so any future drop of `_save_claude_registry`
+    fails the suite instead of the user."""
+    config_root = tmp_path / "config"
+    profiles_dir = tmp_path / "profiles"
+    profiles_dir.mkdir(parents=True)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    env_file = profiles_dir / "claude-one.env"
+    env_file.write_text(
+        "DISCORD_BOT_TOKEN=existing-token\n"
+        f"CLAUDE_WORKDIR={workspace}\n"
+        "ALLOWED_CHANNEL_IDS=42\n"
+        "ALLOWED_USER_IDS=7\n"
+        "BOT_TRIGGER_MODE=mention_or_dm\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(cladex, "CLAUDE_CONFIG_ROOT", config_root)
+    monkeypatch.setattr(cladex, "CLAUDE_REGISTRY_PATH", config_root / "workspaces.json")
+    monkeypatch.setattr(cladex, "_load_claude_registry", lambda: {"profiles": [{"name": "claude-one", "env_file": str(env_file)}], "projects": []})
+    monkeypatch.setattr(cladex.claude_relay, "PROFILES_DIR", profiles_dir)
+
+    profile = {"name": "claude-one", "env_file": str(env_file)}
+    cladex._update_claude_profile(profile, bot_name="Renamed", trigger_mode="mention_or_dm")
+
+    saved = json.loads((config_root / "workspaces.json").read_text(encoding="utf-8"))
+    assert any(p.get("bot_name") == "Renamed" for p in saved["profiles"])
+
+
 def test_claude_running_state_uses_relay_pid(tmp_path: Path, monkeypatch) -> None:
     config_root = tmp_path / "config"
     data_root = tmp_path / "data"
