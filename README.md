@@ -73,8 +73,8 @@ cmd /c npm run electron:build  # Creates installer in release/
 ```
 
 Packaged launchers produced by the build:
-- `release\CLADEX Setup 2.2.0.exe`
-- `release\CLADEX 2.2.0.exe`
+- `release\CLADEX Setup 2.2.1.exe`
+- `release\CLADEX 2.2.1.exe`
 - `release\win-unpacked\CLADEX.exe`
 
 Portable/installer first run:
@@ -134,7 +134,9 @@ cladex gui               # Open the desktop relay manager
 cladex review start --workspace C:\path\repo --provider codex --agents 12 --json
 cladex review list --json
 cladex review fix-plan <review-id> --json
+cladex review cancel <review-id> --json
 cladex backup list --json
+cladex backup create --workspace C:\path\repo --reason manual --json
 cladex backup restore <backup-id> --confirm <backup-id>
 
 # Claude relay

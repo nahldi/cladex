@@ -43,6 +43,65 @@ def test_review_swarm_preflight_writes_report_and_redacts_secret_values(tmp_path
     assert any(item["category"] == "maintenance" for item in findings)
 
 
+def test_secret_name_findings_allowlists_env_template_files(tmp_path: Path) -> None:
+    project = tmp_path / "target"
+    project.mkdir()
+    (project / ".env").write_text("REAL=1\n", encoding="utf-8")
+    (project / ".env.example").write_text("PLACEHOLDER=value\n", encoding="utf-8")
+    (project / ".env.template").write_text("PLACEHOLDER=value\n", encoding="utf-8")
+    (project / ".env.sample").write_text("PLACEHOLDER=value\n", encoding="utf-8")
+    (project / "secrets.example.json").write_text("{}\n", encoding="utf-8")
+    (project / "secrets.json").write_text("{}\n", encoding="utf-8")
+
+    findings = review_swarm.secret_name_findings(project)
+    flagged = sorted(item["path"] for item in findings)
+
+    assert flagged == [".env", "secrets.json"]
+    assert review_swarm.is_template_secret_filename(".env.example") is True
+    assert review_swarm.is_template_secret_filename("secrets.example.json") is True
+    assert review_swarm.is_template_secret_filename(".env") is False
+    assert review_swarm.is_template_secret_filename("secrets.json") is False
+
+
+def test_scan_file_todo_marker_requires_word_boundary_and_comment_context(tmp_path: Path) -> None:
+    project = tmp_path / "target"
+    project.mkdir()
+    sample = project / "lib.py"
+    sample.write_text(
+        '"""Module that mentions todo without a comment."""\n'
+        'PODCAST_TITLE = "todo list maker"\n'
+        'def shack(): return 1\n'
+        '# TODO: real comment marker\n'
+        '# fixme: lowercase comment marker\n'
+        '/* HACK: fix later */\n',
+        encoding="utf-8",
+    )
+
+    findings = review_swarm.scan_file(sample, project)
+    maintenance = [item for item in findings if item["category"] == "maintenance"]
+
+    assert {item["line"] for item in maintenance} == {4, 5, 6}
+    assert all("TODO" in item["detail"] or "FIXME" in item["detail"] or "HACK" in item["detail"] for item in maintenance)
+
+
+def test_dedup_findings_merges_duplicate_lanes_and_keeps_highest_severity() -> None:
+    raw = [
+        {"category": "maintenance", "path": "src/app.py", "line": 12, "title": "Marker", "severity": "low", "agentId": "agent-01"},
+        {"category": "maintenance", "path": "src/app.py", "line": 12, "title": "Marker", "severity": "medium", "agentId": "agent-02"},
+        {"category": "maintenance", "path": "src/app.py", "line": 13, "title": "Marker", "severity": "low", "agentId": "agent-03"},
+        {"category": "secret-hygiene", "path": "src/app.py", "line": 0, "title": "Hit", "severity": "high", "agentId": "agent-01"},
+    ]
+
+    deduped = review_swarm.dedup_findings(raw)
+
+    by_key = {(item["path"], item["line"], item["title"]): item for item in deduped}
+    merged = by_key[("src/app.py", 12, "Marker")]
+    assert merged["severity"] == "medium"
+    assert sorted(merged["seenByAgents"]) == ["agent-01", "agent-02"]
+    assert by_key[("src/app.py", 13, "Marker")]["seenByAgents"] == ["agent-03"]
+    assert by_key[("src/app.py", 0, "Hit")]["severity"] == "high"
+
+
 def test_review_swarm_rejects_invalid_agent_counts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     project = tmp_path / "target"
     project.mkdir()
@@ -140,6 +199,65 @@ def test_backup_restore_requires_confirmation_and_preserves_skip_dirs(tmp_path: 
     assert (src / "kept.py").read_text(encoding="utf-8") == "print('kept')\n"
     assert (project / ".env").read_text(encoding="utf-8") == "LOCAL_SECRET=keep\n"
     assert (node_modules / "cache.txt").read_text(encoding="utf-8") == "keep\n"
+
+
+def test_cancel_review_marks_queued_job_cancelled_immediately(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    project = tmp_path / "target"
+    project.mkdir()
+    (project / "app.py").write_text("print('ok')\n", encoding="utf-8")
+    monkeypatch.setattr(review_swarm, "REVIEW_DATA_ROOT", tmp_path / "reviews")
+
+    job = review_swarm.start_review(project, provider="codex", agents=2, preflight_only=True, launch=False)
+    cancelled = review_swarm.cancel_review(job["id"])
+
+    assert cancelled["status"] == "cancelled"
+    assert cancelled["cancelRequested"] is True
+    assert cancelled.get("error")
+
+
+def test_cancel_review_during_run_stops_subsequent_lanes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    project = tmp_path / "target"
+    project.mkdir()
+    for index in range(8):
+        (project / f"file_{index}.py").write_text(f"print({index})\n", encoding="utf-8")
+    monkeypatch.setattr(review_swarm, "REVIEW_DATA_ROOT", tmp_path / "reviews")
+
+    job = review_swarm.start_review(project, provider="codex", agents=4, preflight_only=True, launch=False)
+    review_swarm.cancel_review(job["id"])
+    finished = review_swarm.run_review_job(job["id"])
+
+    assert finished["status"] == "cancelled"
+    assert all(agent["status"] == "cancelled" for agent in finished["agents"])
+    assert finished["progress"]["cancelled"] == 4
+
+
+def test_completed_review_cancel_is_noop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    project = tmp_path / "target"
+    project.mkdir()
+    (project / "app.py").write_text("print('ok')\n", encoding="utf-8")
+    monkeypatch.setattr(review_swarm, "REVIEW_DATA_ROOT", tmp_path / "reviews")
+
+    job = review_swarm.start_review(project, provider="codex", agents=1, preflight_only=True, launch=False)
+    finished = review_swarm.run_review_job(job["id"])
+    assert finished["status"] == "completed"
+
+    after = review_swarm.cancel_review(job["id"])
+    assert after["status"] == "completed"
+
+
+def test_show_review_includes_severity_counts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    project = tmp_path / "target"
+    project.mkdir()
+    (project / "app.py").write_text("eval(user_input)\n# TODO: revisit\n", encoding="utf-8")
+    monkeypatch.setattr(review_swarm, "REVIEW_DATA_ROOT", tmp_path / "reviews")
+
+    job = review_swarm.start_review(project, provider="codex", agents=1, preflight_only=True, launch=False)
+    finished = review_swarm.run_review_job(job["id"])
+
+    counts = finished.get("severityCounts")
+    assert counts is not None
+    assert counts["high"] >= 1
+    assert counts["low"] >= 1
 
 
 def test_review_and_backup_ids_reject_path_traversal() -> None:

@@ -396,7 +396,7 @@ app.get('/api/runtime-info', async (req, res) => {
     backendDir: BACKEND_DIR,
     frontendDir: FRONTEND_DIR,
     packaged: process.env.NODE_ENV === 'production' || !!process.resourcesPath,
-    appVersion: process.env.npm_package_version || '2.2.0',
+    appVersion: process.env.npm_package_version || '2.2.1',
     remoteAccessProtected: true,
   };
   if (isLoopbackRequest(req)) {
@@ -875,6 +875,14 @@ app.post('/api/reviews/:id/fix-plan', async (req, res) => {
     res.json(await runJson(['cladex.py', 'review', 'fix-plan', req.params.id, '--json']));
   } catch (err) {
     res.status(500).json({ success: false, error: err?.message ?? 'Failed to generate fix plan' });
+  }
+});
+
+app.post('/api/reviews/:id/cancel', async (req, res) => {
+  try {
+    res.json(await runJson(['cladex.py', 'review', 'cancel', req.params.id, '--json']));
+  } catch (err) {
+    res.status(500).json({ success: false, error: err?.message ?? 'Failed to cancel review job' });
   }
 });
 

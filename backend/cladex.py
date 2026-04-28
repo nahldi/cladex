@@ -1510,6 +1510,19 @@ def cmd_review_fix_plan(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_review_cancel(args: argparse.Namespace) -> int:
+    try:
+        record = review_swarm.cancel_review(args.id)
+    except Exception as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    if getattr(args, "json", False):
+        print(json.dumps(record))
+    else:
+        print(f"Cancellation requested for review `{record.get('id')}` (status: {record.get('status')}).")
+    return 0
+
+
 def cmd_gui(_args: argparse.Namespace) -> int:
     if os.environ.get(GUI_CHILD_ENV, "").strip() != "1":
         env = os.environ.copy()
@@ -1808,6 +1821,11 @@ def build_parser() -> argparse.ArgumentParser:
     review_fix_parser.add_argument("id")
     review_fix_parser.add_argument("--json", action="store_true", help="Output as JSON for API")
     review_fix_parser.set_defaults(func=cmd_review_fix_plan)
+
+    review_cancel_parser = review_subparsers.add_parser("cancel", help="Cancel a queued or running review job.")
+    review_cancel_parser.add_argument("id")
+    review_cancel_parser.add_argument("--json", action="store_true", help="Output as JSON for API")
+    review_cancel_parser.set_defaults(func=cmd_review_cancel)
 
     backup_parser = subparsers.add_parser("backup", help="Create, list, and restore CLADEX source snapshots.")
     backup_subparsers = backup_parser.add_subparsers(dest="backup_command")

@@ -98,13 +98,20 @@ interface ReviewProgress {
   running: number;
   done: number;
   failed: number;
+  cancelled?: number;
+}
+
+interface SeverityCounts {
+  high: number;
+  medium: number;
+  low: number;
 }
 
 interface ReviewAgentRecord {
   id: string;
   provider: ReviewProvider;
   focus?: string;
-  status: 'queued' | 'running' | 'done' | 'failed';
+  status: 'queued' | 'running' | 'done' | 'failed' | 'cancelled';
   assignedFiles: number;
   findings: number;
   detail: string;
@@ -120,7 +127,8 @@ interface ReviewJob {
   selfReview?: boolean;
   agentCount: number;
   accountHome?: string;
-  status: 'queued' | 'running' | 'completed' | 'failed';
+  status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
+  cancelRequested?: boolean;
   createdAt: string;
   updatedAt: string;
   startedAt?: string;
@@ -133,6 +141,7 @@ interface ReviewJob {
   fixPlanPath?: string;
   sourceBackup?: { id?: string; error?: string };
   reportPreview?: string;
+  severityCounts?: SeverityCounts;
   error?: string;
 }
 
@@ -365,6 +374,7 @@ const api = {
   createBackup: (body: { workspace: string; reason?: string }) =>
     fetchJson<BackupRecord>(`${API_BASE}/backups`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }),
   createFixPlan: (id: string) => fetchJson<ReviewJob>(`${API_BASE}/reviews/${id}/fix-plan`, { method: 'POST' }),
+  cancelReview: (id: string) => fetchJson<ReviewJob>(`${API_BASE}/reviews/${id}/cancel`, { method: 'POST' }),
   listDirectories: (currentPath = '') => fetchJson<DirectoryListResponse>(`${API_BASE}/fs/list${currentPath ? `?path=${encodeURIComponent(currentPath)}` : ''}`),
 };
 
@@ -373,6 +383,7 @@ export default function App() {
   const [profiles, setProfiles] = useState<Profile[]>([]);
   const [projects, setProjects] = useState<ProjectRecord[]>([]);
   const [reviewJobs, setReviewJobs] = useState<ReviewJob[]>([]);
+  const [backups, setBackups] = useState<BackupRecord[]>([]);
   const [runtimeInfo, setRuntimeInfo] = useState<RuntimeInfo | null>(null);
   const [selectedProfileId, setSelectedProfileId] = useState<string | null>(null);
   const [activeModal, setActiveModal] = useState<'add' | 'edit' | 'logs' | 'settings' | 'workgroup' | null>(null);
@@ -395,10 +406,17 @@ export default function App() {
       setLoading(true);
     }
     try {
-      const [profileRows, projectRows, runtime, reviews] = await Promise.all([api.profiles(), api.projects(), api.runtimeInfo(), api.reviews()]);
+      const [profileRows, projectRows, runtime, reviews, backupRows] = await Promise.all([
+        api.profiles(),
+        api.projects(),
+        api.runtimeInfo(),
+        api.reviews(),
+        api.backups(),
+      ]);
       setProfiles(profileRows);
       setProjects(projectRows);
       setReviewJobs(reviews);
+      setBackups(backupRows);
       setRuntimeInfo(runtime);
       setRemoteAuthRequired(false);
       bootFailureCount.current = 0;
@@ -523,9 +541,12 @@ export default function App() {
             <motion.div key="review" initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -12 }}>
               <ReviewProjectView
                 jobs={reviewJobs}
+                backups={backups}
                 busyKey={busyKey}
                 onStart={(body) => void runAction('review-start', () => api.startReview(body))}
                 onFixPlan={(job) => void runAction(`review-fix-${job.id}`, () => api.createFixPlan(job.id))}
+                onCancel={(job) => void runAction(`review-cancel-${job.id}`, () => api.cancelReview(job.id))}
+                onCreateBackup={(workspace) => void runAction('backup-create', () => api.createBackup({ workspace, reason: 'manual' }))}
               />
             </motion.div>
           ) : (
@@ -840,14 +861,20 @@ function WorkgroupsView({
 
 function ReviewProjectView({
   jobs,
+  backups,
   busyKey,
   onStart,
   onFixPlan,
+  onCancel,
+  onCreateBackup,
 }: {
   jobs: ReviewJob[];
+  backups: BackupRecord[];
   busyKey: string | null;
   onStart: (body: { workspace: string; provider: ReviewProvider; agents: number; title?: string; accountHome?: string; allowSelfReview?: boolean; backupBeforeReview?: boolean }) => void;
   onFixPlan: (job: ReviewJob) => void;
+  onCancel: (job: ReviewJob) => void;
+  onCreateBackup: (workspace: string) => void;
 }) {
   const [workspace, setWorkspace] = useState('');
   const [title, setTitle] = useState('');
@@ -909,6 +936,13 @@ function ReviewProjectView({
                 onStart({ workspace, provider, agents, title, accountHome, allowSelfReview, backupBeforeReview });
               }}
             />
+            <SecondaryButton
+              label={busyKey === 'backup-create' ? 'Saving snapshot...' : 'Save snapshot only'}
+              onClick={() => {
+                if (!workspace.trim()) return;
+                onCreateBackup(workspace);
+              }}
+            />
           </div>
         </div>
 
@@ -916,20 +950,86 @@ function ReviewProjectView({
           {jobs.length === 0 ? (
             <EmptyState title="No project reviews yet." detail="Pick a project folder, choose Codex or Claude lanes, then start a read-only review." />
           ) : (
-            jobs.map((job) => <ReviewJobCard key={job.id} job={job} busy={busyKey === `review-fix-${job.id}`} onFixPlan={() => onFixPlan(job)} />)
+            jobs.map((job) => (
+              <ReviewJobCard
+                key={job.id}
+                job={job}
+                fixPlanBusy={busyKey === `review-fix-${job.id}`}
+                cancelBusy={busyKey === `review-cancel-${job.id}`}
+                onFixPlan={() => onFixPlan(job)}
+                onCancel={() => onCancel(job)}
+              />
+            ))
           )}
+          <BackupListCard backups={backups} />
         </div>
       </div>
     </div>
   );
 }
 
-function ReviewJobCard({ job, busy, onFixPlan }: { job: ReviewJob; busy: boolean; onFixPlan: () => void }) {
+function BackupListCard({ backups }: { backups: BackupRecord[] }) {
+  const recent = backups.slice(0, 8);
+  return (
+    <div className="rounded-[30px] border border-slate-200/80 bg-white/80 p-5 shadow-[0_18px_45px_rgba(15,23,42,0.08)] dark:border-white/10 dark:bg-white/[0.03] dark:shadow-2xl">
+      <div className="flex items-center justify-between gap-3">
+        <div>
+          <div className="text-[10px] font-bold uppercase tracking-[0.22em] text-slate-500 dark:text-gray-500">Source snapshots</div>
+          <div className="mt-1 text-sm font-semibold text-slate-900 dark:text-white">CLADEX-managed backups</div>
+        </div>
+        <MetaPill label={`${backups.length} total`} mono />
+      </div>
+      {recent.length === 0 ? (
+        <div className="mt-4 rounded-2xl border border-dashed border-slate-200/80 bg-slate-50/60 px-4 py-3 text-sm text-slate-500 dark:border-white/10 dark:bg-black/20 dark:text-gray-400">
+          No snapshots yet. Reviews with the snapshot toggle on, or "Save snapshot only", will appear here.
+        </div>
+      ) : (
+        <ul className="mt-4 space-y-2">
+          {recent.map((backup) => (
+            <li key={backup.id} className="rounded-2xl border border-slate-200/80 bg-white/70 px-3 py-3 dark:border-white/5 dark:bg-black/30">
+              <div className="flex flex-wrap items-baseline justify-between gap-2">
+                <div className="font-mono text-xs text-slate-700 dark:text-gray-300">{backup.id}</div>
+                <div className="text-[10px] uppercase tracking-[0.18em] text-slate-500 dark:text-gray-500">{backup.reason || 'manual'}</div>
+              </div>
+              <div className="mt-1 break-all text-xs text-slate-500 dark:text-gray-500">{backup.workspace}</div>
+              <div className="mt-1 text-[11px] text-slate-400 dark:text-gray-500">{backup.createdAt}</div>
+            </li>
+          ))}
+        </ul>
+      )}
+      {backups.length ? (
+        <div className="mt-3 text-[11px] text-slate-500 dark:text-gray-500">
+          Restore is CLI-only: <span className="font-mono">cladex backup restore &lt;id&gt; --confirm &lt;id&gt;</span>.
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function ReviewJobCard({
+  job,
+  fixPlanBusy,
+  cancelBusy,
+  onFixPlan,
+  onCancel,
+}: {
+  job: ReviewJob;
+  fixPlanBusy: boolean;
+  cancelBusy: boolean;
+  onFixPlan: () => void;
+  onCancel: () => void;
+}) {
   const progress = job.progress || { total: job.agentCount || 0, running: 0, done: 0, failed: 0, queued: 0 };
   const total = Math.max(progress.total || job.agentCount || 0, 1);
-  const finished = (progress.done || 0) + (progress.failed || 0);
+  const finished = (progress.done || 0) + (progress.failed || 0) + (progress.cancelled || 0);
   const percent = Math.min(100, Math.round((finished / total) * 100));
-  const statusTone = job.status === 'failed' ? 'text-red-300 bg-red-500/10 border-red-500/25' : job.status === 'completed' ? 'text-emerald-300 bg-emerald-500/10 border-emerald-500/25' : 'text-indigo-300 bg-indigo-500/10 border-indigo-500/25';
+  const statusTone = job.status === 'failed' ? 'text-red-300 bg-red-500/10 border-red-500/25'
+    : job.status === 'completed' ? 'text-emerald-300 bg-emerald-500/10 border-emerald-500/25'
+    : job.status === 'cancelled' ? 'text-amber-300 bg-amber-500/10 border-amber-500/25'
+    : 'text-indigo-300 bg-indigo-500/10 border-indigo-500/25';
+  const inFlight = job.status === 'queued' || job.status === 'running';
+  const severity = job.severityCounts || { high: 0, medium: 0, low: 0 };
+  const totalFindings = severity.high + severity.medium + severity.low;
 
   return (
     <div className="rounded-[30px] border border-slate-200/80 bg-white/80 p-5 shadow-[0_18px_45px_rgba(15,23,42,0.08)] dark:border-white/10 dark:bg-white/[0.03] dark:shadow-2xl">
@@ -940,14 +1040,37 @@ function ReviewJobCard({ job, busy, onFixPlan }: { job: ReviewJob; busy: boolean
             <MetaPill label={`${job.provider} swarm`} mono />
             <MetaPill label={`${job.agentCount} lane${job.agentCount === 1 ? '' : 's'}`} mono />
             {job.selfReview ? <MetaPill label="CLADEX self-review" /> : null}
+            {job.cancelRequested && inFlight ? <MetaPill label="cancel pending" /> : null}
           </div>
           <h3 className="mt-3 text-xl font-bold tracking-tight text-slate-900 dark:text-white">{job.title || job.id}</h3>
           <div className="mt-2 break-all font-mono text-xs text-slate-500 dark:text-gray-500">{job.workspace}</div>
         </div>
-        <div className="flex gap-2">
-          <ActionButton label={busy ? 'Planning...' : 'Fix Plan'} icon={busy ? <Loader2 size={16} className="animate-spin" /> : <FileText size={16} />} busy={busy || job.status === 'queued' || job.status === 'running'} onClick={onFixPlan} />
+        <div className="flex flex-wrap gap-2">
+          <ActionButton
+            label={fixPlanBusy ? 'Planning...' : 'Fix Plan'}
+            icon={fixPlanBusy ? <Loader2 size={16} className="animate-spin" /> : <FileText size={16} />}
+            busy={fixPlanBusy || inFlight}
+            onClick={onFixPlan}
+          />
+          {inFlight ? (
+            <ActionButton
+              label={cancelBusy ? 'Cancelling...' : 'Cancel'}
+              icon={cancelBusy ? <Loader2 size={16} className="animate-spin" /> : <X size={16} />}
+              busy={cancelBusy || job.cancelRequested === true}
+              tone="danger"
+              onClick={onCancel}
+            />
+          ) : null}
         </div>
       </div>
+
+      {totalFindings > 0 ? (
+        <div className="mt-4 flex flex-wrap items-center gap-2 text-[11px]">
+          <span className="rounded-full border border-red-500/25 bg-red-500/10 px-2.5 py-1 font-semibold text-red-200">High {severity.high}</span>
+          <span className="rounded-full border border-amber-500/25 bg-amber-500/10 px-2.5 py-1 font-semibold text-amber-200">Medium {severity.medium}</span>
+          <span className="rounded-full border border-slate-500/25 bg-slate-500/10 px-2.5 py-1 font-semibold text-slate-200">Low {severity.low}</span>
+        </div>
+      ) : null}
 
       <div className="mt-5">
         <div className="mb-2 flex flex-wrap items-center justify-between gap-2 text-sm text-slate-600 dark:text-gray-400">

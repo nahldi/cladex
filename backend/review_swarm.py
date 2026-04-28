@@ -131,6 +131,7 @@ REVIEW_EXTENSIONS = {
     ".yml",
 }
 SECRET_FILENAME_RE = re.compile(r"(^|[._-])(env|secret|secrets|token|tokens|key|keys|credential|credentials)([._-]|$)", re.I)
+SAFE_TEMPLATE_SEGMENTS = frozenset({"example", "sample", "template", "tmpl", "dist"})
 SECRET_VALUE_RE = re.compile(
     r"\b(api[_-]?key|auth[_-]?token|client[_-]?secret|discord[_-]?token|password|private[_-]?key|secret|token)\b\s*[:=]",
     re.I,
@@ -141,6 +142,8 @@ SECRET_ASSIGNMENT_RE = re.compile(
 )
 DISCORD_TOKEN_RE = re.compile(r"\b[A-Za-z0-9_-]{23,28}\.[A-Za-z0-9_-]{6,7}\.[A-Za-z0-9_-]{27,45}\b")
 GITHUB_TOKEN_RE = re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b")
+TODO_MARKER_RE = re.compile(r"\b(TODO|FIXME|HACK|XXX)\b", re.I)
+COMMENT_PREFIX_RE = re.compile(r"(?:#|//|/\*|<!--|--\s|;|\*\s)")
 
 
 def utc_now() -> str:
@@ -188,7 +191,20 @@ def _atomic_write_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
     tmp.write_text(text, encoding="utf-8")
-    tmp.replace(path)
+    last_error: BaseException | None = None
+    for attempt in range(5):
+        try:
+            tmp.replace(path)
+            return
+        except PermissionError as exc:
+            last_error = exc
+            time.sleep(0.05 * (attempt + 1))
+    try:
+        tmp.unlink()
+    except OSError:
+        pass
+    if last_error is not None:
+        raise last_error
 
 
 def _write_json(path: Path, payload: dict[str, Any] | list[Any]) -> None:
@@ -294,6 +310,9 @@ def _public_job(job: dict[str, Any]) -> dict[str, Any]:
     public["fixPlanPath"] = str(plan_path) if plan_path.exists() else ""
     if report_path.exists():
         public["reportPreview"] = report_path.read_text(encoding="utf-8", errors="replace")[:12000]
+    findings_payload = _read_json(findings_json_path(job["id"]), default={"findings": []})
+    findings = findings_payload.get("findings") if isinstance(findings_payload, dict) else None
+    public["severityCounts"] = _severity_counts(findings if isinstance(findings, list) else [])
     return public
 
 
@@ -322,6 +341,33 @@ def list_reviews() -> list[dict[str, Any]]:
 
 def show_review(job_id: str) -> dict[str, Any]:
     return _public_job(load_job(job_id))
+
+
+def cancel_flag_path(job_id: str) -> Path:
+    return job_dir(job_id) / "cancel.flag"
+
+
+def _cancel_requested(job_id: str) -> bool:
+    try:
+        return cancel_flag_path(job_id).exists()
+    except (OSError, ValueError):
+        return False
+
+
+def cancel_review(job_id: str) -> dict[str, Any]:
+    job = load_job(job_id)
+    if job.get("status") in {"completed", "failed", "cancelled"}:
+        return show_review(job_id)
+    flag = cancel_flag_path(job_id)
+    flag.parent.mkdir(parents=True, exist_ok=True)
+    flag.write_text(utc_now(), encoding="utf-8")
+    job["cancelRequested"] = True
+    if job.get("status") == "queued":
+        job["status"] = "cancelled"
+        job["finishedAt"] = utc_now()
+        job["error"] = job.get("error") or "Cancelled before execution."
+    save_job(job)
+    return show_review(job_id)
 
 
 def create_source_backup(workspace: str | Path, *, reason: str = "manual", source_job_id: str = "") -> dict[str, Any]:
@@ -540,26 +586,33 @@ def inventory_files(workspace: str | Path) -> list[Path]:
     return files
 
 
+def is_template_secret_filename(name: str) -> bool:
+    return any(part in SAFE_TEMPLATE_SEGMENTS for part in name.lower().split("."))
+
+
 def secret_name_findings(workspace: Path) -> list[dict[str, Any]]:
     findings: list[dict[str, Any]] = []
     for current, dirs, filenames in os.walk(workspace):
         current_path = Path(current)
         dirs[:] = [name for name in dirs if not _should_skip_dir(current_path / name)]
         for filename in filenames:
-            if SECRET_FILENAME_RE.search(filename):
-                path = current_path / filename
-                findings.append(
-                    {
-                        "severity": "high",
-                        "category": "secret-hygiene",
-                        "path": path.relative_to(workspace).as_posix(),
-                        "line": 0,
-                        "title": "Secret-like file is present in the workspace",
-                        "detail": "A file name looks like it may contain credentials. CLADEX did not read or store its contents.",
-                        "recommendation": "Confirm the file is ignored or remove secrets from the repository before publishing.",
-                        "confidence": "medium",
-                    }
-                )
+            if not SECRET_FILENAME_RE.search(filename):
+                continue
+            if is_template_secret_filename(filename):
+                continue
+            path = current_path / filename
+            findings.append(
+                {
+                    "severity": "high",
+                    "category": "secret-hygiene",
+                    "path": path.relative_to(workspace).as_posix(),
+                    "line": 0,
+                    "title": "Secret-like file is present in the workspace",
+                    "detail": "A file name looks like it may contain credentials. CLADEX did not read or store its contents.",
+                    "recommendation": "Confirm the file is ignored or remove secrets from the repository before publishing.",
+                    "confidence": "medium",
+                }
+            )
     return findings
 
 
@@ -609,7 +662,8 @@ def scan_file(path: Path, workspace: Path) -> list[dict[str, Any]]:
                     confidence="medium",
                 )
             )
-        if "todo" in lowered or "fixme" in lowered or "hack" in lowered:
+        marker_match = TODO_MARKER_RE.search(line)
+        if marker_match and COMMENT_PREFIX_RE.search(line):
             findings.append(
                 _finding(
                     severity="low",
@@ -617,7 +671,7 @@ def scan_file(path: Path, workspace: Path) -> list[dict[str, Any]]:
                     relative_path=relative,
                     line=index,
                     title="Unresolved maintenance marker",
-                    detail="A TODO/FIXME/HACK marker remains in source.",
+                    detail=f"A {marker_match.group(1).upper()} comment remains in source.",
                     recommendation="Convert the marker into a tracked task or finish the underlying cleanup.",
                     confidence="medium",
                 )
@@ -956,6 +1010,41 @@ def _agent_finding_prefix(agent_id: str, provider: str, findings: list[dict[str,
     return prefixed
 
 
+SEVERITY_ORDER = {"high": 0, "medium": 1, "low": 2}
+
+
+def dedup_findings(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse duplicate findings reported by multiple lanes into one entry.
+
+    Two findings are duplicates when they share category, path, line, and title.
+    The kept entry tracks every contributing agent in `seenByAgents` and is
+    promoted to the highest severity any contributor reported.
+    """
+    deduped: dict[tuple[str, str, int, str], dict[str, Any]] = {}
+    for finding in findings:
+        key = (
+            str(finding.get("category", "")),
+            str(finding.get("path", "")),
+            int(finding.get("line", 0) or 0),
+            str(finding.get("title", "")),
+        )
+        existing = deduped.get(key)
+        agent_id = str(finding.get("agentId", "")).strip()
+        if existing is None:
+            entry = dict(finding)
+            entry["seenByAgents"] = [agent_id] if agent_id else []
+            deduped[key] = entry
+            continue
+        agents = existing.setdefault("seenByAgents", [])
+        if agent_id and agent_id not in agents:
+            agents.append(agent_id)
+        existing_rank = SEVERITY_ORDER.get(str(existing.get("severity")), 3)
+        new_rank = SEVERITY_ORDER.get(str(finding.get("severity")), 3)
+        if new_rank < existing_rank:
+            existing["severity"] = finding.get("severity")
+    return list(deduped.values())
+
+
 def _extract_json_payload(text: str) -> dict[str, Any] | None:
     candidates: list[str] = []
     for match in re.finditer(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.I | re.S):
@@ -1036,6 +1125,7 @@ def _update_progress(job: dict[str, Any]) -> None:
         "running": sum(1 for item in agents if item.get("status") == "running"),
         "done": sum(1 for item in agents if item.get("status") == "done"),
         "failed": sum(1 for item in agents if item.get("status") == "failed"),
+        "cancelled": sum(1 for item in agents if item.get("status") == "cancelled"),
     }
 
 
@@ -1071,6 +1161,14 @@ def run_review_job(job_id: str) -> dict[str, Any]:
 
         def process_agent(index: int, shard: list[Path]) -> None:
             agent = job["agents"][index]
+            if _cancel_requested(job["id"]):
+                with lock:
+                    agent["status"] = "cancelled"
+                    agent["assignedFiles"] = len(shard)
+                    agent["detail"] = "Cancelled before launch."
+                    _update_progress(job)
+                    save_job(job)
+                return
             with lock:
                 agent["status"] = "running"
                 agent["assignedFiles"] = len(shard)
@@ -1082,7 +1180,7 @@ def run_review_job(job_id: str) -> dict[str, Any]:
             try:
                 for path in shard:
                     agent_findings.extend(scan_file(path, workspace))
-                if not job.get("preflightOnly"):
+                if not job.get("preflightOnly") and not _cancel_requested(job["id"]):
                     if str(job.get("provider")) == "codex":
                         ai_output = _run_codex_ai_review(job, agent, shard)
                     else:
@@ -1091,9 +1189,14 @@ def run_review_job(job_id: str) -> dict[str, Any]:
                 prefixed = _agent_finding_prefix(agent["id"], str(job["provider"]), agent_findings)
                 with lock:
                     findings.extend(prefixed)
-                    agent["status"] = "done"
-                    agent["findings"] = len(prefixed)
-                    agent["detail"] = f"Reviewed {len(shard)} file(s); found {len(prefixed)} item(s)."
+                    if _cancel_requested(job["id"]):
+                        agent["status"] = "cancelled"
+                        agent["findings"] = len(prefixed)
+                        agent["detail"] = f"Cancelled mid-shard after {len(prefixed)} preflight finding(s)."
+                    else:
+                        agent["status"] = "done"
+                        agent["findings"] = len(prefixed)
+                        agent["detail"] = f"Reviewed {len(shard)} file(s); found {len(prefixed)} item(s)."
                     _update_progress(job)
                     save_job(job)
             except Exception as exc:
@@ -1111,9 +1214,10 @@ def run_review_job(job_id: str) -> dict[str, Any]:
             for future in concurrent.futures.as_completed(futures):
                 future.result()
 
+        findings = dedup_findings(findings)
         findings.sort(
             key=lambda item: (
-                {"high": 0, "medium": 1, "low": 2}.get(str(item.get("severity")), 3),
+                SEVERITY_ORDER.get(str(item.get("severity")), 3),
                 str(item.get("path", "")),
                 int(item.get("line", 0) or 0),
                 str(item.get("title", "")),
@@ -1123,10 +1227,22 @@ def run_review_job(job_id: str) -> dict[str, Any]:
             finding["id"] = f"F{index:04d}"
         _write_json(findings_json_path(job_id), {"jobId": job_id, "findings": findings})
         _atomic_write_text(report_markdown_path(job_id), build_report(job, findings, files))
-        failed = sum(1 for item in job["agents"] if item.get("status") == "failed")
-        job["status"] = "failed" if failed == len(job["agents"]) else "completed"
+        statuses = [str(item.get("status")) for item in job["agents"]]
+        cancelled = sum(1 for status in statuses if status == "cancelled")
+        failed = sum(1 for status in statuses if status == "failed")
+        if cancelled and (cancelled + failed) == len(job["agents"]):
+            job["status"] = "cancelled"
+            job["error"] = "Cancelled before all lanes finished."
+        elif failed == len(job["agents"]):
+            job["status"] = "failed"
+            job["error"] = "All reviewer lanes failed."
+        elif _cancel_requested(job_id) and cancelled:
+            job["status"] = "cancelled"
+            job["error"] = "Cancelled before all lanes finished."
+        else:
+            job["status"] = "completed"
+            job["error"] = ""
         job["finishedAt"] = utc_now()
-        job["error"] = "" if job["status"] == "completed" else "All reviewer lanes failed."
         _update_progress(job)
         save_job(job)
     except Exception as exc:

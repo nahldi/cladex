@@ -2,6 +2,17 @@
 
 CLADEX stays focused on Claude Code and OpenAI Codex relays. The current production path is to keep clone-to-run setup clean, keep model/account behavior provider-led, and add scaling only after compatibility and load tests prove the lower layers.
 
+## Completed For 2.2.1
+
+- Dropped the dead `claude-code-sdk` runtime dependency from `backend/pyproject.toml` and regenerated `backend/constraints.txt`. Trims 27 transitive packages (`mcp`, `pydantic*`, `httpx*`, `starlette`, `uvicorn`, `cryptography`, `cffi`, `pycparser`, `jsonschema*`, etc.) that were pulled in only for the SDK chain. Source has used a subprocess-based Claude transport for several releases, so no import path needs the package.
+- Stopped the project review swarm from flagging template/sample env files. `.env.example`, `.env.template`, `.env.sample`, `secrets.example.json`, and similar conventional placeholders are now allowlisted (any `.example/.sample/.template/.tmpl/.dist` segment) while the underlying secret-filename match still triggers on `.env`, `secrets.json`, etc.
+- Tightened the TODO/FIXME/HACK/XXX maintenance marker rule. Substring matches like `podcast`, `shack`, doc string mentions of "todo", or marker tokens inside string literals no longer fire. The rule now requires a word boundary around the marker AND a comment context (`#`, `//`, `/*`, `<!--`, `;`, `-- `, `* `).
+- Added cross-lane finding deduplication. Findings sharing category + path + line + title from multiple reviewer lanes collapse to a single entry that lists every contributor in `seenByAgents` and is promoted to the highest severity any contributor reported.
+- Added review job cancellation. `cladex review cancel <id>` (CLI) and `POST /api/reviews/:id/cancel` (API) write a per-job `cancel.flag` file. Queued jobs are marked cancelled immediately; running jobs stop launching further AI lanes and finalize as `cancelled`. Cancel control surfaced in the desktop UI alongside Fix Plan.
+- Surfaced severity counts on review jobs. Backend `_public_job` now returns `severityCounts: {high, medium, low}` and the desktop UI renders colored severity pills on the review job card once any finding has been recorded.
+- Wired the backup management UI that was previously plumbed only at the API layer. Desktop `Review Project` view now lists CLADEX-managed source snapshots, polls them with the rest of state, and exposes a "Save snapshot only" button next to "Review Project". Restore stays CLI-only and confirmation-gated.
+- Hardened `_atomic_write_text` against transient Windows `PermissionError` during concurrent rename. Five-attempt 50ms backoff covers the race window, then re-raises so a real lockout still surfaces fast.
+
 ## Completed For 2.2.0
 
 - Updated GitHub Actions workflow references to official Node 24-based action majors (`actions/checkout@v6`, `actions/setup-node@v6`, and `actions/setup-python@v6`) after verifying the action metadata.
@@ -52,10 +63,10 @@ CLADEX stays focused on Claude Code and OpenAI Codex relays. The current product
 
 - Advance Project Review from the safe foundation to a full production repair loop:
   - planner shards by package boundaries, recent git hotspots, test surfaces, and security-sensitive paths instead of only deterministic file distribution,
-  - reducer de-duplicates findings by file, symptom, evidence, agent focus, and recommended fix,
+  - reducer de-duplicates findings by evidence, agent focus, and recommended fix as well (current 2.2.1 reducer is title/path/line/category exact-match),
   - live AI review lanes should emit validated structured JSON findings with command-attempt evidence,
   - expose queue/concurrency controls and clearer rate-limit/account-pressure reporting,
-  - UI should support cancel/retry/export, richer severity filtering, and backup management.
+  - UI should grow retry/export, richer interactive severity/category/agent filtering, and a snapshot restore button gated behind explicit confirmation (CLI restore stays the source of truth).
 - Add a guarded fix phase for review reports:
   - one planner converts findings into ordered fix phases,
   - user approval is required before edits,
