@@ -8,8 +8,8 @@
 2. Install the AI CLI you plan to use:
    - `codex` for Codex relays
    - `claude` for Claude relays
-3. Open `release\CLADEX Setup 2.1.0.exe` and install it.
-4. Or run `release\CLADEX 2.1.0.exe` or `release\win-unpacked\CLADEX.exe` directly.
+3. Open `release\CLADEX Setup 2.1.1.exe` and install it.
+4. Or run `release\CLADEX 2.1.1.exe` or `release\win-unpacked\CLADEX.exe` directly.
 5. In CLADEX, choose `Add Relay`, then enter:
    - a workspace folder
    - a Discord bot token
@@ -21,6 +21,8 @@ Security notes for packaged users:
 - `CLADEX.exe` is local-first. It should be run on the same machine that owns the relays.
 - The local API should stay on loopback. Do not expose it externally unless you know exactly why and have added your own auth/network controls.
 - Treat the Discord bot token and the saved profile env files as secrets.
+- CLADEX does not ship Codex or Claude credentials. Each user must install and authenticate their own `codex` and `claude` CLIs before starting those relay types.
+- Before publishing a source checkout, run `python backend/relayctl.py privacy-audit --tracked-only .` and keep profile env files, auth homes, logs, local memory, and generated builds out of git.
 
 ### Option 2: Run from source
 

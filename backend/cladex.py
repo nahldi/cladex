@@ -16,6 +16,7 @@ from typing import Any
 import psutil
 from platformdirs import user_config_dir, user_data_dir
 
+from agent_guardrails import assert_workspace_allowed, workspace_protection_violation
 import claude_relay
 import relayctl
 
@@ -371,6 +372,12 @@ def _ensure_claude_background_runtime() -> None:
 def start_profile(profile: dict[str, Any], *, start_reason: str = "operator-start") -> None:
     relay_type = str(profile.get("_relay_type", "")).strip().lower()
     if relay_type == "codex":
+        workspace = Path(str(profile.get("workspace", "") or Path.cwd()))
+        env_file = Path(str(profile.get("env_file", "")).strip()) if profile.get("env_file") else None
+        env: dict[str, str] = {}
+        if env_file is not None and env_file.is_file():
+            env = relayctl._normalized_profile_env(relayctl._load_env_file(env_file))
+        assert_workspace_allowed(workspace, env=env)
         relayctl._run_profile(profile)
         return
     if relay_type != "claude":
@@ -384,6 +391,7 @@ def start_profile(profile: dict[str, Any], *, start_reason: str = "operator-star
 
     env = _load_claude_env(profile)
     workspace = str(profile.get("workspace", "") or Path.cwd())
+    assert_workspace_allowed(Path(workspace), env=env)
     state_namespace = str(profile.get("state_namespace", "")).strip()
 
     # Create state directory
@@ -669,6 +677,7 @@ def _update_codex_profile(
     if startup_channel_text is not None:
         env["STARTUP_CHANNEL_TEXT"] = startup_channel_text.strip()
     env = relayctl._normalized_profile_env(env)
+    assert_workspace_allowed(Path(env["CODEX_WORKDIR"]), env=env)
     new_profile = relayctl._profile_from_env(env)
     relayctl._replace_profile_registration(profile, new_profile)
 
@@ -722,6 +731,7 @@ def _update_claude_profile(
     env["ALLOWED_BOT_IDS"] = claude_relay._parse_csv_ids(env.get("ALLOWED_BOT_IDS", ""))
     env["ALLOWED_CHANNEL_IDS"] = claude_relay._parse_csv_ids(env.get("ALLOWED_CHANNEL_IDS", ""))
     env["CLAUDE_MODEL"] = (env.get("CLAUDE_MODEL", "") or "").strip()
+    assert_workspace_allowed(Path(env["CLAUDE_WORKDIR"]), env=env)
     new_profile = claude_relay._profile_from_env(env)
     registry = _load_claude_registry()
     previous_name = str(profile.get("name", "")).strip()
@@ -1143,23 +1153,55 @@ def _doctor_windows_powershell_shim(name: str) -> dict[str, Any]:
 def _doctor_profiles() -> dict[str, Any]:
     profiles = get_all_profiles()
     ports: dict[str, list[str]] = {}
+    unsafe_workspaces: list[dict[str, str]] = []
+    account_homes: dict[str, dict[str, list[str]]] = {"codex": {}, "claude": {}}
     for profile in profiles:
-        if str(profile.get("_relay_type", "")).lower() != "codex":
+        relay_type = str(profile.get("_relay_type", "")).lower()
+        env: dict[str, str] = {}
+        if relay_type == "codex":
+            try:
+                env = relayctl._normalized_profile_env(relayctl._load_env_file(Path(str(profile.get("env_file", "")))))
+            except Exception:
+                env = {}
+            port = str(env.get("CODEX_APP_SERVER_PORT", "")).strip()
+            if port:
+                ports.setdefault(port, []).append(str(profile.get("name", "")))
+            home = str(env.get("CODEX_HOME", "")).strip() or "(default Codex home)"
+            account_homes["codex"].setdefault(home, []).append(str(profile.get("name", "")))
+        elif relay_type == "claude":
+            env = _load_claude_env(profile)
+            home = str(env.get("CLAUDE_CONFIG_DIR", "")).strip() or "(default Claude config)"
+            account_homes["claude"].setdefault(home, []).append(str(profile.get("name", "")))
+        else:
             continue
-        try:
-            env = relayctl._normalized_profile_env(relayctl._load_env_file(Path(str(profile.get("env_file", "")))))
-        except Exception:
+
+        workspace = str(profile.get("workspace", "")).strip()
+        if not workspace:
             continue
-        port = str(env.get("CODEX_APP_SERVER_PORT", "")).strip()
-        if port:
-            ports.setdefault(port, []).append(str(profile.get("name", "")))
+        violation = workspace_protection_violation(workspace, env=env)
+        if violation:
+            unsafe_workspaces.append(
+                {
+                    "name": str(profile.get("name", "")),
+                    "relayType": relay_type,
+                    "workspace": workspace,
+                    "reason": violation,
+                }
+            )
     duplicate_ports = {port: names for port, names in ports.items() if len(names) > 1}
+    shared_account_homes = {
+        relay_type: {home: names for home, names in homes.items() if len(names) > 1}
+        for relay_type, homes in account_homes.items()
+    }
     return {
         "count": len(profiles),
         "codex": sum(1 for item in profiles if item.get("_relay_type") == "codex"),
         "claude": sum(1 for item in profiles if item.get("_relay_type") == "claude"),
         "running": [item.get("name", "") for item in profiles if item.get("_running")],
         "duplicateCodexPorts": duplicate_ports,
+        "unsafeWorkspaces": unsafe_workspaces,
+        "accountHomes": {relay_type: len(homes) for relay_type, homes in account_homes.items()},
+        "sharedAccountHomes": shared_account_homes,
     }
 
 
@@ -1182,7 +1224,11 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         _doctor_windows_powershell_shim("claude"),
     ]
     profiles = _doctor_profiles()
-    ok = all(bool(item.get("ok")) for item in checks) and not profiles["duplicateCodexPorts"]
+    ok = (
+        all(bool(item.get("ok")) for item in checks)
+        and not profiles["duplicateCodexPorts"]
+        and not profiles.get("unsafeWorkspaces")
+    )
     payload = {
         "ok": ok,
         "repo": str(Path(__file__).resolve().parents[1]),
@@ -1195,7 +1241,9 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             "npm run lint",
             "npm run build",
             "python -m pip install -e \"backend[dev]\" -c backend/constraints.txt",
+            "python backend/relayctl.py privacy-audit --tracked-only .",
             "python -m pytest --tb=short -q",
+            "npm run electron:build",
         ],
     }
     if getattr(args, "json", False):
@@ -1213,6 +1261,12 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         print(f"- profiles: {profiles['count']} total, {profiles['running']} running")
         if profiles["duplicateCodexPorts"]:
             print(f"- duplicate Codex ports: {profiles['duplicateCodexPorts']}")
+        if profiles.get("unsafeWorkspaces"):
+            print(f"- unsafe workspaces: {profiles['unsafeWorkspaces']}")
+        if profiles.get("sharedAccountHomes"):
+            shared = {kind: homes for kind, homes in profiles["sharedAccountHomes"].items() if homes}
+            if shared:
+                print(f"- shared account homes: {shared}")
     return 0 if ok else 1
 
 

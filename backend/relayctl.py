@@ -20,6 +20,7 @@ import time
 from pathlib import Path
 
 import psutil
+from agent_guardrails import assert_workspace_allowed
 from relay_common import (
     CONFIG_ROOT,
     DATA_ROOT,
@@ -64,6 +65,7 @@ ENV_KEY_ORDER = [
     "CODEX_READ_ONLY",
     "CODEX_APP_SERVER_TRANSPORT",
     "CODEX_APP_SERVER_PORT",
+    "CLADEX_ALLOW_CLADEX_WORKSPACE",
     "STATE_NAMESPACE",
     "ALLOW_DMS",
     "BOT_TRIGGER_MODE",
@@ -845,7 +847,15 @@ def _prompt_bool(prompt: str, default: bool = False) -> bool:
             return False
 
 
+def _require_workspace_allowed(workspace: Path, env: dict[str, str] | None = None) -> None:
+    try:
+        assert_workspace_allowed(workspace, env=env)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+
+
 def _interactive_register(workspace: Path) -> dict:
+    _require_workspace_allowed(workspace)
     print(f"Configuring Discord relay for workspace:\n{workspace}")
     token = _prompt("Discord bot token", secret=True)
     bot_name = _prompt("Discord bot name (optional)", default="")
@@ -1154,6 +1164,64 @@ def _privacy_audit(root: Path) -> list[str]:
                     break
             if re.search(r"/mnt/c/users/[a-z0-9._ -]{2,}/", text, flags=re.IGNORECASE) or re.search(r"c:\\users\\[a-z0-9._ -]{2,}\\", text, flags=re.IGNORECASE):
                 findings.append(f"user-specific path literal found in {relative_text}")
+    return findings
+
+
+def _git_tracked_files(root: Path) -> list[Path]:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), "ls-files", "-z"],
+            check=True,
+            capture_output=True,
+            text=False,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise SystemExit(f"`--tracked-only` requires a git checkout: {exc}") from exc
+    files: list[Path] = []
+    for raw_item in result.stdout.split(b"\0"):
+        if not raw_item:
+            continue
+        try:
+            relative = raw_item.decode("utf-8")
+        except UnicodeDecodeError:
+            relative = raw_item.decode(sys.getfilesystemencoding(), errors="replace")
+        files.append(root / relative)
+    return files
+
+
+def _privacy_audit_tracked(root: Path) -> list[str]:
+    findings: list[str] = []
+    markers = _privacy_personal_markers()
+    for path in _git_tracked_files(root):
+        if not path.exists() or not path.is_file():
+            continue
+        try:
+            relative = path.relative_to(root)
+        except ValueError:
+            continue
+        relative_text = str(relative)
+        lowered_name = path.name.lower()
+        if lowered_name.startswith(".env") and path.name not in PRIVACY_ALLOWED_DOTENV_FILES:
+            findings.append(f"tracked secret file: {relative_text}")
+            sensitive_keys = _privacy_sensitive_env_keys(path)
+            if sensitive_keys:
+                findings.append(f"secret-like env keys in {relative_text}: {', '.join(sensitive_keys)}")
+            continue
+        if lowered_name.endswith((".log", ".jsonl")):
+            findings.append(f"tracked runtime artifact: {relative_text}")
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        lowered_text = text.lower()
+        for marker in markers:
+            if marker and marker.lower() in lowered_text:
+                findings.append(f"personal marker found in tracked file {relative_text}: {marker}")
+                break
+        if re.search(r"/mnt/c/users/[a-z0-9._ -]{2,}/", text, flags=re.IGNORECASE) or re.search(r"c:\\users\\[a-z0-9._ -]{2,}\\", text, flags=re.IGNORECASE):
+            findings.append(f"user-specific path literal found in tracked file {relative_text}")
     return findings
 
 
@@ -1650,6 +1718,7 @@ def _launch_bot_worker(
 
 def _run_profile_foreground(profile: dict) -> int:
     env = _normalized_profile_env(_load_env_file(Path(profile["env_file"])))
+    _require_workspace_allowed(Path(profile["workspace"]), env)
     state_dir = state_dir_for_namespace(env["STATE_NAMESPACE"])
     state_dir.mkdir(parents=True, exist_ok=True)
     (state_dir / "logs").mkdir(parents=True, exist_ok=True)
@@ -1702,6 +1771,7 @@ def _run_profile_foreground(profile: dict) -> int:
 
 def _run_profile(profile: dict) -> int:
     env = _normalized_profile_env(_load_env_file(Path(profile["env_file"])))
+    _require_workspace_allowed(Path(profile["workspace"]), env)
     state_dir = state_dir_for_namespace(env["STATE_NAMESPACE"])
     state_dir.mkdir(parents=True, exist_ok=True)
     (state_dir / "logs").mkdir(parents=True, exist_ok=True)
@@ -3095,6 +3165,9 @@ def cmd_gui(_args: argparse.Namespace) -> int:
 
 def cmd_register(args: argparse.Namespace) -> int:
     workspace = Path(args.workspace or Path.cwd()).resolve()
+    allow_cladex_workspace = bool(getattr(args, "allow_cladex_workspace", False))
+    if not allow_cladex_workspace:
+        _require_workspace_allowed(workspace)
     if not args.allow_dms and not args.allowed_channel_ids:
         raise SystemExit("At least one --allowed-channel-id is required unless --allow-dms is enabled.")
     inferred_trigger_mode = args.trigger_mode or "mention_or_dm"
@@ -3123,6 +3196,8 @@ def cmd_register(args: argparse.Namespace) -> int:
         "OPEN_VISIBLE_TERMINAL": "true" if args.open_visible_terminal else "false",
         "RELAY_ATTACH_CHANNEL_ID": args.attach_channel_id or (args.allowed_channel_ids[0] if args.allowed_channel_ids else ""),
     }
+    if allow_cladex_workspace:
+        env["CLADEX_ALLOW_CLADEX_WORKSPACE"] = "true"
     profile = _profile_from_env(env)
     _register_profile(profile)
     print(f"Registered {profile['name']} for {profile['workspace']}")
@@ -3292,11 +3367,14 @@ def cmd_setup(_args: argparse.Namespace) -> int:
 
 def cmd_privacy_audit(args: argparse.Namespace) -> int:
     root = Path(args.path or Path.cwd()).resolve()
-    findings = _privacy_audit(root)
+    tracked_only = bool(getattr(args, "tracked_only", False))
+    findings = _privacy_audit_tracked(root) if tracked_only else _privacy_audit(root)
     if not findings:
-        print(f"No privacy findings under {root}")
+        scope = "tracked files under" if tracked_only else "under"
+        print(f"No privacy findings {scope} {root}")
         return 0
-    print(f"Privacy findings under {root}:")
+    scope = "tracked files under" if tracked_only else "under"
+    print(f"Privacy findings {scope} {root}:")
     for finding in findings:
         print(f"- {finding}")
     return 1
@@ -3752,6 +3830,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     privacy_parser = subparsers.add_parser("privacy-audit", help="Scan a tree for repo-local secrets and personal path markers")
     privacy_parser.add_argument("path", nargs="?", default=str(Path.cwd()), help="Directory to scan; defaults to the current workspace")
+    privacy_parser.add_argument(
+        "--tracked-only",
+        action="store_true",
+        default=False,
+        help="Scan only git-tracked files; use this as the public repo/release gate",
+    )
     privacy_parser.set_defaults(func=cmd_privacy_audit)
 
     version_parser = subparsers.add_parser("version", help="Show the installed discord-codex-relay package version")
@@ -3804,6 +3888,11 @@ def build_parser() -> argparse.ArgumentParser:
     register_parser.add_argument("--model", default="", help="Optional model override for this relay profile")
     register_parser.add_argument("--codex-model", default="", help="Optional model override for this relay profile")
     register_parser.add_argument("--codex-home", default="", help="Optional CODEX_HOME for this relay profile/account")
+    register_parser.add_argument(
+        "--allow-cladex-workspace",
+        action="store_true",
+        help="Allow this profile to use the CLADEX runtime repository as its workspace; only use for deliberate CLADEX development.",
+    )
     register_parser.add_argument("--trigger-mode", choices=["all", "mention_or_dm", "dm_only"], default=None, help="How channel messages trigger the relay; defaults to `mention_or_dm` when a channel is configured")
     register_parser.add_argument("--channel-history-limit", type=int, default=20, help="Relevant messages included in a fresh channel bootstrap digest; use 0 for an unlimited backfill scan")
     register_parser.add_argument("--startup-dm-text", default="Discord relay online. DM me here to chat with Codex.", help="Optional startup DM text")

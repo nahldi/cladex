@@ -26,6 +26,7 @@ from pathlib import Path
 
 import psutil
 
+from agent_guardrails import assert_workspace_allowed
 from claude_common import (
     CONFIG_ROOT,
     DATA_ROOT,
@@ -55,6 +56,7 @@ ENV_KEY_ORDER = [
     "CLAUDE_CONFIG_DIR",
     "CLAUDE_MODEL",
     "CLAUDE_PERMISSION_MODE",
+    "CLADEX_ALLOW_CLADEX_WORKSPACE",
     "STATE_NAMESPACE",
     "ALLOW_DMS",
     "BOT_TRIGGER_MODE",
@@ -116,6 +118,13 @@ def _parse_csv_ids(value: str) -> str:
     parts = [part.strip() for part in value.split(",") if part.strip()]
     valid = [part for part in parts if part.isdigit()]
     return ",".join(valid)
+
+
+def _require_workspace_allowed(workspace: Path, env: dict[str, str] | None = None) -> None:
+    try:
+        assert_workspace_allowed(workspace, env=env)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
 
 
 def _profile_from_env(env: dict[str, str]) -> dict:
@@ -197,6 +206,7 @@ def _package_version() -> str:
 
 def interactive_setup(workspace: Path) -> dict:
     """Interactive setup wizard for new workspace."""
+    _require_workspace_allowed(workspace)
     print("\n=== Discord Claude Relay Setup ===\n")
 
     # Bot token
@@ -294,6 +304,9 @@ def cmd_register(args: argparse.Namespace) -> int:
         workspace = workspace_root(Path(args.workspace).resolve())
     else:
         workspace = workspace_root(Path.cwd())
+    allow_cladex_workspace = bool(getattr(args, "allow_cladex_workspace", False))
+    if not allow_cladex_workspace:
+        _require_workspace_allowed(workspace)
 
     env = {
         "DISCORD_BOT_TOKEN": args.discord_bot_token,
@@ -310,6 +323,8 @@ def cmd_register(args: argparse.Namespace) -> int:
         "CLAUDE_MODEL": (args.model or "").strip(),
         "CLAUDE_PERMISSION_MODE": "default",
     }
+    if allow_cladex_workspace:
+        env["CLADEX_ALLOW_CLADEX_WORKSPACE"] = "true"
 
     profile = _profile_from_env(env)
 
@@ -463,6 +478,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         return 1
 
     env = _load_env_file(env_file)
+    _require_workspace_allowed(workspace, env)
 
     # Create state directory
     state_dir = state_dir_for_namespace(profile.get("state_namespace", ""))
@@ -537,6 +553,11 @@ def main() -> int:
     reg_parser.add_argument("--channel-history-limit", type=int, default=20)
     reg_parser.add_argument("--model", default="")
     reg_parser.add_argument("--claude-config-dir", default="", help="Optional CLAUDE_CONFIG_DIR for this relay profile/account")
+    reg_parser.add_argument(
+        "--allow-cladex-workspace",
+        action="store_true",
+        help="Allow this profile to use the CLADEX runtime repository as its workspace; only use for deliberate CLADEX development.",
+    )
 
     # status
     subparsers.add_parser("status", help="Show status")

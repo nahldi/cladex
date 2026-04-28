@@ -100,6 +100,29 @@ def test_register_handles_100_isolated_codex_profiles_without_port_or_account_co
     assert "Registered" in capsys.readouterr().out
 
 
+def test_register_rejects_protected_cladex_workspace(monkeypatch) -> None:
+    parser = relayctl.build_parser()
+    args = parser.parse_args(
+        [
+            "register",
+            "--workspace",
+            str(Path(relayctl.__file__).resolve().parents[1]),
+            "--discord-bot-token",
+            "token",
+            "--allowed-channel-id",
+            "1234567890",
+        ]
+    )
+    monkeypatch.setattr(relayctl, "_register_profile", lambda profile: None)
+
+    try:
+        relayctl.cmd_register(args)
+    except SystemExit as exc:
+        assert "overlaps protected CLADEX/runtime root" in str(exc)
+    else:
+        raise AssertionError("cmd_register should reject protected CLADEX workspaces")
+
+
 def test_prepare_relay_codex_home_copies_auth_without_personal_config(tmp_path: Path) -> None:
     source_home = tmp_path / "source-home"
     target_home = tmp_path / "target-home"
@@ -928,6 +951,19 @@ def test_privacy_audit_flags_repo_local_env_and_secret_keys(tmp_path: Path) -> N
     findings = relayctl._privacy_audit(tmp_path)
     assert any(item == "repo-local secret file: .env" for item in findings)
     assert any("DISCORD_BOT_TOKEN" in item for item in findings)
+
+
+def test_privacy_audit_tracked_scans_only_git_tracked_files(tmp_path: Path, monkeypatch) -> None:
+    tracked_env = tmp_path / ".env"
+    ignored_env = tmp_path / "ignored.env"
+    tracked_env.write_text("DISCORD_BOT_TOKEN=secret\n", encoding="utf-8")
+    ignored_env.write_text("DISCORD_BOT_TOKEN=secret\n", encoding="utf-8")
+    monkeypatch.setattr(relayctl, "_git_tracked_files", lambda root: [tracked_env])
+
+    findings = relayctl._privacy_audit_tracked(tmp_path)
+
+    assert "tracked secret file: .env" in findings
+    assert all("ignored.env" not in item for item in findings)
 
 
 def test_privacy_audit_allows_generic_user_path_patterns() -> None:

@@ -45,8 +45,8 @@ That gives you the desktop manager plus the Python relay commands:
 
 Important for packaged users: the `.exe` bundles the CLADEX UI and bundled backend files, but it does not bundle Python or the external AI CLIs. You still need:
 - Python 3.10+
-- `codex` for Codex relays
-- `claude` for Claude relays
+- `codex` for Codex relays, installed and logged in with your own account/subscription
+- `claude` for Claude relays, installed and logged in with your own account/subscription
 - a Discord bot token and target channel id
 
 ```bash
@@ -72,8 +72,8 @@ cmd /c npm run electron:build  # Creates installer in release/
 ```
 
 Packaged launchers produced by the build:
-- `release\CLADEX Setup 2.1.0.exe`
-- `release\CLADEX 2.1.0.exe`
+- `release\CLADEX Setup 2.1.1.exe`
+- `release\CLADEX 2.1.1.exe`
 - `release\win-unpacked\CLADEX.exe`
 
 Portable/installer first run:
@@ -88,6 +88,7 @@ Portable/installer first run:
 - CLADEX is intended for same-machine use. Do not expose the local API directly to your LAN or the public internet.
 - Non-loopback API requests require the CLADEX remote token, and remote filesystem browsing is scoped to saved profile workspaces/account homes plus `CLADEX_REMOTE_FS_ROOTS`.
 - Relay profile env files and relay logs can contain secrets and sensitive workspace metadata. Keep them local.
+- The public git repo should stay source-only: no profile env files, auth homes, relay logs, local memory, generated release output, or user-specific paths. Run `python backend/relayctl.py privacy-audit --tracked-only .` before publishing.
 - Use least-privilege Discord allowlists: `ALLOWED_CHANNEL_IDS`, `ALLOWED_USER_IDS`, `ALLOWED_BOT_IDS`, and related fields should stay as narrow as possible.
 - See [SECURITY.md](SECURITY.md) for the expected operating model and secret-handling guidance.
 

@@ -35,7 +35,7 @@ def test_start_codex_profile_delegates_to_relayctl(monkeypatch) -> None:
     calls: list[dict] = []
     monkeypatch.setattr(cladex.relayctl, "_run_profile", lambda profile: calls.append(profile) or 0)
 
-    profile = {"name": "codex-one", "_relay_type": "codex"}
+    profile = {"name": "codex-one", "_relay_type": "codex", "workspace": "C:/repo"}
     cladex.start_profile(profile)
 
     assert calls == [profile]
@@ -321,6 +321,7 @@ def test_cmd_doctor_json_reports_profile_port_collisions(monkeypatch, capsys) ->
             "claude": 0,
             "running": [],
             "duplicateCodexPorts": {"18000": ["one", "two"]},
+            "unsafeWorkspaces": [],
         },
     )
     monkeypatch.setattr(
@@ -340,6 +341,84 @@ def test_cmd_doctor_json_reports_profile_port_collisions(monkeypatch, capsys) ->
     payload = json.loads(capsys.readouterr().out)
     assert payload["ok"] is False
     assert payload["profiles"]["duplicateCodexPorts"]["18000"] == ["one", "two"]
+
+
+def test_doctor_profiles_reports_unsafe_workspaces_and_mixed_100_scale(tmp_path: Path, monkeypatch) -> None:
+    profiles: list[dict] = []
+    env_by_path: dict[str, dict[str, str]] = {}
+    for index in range(50):
+        workspace = tmp_path / "workspaces" / f"codex-{index:02d}"
+        account_home = tmp_path / "accounts" / f"codex-{index:02d}"
+        workspace.mkdir(parents=True)
+        env_path = tmp_path / "env" / f"codex-{index:02d}.env"
+        env_path.parent.mkdir(parents=True, exist_ok=True)
+        env_by_path[str(env_path)] = {
+            "DISCORD_BOT_TOKEN": f"codex-token-{index}",
+            "CODEX_WORKDIR": str(workspace),
+            "CODEX_HOME": str(account_home),
+            "CODEX_APP_SERVER_PORT": str(18_000 + index),
+            "ALLOWED_CHANNEL_IDS": str(10_000 + index),
+        }
+        profiles.append(
+            {
+                "name": f"codex-{index:02d}",
+                "_relay_type": "codex",
+                "workspace": str(workspace),
+                "env_file": str(env_path),
+                "_running": False,
+            }
+        )
+    for index in range(50):
+        workspace = tmp_path / "workspaces" / f"claude-{index:02d}"
+        config_dir = tmp_path / "accounts" / f"claude-{index:02d}"
+        workspace.mkdir(parents=True)
+        env_path = tmp_path / "env" / f"claude-{index:02d}.env"
+        env_path.parent.mkdir(parents=True, exist_ok=True)
+        env_by_path[str(env_path)] = {
+            "DISCORD_BOT_TOKEN": f"claude-token-{index}",
+            "CLAUDE_WORKDIR": str(workspace),
+            "CLAUDE_CONFIG_DIR": str(config_dir),
+        }
+        profiles.append(
+            {
+                "name": f"claude-{index:02d}",
+                "_relay_type": "claude",
+                "workspace": str(workspace),
+                "env_file": str(env_path),
+                "_running": False,
+            }
+        )
+    unsafe_workspace = Path(cladex.__file__).resolve().parents[1]
+    unsafe_env = tmp_path / "env" / "unsafe.env"
+    env_by_path[str(unsafe_env)] = {
+        "DISCORD_BOT_TOKEN": "unsafe-token",
+        "CODEX_WORKDIR": str(unsafe_workspace),
+        "CODEX_APP_SERVER_PORT": "19999",
+    }
+    profiles.append(
+        {
+            "name": "unsafe-codex",
+            "_relay_type": "codex",
+            "workspace": str(unsafe_workspace),
+            "env_file": str(unsafe_env),
+            "_running": False,
+        }
+    )
+
+    monkeypatch.setattr(cladex, "get_all_profiles", lambda: profiles)
+    monkeypatch.setattr(cladex.relayctl, "_load_env_file", lambda path: env_by_path[str(path)])
+    monkeypatch.setattr(cladex, "_load_claude_env", lambda profile: env_by_path[str(profile["env_file"])])
+
+    result = cladex._doctor_profiles()
+
+    assert result["count"] == 101
+    assert result["codex"] == 51
+    assert result["claude"] == 50
+    assert result["duplicateCodexPorts"] == {}
+    assert result["accountHomes"] == {"codex": 51, "claude": 50}
+    assert result["sharedAccountHomes"] == {"codex": {}, "claude": {}}
+    assert result["unsafeWorkspaces"][0]["name"] == "unsafe-codex"
+    assert "overlaps protected CLADEX/runtime root" in result["unsafeWorkspaces"][0]["reason"]
 
 
 def test_cmd_remove_codex_uses_registry_cleanup(monkeypatch, capsys) -> None:

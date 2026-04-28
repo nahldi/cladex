@@ -27,6 +27,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable
 
+from agent_guardrails import format_workspace_guidance
 from claude_common import claude_code_bin, claude_code_version, atomic_write_text, slugify
 from relay_runtime import DurableRuntime, RELAY_PROJECT_ROOT, _extract_blocker, _extract_next_step, _now_iso
 
@@ -540,6 +541,9 @@ class ClaudeBackend:
                 "- No filler, no agreement-only replies, no loop chatter, no fake completion claims.\n"
                 "- Use the lightest path that solves the task. Do not burn tools or context without reason.\n"
                 "- Keep replies compact and operationally useful.\n"
+                "- Edit only the active workspace/worktree unless the user explicitly assigns another allowed workspace.\n"
+                "- Do not edit the CLADEX relay/runtime repository from a managed relay profile unless that profile was deliberately configured for CLADEX development.\n"
+                "- Use workspace-local rule files, Codex skills, Claude subagents, and slash commands when they match the task; do not paste full rulebooks or skill docs into every message.\n"
                 "- Before answering, check AGENTS.md, memory/*, code, tests, and git state in the current worktree.\n"
                 "- After meaningful progress, make sure durable memory and handoff remain truthful.\n"
                 "- If another AI made a claim, verify it before trusting it.\n"
@@ -550,6 +554,9 @@ class ClaudeBackend:
         durable_context = self._durable_context(prompt_workspace, lightweight=False)
         if durable_context:
             parts.append(f"Relevant repo documents:\n{durable_context}")
+        workspace_guidance = format_workspace_guidance(prompt_workspace, agent_name="claude", max_chars=1400)
+        if workspace_guidance:
+            parts.append(f"Workspace guidance:\n{workspace_guidance}")
         parts.append(
             "\n".join(
                 [

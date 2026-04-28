@@ -325,6 +325,9 @@ def test_format_prompt_includes_durable_context_and_caveman_rules(tmp_path: Path
     assert "For relay implementation, runtime, packaging, or audit questions" in prompt
     assert "[AGENTS.md]" in prompt
     assert "[memory/STATUS.md]" in prompt
+    assert "Workspace guidance:" in prompt
+    assert "Workspace-local rules and skills." in prompt
+    assert "Protected CLADEX root:" in prompt
     assert "User message:\nfix the relay" in prompt
     assert "Current relay effort policy for this turn: high." in prompt
 
@@ -504,6 +507,7 @@ def test_format_prompt_uses_lightweight_path_for_short_messages(tmp_path: Path) 
     )
     assert "lightweight coordination message" in lightweight_prompt
     assert "AGENTS.md" not in lightweight_prompt
+    assert "Workspace guidance:" not in lightweight_prompt
     assert "Be brief" in lightweight_prompt
 
     full_prompt = backend._format_prompt(
@@ -520,6 +524,7 @@ def test_format_prompt_uses_lightweight_path_for_short_messages(tmp_path: Path) 
     assert "lightweight coordination message" not in full_prompt
     assert "caveman mode" in full_prompt
     assert "AGENTS.md" in full_prompt or "Relevant repo documents:" in full_prompt
+    assert "Workspace guidance:" in full_prompt
 
 
 def test_full_prompt_does_not_embed_raw_handoff_or_decisions_files(tmp_path: Path) -> None:

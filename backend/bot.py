@@ -19,6 +19,7 @@ from pathlib import Path
 
 import aiohttp
 import discord
+from agent_guardrails import discover_workspace_guidance, format_workspace_guidance
 from dotenv import load_dotenv
 from relay_backend import AppServerCodexBackend, CliResumeCodexBackend
 from relay_common import (
@@ -47,6 +48,10 @@ Rules:
 - The attached {runtime_name} CLI and the Discord relay are the same live session.
 - Be concise by default, but do the actual work instead of stopping at status updates.
 - You have full local workspace access unless the runtime config says otherwise. You may inspect files, edit files, run commands, and use available tools when needed.
+- Your editable scope is the active workspace/worktree unless the user explicitly assigns another allowed workspace.
+- Do not edit the CLADEX relay/runtime repository from a managed relay profile unless that profile was deliberately configured for CLADEX development.
+- Discover and follow workspace-local rule files, Codex skills, Claude subagents, and slash commands when they match the task.
+- Keep rule/skill discovery compact. Do not paste full rulebooks, skills, or tool docs into every message.
 - Use plain text unless formatting clearly helps.
 - In guild channels, pay attention to the relayed Discord speaker metadata.
 - Discord attachments, images, embeds, and file URLs included in relayed messages are part of the relay context. Inspect them when relevant.
@@ -318,7 +323,12 @@ def _load_project_context_block(workdir: Path, relay_bot_name: str) -> str:
 
     agent_path = _find_upward_file(workdir, PROJECT_AGENT_FILE_NAMES)
     roadmap_path = _find_upward_file(workdir, PROJECT_ROADMAP_FILE_NAMES)
-    if agent_path is None and roadmap_path is None:
+    discovered_guidance = discover_workspace_guidance(workdir, agent_name=relay_bot_name)
+    has_workspace_discovery = any(
+        discovered_guidance.get(key)
+        for key in ("ruleFiles", "codexSkills", "claudeAgents", "claudeCommands")
+    )
+    if agent_path is None and roadmap_path is None and not has_workspace_discovery:
         return ""
 
     lines = ["Project coordination context discovered from the workspace tree."]
@@ -351,6 +361,9 @@ def _load_project_context_block(workdir: Path, relay_bot_name: str) -> str:
             "If teammate chatter conflicts with these docs or the latest human instruction, prefer the docs plus the latest human instruction.",
         ]
     )
+    workspace_guidance = format_workspace_guidance(workdir, agent_name=relay_bot_name, max_chars=1400)
+    if workspace_guidance:
+        lines.extend(["", workspace_guidance])
     return "\n".join(lines)
 
 

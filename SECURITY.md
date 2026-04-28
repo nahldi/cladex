@@ -37,6 +37,24 @@ Do not:
 - publish `%LOCALAPPDATA%` relay state directories
 - reuse broad-permission Discord bot tokens across unrelated projects
 
+## Public repo hygiene
+
+The git repository must not contain personal runtime state:
+
+- profile env files other than `.env.example`
+- Codex or Claude auth homes
+- relay logs, JSONL transcripts, or generated local memory
+- packaged `release/`, `dist/`, `build/`, `node_modules/`, or virtualenv output
+- user-specific absolute paths
+
+Before publishing or cutting a release, run:
+
+```bash
+python backend/relayctl.py privacy-audit --tracked-only .
+```
+
+CI runs the same tracked-file privacy gate. Ignored local folders can still contain private runtime state on a developer machine, but they must not be committed.
+
 ## Packaged app expectations
 
 `CLADEX.exe` bundles the app UI and backend files, but it does not bundle:
@@ -45,7 +63,7 @@ Do not:
 - the `codex` CLI
 - the `claude` CLI
 
-A packaged user still needs those installed locally before starting relays.
+A packaged user still needs those installed and authenticated locally before starting relays. CLADEX never ships maintainer Codex or Claude credentials.
 
 ## Workspace and machine trust
 

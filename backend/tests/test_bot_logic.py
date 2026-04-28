@@ -559,6 +559,23 @@ def test_project_context_block_pulls_role_and_roadmap(tmp_path) -> None:
     assert "Frontend Execution" in block
     assert "Project roadmap file:" in block
     assert "Phase 4.5 is next" in block
+    assert "Workspace-local rules and skills." in block
+
+
+def test_project_context_block_lists_workspace_skills_without_full_dump(tmp_path) -> None:
+    bot = _load_bot_module()
+    project_root = tmp_path / "teamspace"
+    workspace = project_root / "packages" / "agent-review"
+    workspace.mkdir(parents=True)
+    (project_root / ".git").mkdir()
+    skill_dir = project_root / ".codex" / "skills" / "review"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("SECRET FULL SKILL BODY\n", encoding="utf-8")
+
+    block = bot._load_project_context_block(workspace, "agent-review")
+
+    assert "Codex project skills discovered: review." in block
+    assert "SECRET FULL SKILL BODY" not in block
 
 
 def test_parse_verification_claim_supports_extended_claim_types() -> None:
