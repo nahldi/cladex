@@ -69,6 +69,19 @@ A packaged user still needs those installed and authenticated locally before sta
 
 CLADEX relays can read and act within the configured workspace through the installed model CLIs. Only point a relay at a workspace and machine you trust for that model to access.
 
+## Project Review swarm
+
+- Review jobs read project source and write artifacts only under the local CLADEX data directory.
+- Review jobs can consume the user's local Codex or Claude subscription/account. Use the optional account-home field when a review should use a specific `CODEX_HOME` or `CLAUDE_CONFIG_DIR`.
+- Review lanes are queued behind a bounded default worker pool. Raising `CLADEX_REVIEW_MAX_PARALLEL` should be treated as a resource and account-rate-limit decision.
+- Codex and Claude review lanes run against a scratch workspace with no approval escalation. Claude write/edit tools are disabled; Bash is available only for safe validation commands inside the scratch workspace.
+- Review jobs do not apply fixes. The fix-plan action writes a plan artifact only.
+- CLADEX self-review is blocked by default and requires an explicit opt-in. A source backup is created before self-review starts.
+- Backup restore is CLI-only and requires `--confirm <backup-id>` to avoid accidental source overwrite through the remote UI.
+- Review and backup ids are pattern-validated before filesystem access; restore preserves ignored dependency/cache folders and secret-like local files.
+- Review reports intentionally avoid storing detected credential values. If a finding says a secret-like value exists, rotate the value before publishing.
+- Do not run review swarms against untrusted repositories with broad AI permissions. Repository instructions and files can be prompt-injection input.
+
 ## Discord setup guidance
 
 - Use dedicated bot tokens for relay bots

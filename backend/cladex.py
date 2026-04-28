@@ -19,6 +19,7 @@ from platformdirs import user_config_dir, user_data_dir
 from agent_guardrails import assert_workspace_allowed, workspace_protection_violation
 import claude_relay
 import relayctl
+import review_swarm
 
 
 CLAUDE_APP_NAME = "discord-claude-relay"
@@ -1389,6 +1390,126 @@ def cmd_project_remove(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_review_list(args: argparse.Namespace) -> int:
+    records = review_swarm.list_reviews()
+    if getattr(args, "json", False):
+        print(json.dumps(records))
+        return 0
+    if not records:
+        print("No review jobs.")
+        return 0
+    for record in records:
+        progress = record.get("progress", {})
+        print(
+            f"{record.get('id')}\t{record.get('status')}\t"
+            f"running {progress.get('running', 0)}/{progress.get('total', 0)}\t"
+            f"done {progress.get('done', 0)}/{progress.get('total', 0)}\t"
+            f"{record.get('workspace')}"
+        )
+    return 0
+
+
+def cmd_review_start(args: argparse.Namespace) -> int:
+    try:
+        record = review_swarm.start_review(
+            args.workspace,
+            provider=args.provider,
+            agents=args.agents,
+            title=args.title or "",
+            account_home=args.account_home or "",
+            launch=not getattr(args, "no_background", False),
+            preflight_only=getattr(args, "preflight_only", False),
+            allow_self_review=getattr(args, "allow_cladex_self_review", False),
+            backup_before_review=not getattr(args, "no_backup", False),
+        )
+    except Exception as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    if getattr(args, "json", False):
+        print(json.dumps(record))
+    else:
+        print(f"Started review `{record['id']}`. Report: {record.get('reportPath')}")
+    return 0
+
+
+def cmd_backup_list(args: argparse.Namespace) -> int:
+    records = review_swarm.list_backups()
+    if getattr(args, "json", False):
+        print(json.dumps(records))
+        return 0
+    if not records:
+        print("No CLADEX source backups.")
+        return 0
+    for record in records:
+        print(f"{record.get('id')}\t{record.get('createdAt')}\t{record.get('reason')}\t{record.get('workspace')}")
+    return 0
+
+
+def cmd_backup_create(args: argparse.Namespace) -> int:
+    try:
+        record = review_swarm.create_source_backup(args.workspace, reason=args.reason or "manual")
+    except Exception as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    if getattr(args, "json", False):
+        print(json.dumps(record))
+    else:
+        print(f"Created backup `{record['id']}` for {record['workspace']}.")
+    return 0
+
+
+def cmd_backup_restore(args: argparse.Namespace) -> int:
+    try:
+        record = review_swarm.restore_backup(args.id, confirm=args.confirm or "")
+    except Exception as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    if getattr(args, "json", False):
+        print(json.dumps(record))
+    else:
+        print(f"Restored backup `{record['id']}`. Pre-restore backup: {record.get('preRestoreBackupId')}")
+    return 0
+
+
+def cmd_review_run(args: argparse.Namespace) -> int:
+    try:
+        record = review_swarm.run_review_job(args.id)
+    except Exception as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    if getattr(args, "json", False):
+        print(json.dumps(record))
+    else:
+        print(f"Review `{record['id']}` is {record.get('status')}.")
+    return 0
+
+
+def cmd_review_show(args: argparse.Namespace) -> int:
+    try:
+        record = review_swarm.show_review(args.id)
+    except Exception as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    if getattr(args, "json", False):
+        print(json.dumps(record))
+    else:
+        print(json.dumps(record, indent=2))
+    return 0
+
+
+def cmd_review_fix_plan(args: argparse.Namespace) -> int:
+    try:
+        record = review_swarm.create_fix_plan(args.id)
+    except Exception as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    if getattr(args, "json", False):
+        print(json.dumps(record))
+    else:
+        print(f"Wrote fix plan: {record.get('fixPlanPath')}")
+    return 0
+
+
 def cmd_gui(_args: argparse.Namespace) -> int:
     if os.environ.get(GUI_CHILD_ENV, "").strip() != "1":
         env = os.environ.copy()
@@ -1652,6 +1773,60 @@ def build_parser() -> argparse.ArgumentParser:
     project_remove_parser = project_subparsers.add_parser("remove", help="Remove a workgroup.")
     project_remove_parser.add_argument("name")
     project_remove_parser.set_defaults(func=cmd_project_remove)
+
+    review_parser = subparsers.add_parser("review", help="Run read-only project review swarms.")
+    review_subparsers = review_parser.add_subparsers(dest="review_command")
+
+    review_list_parser = review_subparsers.add_parser("list", help="List project review jobs.")
+    review_list_parser.add_argument("--json", action="store_true", help="Output as JSON for API")
+    review_list_parser.set_defaults(func=cmd_review_list)
+
+    review_start_parser = review_subparsers.add_parser("start", help="Start a read-only project review job.")
+    review_start_parser.add_argument("--workspace", required=True)
+    review_start_parser.add_argument("--provider", choices=("codex", "claude"), default="codex")
+    review_start_parser.add_argument("--agents", type=int, default=4)
+    review_start_parser.add_argument("--account-home", default="")
+    review_start_parser.add_argument("--title", default="")
+    review_start_parser.add_argument("--allow-cladex-self-review", action="store_true", help="Explicitly allow reviewing the protected CLADEX repo after creating a source backup.")
+    review_start_parser.add_argument("--no-backup", action="store_true", help="Skip the source snapshot for non-CLADEX review targets.")
+    review_start_parser.add_argument("--preflight-only", action="store_true", help=argparse.SUPPRESS)
+    review_start_parser.add_argument("--no-background", action="store_true", help=argparse.SUPPRESS)
+    review_start_parser.add_argument("--json", action="store_true", help="Output as JSON for API")
+    review_start_parser.set_defaults(func=cmd_review_start)
+
+    review_run_parser = review_subparsers.add_parser("run", help=argparse.SUPPRESS)
+    review_run_parser.add_argument("id")
+    review_run_parser.add_argument("--json", action="store_true", help="Output as JSON for API")
+    review_run_parser.set_defaults(func=cmd_review_run)
+
+    review_show_parser = review_subparsers.add_parser("show", help="Show one project review job.")
+    review_show_parser.add_argument("id")
+    review_show_parser.add_argument("--json", action="store_true", help="Output as JSON for API")
+    review_show_parser.set_defaults(func=cmd_review_show)
+
+    review_fix_parser = review_subparsers.add_parser("fix-plan", help="Generate an ordered fix plan for a review job.")
+    review_fix_parser.add_argument("id")
+    review_fix_parser.add_argument("--json", action="store_true", help="Output as JSON for API")
+    review_fix_parser.set_defaults(func=cmd_review_fix_plan)
+
+    backup_parser = subparsers.add_parser("backup", help="Create, list, and restore CLADEX source snapshots.")
+    backup_subparsers = backup_parser.add_subparsers(dest="backup_command")
+
+    backup_list_parser = backup_subparsers.add_parser("list", help="List source backups.")
+    backup_list_parser.add_argument("--json", action="store_true", help="Output as JSON for API")
+    backup_list_parser.set_defaults(func=cmd_backup_list)
+
+    backup_create_parser = backup_subparsers.add_parser("create", help="Create a source backup snapshot.")
+    backup_create_parser.add_argument("--workspace", required=True)
+    backup_create_parser.add_argument("--reason", default="manual")
+    backup_create_parser.add_argument("--json", action="store_true", help="Output as JSON for API")
+    backup_create_parser.set_defaults(func=cmd_backup_create)
+
+    backup_restore_parser = backup_subparsers.add_parser("restore", help="Restore a source backup snapshot.")
+    backup_restore_parser.add_argument("id")
+    backup_restore_parser.add_argument("--confirm", required=True, help="Must exactly match the backup id.")
+    backup_restore_parser.add_argument("--json", action="store_true", help="Output as JSON for automation")
+    backup_restore_parser.set_defaults(func=cmd_backup_restore)
 
     gui_parser = subparsers.add_parser("gui", help="Open the CLADEX GUI.")
     gui_parser.set_defaults(func=cmd_gui)

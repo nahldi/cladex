@@ -2,6 +2,28 @@
 
 CLADEX stays focused on Claude Code and OpenAI Codex relays. The current production path is to keep clone-to-run setup clean, keep model/account behavior provider-led, and add scaling only after compatibility and load tests prove the lower layers.
 
+## Completed For 2.2.0
+
+- Updated GitHub Actions workflow references to official Node 24-based action majors (`actions/checkout@v6`, `actions/setup-node@v6`, and `actions/setup-python@v6`) after verifying the action metadata.
+- Added the Project Review swarm foundation:
+  - desktop `Review Project` view with folder picker, Codex/Claude selector, account-home field, explicit CLADEX self-review toggle, source-backup toggle, and a 1-50 reviewer slider,
+  - API and CLI review job commands,
+  - durable job state under the local CLADEX data directory,
+  - deterministic file sharding, generated/vendor/secret-heavy folder skips, internal preflight heuristics, and per-lane progress,
+  - distinct reviewer lane focuses covering security, runtime, testing, concurrency, backend, frontend, release, dependencies, performance, and data integrity,
+  - AI reviewer execution against a CLADEX-owned scratch copy where possible so smoke/stress experiments do not touch the selected source tree,
+  - bounded AI reviewer concurrency by default so 1-50 lane jobs queue safely instead of bursting every lane at once,
+  - one universal `CLADEX_PROJECT_REVIEW.md` report plus structured `findings.json`,
+  - a separate `CLADEX_FIX_PLAN.md` generator that does not edit source.
+- Added source snapshot support:
+  - review jobs can create local snapshots under the CLADEX data directory,
+  - CLADEX self-review requires explicit opt-in and creates a backup before the job is launched,
+  - CLI backup commands can list, create, and restore snapshots with exact-id confirmation,
+  - restore removes stale nested source files while preserving ignored dependency/cache folders and secret-like local files.
+- Kept review workers from applying fixes. Codex and Claude review lanes use a scratch workspace and no approval escalation; Claude write/edit tools are disabled while Bash remains available for safe validation commands in scratch.
+- Validated review/backup ids before mapping them into local artifact paths.
+- Tightened protected-root parsing so `CLADEX_PROTECTED_ROOT` and `CLADEX_PROTECTED_ROOTS` combine instead of overriding each other.
+
 ## Completed For 2.1.1
 
 - Added shared workspace guardrails for Codex and Claude profiles. Registration, profile update, GUI/CLI start, and doctor now block workspaces that overlap the CLADEX runtime repo unless explicitly enabled for CLADEX development.
@@ -28,28 +50,19 @@ CLADEX stays focused on Claude Code and OpenAI Codex relays. The current product
 
 ## Remaining Work
 
-- Add a local Project Review swarm mode inspired by ClawSweeper's proposal-only sweep/apply split:
-  - provider selector for Codex or Claude,
-  - agent-count slider from 1 to 50,
-  - folder picker for the target project,
-  - queued read-only review workers with progress like `Running 2/15` and `Done 13/15`,
-  - one universal markdown report with evidence, severity, confidence, and recommended fixes.
-- Implement review-job orchestration separate from Discord relay profiles:
-  - planner shards the project by risk area, package boundaries, test surfaces, recent git hotspots, and security-sensitive paths,
-  - workers run against read-only or throwaway workspaces,
-  - reducer merges worker JSON into one durable report and de-duplicates by file, symptom, evidence, and recommended fix,
-  - UI can resume job state after restart.
-- Enforce review-mode safety:
-  - no review worker receives write credentials,
-  - Codex uses read-only sandbox/permission profiles where supported,
-  - Claude uses throwaway/read-only checkouts plus mandatory clean-diff verification,
-  - all workers are blocked from editing the CLADEX runtime repo unless explicitly in CLADEX development mode,
-  - repository content is treated as evidence, not trusted instructions, to reduce prompt-injection risk.
+- Advance Project Review from the safe foundation to a full production repair loop:
+  - planner shards by package boundaries, recent git hotspots, test surfaces, and security-sensitive paths instead of only deterministic file distribution,
+  - reducer de-duplicates findings by file, symptom, evidence, agent focus, and recommended fix,
+  - live AI review lanes should emit validated structured JSON findings with command-attempt evidence,
+  - expose queue/concurrency controls and clearer rate-limit/account-pressure reporting,
+  - UI should support cancel/retry/export, richer severity filtering, and backup management.
 - Add a guarded fix phase for review reports:
   - one planner converts findings into ordered fix phases,
   - user approval is required before edits,
   - write workers edit only assigned project workspaces/worktrees,
-  - planner validates diffs and tests between phases before continuing.
+  - source backup is mandatory before edits,
+  - planner validates diffs and tests between phases before continuing,
+  - restore command remains explicit and confirmation-gated.
 - Build the full supervisor/queue/account-pooling runtime:
   - pool Discord clients by bot token where safe,
   - pool Codex app-server workers by account home where safe,

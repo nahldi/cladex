@@ -396,7 +396,7 @@ app.get('/api/runtime-info', async (req, res) => {
     backendDir: BACKEND_DIR,
     frontendDir: FRONTEND_DIR,
     packaged: process.env.NODE_ENV === 'production' || !!process.resourcesPath,
-    appVersion: process.env.npm_package_version || '2.1.0',
+    appVersion: process.env.npm_package_version || '2.2.0',
     remoteAccessProtected: true,
   };
   if (isLoopbackRequest(req)) {
@@ -786,6 +786,96 @@ app.delete('/api/projects/:name', async (req, res) => {
     return;
   }
   res.json({ success: true });
+});
+
+app.get('/api/reviews', async (_req, res) => {
+  try {
+    res.json(await runJson(['cladex.py', 'review', 'list', '--json']));
+  } catch (err) {
+    res.status(500).json({ error: err?.message ?? 'Failed to load review jobs' });
+  }
+});
+
+app.get('/api/reviews/:id', async (req, res) => {
+  try {
+    res.json(await runJson(['cladex.py', 'review', 'show', req.params.id, '--json']));
+  } catch (err) {
+    res.status(500).json({ error: err?.message ?? 'Failed to load review job' });
+  }
+});
+
+app.post('/api/reviews', async (req, res) => {
+  const workspace = String(req.body?.workspace || '').trim();
+  const provider = String(req.body?.provider || 'codex').trim().toLowerCase();
+  const agents = Number(req.body?.agents || 4);
+  const title = String(req.body?.title || '').trim();
+  const accountHome = String(req.body?.accountHome || '').trim();
+  const allowSelfReview = Boolean(req.body?.allowSelfReview);
+  const backupBeforeReview = req.body?.backupBeforeReview !== false;
+  if (!workspace) {
+    res.status(400).json({ success: false, error: 'workspace is required' });
+    return;
+  }
+  if (provider !== 'codex' && provider !== 'claude') {
+    res.status(400).json({ success: false, error: 'provider must be codex or claude' });
+    return;
+  }
+  if (!Number.isInteger(agents) || agents < 1 || agents > 50) {
+    res.status(400).json({ success: false, error: 'agents must be between 1 and 50' });
+    return;
+  }
+  const args = [
+    'cladex.py',
+    'review',
+    'start',
+    '--workspace',
+    path.resolve(workspace),
+    '--provider',
+    provider,
+    '--agents',
+    String(agents),
+    '--json',
+  ];
+  if (title) args.push('--title', title);
+  if (accountHome) args.push('--account-home', accountHome);
+  if (allowSelfReview) args.push('--allow-cladex-self-review');
+  if (!backupBeforeReview) args.push('--no-backup');
+  try {
+    res.json(await runJson(args));
+  } catch (err) {
+    res.status(500).json({ success: false, error: err?.message ?? 'Failed to start review job' });
+  }
+});
+
+app.get('/api/backups', async (_req, res) => {
+  try {
+    res.json(await runJson(['cladex.py', 'backup', 'list', '--json']));
+  } catch (err) {
+    res.status(500).json({ error: err?.message ?? 'Failed to load source backups' });
+  }
+});
+
+app.post('/api/backups', async (req, res) => {
+  const workspace = String(req.body?.workspace || '').trim();
+  const reason = String(req.body?.reason || 'manual').trim();
+  if (!workspace) {
+    res.status(400).json({ success: false, error: 'workspace is required' });
+    return;
+  }
+  const args = ['cladex.py', 'backup', 'create', '--workspace', path.resolve(workspace), '--reason', reason, '--json'];
+  try {
+    res.json(await runJson(args));
+  } catch (err) {
+    res.status(500).json({ success: false, error: err?.message ?? 'Failed to create source backup' });
+  }
+});
+
+app.post('/api/reviews/:id/fix-plan', async (req, res) => {
+  try {
+    res.json(await runJson(['cladex.py', 'review', 'fix-plan', req.params.id, '--json']));
+  } catch (err) {
+    res.status(500).json({ success: false, error: err?.message ?? 'Failed to generate fix plan' });
+  }
 });
 
 app.use('/api', (_req, res) => {

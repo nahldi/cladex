@@ -64,7 +64,14 @@ def paths_overlap(left: Path, right: Path) -> bool:
 
 def protected_roots_from_env() -> list[Path]:
     roots = [CLADEX_REPO_ROOT]
-    raw = os.environ.get("CLADEX_PROTECTED_ROOTS", "") or os.environ.get("CLADEX_PROTECTED_ROOT", "")
+    raw = ";".join(
+        value
+        for value in (
+            os.environ.get("CLADEX_PROTECTED_ROOT", ""),
+            os.environ.get("CLADEX_PROTECTED_ROOTS", ""),
+        )
+        if value
+    )
     for item in re.split(r"[;,]", raw):
         text = item.strip()
         if text:

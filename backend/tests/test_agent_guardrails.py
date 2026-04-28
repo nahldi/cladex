@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from agent_guardrails import format_workspace_guidance, workspace_protection_violation
+from agent_guardrails import format_workspace_guidance, protected_roots_from_env, workspace_protection_violation
 
 
 def test_workspace_protection_blocks_overlapping_roots(tmp_path: Path) -> None:
@@ -15,6 +15,23 @@ def test_workspace_protection_blocks_overlapping_roots(tmp_path: Path) -> None:
     assert "overlaps protected CLADEX/runtime root" in violation
     assert workspace_protection_violation(tmp_path, protected_roots=[protected])
     assert workspace_protection_violation(workspace, env={"CLADEX_ALLOW_CLADEX_WORKSPACE": "1"}, protected_roots=[protected]) == ""
+
+
+def test_protected_roots_include_singular_and_plural_env_vars(tmp_path: Path, monkeypatch) -> None:
+    singular = tmp_path / "single"
+    plural_a = tmp_path / "plural-a"
+    plural_b = tmp_path / "plural-b"
+    for root in (singular, plural_a, plural_b):
+        root.mkdir()
+
+    monkeypatch.setenv("CLADEX_PROTECTED_ROOT", str(singular))
+    monkeypatch.setenv("CLADEX_PROTECTED_ROOTS", f"{plural_a};{plural_b};{singular}")
+
+    roots = {str(root) for root in protected_roots_from_env()}
+
+    assert str(singular.resolve()) in roots
+    assert str(plural_a.resolve()) in roots
+    assert str(plural_b.resolve()) in roots
 
 
 def test_workspace_guidance_discovers_rules_skills_agents_and_commands(tmp_path: Path) -> None:

@@ -19,6 +19,7 @@ The shipped product is local-first:
 - **Workspace-Scoped**: Each workspace can have multiple relay profiles
 - **Local Operator Chat**: Talk to a running relay from inside CLADEX without using Discord while staying on the same bound relay session
 - **Saved Workgroups**: Start or stop related relays together, including migrated legacy Codex project groups
+- **Project Review Swarm**: Run 1-50 read-only Codex or Claude review lanes against a selected project and merge findings into one Markdown report plus a separate fix plan
 
 ## Quick Start
 
@@ -72,8 +73,8 @@ cmd /c npm run electron:build  # Creates installer in release/
 ```
 
 Packaged launchers produced by the build:
-- `release\CLADEX Setup 2.1.1.exe`
-- `release\CLADEX 2.1.1.exe`
+- `release\CLADEX Setup 2.2.0.exe`
+- `release\CLADEX 2.2.0.exe`
 - `release\win-unpacked\CLADEX.exe`
 
 Portable/installer first run:
@@ -82,6 +83,8 @@ Portable/installer first run:
 3. Launch `CLADEX.exe`.
 4. In the app, choose `Add Relay`, then enter the workspace path, Discord bot token, allowed channel id, and optional per-relay account home (`CODEX_HOME` or `CLAUDE_CONFIG_DIR`).
 5. Start the profile and verify it reaches `Ready` before testing in Discord.
+
+Project reviews do not require a Discord relay profile. Open `Review Project`, choose a folder, select Codex or Claude, set 1-50 reviewer lanes, and start the swarm. CLADEX gives every lane a different focus and shard, queues AI lanes behind a bounded worker pool, creates a local source snapshot when enabled, runs reviewers against a scratch copy where possible, and merges results into one report plus a fix plan.
 
 ## Security
 
@@ -128,6 +131,11 @@ cladex doctor --json     # Check prerequisites, CLI shims, Codex app-server sche
 cladex start --type X    # Start relay (claude/codex)
 cladex stop --type X     # Stop relay
 cladex gui               # Open the desktop relay manager
+cladex review start --workspace C:\path\repo --provider codex --agents 12 --json
+cladex review list --json
+cladex review fix-plan <review-id> --json
+cladex backup list --json
+cladex backup restore <backup-id> --confirm <backup-id>
 
 # Claude relay
 claude-discord setup
@@ -182,6 +190,8 @@ codex-discord stop
 - The packaged desktop app uses a loopback-only local API. It is meant to manage relays on the same machine, not expose a remote control surface.
 - If you intentionally override the loopback-only API guard, set `CLADEX_ALLOW_REMOTE_API=1`, protect the remote token, and add any extra browse roots with `CLADEX_REMOTE_FS_ROOTS`.
 - `CLADEX_REMOTE_FS_UNRESTRICTED=1` restores arbitrary host browsing and should only be used on a trusted private machine.
+- Project Review artifacts and source snapshots are stored under the local CLADEX data directory, not written into the reviewed project. Review workers do not apply fixes; applying fixes is a separate explicit implementation phase.
+- Set `CLADEX_REVIEW_MAX_PARALLEL` if a machine/account pool can safely run more reviewer CLI processes than the default.
 - Production roadmap and remaining release gates live in [ROADMAP.md](ROADMAP.md).
 
 ## License

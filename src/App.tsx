@@ -15,6 +15,7 @@ import {
   Plus,
   RefreshCw,
   RotateCcw,
+  SearchCheck,
   Settings,
   Square,
   Terminal,
@@ -23,9 +24,10 @@ import {
 } from 'lucide-react';
 import CladexBackground from './components/CladexBackground';
 
-type ViewName = 'relays' | 'workgroups' | 'live';
+type ViewName = 'relays' | 'workgroups' | 'review' | 'live';
 type ProfileType = 'Claude' | 'Codex';
 type RelayType = 'claude' | 'codex';
+type ReviewProvider = 'codex' | 'claude';
 
 interface Profile {
   id: string;
@@ -88,6 +90,60 @@ interface ProjectRecord {
   memberCount: number;
   members: Array<{ id: string; displayName: string; relayType: RelayType; workspace: string }>;
   missingMembers: Array<{ name: string; relayType: RelayType }>;
+}
+
+interface ReviewProgress {
+  total: number;
+  queued: number;
+  running: number;
+  done: number;
+  failed: number;
+}
+
+interface ReviewAgentRecord {
+  id: string;
+  provider: ReviewProvider;
+  focus?: string;
+  status: 'queued' | 'running' | 'done' | 'failed';
+  assignedFiles: number;
+  findings: number;
+  detail: string;
+}
+
+interface ReviewJob {
+  id: string;
+  title: string;
+  workspace: string;
+  provider: ReviewProvider;
+  strategy?: string;
+  preflightOnly?: boolean;
+  selfReview?: boolean;
+  agentCount: number;
+  accountHome?: string;
+  status: 'queued' | 'running' | 'completed' | 'failed';
+  createdAt: string;
+  updatedAt: string;
+  startedAt?: string;
+  finishedAt?: string;
+  progress: ReviewProgress;
+  agents: ReviewAgentRecord[];
+  artifactDir: string;
+  reportPath: string;
+  findingsPath: string;
+  fixPlanPath?: string;
+  sourceBackup?: { id?: string; error?: string };
+  reportPreview?: string;
+  error?: string;
+}
+
+interface BackupRecord {
+  id: string;
+  workspace: string;
+  snapshot: string;
+  reason: string;
+  sourceJobId?: string;
+  createdAt: string;
+  status: string;
 }
 
 interface ProfileFormData {
@@ -302,6 +358,13 @@ const api = {
   startProject: (name: string) => fetchJson(`${API_BASE}/projects/${encodeURIComponent(name)}/start`, { method: 'POST' }),
   stopProject: (name: string) => fetchJson(`${API_BASE}/projects/${encodeURIComponent(name)}/stop`, { method: 'POST' }),
   removeProject: (name: string) => fetchJson(`${API_BASE}/projects/${encodeURIComponent(name)}`, { method: 'DELETE' }),
+  reviews: () => fetchJson<ReviewJob[]>(`${API_BASE}/reviews`),
+  backups: () => fetchJson<BackupRecord[]>(`${API_BASE}/backups`),
+  startReview: (body: { workspace: string; provider: ReviewProvider; agents: number; title?: string; accountHome?: string; allowSelfReview?: boolean; backupBeforeReview?: boolean }) =>
+    fetchJson<ReviewJob>(`${API_BASE}/reviews`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }),
+  createBackup: (body: { workspace: string; reason?: string }) =>
+    fetchJson<BackupRecord>(`${API_BASE}/backups`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }),
+  createFixPlan: (id: string) => fetchJson<ReviewJob>(`${API_BASE}/reviews/${id}/fix-plan`, { method: 'POST' }),
   listDirectories: (currentPath = '') => fetchJson<DirectoryListResponse>(`${API_BASE}/fs/list${currentPath ? `?path=${encodeURIComponent(currentPath)}` : ''}`),
 };
 
@@ -309,6 +372,7 @@ export default function App() {
   const [view, setView] = useState<ViewName>('relays');
   const [profiles, setProfiles] = useState<Profile[]>([]);
   const [projects, setProjects] = useState<ProjectRecord[]>([]);
+  const [reviewJobs, setReviewJobs] = useState<ReviewJob[]>([]);
   const [runtimeInfo, setRuntimeInfo] = useState<RuntimeInfo | null>(null);
   const [selectedProfileId, setSelectedProfileId] = useState<string | null>(null);
   const [activeModal, setActiveModal] = useState<'add' | 'edit' | 'logs' | 'settings' | 'workgroup' | null>(null);
@@ -331,9 +395,10 @@ export default function App() {
       setLoading(true);
     }
     try {
-      const [profileRows, projectRows, runtime] = await Promise.all([api.profiles(), api.projects(), api.runtimeInfo()]);
+      const [profileRows, projectRows, runtime, reviews] = await Promise.all([api.profiles(), api.projects(), api.runtimeInfo(), api.reviews()]);
       setProfiles(profileRows);
       setProjects(projectRows);
+      setReviewJobs(reviews);
       setRuntimeInfo(runtime);
       setRemoteAuthRequired(false);
       bootFailureCount.current = 0;
@@ -454,6 +519,15 @@ export default function App() {
                 onRemove={(name) => void runAction(`project-remove-${name}`, () => api.removeProject(name))}
               />
             </motion.div>
+          ) : view === 'review' ? (
+            <motion.div key="review" initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -12 }}>
+              <ReviewProjectView
+                jobs={reviewJobs}
+                busyKey={busyKey}
+                onStart={(body) => void runAction('review-start', () => api.startReview(body))}
+                onFixPlan={(job) => void runAction(`review-fix-${job.id}`, () => api.createFixPlan(job.id))}
+              />
+            </motion.div>
           ) : (
             <motion.div key="live" initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -12 }}>
               <LiveFeed profiles={profiles} selectedProfileId={selectedProfileId} onSelectProfile={setSelectedProfileId} />
@@ -466,6 +540,7 @@ export default function App() {
         <div className={`flex items-center justify-between gap-1 overflow-x-auto rounded-2xl border p-2 backdrop-blur-xl shadow-2xl transition-colors duration-500 sm:gap-2 ${isDark ? 'border-white/10 bg-white/5 shadow-black/50' : 'border-slate-300/70 bg-white/80 shadow-slate-300/50'}`}>
           <DockButton icon={<LayoutGrid />} label="Relays" active={view === 'relays'} onClick={() => setView('relays')} light={!isDark} />
           <DockButton icon={<FolderKanban />} label="Workgroups" active={view === 'workgroups'} onClick={() => setView('workgroups')} light={!isDark} />
+          <DockButton icon={<SearchCheck />} label="Review Project" active={view === 'review'} onClick={() => setView('review')} light={!isDark} />
           <DockButton icon={<MessageSquare />} label="Live Console" active={view === 'live'} onClick={() => setView('live')} light={!isDark} />
           <div className={`mx-2 h-8 w-px ${isDark ? 'bg-white/10' : 'bg-slate-300/80'}`} />
           <DockButton icon={<Plus />} label="Add Relay" onClick={() => setActiveModal('add')} light={!isDark} />
@@ -759,6 +834,160 @@ function WorkgroupsView({
           ))}
         </div>
       )}
+    </div>
+  );
+}
+
+function ReviewProjectView({
+  jobs,
+  busyKey,
+  onStart,
+  onFixPlan,
+}: {
+  jobs: ReviewJob[];
+  busyKey: string | null;
+  onStart: (body: { workspace: string; provider: ReviewProvider; agents: number; title?: string; accountHome?: string; allowSelfReview?: boolean; backupBeforeReview?: boolean }) => void;
+  onFixPlan: (job: ReviewJob) => void;
+}) {
+  const [workspace, setWorkspace] = useState('');
+  const [title, setTitle] = useState('');
+  const [provider, setProvider] = useState<ReviewProvider>('codex');
+  const [agents, setAgents] = useState(8);
+  const [accountHome, setAccountHome] = useState('');
+  const [allowSelfReview, setAllowSelfReview] = useState(false);
+  const [backupBeforeReview, setBackupBeforeReview] = useState(true);
+  const activeJobs = jobs.filter((job) => job.status === 'queued' || job.status === 'running').length;
+
+  return (
+    <div className="mx-auto flex w-full max-w-7xl flex-1 flex-col px-4 pb-8 pt-6 sm:px-8 sm:pt-8">
+      <div className="mb-6 flex flex-col gap-4 sm:mb-8 lg:flex-row lg:items-end lg:justify-between">
+        <div>
+          <div className="text-[10px] font-bold uppercase tracking-[0.24em] text-slate-500 dark:text-gray-500">Project review swarm</div>
+          <h2 className="mt-2 text-3xl font-black tracking-tight text-slate-900 dark:text-white">Send read-only reviewers through a project.</h2>
+          <p className="mt-2 max-w-3xl text-sm text-slate-600 dark:text-gray-400">Each lane gets a different focus, explores a separate shard, and merges findings into one report plus a fix plan. Reviewers do not apply source changes.</p>
+        </div>
+        <MetaPill label={`${activeJobs} active review${activeJobs === 1 ? '' : 's'}`} />
+      </div>
+
+      <div className="grid gap-5 xl:grid-cols-[420px_minmax(0,1fr)]">
+        <div className="rounded-[30px] border border-slate-200/80 bg-white/80 p-5 shadow-[0_18px_45px_rgba(15,23,42,0.08)] dark:border-white/10 dark:bg-white/[0.03] dark:shadow-2xl">
+          <div className="space-y-5">
+            <FormSection title="Target">
+              <BrowseField label="Project folder" value={workspace} onChange={setWorkspace} placeholder="C:\\Projects\\target-repo" />
+              <FormInput label="Review title" value={title} onChange={setTitle} placeholder="Production readiness pass" />
+            </FormSection>
+
+            <FormSection title="Review lanes">
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                <TypeButton active={provider === 'codex'} label="Codex" icon={<Terminal size={18} />} onClick={() => setProvider('codex')} tone="emerald" />
+                <TypeButton active={provider === 'claude'} label="Claude Code" icon={<Bot size={18} />} onClick={() => setProvider('claude')} tone="orange" />
+              </div>
+              <label className="block">
+                <div className="mb-2 flex items-center justify-between gap-3">
+                  <div className="text-[10px] font-bold uppercase tracking-[0.22em] text-slate-500 dark:text-gray-500">Reviewer count</div>
+                  <div className="font-mono text-sm text-slate-700 dark:text-gray-300">{agents}</div>
+                </div>
+                <input
+                  type="range"
+                  min={1}
+                  max={50}
+                  value={agents}
+                  onChange={(event) => setAgents(Number(event.target.value))}
+                  className="w-full accent-indigo-500"
+                />
+              </label>
+              <BrowseField label={provider === 'codex' ? 'Codex account home' : 'Claude config folder'} value={accountHome} onChange={setAccountHome} placeholder="Optional account home for this review run" />
+              <ToggleRow checked={backupBeforeReview} onChange={setBackupBeforeReview} label="Save a source snapshot before review" />
+              <ToggleRow checked={allowSelfReview} onChange={setAllowSelfReview} label="Allow explicit CLADEX self-review" />
+            </FormSection>
+
+            <PrimaryButton
+              label={busyKey === 'review-start' ? 'Starting...' : 'Review Project'}
+              icon={busyKey === 'review-start' ? <Loader2 size={16} className="animate-spin" /> : <SearchCheck size={16} />}
+              onClick={() => {
+                if (!workspace.trim()) return;
+                onStart({ workspace, provider, agents, title, accountHome, allowSelfReview, backupBeforeReview });
+              }}
+            />
+          </div>
+        </div>
+
+        <div className="space-y-4">
+          {jobs.length === 0 ? (
+            <EmptyState title="No project reviews yet." detail="Pick a project folder, choose Codex or Claude lanes, then start a read-only review." />
+          ) : (
+            jobs.map((job) => <ReviewJobCard key={job.id} job={job} busy={busyKey === `review-fix-${job.id}`} onFixPlan={() => onFixPlan(job)} />)
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ReviewJobCard({ job, busy, onFixPlan }: { job: ReviewJob; busy: boolean; onFixPlan: () => void }) {
+  const progress = job.progress || { total: job.agentCount || 0, running: 0, done: 0, failed: 0, queued: 0 };
+  const total = Math.max(progress.total || job.agentCount || 0, 1);
+  const finished = (progress.done || 0) + (progress.failed || 0);
+  const percent = Math.min(100, Math.round((finished / total) * 100));
+  const statusTone = job.status === 'failed' ? 'text-red-300 bg-red-500/10 border-red-500/25' : job.status === 'completed' ? 'text-emerald-300 bg-emerald-500/10 border-emerald-500/25' : 'text-indigo-300 bg-indigo-500/10 border-indigo-500/25';
+
+  return (
+    <div className="rounded-[30px] border border-slate-200/80 bg-white/80 p-5 shadow-[0_18px_45px_rgba(15,23,42,0.08)] dark:border-white/10 dark:bg-white/[0.03] dark:shadow-2xl">
+      <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className={`rounded-full border px-2.5 py-1 text-[10px] font-bold uppercase tracking-[0.22em] ${statusTone}`}>{job.status}</span>
+            <MetaPill label={`${job.provider} swarm`} mono />
+            <MetaPill label={`${job.agentCount} lane${job.agentCount === 1 ? '' : 's'}`} mono />
+            {job.selfReview ? <MetaPill label="CLADEX self-review" /> : null}
+          </div>
+          <h3 className="mt-3 text-xl font-bold tracking-tight text-slate-900 dark:text-white">{job.title || job.id}</h3>
+          <div className="mt-2 break-all font-mono text-xs text-slate-500 dark:text-gray-500">{job.workspace}</div>
+        </div>
+        <div className="flex gap-2">
+          <ActionButton label={busy ? 'Planning...' : 'Fix Plan'} icon={busy ? <Loader2 size={16} className="animate-spin" /> : <FileText size={16} />} busy={busy || job.status === 'queued' || job.status === 'running'} onClick={onFixPlan} />
+        </div>
+      </div>
+
+      <div className="mt-5">
+        <div className="mb-2 flex flex-wrap items-center justify-between gap-2 text-sm text-slate-600 dark:text-gray-400">
+          <span>Running: {progress.running || 0}/{total}</span>
+          <span>Done {progress.done || 0}/{total}</span>
+          <span>Failed {progress.failed || 0}/{total}</span>
+        </div>
+        <div className="h-2 overflow-hidden rounded-full bg-slate-200 dark:bg-white/10">
+          <div className="h-full rounded-full bg-indigo-500 transition-all" style={{ width: `${percent}%` }} />
+        </div>
+      </div>
+
+      <div className="mt-5 grid gap-3 lg:grid-cols-2">
+        <InspectorRow label="Report" value={job.reportPath || 'Pending'} mono />
+        <InspectorRow label="Fix plan" value={job.fixPlanPath || 'Not generated'} mono />
+        <InspectorRow label="Backup" value={job.sourceBackup?.id || job.sourceBackup?.error || 'Not created'} mono />
+      </div>
+
+      {job.error ? <div className="mt-4 rounded-2xl border border-red-500/25 bg-red-500/10 px-4 py-3 text-sm text-red-100">{job.error}</div> : null}
+
+      {job.agents?.length ? (
+        <div className="mt-5 grid gap-2 md:grid-cols-2">
+          {job.agents.slice(0, 8).map((agent) => (
+            <div key={agent.id} className="rounded-2xl border border-slate-200/80 bg-white/70 px-3 py-3 dark:border-white/5 dark:bg-black/30">
+              <div className="flex items-center justify-between gap-3">
+                <div className="font-mono text-xs text-slate-700 dark:text-gray-300">{agent.id}</div>
+                <div className="text-[10px] font-bold uppercase tracking-[0.18em] text-slate-500 dark:text-gray-500">{agent.status}</div>
+              </div>
+              <div className="mt-1 text-xs text-slate-500 dark:text-gray-500">{agent.focus || 'review'} - {agent.assignedFiles} files, {agent.findings} findings</div>
+            </div>
+          ))}
+        </div>
+      ) : null}
+
+      {job.reportPreview ? (
+        <details className="mt-5">
+          <summary className="cursor-pointer text-sm font-semibold text-indigo-300">Report preview</summary>
+          <pre className="mt-3 max-h-80 overflow-y-auto whitespace-pre-wrap rounded-2xl border border-white/5 bg-black p-4 text-xs leading-relaxed text-gray-300">{job.reportPreview}</pre>
+        </details>
+      ) : null}
     </div>
   );
 }
