@@ -23,6 +23,8 @@ import psutil
 from relay_common import (
     CONFIG_ROOT,
     DATA_ROOT,
+    DEFAULT_APP_SERVER_PORT_RANGE,
+    DEFAULT_APP_SERVER_PORT_START,
     PROFILES_DIR,
     REGISTRY_PATH,
     atomic_write_json,
@@ -56,6 +58,7 @@ ENV_KEY_ORDER = [
     "RELAY_BOT_NAME",
     "RELAY_MODEL",
     "CODEX_WORKDIR",
+    "CODEX_HOME",
     "CODEX_MODEL",
     "CODEX_FULL_ACCESS",
     "CODEX_READ_ONLY",
@@ -87,7 +90,8 @@ STALE_PROFILE_KEYS = {
 
 PACKAGE_NAME = "discord-codex-relay"
 GUI_CHILD_ENV = "CODEX_DISCORD_GUI_CHILD"
-DEFAULT_CODEX_MODEL = "gpt-5.4"
+DEFAULT_CODEX_MODEL = ""
+DEFAULT_CODEX_MODEL_LABEL = "Codex default"
 SUPERVISOR_FAILURE_WINDOW_SECONDS = 10 * 60
 SUPERVISOR_BACKOFF_INITIAL_SECONDS = 2.0
 SUPERVISOR_BACKOFF_MAX_SECONDS = 5 * 60
@@ -510,6 +514,49 @@ def _parse_csv_ids(value: str) -> str:
     return ",".join(valid)
 
 
+def _registered_profile_ports() -> set[int]:
+    ports: set[int] = set()
+    for profile in _load_registry().get("profiles", []):
+        env_file = str(profile.get("env_file", "")).strip()
+        if not env_file:
+            continue
+        try:
+            env = _load_env_file(Path(env_file))
+        except Exception:
+            continue
+        port_text = str(env.get("CODEX_APP_SERVER_PORT", "")).strip()
+        if port_text.isdigit():
+            ports.add(int(port_text))
+    return ports
+
+
+def _port_is_available(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        try:
+            probe.bind(("127.0.0.1", port))
+        except OSError:
+            return False
+    return True
+
+
+def _default_app_server_port_for_profile(workspace: Path, *, token: str | None = None) -> int:
+    first = default_port_for_workspace(workspace, token=token)
+    used = _registered_profile_ports()
+    start_offset = (first - DEFAULT_APP_SERVER_PORT_START) % DEFAULT_APP_SERVER_PORT_RANGE
+    for offset in range(DEFAULT_APP_SERVER_PORT_RANGE):
+        candidate = DEFAULT_APP_SERVER_PORT_START + ((start_offset + offset) % DEFAULT_APP_SERVER_PORT_RANGE)
+        if candidate not in used and _port_is_available(candidate):
+            return candidate
+    return first
+
+
+def _env_flag(value: str | None, *, default: bool = False) -> bool:
+    text = (value or "").strip().lower()
+    if not text:
+        return default
+    return text in {"1", "true", "yes", "on"}
+
+
 def _normalized_profile_env(env: dict[str, str]) -> dict[str, str]:
     workspace = Path(env["CODEX_WORKDIR"]).resolve()
     normalized = {
@@ -519,12 +566,18 @@ def _normalized_profile_env(env: dict[str, str]) -> dict[str, str]:
     }
     token = normalized.get("DISCORD_BOT_TOKEN", "")
     normalized["CODEX_WORKDIR"] = str(workspace)
+    codex_home = str(normalized.get("CODEX_HOME", "")).strip()
+    if codex_home:
+        normalized["CODEX_HOME"] = str(Path(codex_home).expanduser().resolve())
+    else:
+        normalized.pop("CODEX_HOME", None)
     normalized["RELAY_BOT_NAME"] = normalized.get("RELAY_BOT_NAME", "").strip()
-    default_model = DEFAULT_CODEX_MODEL
-    normalized["RELAY_MODEL"] = (normalized.get("RELAY_MODEL") or normalized.get("CODEX_MODEL") or default_model).strip()
+    normalized["RELAY_MODEL"] = (normalized.get("RELAY_MODEL") or normalized.get("CODEX_MODEL") or DEFAULT_CODEX_MODEL).strip()
     normalized["CODEX_MODEL"] = normalized["RELAY_MODEL"]
-    normalized["CODEX_FULL_ACCESS"] = "true"
-    normalized["CODEX_READ_ONLY"] = "false"
+    read_only = _env_flag(normalized.get("CODEX_READ_ONLY"), default=False)
+    full_access = _env_flag(normalized.get("CODEX_FULL_ACCESS"), default=False) and not read_only
+    normalized["CODEX_FULL_ACCESS"] = "true" if full_access else "false"
+    normalized["CODEX_READ_ONLY"] = "true" if read_only else "false"
     transport = (normalized.get("CODEX_APP_SERVER_TRANSPORT", "stdio") or "stdio").strip().lower()
     normalized["CODEX_APP_SERVER_TRANSPORT"] = transport if transport in {"stdio", "websocket"} else "stdio"
     normalized["OPEN_VISIBLE_TERMINAL"] = "true" if normalized.get("OPEN_VISIBLE_TERMINAL", "false").lower() in {"1", "true", "yes", "on"} else "false"
@@ -810,10 +863,10 @@ def _interactive_register(workspace: Path) -> dict:
         "RELAY_BOT_NAME": bot_name,
         "CODEX_WORKDIR": str(workspace),
         "CODEX_MODEL": DEFAULT_CODEX_MODEL,
-        "CODEX_FULL_ACCESS": "true",
+        "CODEX_FULL_ACCESS": "false",
         "CODEX_READ_ONLY": "false",
         "CODEX_APP_SERVER_TRANSPORT": "stdio",
-        "CODEX_APP_SERVER_PORT": str(default_port_for_workspace(workspace, token=token)),
+        "CODEX_APP_SERVER_PORT": str(_default_app_server_port_for_profile(workspace, token=token)),
         "STATE_NAMESPACE": default_namespace_for_workspace(workspace, token=token),
         "ALLOW_DMS": "true" if allow_dms else "false",
         "BOT_TRIGGER_MODE": trigger_mode,
@@ -1125,7 +1178,8 @@ def _reconcile_auth_failure_marker(profile: dict, auth_failure_marker_path: Path
     if not workspace_text:
         return True
     try:
-        logged_in, _status_text = _codex_login_status(Path(workspace_text))
+        profile_env = _normalized_profile_env(_load_env_file(Path(profile["env_file"]))) if profile.get("env_file") else None
+        logged_in, _status_text = _codex_login_status(Path(workspace_text), profile_env)
     except Exception:
         return True
     if not logged_in:
@@ -1375,14 +1429,21 @@ def _profile_runtime_state(profile: dict) -> dict:
     }
 
 
-def _quarantine_stale_session_bindings(state_dir: Path, workspace: Path | None = None) -> int:
+def _quarantine_stale_session_bindings(
+    state_dir: Path,
+    workspace: Path | None = None,
+    profile_env: dict[str, str] | None = None,
+) -> int:
     session_dir = state_dir / "sessions"
     if not session_dir.exists():
         return 0
+    base_env = os.environ.copy()
+    if profile_env:
+        base_env.update(profile_env)
     if workspace is not None:
-        codex_root = prepare_relay_codex_home(workspace) / "sessions"
+        codex_root = Path(relay_codex_env(workspace, base_env)["CODEX_HOME"]) / "sessions"
     else:
-        codex_root = prepare_relay_codex_home(Path.cwd()) / "sessions"
+        codex_root = Path(relay_codex_env(Path.cwd(), base_env)["CODEX_HOME"]) / "sessions"
     moved = 0
     for session_file in session_dir.glob("*.json"):
         try:
@@ -1522,18 +1583,21 @@ def _backend_script_path(name: str) -> str:
     return str(Path(__file__).resolve().with_name(name))
 
 
-def _codex_login_status(workspace: Path) -> tuple[bool, str]:
+def _codex_login_status(workspace: Path, profile_env: dict[str, str] | None = None) -> tuple[bool, str]:
     provider_name = "codex"
     creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
     codex_bin = resolve_codex_bin()
     if not codex_bin:
         return False, "Codex CLI is not installed."
+    base_env = os.environ.copy()
+    if profile_env:
+        base_env.update(profile_env)
     result = subprocess.run(
         [codex_bin, "login", "status"],
         capture_output=True,
         text=True,
         check=False,
-        env=relay_codex_env(workspace, os.environ.copy()),
+        env=relay_codex_env(workspace, base_env),
         creationflags=creationflags,
     )
     output = ((result.stdout or "") + (result.stderr or "")).strip()
@@ -1550,7 +1614,9 @@ def _launch_bot_worker(
     env_data = _load_env_file(env_file)
     env_data.setdefault("CODEX_WORKDIR", str(workspace))
     env = _normalized_profile_env(env_data)
-    child_env = relay_codex_env(workspace, os.environ.copy())
+    child_base_env = os.environ.copy()
+    child_base_env.update(env)
+    child_env = relay_codex_env(workspace, child_base_env)
     child_env["ENV_FILE"] = str(env_file)
     child_env["PYTHONUNBUFFERED"] = "1"
     child_env["CLADEX_START_REASON"] = start_reason
@@ -1587,7 +1653,7 @@ def _run_profile_foreground(profile: dict) -> int:
     state_dir = state_dir_for_namespace(env["STATE_NAMESPACE"])
     state_dir.mkdir(parents=True, exist_ok=True)
     (state_dir / "logs").mkdir(parents=True, exist_ok=True)
-    _quarantine_stale_session_bindings(state_dir, Path(profile["workspace"]))
+    _quarantine_stale_session_bindings(state_dir, Path(profile["workspace"]), env)
     launch_lock = None
     try:
         try:
@@ -1599,7 +1665,7 @@ def _run_profile_foreground(profile: dict) -> int:
         if runtime["running"]:
             return 0
 
-        logged_in, login_status = _codex_login_status(Path(profile["workspace"]))
+        logged_in, login_status = _codex_login_status(Path(profile["workspace"]), env)
         if not logged_in:
             raise SystemExit(
                 "Native Codex CLI is not logged in for this terminal environment.\n"
@@ -1611,7 +1677,9 @@ def _run_profile_foreground(profile: dict) -> int:
         runtime["auth_failure_marker_path"].unlink(missing_ok=True)
         runtime["ready_marker_path"].unlink(missing_ok=True)
 
-        child_env = relay_codex_env(Path(profile["workspace"]), os.environ.copy())
+        child_base_env = os.environ.copy()
+        child_base_env.update(env)
+        child_env = relay_codex_env(Path(profile["workspace"]), child_base_env)
         child_env["ENV_FILE"] = profile["env_file"]
         child_env["PYTHONUNBUFFERED"] = "1"
         child_env["CLADEX_START_REASON"] = os.environ.get("CLADEX_START_REASON", "operator-start").strip() or "operator-start"
@@ -1637,7 +1705,7 @@ def _run_profile(profile: dict) -> int:
     state_dir = state_dir_for_namespace(env["STATE_NAMESPACE"])
     state_dir.mkdir(parents=True, exist_ok=True)
     (state_dir / "logs").mkdir(parents=True, exist_ok=True)
-    _quarantine_stale_session_bindings(state_dir, Path(profile["workspace"]))
+    _quarantine_stale_session_bindings(state_dir, Path(profile["workspace"]), env)
     launch_lock = None
     try:
         try:
@@ -1649,11 +1717,13 @@ def _run_profile(profile: dict) -> int:
         if runtime["running"]:
             return 0
 
-        launch_env = relay_codex_env(Path(profile["workspace"]), os.environ.copy())
+        launch_base_env = os.environ.copy()
+        launch_base_env.update(env)
+        launch_env = relay_codex_env(Path(profile["workspace"]), launch_base_env)
         launch_env["ENV_FILE"] = profile["env_file"]
         launch_env["PYTHONUNBUFFERED"] = "1"
         launch_env["CLADEX_START_REASON"] = os.environ.get("CLADEX_START_REASON", "operator-start").strip() or "operator-start"
-        logged_in, login_status = _codex_login_status(Path(profile["workspace"]))
+        logged_in, login_status = _codex_login_status(Path(profile["workspace"]), env)
         if not logged_in:
             raise SystemExit(
                 "Native Codex CLI is not logged in for this terminal environment.\n"
@@ -1721,7 +1791,7 @@ def _print_profile_status(profile: dict) -> None:
     print(f"profile: {profile['name']}")
     print(f"bot: {_bot_label(profile)}")
     print("provider: codex")
-    print(f"model: {env.get('CODEX_MODEL') or DEFAULT_CODEX_MODEL}")
+    print(f"model: {env.get('CODEX_MODEL') or DEFAULT_CODEX_MODEL or DEFAULT_CODEX_MODEL_LABEL}")
     print(
         "reasoning effort: "
         f"quick={env.get('CODEX_REASONING_EFFORT_QUICK', 'medium')} "
@@ -2737,11 +2807,12 @@ def cmd_gui(_args: argparse.Namespace) -> int:
                 "DISCORD_BOT_TOKEN": token,
                 "RELAY_BOT_NAME": vars_map["bot_name"].get().strip(),
                 "CODEX_WORKDIR": str(workspace),
+                "CODEX_HOME": existing_env.get("CODEX_HOME", ""),
                 "CODEX_MODEL": vars_map["model"].get().strip(),
-                "CODEX_FULL_ACCESS": "true",
+                "CODEX_FULL_ACCESS": existing_env.get("CODEX_FULL_ACCESS", "false"),
                 "CODEX_READ_ONLY": "false",
                 "CODEX_APP_SERVER_TRANSPORT": "stdio",
-                "CODEX_APP_SERVER_PORT": str(default_port_for_workspace(workspace, token=token)),
+                "CODEX_APP_SERVER_PORT": str(_default_app_server_port_for_profile(workspace, token=token)),
                 "STATE_NAMESPACE": existing_env.get("STATE_NAMESPACE") if editing else default_namespace_for_workspace(workspace, token=token),
                 "ALLOW_DMS": "true" if vars_map["allow_dms"].get() else "false",
                 "BOT_TRIGGER_MODE": vars_map["trigger_mode"].get().strip() or "mention_or_dm",
@@ -3032,11 +3103,12 @@ def cmd_register(args: argparse.Namespace) -> int:
         "RELAY_BOT_NAME": args.bot_name or "",
         "RELAY_MODEL": args.model or args.codex_model or "",
         "CODEX_WORKDIR": str(workspace),
+        "CODEX_HOME": args.codex_home or "",
         "CODEX_MODEL": args.model or args.codex_model or "",
-        "CODEX_FULL_ACCESS": "true",
+        "CODEX_FULL_ACCESS": "false",
         "CODEX_READ_ONLY": "false",
         "CODEX_APP_SERVER_TRANSPORT": args.app_server_transport or "stdio",
-        "CODEX_APP_SERVER_PORT": str(args.app_server_port or default_port_for_workspace(workspace, token=args.discord_bot_token)),
+        "CODEX_APP_SERVER_PORT": str(args.app_server_port or _default_app_server_port_for_profile(workspace, token=args.discord_bot_token)),
         "STATE_NAMESPACE": args.state_namespace or default_namespace_for_workspace(workspace, token=args.discord_bot_token),
         "ALLOW_DMS": "true" if args.allow_dms else "false",
         "BOT_TRIGGER_MODE": inferred_trigger_mode,
@@ -3154,7 +3226,9 @@ def cmd_doctor(_args: argparse.Namespace) -> int:
 
     state = _profile_runtime_state(profile)
     env = state["env"]
-    relay_env = relay_codex_env(Path(profile["workspace"]), os.environ.copy())
+    relay_base_env = os.environ.copy()
+    relay_base_env.update(env)
+    relay_env = relay_codex_env(Path(profile["workspace"]), relay_base_env)
     relay_config_path = Path(relay_env["CODEX_HOME"]) / "config.toml"
     runtime_bin = resolve_codex_bin()
     print(f"workspace: {workspace}")
@@ -3176,7 +3250,7 @@ def cmd_doctor(_args: argparse.Namespace) -> int:
         )
         version_text = (version.stdout or version.stderr).strip()
         print(f"codex version: {version_text or 'unknown'}")
-        logged_in, login_text = _codex_login_status(Path(profile["workspace"]))
+        logged_in, login_text = _codex_login_status(Path(profile["workspace"]), env)
         print(f"codex login: {'ok' if logged_in else 'missing'}")
         if login_text:
             print(_sanitize_auth_status_text(login_text))
@@ -3729,6 +3803,7 @@ def build_parser() -> argparse.ArgumentParser:
     register_parser.add_argument("--app-server-transport", choices=["stdio", "websocket"], default=None, help="Codex app-server transport; defaults to `stdio` for production use")
     register_parser.add_argument("--model", default="", help="Optional model override for this relay profile")
     register_parser.add_argument("--codex-model", default="", help="Optional model override for this relay profile")
+    register_parser.add_argument("--codex-home", default="", help="Optional CODEX_HOME for this relay profile/account")
     register_parser.add_argument("--trigger-mode", choices=["all", "mention_or_dm", "dm_only"], default=None, help="How channel messages trigger the relay; defaults to `mention_or_dm` when a channel is configured")
     register_parser.add_argument("--channel-history-limit", type=int, default=20, help="Relevant messages included in a fresh channel bootstrap digest; use 0 for an unlimited backfill scan")
     register_parser.add_argument("--startup-dm-text", default="Discord relay online. DM me here to chat with Codex.", help="Optional startup DM text")

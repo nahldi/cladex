@@ -298,13 +298,105 @@ function listDirectoryRoots() {
   return [{ name: '/', path: '/' }];
 }
 
+function parseRemoteFilesystemRoots() {
+  return String(process.env.CLADEX_REMOTE_FS_ROOTS || process.env.CLADEX_REMOTE_FS_ROOT || '')
+    .split(/[;,]/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function comparablePath(value) {
+  const resolved = path.resolve(String(value || ''));
+  const normalized = process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+  return normalized.endsWith(path.sep) && normalized !== path.parse(normalized).root
+    ? normalized.slice(0, -1)
+    : normalized;
+}
+
+function isSubpathOrSame(candidate, root) {
+  const target = comparablePath(candidate);
+  const base = comparablePath(root);
+  if (target === base) {
+    return true;
+  }
+  const relative = path.relative(base, target);
+  return Boolean(relative) && !relative.startsWith('..') && !path.isAbsolute(relative);
+}
+
+async function canonicalDirectoryPath(candidate) {
+  const resolved = path.resolve(String(candidate || ''));
+  const stats = await fs.stat(resolved);
+  if (!stats.isDirectory()) {
+    return '';
+  }
+  return fs.realpath(resolved).catch(() => resolved);
+}
+
+async function remoteFilesystemRoots() {
+  const candidates = [...parseRemoteFilesystemRoots()];
+  try {
+    const profiles = await getProfiles();
+    for (const profile of profiles) {
+      for (const key of ['workspace', 'activeWorktree', 'codexHome', 'claudeConfigDir']) {
+        const value = String(profile?.[key] || '').trim();
+        if (value) {
+          candidates.push(value);
+        }
+      }
+    }
+  } catch {}
+
+  const roots = [];
+  const seen = new Set();
+  for (const candidate of candidates) {
+    try {
+      const realPath = await canonicalDirectoryPath(candidate);
+      const comparable = comparablePath(realPath);
+      if (realPath && !seen.has(comparable)) {
+        seen.add(comparable);
+        roots.push(realPath);
+      }
+    } catch {}
+  }
+  return roots.sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
+}
+
+function rootLabel(root) {
+  const parsed = path.parse(root);
+  if (root === parsed.root) {
+    return root;
+  }
+  return path.basename(root) || root;
+}
+
+async function directoryRootsForRequest(req) {
+  if (isLoopbackRequest(req) || process.env.CLADEX_REMOTE_FS_UNRESTRICTED === '1') {
+    return listDirectoryRoots();
+  }
+  const roots = await remoteFilesystemRoots();
+  return roots.map((root) => ({ name: rootLabel(root), path: root }));
+}
+
+async function allowedDirectoryForRequest(req, requestedPath) {
+  if (isLoopbackRequest(req) || process.env.CLADEX_REMOTE_FS_UNRESTRICTED === '1') {
+    return canonicalDirectoryPath(requestedPath);
+  }
+  const roots = await remoteFilesystemRoots();
+  const resolved = path.resolve(String(requestedPath || ''));
+  if (!roots.some((root) => isSubpathOrSame(resolved, root))) {
+    return '';
+  }
+  const target = await canonicalDirectoryPath(resolved);
+  return roots.some((root) => isSubpathOrSame(target, root)) ? target : '';
+}
+
 app.get('/api/runtime-info', async (req, res) => {
   const payload = {
     apiBase: `${requestBase(req)}/api`,
     backendDir: BACKEND_DIR,
     frontendDir: FRONTEND_DIR,
     packaged: process.env.NODE_ENV === 'production' || !!process.resourcesPath,
-    appVersion: process.env.npm_package_version || '2.0.10',
+    appVersion: process.env.npm_package_version || '2.1.0',
     remoteAccessProtected: true,
   };
   if (isLoopbackRequest(req)) {
@@ -316,11 +408,15 @@ app.get('/api/runtime-info', async (req, res) => {
 app.get('/api/fs/list', async (req, res) => {
   const raw = String(req.query.path || '').trim();
   if (!raw) {
-    res.json({ currentPath: '', parentPath: '', directories: listDirectoryRoots() });
+    res.json({ currentPath: '', parentPath: '', directories: await directoryRootsForRequest(req) });
     return;
   }
-  const target = path.resolve(raw);
   try {
+    const target = await allowedDirectoryForRequest(req, raw);
+    if (!target) {
+      res.status(403).json({ error: 'Path is outside the configured remote filesystem roots' });
+      return;
+    }
     const stats = await fs.stat(target);
     if (!stats.isDirectory()) {
       res.status(400).json({ error: 'Path is not a directory' });
@@ -332,9 +428,13 @@ app.get('/api/fs/list', async (req, res) => {
       .map((entry) => ({ name: entry.name, path: path.join(target, entry.name) }))
       .sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }));
     const parentPath = path.dirname(target);
+    let allowedParent = '';
+    if (parentPath && parentPath !== target) {
+      allowedParent = await allowedDirectoryForRequest(req, parentPath);
+    }
     res.json({
       currentPath: target,
-      parentPath: parentPath && parentPath !== target ? parentPath : '',
+      parentPath: allowedParent || '',
       directories,
     });
   } catch (error) {
@@ -432,6 +532,8 @@ app.patch('/api/profiles/:id', async (req, res) => {
   if (Object.prototype.hasOwnProperty.call(req.body, 'discordToken')) args.push('--discord-bot-token', String(req.body?.discordToken || '').trim());
   if (Object.prototype.hasOwnProperty.call(req.body, 'botName')) args.push('--bot-name', String(req.body?.botName || '').trim());
   if (Object.prototype.hasOwnProperty.call(req.body, 'model')) args.push('--model', String(req.body?.model || '').trim());
+  if (Object.prototype.hasOwnProperty.call(req.body, 'codexHome')) args.push('--codex-home', String(req.body?.codexHome || '').trim());
+  if (Object.prototype.hasOwnProperty.call(req.body, 'claudeConfigDir')) args.push('--claude-config-dir', String(req.body?.claudeConfigDir || '').trim());
   if (Object.prototype.hasOwnProperty.call(req.body, 'triggerMode')) args.push('--trigger-mode', String(req.body?.triggerMode || '').trim() || 'mention_or_dm');
   if (req.body?.allowDms === true) args.push('--allow-dms');
   if (req.body?.allowDms === false) args.push('--deny-dms');
@@ -548,6 +650,8 @@ app.post('/api/profiles', async (req, res) => {
   const discordToken = String(req.body?.discordToken || '').trim();
   const channelId = String(req.body?.channelId || '').trim();
   const model = String(req.body?.model || '').trim();
+  const codexHome = String(req.body?.codexHome || '').trim();
+  const claudeConfigDir = String(req.body?.claudeConfigDir || '').trim();
   const triggerMode = String(req.body?.triggerMode || 'mention_or_dm').trim();
   const allowDms = Boolean(req.body?.allowDms);
   const operatorIds = String(req.body?.operatorIds || '').trim();
@@ -587,6 +691,7 @@ app.post('/api/profiles', async (req, res) => {
       triggerMode,
       ...(allowDms ? ['--allow-dms'] : []),
       ...(model ? ['--model', model] : []),
+      ...(codexHome ? ['--codex-home', codexHome] : []),
       ...(channelHistoryLimit ? ['--channel-history-limit', channelHistoryLimit] : []),
       ...(startupDmText ? ['--startup-dm-text', startupDmText] : []),
       ...(startupChannelText ? ['--startup-channel-text', startupChannelText] : []),
@@ -612,6 +717,7 @@ app.post('/api/profiles', async (req, res) => {
       triggerMode,
       ...(allowDms ? ['--allow-dms'] : []),
       ...(model ? ['--model', model] : []),
+      ...(claudeConfigDir ? ['--claude-config-dir', claudeConfigDir] : []),
       ...(channelHistoryLimit ? ['--channel-history-limit', channelHistoryLimit] : []),
       ...(operatorIds ? ['--operator-ids', operatorIds] : []),
       ...(allowedUserIds ? ['--allowed-user-ids', allowedUserIds] : []),
@@ -693,7 +799,7 @@ app.use((err, _req, res, _next) => {
 
 if (fsSync.existsSync(FRONTEND_DIR)) {
   app.use(express.static(FRONTEND_DIR, { index: 'index.html' }));
-  app.get('*', (req, res, next) => {
+  app.get('/{*splat}', (req, res, next) => {
     if (req.path.startsWith('/api/')) {
       next();
       return;

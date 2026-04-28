@@ -82,6 +82,126 @@ class CodexBackend(ABC):
         raise NotImplementedError
 
 
+def codex_text_input(text: str) -> list[dict[str, Any]]:
+    return [{"type": "text", "text": text, "text_elements": []}]
+
+
+def _session_permission_profile(session) -> dict[str, Any] | None:
+    provider = getattr(session, "_permission_profile", None)
+    if provider is None:
+        return None
+    profile = provider()
+    return profile if isinstance(profile, dict) and profile else None
+
+
+def _thread_permission_fields(session) -> dict[str, Any]:
+    permission_profile = _session_permission_profile(session)
+    if permission_profile is not None:
+        return {"permissionProfile": permission_profile}
+    return {
+        "approvalPolicy": session._approval_policy(),
+        "approvalsReviewer": None,
+        "sandbox": session._sandbox_mode(),
+    }
+
+
+def _turn_permission_fields(session) -> dict[str, Any]:
+    permission_profile = _session_permission_profile(session)
+    if permission_profile is not None:
+        return {"permissionProfile": permission_profile}
+    return {
+        "approvalPolicy": None,
+        "approvalsReviewer": None,
+        "sandboxPolicy": None,
+    }
+
+
+def build_thread_start_params(session, *, cwd: Path) -> dict[str, Any]:
+    params = {
+        "model": session._configured_model(),
+        "modelProvider": None,
+        "serviceTier": None,
+        "cwd": str(cwd),
+        "config": None,
+        "serviceName": "discord-codex-relay",
+        "baseInstructions": None,
+        "developerInstructions": session._developer_instructions(),
+        "personality": None,
+        "ephemeral": False,
+        "experimentalRawEvents": False,
+        "persistExtendedHistory": True,
+    }
+    params.update(_thread_permission_fields(session))
+    return params
+
+
+def build_thread_resume_params(session, *, thread_id: str, cwd: Path) -> dict[str, Any]:
+    params = {
+        "threadId": thread_id,
+        "history": None,
+        "path": None,
+        "model": session._configured_model(),
+        "modelProvider": None,
+        "serviceTier": None,
+        "cwd": str(cwd),
+        "config": None,
+        "baseInstructions": None,
+        "developerInstructions": session._developer_instructions(),
+        "personality": None,
+        "persistExtendedHistory": True,
+    }
+    params.update(_thread_permission_fields(session))
+    return params
+
+
+def build_thread_list_params(session, *, limit: int = 50) -> dict[str, Any]:
+    return {
+        "cwd": str(session._runtime_workdir()),
+        "limit": limit,
+        "archived": False,
+        "sourceKinds": [],
+        "modelProviders": [],
+        "searchTerm": None,
+        "sortKey": "updated_at",
+    }
+
+
+def build_turn_start_params(
+    session,
+    *,
+    thread_id: str,
+    prompt: str,
+    injected_context: str,
+) -> dict[str, Any]:
+    params = {
+        "threadId": thread_id,
+        "input": codex_text_input(f"{injected_context}\n\n{prompt}"),
+        "cwd": None,
+        "model": None,
+        "serviceTier": None,
+        "effort": session._turn_effort("implementation"),
+        "summary": None,
+        "personality": None,
+        "outputSchema": None,
+        "collaborationMode": None,
+    }
+    params.update(_turn_permission_fields(session))
+    return params
+
+
+def build_turn_steer_params(*, thread_id: str, prompt: str, expected_turn_id: str | None = None) -> dict[str, Any]:
+    params = {"threadId": thread_id, "input": codex_text_input(prompt)}
+    if expected_turn_id:
+        params["expectedTurnId"] = expected_turn_id
+    return params
+
+
+def build_turn_interrupt_params(*, thread_id: str, turn_id: str | None = None) -> dict[str, Any]:
+    if turn_id:
+        return {"threadId": thread_id, "turnId": turn_id}
+    return {"threadId": thread_id}
+
+
 class AppServerCodexBackend(CodexBackend):
     def __init__(self, session) -> None:
         self.session = session
@@ -101,23 +221,7 @@ class AppServerCodexBackend(CodexBackend):
     async def create_thread(self, channel_binding) -> BackendThread:
         response = await self._invoke(
             "thread/start",
-            {
-                "model": self.session._configured_model(),
-                "modelProvider": None,
-                "serviceTier": None,
-                "cwd": str(channel_binding.worktree_path),
-                "approvalPolicy": self.session._approval_policy(),
-                "approvalsReviewer": None,
-                "sandbox": self.session._sandbox_mode(),
-                "config": None,
-                "serviceName": "discord-codex-relay",
-                "baseInstructions": None,
-                "developerInstructions": self.session._developer_instructions(),
-                "personality": None,
-                "ephemeral": False,
-                "experimentalRawEvents": False,
-                "persistExtendedHistory": True,
-            },
+            build_thread_start_params(self.session, cwd=Path(channel_binding.worktree_path)),
         )
         thread = response.get("thread") or {}
         return BackendThread(
@@ -129,23 +233,7 @@ class AppServerCodexBackend(CodexBackend):
     async def resume_thread(self, thread_id: str) -> BackendThread:
         response = await self._invoke(
             "thread/resume",
-            {
-                "threadId": thread_id,
-                "history": None,
-                "path": None,
-                "model": self.session._configured_model(),
-                "modelProvider": None,
-                "serviceTier": None,
-                "cwd": str(self.session._runtime_workdir()),
-                "approvalPolicy": self.session._approval_policy(),
-                "approvalsReviewer": None,
-                "sandbox": self.session._sandbox_mode(),
-                "config": None,
-                "baseInstructions": None,
-                "developerInstructions": self.session._developer_instructions(),
-                "personality": None,
-                "persistExtendedHistory": True,
-            },
+            build_thread_resume_params(self.session, thread_id=thread_id, cwd=self.session._runtime_workdir()),
         )
         thread = response.get("thread") or {}
         return BackendThread(
@@ -169,15 +257,7 @@ class AppServerCodexBackend(CodexBackend):
     async def list_threads(self, project_id: str) -> list[BackendThread]:
         response = await self._invoke(
             "thread/list",
-            {
-                "cwd": str(self.session._runtime_workdir()),
-                "limit": 50,
-                "archived": False,
-                "sourceKinds": [],
-                "modelProviders": [],
-                "searchTerm": None,
-                "sortKey": "updated_at",
-            },
+            build_thread_list_params(self.session),
         )
         items = response.get("data") or response.get("threads") or []
         return [
@@ -194,30 +274,31 @@ class AppServerCodexBackend(CodexBackend):
     async def start_turn(self, thread_id: str, prompt: str, injected_context: str) -> BackendTurn:
         response = await self._invoke(
             "turn/start",
-            {
-                "threadId": thread_id,
-                "input": [{"type": "text", "text": f"{injected_context}\n\n{prompt}", "text_elements": []}],
-                "cwd": None,
-                "approvalPolicy": None,
-                "approvalsReviewer": None,
-                "sandboxPolicy": None,
-                "model": None,
-                "serviceTier": None,
-                "effort": self.session._turn_effort("implementation"),
-                "summary": None,
-                "personality": None,
-                "outputSchema": None,
-                "collaborationMode": None,
-            },
+            build_turn_start_params(
+                self.session,
+                thread_id=thread_id,
+                prompt=prompt,
+                injected_context=injected_context,
+            ),
         )
         turn = response.get("turn") or {}
         return BackendTurn(turn_id=str(turn.get("id", "")), metadata=response)
 
     async def steer_turn(self, thread_id: str, prompt: str) -> dict[str, Any]:
-        return await self._invoke("turn/steer", {"threadId": thread_id, "input": prompt})
+        active_turn = getattr(self.session, "active_turn", None)
+        expected_turn_id = getattr(active_turn, "turn_id", None)
+        return await self._invoke(
+            "turn/steer",
+            build_turn_steer_params(thread_id=thread_id, prompt=prompt, expected_turn_id=expected_turn_id),
+        )
 
     async def interrupt_turn(self, thread_id: str) -> dict[str, Any]:
-        return await self._invoke("turn/interrupt", {"turnId": thread_id} if thread_id.startswith("turn-") else {"threadId": thread_id})
+        active_turn = getattr(self.session, "active_turn", None)
+        turn_id = getattr(active_turn, "turn_id", None)
+        return await self._invoke(
+            "turn/interrupt",
+            build_turn_interrupt_params(thread_id=thread_id, turn_id=turn_id),
+        )
 
     async def start_review(self, thread_id: str) -> BackendTurn:
         response = await self._invoke(

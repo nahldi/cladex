@@ -19,7 +19,7 @@ def test_get_all_profiles_uses_codex_runtime_state(monkeypatch) -> None:
         "_profile_runtime_state",
         lambda profile: {"running": True, "ready": True, "degraded": False, "log_path": Path("C:/relay.log")},
     )
-    monkeypatch.setattr(cladex.relayctl, "_load_env_file", lambda path: {"CODEX_MODEL": "gpt-5.4"})
+    monkeypatch.setattr(cladex.relayctl, "_load_env_file", lambda path: {"CODEX_MODEL": "gpt-explicit"})
     monkeypatch.setattr(cladex.relayctl, "_normalized_profile_env", lambda env: env)
     monkeypatch.setattr(cladex, "_load_claude_registry", lambda: {"profiles": [], "projects": []})
 
@@ -162,7 +162,7 @@ def test_claude_runtime_state_reads_status_json(tmp_path: Path, monkeypatch) -> 
                 "session_id": "sess-123",
                 "active_worktree": "C:/repo/worktree",
                 "active_channel": "456",
-                "model": "claude-opus-4-5-20251101",
+                "model": "claude-explicit",
                 "effort": "high",
             }
         ),
@@ -180,7 +180,7 @@ def test_claude_runtime_state_reads_status_json(tmp_path: Path, monkeypatch) -> 
     assert state["session_id"] == "sess-123"
     assert state["active_worktree"] == "C:/repo/worktree"
     assert state["active_channel"] == "456"
-    assert state["model"] == "claude-opus-4-5-20251101"
+    assert state["model"] == "claude-explicit"
     assert state["effort"] == "high"
 
 
@@ -229,7 +229,8 @@ def test_list_json_contains_runtime_fields(monkeypatch, capsys) -> None:
                 "_running": True,
                 "_ready": True,
                 "_provider": "codex-app-server",
-                "_model": "gpt-5.4",
+                "_model": "gpt-explicit",
+                "_codex_home": "C:/accounts/codex-one",
                 "_trigger_mode": "mention_or_dm",
                 "_effort": "high",
                 "_bot_name": "Kurt",
@@ -251,6 +252,7 @@ def test_list_json_contains_runtime_fields(monkeypatch, capsys) -> None:
     assert payload[0]["discordChannel"] == "123"
     assert payload[0]["effort"] == "high"
     assert payload[0]["botName"] == "Kurt"
+    assert payload[0]["codexHome"] == "C:/accounts/codex-one"
     assert payload[0]["allowDms"] is True
     assert payload[0]["stateNamespace"] == "codex-ns"
     assert payload[0]["displayName"] == "Kurt"
@@ -269,6 +271,7 @@ def test_status_json_returns_profiles_and_running(monkeypatch, capsys) -> None:
                 "_ready": True,
                 "_provider": "claude-code",
                 "_model": "",
+                "_claude_config_dir": "C:/accounts/claude-one",
                 "_trigger_mode": "mention_or_dm",
                 "workspace": "C:/claude",
                 "_log_path": "C:/claude/relay.log",
@@ -282,6 +285,7 @@ def test_status_json_returns_profiles_and_running(monkeypatch, capsys) -> None:
     payload = json.loads(capsys.readouterr().out)
     assert payload["running"] == ["claude-one"]
     assert payload["profiles"][0]["relayType"] == "claude"
+    assert payload["profiles"][0]["claudeConfigDir"] == "C:/accounts/claude-one"
 
 
 def test_cmd_logs_json_reads_tail(monkeypatch, tmp_path: Path, capsys) -> None:
@@ -300,6 +304,42 @@ def test_cmd_logs_json_reads_tail(monkeypatch, tmp_path: Path, capsys) -> None:
     assert rc == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["logs"] == ["two", "three"]
+
+
+def test_cmd_doctor_json_reports_profile_port_collisions(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        cladex,
+        "_doctor_version",
+        lambda name, command: {"name": name, "ok": True, "version": "test", "detail": ""},
+    )
+    monkeypatch.setattr(
+        cladex,
+        "_doctor_profiles",
+        lambda: {
+            "count": 2,
+            "codex": 2,
+            "claude": 0,
+            "running": [],
+            "duplicateCodexPorts": {"18000": ["one", "two"]},
+        },
+    )
+    monkeypatch.setattr(
+        cladex,
+        "_doctor_codex_app_server_schema",
+        lambda: {"name": "codex-app-server-schema", "ok": True, "version": "test", "detail": "", "schemas": ["schema.json"]},
+    )
+    monkeypatch.setattr(
+        cladex,
+        "_doctor_windows_powershell_shim",
+        lambda name: {"name": f"{name}-powershell-shim", "ok": True, "warning": False, "detail": ""},
+    )
+
+    rc = cladex.cmd_doctor(SimpleNamespace(json=True))
+
+    assert rc == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert payload["profiles"]["duplicateCodexPorts"]["18000"] == ["one", "two"]
 
 
 def test_cmd_remove_codex_uses_registry_cleanup(monkeypatch, capsys) -> None:
@@ -333,7 +373,7 @@ def test_cmd_update_passes_fields_to_update_profile(monkeypatch, capsys) -> None
             name="codex-one",
             type="codex",
             bot_name="Tyson",
-            model="gpt-5.4",
+            model="gpt-explicit",
             trigger_mode="mention_or_dm",
             allow_dms=True,
             deny_dms=False,

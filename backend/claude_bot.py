@@ -32,6 +32,7 @@ from claude_common import (
 
 logger = logging.getLogger(__name__)
 OPERATOR_HISTORY_LIMIT = 80
+SAFE_ALLOWED_MENTIONS = discord.AllowedMentions.none()
 
 
 class _DiscordVoiceWarningFilter(logging.Filter):
@@ -172,9 +173,13 @@ class ClaudeRelayBot(commands.Bot):
                 first = True
                 for chunk in self._split_message(content):
                     if first and source_message is not None:
-                        await source_message.reply(chunk, mention_author=False)
+                        await source_message.reply(
+                            chunk,
+                            mention_author=False,
+                            allowed_mentions=SAFE_ALLOWED_MENTIONS,
+                        )
                     else:
-                        await channel.send(chunk)
+                        await channel.send(chunk, allowed_mentions=SAFE_ALLOWED_MENTIONS)
                     first = False
 
         except Exception as e:

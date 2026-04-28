@@ -7,10 +7,12 @@ This repo now contains two relay runtimes under one package:
 - Codex relay
   - primary backend: Codex app-server
   - degraded fallback: Codex CLI `exec` / `exec resume`
-  - default model: `gpt-5.4`
+  - default model: blank, meaning the installed Codex CLI chooses its configured/current default
+  - account home: optional per-profile `CODEX_HOME`
 - Claude relay
-  - backend: Claude Code CLI one-shot print mode per turn
-  - continuity: explicit persisted session ID with `--session-id` then `--resume`
+  - backend: persistent Claude Code CLI print-mode subprocess with stream-json stdin/stdout
+  - default model: blank, meaning the installed Claude CLI chooses its configured/current default
+  - account home: optional per-profile `CLAUDE_CONFIG_DIR`
 
 `cladex` is the unified manager for both.
 
@@ -20,9 +22,19 @@ The selected Codex model comes from:
 
 1. `RELAY_MODEL`
 2. `CODEX_MODEL`
-3. relay default `gpt-5.4`
+3. blank/omitted, which lets Codex use its CLI default
 
-The model is pinned when the relay starts or resumes a Codex thread.
+The model is only pinned when a relay profile explicitly sets one.
+
+## Account Home Selection
+
+Codex profiles may set `CODEX_HOME` to point at a specific Codex account home.
+When omitted, CLADEX keeps the existing shared relay home behavior. When set,
+the relay uses that explicit home directly and does not copy default `~/.codex`
+auth into it; log in that home intentionally before starting the profile.
+
+Claude profiles may set `CLAUDE_CONFIG_DIR` to point at a specific Claude Code
+configuration/account home. When omitted, Claude Code uses its normal default.
 
 ## Reasoning Effort
 
@@ -42,8 +54,8 @@ There are two different meanings:
    - `claude-code`
 
 2. AI model choice inside the backend
-   - Codex default: `gpt-5.4`
-   - Claude model: whatever the local Claude CLI is configured to use unless explicitly overridden there
+   - Codex model: profile override if set, otherwise the Codex CLI default
+   - Claude model: profile override if set, otherwise the Claude CLI default
 
 Skills, browser tools, media tools, and deploy helpers are not providers.
 

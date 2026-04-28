@@ -33,7 +33,9 @@ from relay_runtime import DurableRuntime, RELAY_PROJECT_ROOT, _extract_blocker, 
 logger = logging.getLogger(__name__)
 TASK_HEARTBEAT_INTERVAL_SECONDS = 60
 
-DEFAULT_CLAUDE_MODEL = "claude-opus-4-5-20251101"
+DEFAULT_CLAUDE_MODEL = ""
+DEFAULT_CLAUDE_PERMISSION_MODE = "default"
+ALLOWED_CLAUDE_PERMISSION_MODES = {"acceptEdits", "auto", "bypassPermissions", "default", "dontAsk", "plan"}
 
 PROMPT_CONTEXT_FILES: tuple[tuple[str, int], ...] = (
     ("AGENTS.md", 2600),
@@ -224,7 +226,13 @@ class ClaudeBackend:
             state_namespace=state_dir.name or "default",
             agent_name="claude",
         )
-        self.model = (os.environ.get("CLAUDE_MODEL") or DEFAULT_CLAUDE_MODEL).strip() or DEFAULT_CLAUDE_MODEL
+        self.model = (os.environ.get("CLAUDE_MODEL") or DEFAULT_CLAUDE_MODEL).strip()
+        self.permission_mode = (
+            os.environ.get("CLAUDE_PERMISSION_MODE") or DEFAULT_CLAUDE_PERMISSION_MODE
+        ).strip() or DEFAULT_CLAUDE_PERMISSION_MODE
+        if self.permission_mode not in ALLOWED_CLAUDE_PERMISSION_MODES:
+            logger.warning("Invalid CLAUDE_PERMISSION_MODE=%s; falling back to default", self.permission_mode)
+            self.permission_mode = DEFAULT_CLAUDE_PERMISSION_MODE
         self.reasoning_effort_quick = (os.environ.get("CLAUDE_REASONING_EFFORT_QUICK", "medium").strip().lower() or "medium")
         self.reasoning_effort_default = (os.environ.get("CLAUDE_REASONING_EFFORT_DEFAULT", "high").strip().lower() or "high")
         self.reasoning_effort_allow_xhigh = os.environ.get("CLAUDE_REASONING_EFFORT_ALLOW_XHIGH", "false").strip().lower() in {"1", "true", "yes", "on"}
@@ -586,11 +594,11 @@ class ClaudeBackend:
             "--output-format",
             "stream-json",
             "--verbose",
-            "--model",
-            self.model,
-            "--permission-mode",
-            "bypassPermissions",
         ]
+        if self.model:
+            cmd.extend(["--model", self.model])
+        if self.permission_mode:
+            cmd.extend(["--permission-mode", self.permission_mode])
         # Resume existing session if we have one
         if session_id:
             cmd.extend(["--resume", session_id])

@@ -10,7 +10,7 @@ Claude support is now built into this repo and uses the same durable runtime as 
 - Per-channel worktree-aware execution
 - Turn artifacts recorded (success and failure) to STATUS.md, HANDOFF.md, TASKS.json
 - Session recovery/rebind on restart or stale sessions
-- Pinned to Opus 4.5 (`claude-opus-4-5-20251101`)
+- Model override is optional. Blank means the installed Claude CLI chooses its configured/current default.
 
 ## Verified Runtime Contract
 
@@ -18,14 +18,15 @@ The current Claude CLI transport used here is a persistent Claude CLI print-mode
 subprocess using JSON stdin/stdout. The spawned Claude process looks like:
 
 - persistent process transport:
-  - `claude -p --input-format stream-json --output-format stream-json --verbose --model claude-opus-4-5-20251101 --permission-mode bypassPermissions`
+  - `claude -p --input-format stream-json --output-format stream-json --verbose --permission-mode default`
 - per-message session behavior:
   - Discord/operator messages are written into the existing per-channel Claude process over stdin as stream-json `user` messages.
   - The same process can handle multiple turns before shutdown.
   - A fresh Claude session id/process is created only for explicit recovery cases such as stale/broken session state.
 
-The permission bypass remains part of the spawned Claude CLI command. It is not
-injected into chat content or sent as a separate preflight message.
+Permission mode remains a spawned Claude CLI argument. It is not injected into
+chat content or sent as a separate preflight message. Production defaults use
+Claude `default`; `bypassPermissions` is an explicit operator opt-in.
 
 This is still distinct from the older one-shot `claude -p -- ...prompt` relay
 transport because the current backend keeps stdin open and streams multiple turns

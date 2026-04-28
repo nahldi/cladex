@@ -28,6 +28,8 @@ RELAY_CODEX_HOME_ROOT = DATA_ROOT / "codex-home"
 PROFILES_DIR = CONFIG_ROOT / "profiles"
 REGISTRY_PATH = CONFIG_ROOT / "workspaces.json"
 RELAY_CODEX_CONFIG_HEADER = '# Managed by discord-codex-relay.\n[windows]\nsandbox = "elevated"\n'
+DEFAULT_APP_SERVER_PORT_START = 18000
+DEFAULT_APP_SERVER_PORT_RANGE = 40000
 
 
 def slugify(value: str) -> str:
@@ -58,7 +60,7 @@ def token_fingerprint(token: str) -> str:
 def default_port_for_workspace(workspace: Path, *, token: str | None = None) -> int:
     seed = str(workspace) if token is None else f"{workspace}|{token_fingerprint(token)}"
     digest = hashlib.sha1(seed.encode("utf-8")).hexdigest()
-    return 8700 + (int(digest[:6], 16) % 1000)
+    return DEFAULT_APP_SERVER_PORT_START + (int(digest[:8], 16) % DEFAULT_APP_SERVER_PORT_RANGE)
 
 
 def default_namespace_for_workspace(workspace: Path, *, token: str | None = None) -> str:
@@ -326,7 +328,14 @@ def prepare_relay_codex_home(
 
 def relay_codex_env(workspace: Path, base_env: dict[str, str] | None = None) -> dict[str, str]:
     env = dict((base_env or os.environ).items())
-    env["CODEX_HOME"] = str(prepare_relay_codex_home(workspace))
+    configured_home = str(env.get("CODEX_HOME", "")).strip()
+    if configured_home:
+        relay_home = Path(configured_home).expanduser().resolve()
+        env["CODEX_HOME"] = str(
+            prepare_relay_codex_home(workspace, source_home=relay_home, target_home=relay_home)
+        )
+    else:
+        env["CODEX_HOME"] = str(prepare_relay_codex_home(workspace))
     return env
 
 

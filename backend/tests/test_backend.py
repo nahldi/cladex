@@ -3,10 +3,21 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 from types import SimpleNamespace
+import json
 
 import pytest
 
-from relay_backend import AppServerCodexBackend, AppServerProtocolError, CliResumeCodexBackend
+from relay_backend import (
+    AppServerCodexBackend,
+    AppServerProtocolError,
+    CliResumeCodexBackend,
+    build_thread_list_params,
+    build_thread_resume_params,
+    build_thread_start_params,
+    build_turn_interrupt_params,
+    build_turn_start_params,
+    build_turn_steer_params,
+)
 
 
 class _MissingMethodError(RuntimeError):
@@ -37,7 +48,7 @@ class _FakeSession:
         return {}
 
     def _configured_model(self) -> str:
-        return "gpt-5.4"
+        return "gpt-explicit"
 
     def _approval_policy(self) -> str:
         return "never"
@@ -53,6 +64,67 @@ class _FakeSession:
 
     def _turn_effort(self, kind: str, prompt_text: str = "") -> str:
         return "high"
+
+
+def _schema_summary() -> dict:
+    path = Path(__file__).parent / "fixtures" / "codex_app_server_schema_summary.json"
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _assert_schema_compatible(method: str, params: dict) -> None:
+    method_schema = _schema_summary()["methods"][method]
+    allowed = set(method_schema["allowedProperties"])
+    required = set(method_schema["required"])
+    assert set(params).issubset(allowed)
+    assert required.issubset(params)
+
+
+def test_codex_app_server_payload_builders_match_schema_summary() -> None:
+    session = _FakeSession()
+
+    payloads = {
+        "thread/start": build_thread_start_params(session, cwd=Path("C:/repo")),
+        "thread/resume": build_thread_resume_params(session, thread_id="thread-1", cwd=Path("C:/repo")),
+        "thread/list": build_thread_list_params(session),
+        "turn/start": build_turn_start_params(
+            session,
+            thread_id="thread-1",
+            prompt="do the work",
+            injected_context="context",
+        ),
+        "turn/steer": build_turn_steer_params(
+            thread_id="thread-1",
+            prompt="new context",
+            expected_turn_id="turn-1",
+        ),
+        "turn/interrupt": build_turn_interrupt_params(thread_id="thread-1", turn_id="turn-1"),
+    }
+
+    for method, params in payloads.items():
+        _assert_schema_compatible(method, params)
+
+    assert payloads["turn/start"]["input"][0]["type"] == "text"
+    assert payloads["turn/steer"]["input"][0]["type"] == "text"
+
+
+def test_codex_permission_profile_payloads_do_not_mix_legacy_sandbox_fields() -> None:
+    session = _FakeSession()
+    session._permission_profile = lambda: {"profileName": "workspace-write"}  # type: ignore[attr-defined]
+
+    thread_payload = build_thread_start_params(session, cwd=Path("C:/repo"))
+    turn_payload = build_turn_start_params(
+        session,
+        thread_id="thread-1",
+        prompt="do it",
+        injected_context="context",
+    )
+
+    assert thread_payload["permissionProfile"] == {"profileName": "workspace-write"}
+    assert "sandbox" not in thread_payload
+    assert "approvalPolicy" not in thread_payload
+    assert turn_payload["permissionProfile"] == {"profileName": "workspace-write"}
+    assert "sandboxPolicy" not in turn_payload
+    assert "approvalPolicy" not in turn_payload
 
 
 def test_app_server_backend_uses_current_protocol_shapes() -> None:
@@ -90,6 +162,33 @@ def test_app_server_backend_uses_current_protocol_shapes() -> None:
     assert ("thread/name/set", {"threadId": "thread-1", "name": "relay thread"}) in session.calls
 
 
+def test_app_server_backend_interrupt_uses_active_turn_when_available() -> None:
+    session = _FakeSession()
+    session.active_turn = SimpleNamespace(turn_id="turn-1")
+    backend = AppServerCodexBackend(session)
+
+    asyncio.run(backend.interrupt_turn("thread-1"))
+
+    assert ("turn/interrupt", {"threadId": "thread-1", "turnId": "turn-1"}) in session.calls
+
+
+def test_app_server_backend_steer_uses_active_turn_precondition() -> None:
+    session = _FakeSession()
+    session.active_turn = SimpleNamespace(turn_id="turn-1")
+    backend = AppServerCodexBackend(session)
+
+    asyncio.run(backend.steer_turn("thread-1", "fold this in"))
+
+    assert (
+        "turn/steer",
+        {
+            "threadId": "thread-1",
+            "input": [{"type": "text", "text": "fold this in", "text_elements": []}],
+            "expectedTurnId": "turn-1",
+        },
+    ) in session.calls
+
+
 def test_app_server_backend_raises_clear_protocol_error(monkeypatch: pytest.MonkeyPatch) -> None:
     session = _FakeSession()
 
@@ -110,7 +209,7 @@ def test_app_server_backend_raises_clear_protocol_error(monkeypatch: pytest.Monk
 def test_cli_resume_backend_builds_real_exec_commands(monkeypatch: pytest.MonkeyPatch) -> None:
     session = SimpleNamespace(
         config=SimpleNamespace(codex_full_access=True),
-        _configured_model=lambda: "gpt-5.4",
+        _configured_model=lambda: "gpt-explicit",
         _runtime_workdir=lambda: Path("C:/relay-worktree"),
     )
     backend = CliResumeCodexBackend(session, state_store=SimpleNamespace(list_threads_for_project=lambda project_id: []))

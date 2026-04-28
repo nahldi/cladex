@@ -69,7 +69,9 @@ Rules:
 - In shared team channels, default to caveman mode: facts, decisions, blockers, results. If you only agree, are waiting, are ready, or have no new information, send no Discord reply.
 """
 
-DEFAULT_CODEX_MODEL = "gpt-5.4"
+DEFAULT_CODEX_MODEL = ""
+DEFAULT_CODEX_MODEL_LABEL = "Codex default"
+SAFE_ALLOWED_MENTIONS = discord.AllowedMentions.none()
 MISSING_REPLY_SENTINEL = "[[missing_discord_reply]]"
 NO_REPLY_NEEDED_SENTINEL = "[[no_discord_reply_needed]]"
 PROJECT_AGENT_FILE_NAMES = ("AGENTS.md", "AGENT.md", "agents.md", "agent.md")
@@ -392,11 +394,9 @@ def _load_config() -> Config:
     token = os.environ.get("DISCORD_BOT_TOKEN", "").strip()
     relay_bot_name = os.environ.get("RELAY_BOT_NAME", "").strip()
     workdir = Path(os.environ.get("CODEX_WORKDIR", "") or Path.cwd()).resolve()
-    model = (os.environ.get("RELAY_MODEL") or os.environ.get("CODEX_MODEL") or "").strip()
-    if not model:
-        model = DEFAULT_CODEX_MODEL
-    full_access = os.environ.get("CODEX_FULL_ACCESS", "true").strip().lower() not in {"0", "false", "no", "off"}
-    read_only = os.environ.get("CODEX_READ_ONLY", "false").strip().lower() not in {"0", "false", "no", "off"}
+    model = (os.environ.get("RELAY_MODEL") or os.environ.get("CODEX_MODEL") or DEFAULT_CODEX_MODEL).strip()
+    full_access = os.environ.get("CODEX_FULL_ACCESS", "false").strip().lower() in {"1", "true", "yes", "on"}
+    read_only = os.environ.get("CODEX_READ_ONLY", "false").strip().lower() in {"1", "true", "yes", "on"}
     app_server_port = int(os.environ.get("CODEX_APP_SERVER_PORT", "8765"))
     app_server_transport = os.environ.get("CODEX_APP_SERVER_TRANSPORT", "stdio").strip().lower() or "stdio"
     if app_server_transport not in {"stdio", "websocket"}:
@@ -1177,7 +1177,7 @@ class _LocalOperatorSentMessage:
         self.id = message_id
         self._collector = collector
 
-    async def edit(self, *, content: str | None = None, view=None) -> None:
+    async def edit(self, *, content: str | None = None, view=None, **_kwargs) -> None:
         self._collector.update(self.id, content)
 
 
@@ -1226,8 +1226,8 @@ class _LocalOperatorMessage:
         self.embeds = []
         self.stickers = []
 
-    async def reply(self, content: str, mention_author: bool = False, view=None):
-        return await self.channel.send(content, mention_author=mention_author, view=view)
+    async def reply(self, content: str, mention_author: bool = False, view=None, **kwargs):
+        return await self.channel.send(content, mention_author=mention_author, view=view, **kwargs)
 
 
 def _operator_author_id() -> int:
@@ -2415,7 +2415,7 @@ async def _progress_updater(turn: ActiveTurn) -> None:
         frame_index += 1
         if content != turn.last_progress_render:
             try:
-                await turn.progress_message.edit(content=content)
+                await turn.progress_message.edit(content=content, allowed_mentions=SAFE_ALLOWED_MENTIONS)
                 turn.last_progress_render = content
             except Exception:
                 return
@@ -2875,7 +2875,11 @@ class CodexSession:
         if message.guild is None:
             if turn.progress_message is None:
                 try:
-                    turn.progress_message = await message.reply("Thinking `0s`", mention_author=False)
+                    turn.progress_message = await message.reply(
+                        "Thinking `0s`",
+                        mention_author=False,
+                        allowed_mentions=SAFE_ALLOWED_MENTIONS,
+                    )
                 except Exception:
                     turn.progress_message = None
             if turn.progress_message is not None:
@@ -4356,7 +4360,12 @@ class CodexSession:
             allow_session=_approval_allows_session(method, params),
         )
         try:
-            pending.prompt_message = await source_message.reply(summary, mention_author=False, view=view)
+            pending.prompt_message = await source_message.reply(
+                summary,
+                mention_author=False,
+                allowed_mentions=SAFE_ALLOWED_MENTIONS,
+                view=view,
+            )
         except Exception as exc:
             self.pending_approvals.pop(request_id, None)
             await self._send_transport_payload(
@@ -4391,7 +4400,7 @@ class CodexSession:
             if pending.resolved_label:
                 content += f"\n\nDecision: {pending.resolved_label}"
             try:
-                await pending.prompt_message.edit(content=content, view=view)
+                await pending.prompt_message.edit(content=content, allowed_mentions=SAFE_ALLOWED_MENTIONS, view=view)
             except Exception:
                 pass
 
@@ -4409,6 +4418,21 @@ class CodexSession:
 
     def _configured_model(self) -> str | None:
         return CONFIG.codex_model or None
+
+    def _visible_terminal_resume_args(self, thread_id: str) -> list[str]:
+        if CONFIG.codex_full_access:
+            permission_args = ["--dangerously-bypass-approvals-and-sandbox"]
+        else:
+            permission_args = ["--sandbox", self._sandbox_mode(), "--ask-for-approval", self._approval_policy()]
+        return [
+            *permission_args,
+            "resume",
+            thread_id,
+            "--include-non-interactive",
+            "--remote",
+            APP_SERVER.ws_url,
+            "--no-alt-screen",
+        ]
 
     def _thread_name(self) -> str:
         workspace = self._runtime_workdir().name
@@ -4454,11 +4478,10 @@ class CodexSession:
             shell = best_windows_shell()
             escaped_workdir = workdir.replace("'", "''")
             escaped_codex = codex_bin.replace("'", "''")
-            escaped_thread = thread_id.replace("'", "''")
+            resume_args = " ".join("'" + arg.replace("'", "''") + "'" for arg in self._visible_terminal_resume_args(thread_id))
             command = (
                 f"Set-Location -LiteralPath '{escaped_workdir}'; "
-                f"& '{escaped_codex}' --dangerously-bypass-approvals-and-sandbox resume '{escaped_thread}' "
-                f"--include-non-interactive --remote '{APP_SERVER.ws_url}' --no-alt-screen"
+                f"& '{escaped_codex}' {resume_args}"
             )
             terminal = shutil.which("wt.exe") or shutil.which("wt")
             if terminal and shell:
@@ -4466,13 +4489,15 @@ class CodexSession:
             if shell:
                 launch_variants.append([shell, "-NoExit", "-Command", command])
         elif sys.platform == "darwin":
-            quoted = f"cd {shlex.quote(str(CONFIG.codex_workdir))} && {shlex.quote(CODEX_BIN)} --dangerously-bypass-approvals-and-sandbox resume {shlex.quote(thread_id)} --include-non-interactive --remote {shlex.quote(APP_SERVER.ws_url)} --no-alt-screen"
+            resume_args = " ".join(shlex.quote(arg) for arg in self._visible_terminal_resume_args(thread_id))
+            quoted = f"cd {shlex.quote(str(CONFIG.codex_workdir))} && {shlex.quote(CODEX_BIN)} {resume_args}"
             apple_script = quoted.replace("\\", "\\\\").replace('"', '\\"')
             osascript = shutil.which("osascript")
             if osascript:
                 launch_variants.append([osascript, "-e", f'tell application "Terminal" to do script "{apple_script}"'])
         else:
-            command = f"cd {shlex.quote(str(CONFIG.codex_workdir))} && {shlex.quote(CODEX_BIN)} --dangerously-bypass-approvals-and-sandbox resume {shlex.quote(thread_id)} --include-non-interactive --remote {shlex.quote(APP_SERVER.ws_url)} --no-alt-screen"
+            resume_args = " ".join(shlex.quote(arg) for arg in self._visible_terminal_resume_args(thread_id))
+            command = f"cd {shlex.quote(str(CONFIG.codex_workdir))} && {shlex.quote(CODEX_BIN)} {resume_args}"
             for variant in (
                 ["x-terminal-emulator", "-T", title, "-e", "bash", "-lc", command],
                 ["gnome-terminal", "--title", title, "--", "bash", "-lc", command],
@@ -4545,10 +4570,10 @@ async def _deliver_reply(turn: ActiveTurn, reply_text: str) -> None:
 
     if progress_message is not None:
         try:
-            await progress_message.edit(content=chunks[0], view=None)
+            await progress_message.edit(content=chunks[0], allowed_mentions=SAFE_ALLOWED_MENTIONS, view=None)
             _remember_relay_message_id(progress_message.id)
             for chunk in chunks[1:]:
-                sent = await latest_message.channel.send(chunk)
+                sent = await latest_message.channel.send(chunk, allowed_mentions=SAFE_ALLOWED_MENTIONS)
                 _remember_relay_message_id(sent.id)
             return
         except Exception:
@@ -4557,11 +4582,15 @@ async def _deliver_reply(turn: ActiveTurn, reply_text: str) -> None:
     first = True
     for chunk in chunks:
         if first:
-            sent = await latest_message.reply(chunk, mention_author=False)
+            sent = await latest_message.reply(
+                chunk,
+                mention_author=False,
+                allowed_mentions=SAFE_ALLOWED_MENTIONS,
+            )
             _remember_relay_message_id(sent.id)
             first = False
         else:
-            sent = await latest_message.channel.send(chunk)
+            sent = await latest_message.channel.send(chunk, allowed_mentions=SAFE_ALLOWED_MENTIONS)
             _remember_relay_message_id(sent.id)
     _log_observer_event("delivered", _short_observer_text(reply_text, limit=240))
 
@@ -4608,11 +4637,11 @@ async def _send_relay_error(
     print(f"Relay error for {_history_key(message)}: {exc}")
     if progress_message is not None:
         try:
-            await progress_message.edit(content=text, view=error_view)
+            await progress_message.edit(content=text, allowed_mentions=SAFE_ALLOWED_MENTIONS, view=error_view)
             return
         except Exception:
             pass
-    await message.reply(text, mention_author=False, view=error_view)
+    await message.reply(text, mention_author=False, allowed_mentions=SAFE_ALLOWED_MENTIONS, view=error_view)
 
 
 async def _handle_relay_message(message: discord.Message) -> None:
@@ -4732,11 +4761,15 @@ async def _handle_relay_message_internal(message: discord.Message, *, force: boo
             first = True
             for chunk in chunks:
                 if first:
-                    sent = await message.reply(chunk, mention_author=False)
+                    sent = await message.reply(
+                        chunk,
+                        mention_author=False,
+                        allowed_mentions=SAFE_ALLOWED_MENTIONS,
+                    )
                     _remember_relay_message_id(sent.id)
                     first = False
                 else:
-                    sent = await message.channel.send(chunk)
+                    sent = await message.channel.send(chunk, allowed_mentions=SAFE_ALLOWED_MENTIONS)
                     _remember_relay_message_id(sent.id)
             _log_observer_event("delivered", _short_observer_text(reply_text, limit=240))
             return
@@ -4808,7 +4841,7 @@ def _tail_lines(text: str, *, count: int = 20) -> str:
 async def _interaction_send(interaction: discord.Interaction, text: str) -> None:
     payload = _trim_block(text, limit=1800) or "(empty)"
     if interaction.response.is_done():
-        await interaction.followup.send(payload, ephemeral=True)
+        await interaction.followup.send(payload, allowed_mentions=SAFE_ALLOWED_MENTIONS, ephemeral=True)
     else:
         await interaction.response.send_message(payload, ephemeral=True)
 
@@ -5112,14 +5145,14 @@ async def on_ready() -> None:
             for user_id in sorted(startup_dm_targets):
                 user = await client.fetch_user(user_id)
                 if user_id in CONFIG.startup_dm_user_ids:
-                    await user.send(CONFIG.startup_dm_text)
+                    await user.send(CONFIG.startup_dm_text, allowed_mentions=SAFE_ALLOWED_MENTIONS)
                     print(f"Startup DM sent to {user_id}")
 
             first_channel_id = next(iter(sorted(CONFIG.allowed_channel_ids)), None)
             for channel_id in sorted(CONFIG.allowed_channel_ids):
                 channel = client.get_channel(channel_id) or await client.fetch_channel(channel_id)
                 if channel_id == first_channel_id and CONFIG.startup_channel_text:
-                    await channel.send(CONFIG.startup_channel_text)
+                    await channel.send(CONFIG.startup_channel_text, allowed_mentions=SAFE_ALLOWED_MENTIONS)
                     print(f"Startup channel message sent to {channel_id}")
             _record_startup_notice()
         else:
@@ -5144,7 +5177,11 @@ async def on_message(message: discord.Message) -> None:
         session = SESSIONS.get(key)
         if session is not None:
             await session.reset()
-        await message.reply("Context cleared.", mention_author=False)
+        await message.reply(
+            "Context cleared.",
+            mention_author=False,
+            allowed_mentions=SAFE_ALLOWED_MENTIONS,
+        )
         return
 
     if not _message_is_observable_by_relay(message, client.user):

@@ -4,8 +4,10 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -228,6 +230,7 @@ def _codex_profiles() -> list[dict[str, Any]]:
                 "_status": "running" if runtime["running"] else "stopped",
                 "_provider": "codex-app-server" if not runtime.get("degraded") else "codex-cli-resume",
                 "_model": env.get("CODEX_MODEL", relayctl.DEFAULT_CODEX_MODEL),
+                "_codex_home": env.get("CODEX_HOME", ""),
                 "_trigger_mode": env.get("BOT_TRIGGER_MODE", "mention_or_dm"),
                 "_log_path": str(runtime["log_path"]),
                 "_bot_name": env.get("RELAY_BOT_NAME", profile.get("bot_name", "")),
@@ -263,6 +266,7 @@ def _claude_profiles() -> list[dict[str, Any]]:
                 "_status": "running" if runtime["running"] else "stopped",
                 "_provider": "claude-code",
                 "_model": runtime.get("model") or env.get("CLAUDE_MODEL", ""),
+                "_claude_config_dir": env.get("CLAUDE_CONFIG_DIR", ""),
                 "_trigger_mode": env.get("BOT_TRIGGER_MODE", "mention_or_dm"),
                 "_log_path": str(runtime["log_path"]),
                 "_state": runtime.get("state", "idle"),
@@ -489,6 +493,8 @@ def _profile_json_record(profile: dict[str, Any]) -> dict[str, Any]:
         "ready": bool(profile.get("_ready")),
         "provider": profile.get("_provider", ""),
         "model": profile.get("_model", ""),
+        "codexHome": profile.get("_codex_home", "") if relay_type == "codex" else "",
+        "claudeConfigDir": profile.get("_claude_config_dir", "") if relay_type == "claude" else "",
         "triggerMode": profile.get("_trigger_mode", ""),
         "botName": profile.get("_bot_name", ""),
         "allowDms": bool(profile.get("_allow_dms", False)),
@@ -611,6 +617,7 @@ def _update_codex_profile(
     discord_bot_token: str | None = None,
     bot_name: str | None = None,
     model: str | None = None,
+    codex_home: str | None = None,
     trigger_mode: str | None = None,
     allow_dms: bool | None = None,
     allowed_user_ids: str | None = None,
@@ -633,8 +640,10 @@ def _update_codex_profile(
         env["RELAY_BOT_NAME"] = bot_name.strip()
     if model is not None:
         normalized_model = model.strip()
-        env["RELAY_MODEL"] = normalized_model or relayctl.DEFAULT_CODEX_MODEL
+        env["RELAY_MODEL"] = normalized_model
         env["CODEX_MODEL"] = env["RELAY_MODEL"]
+    if codex_home is not None:
+        env["CODEX_HOME"] = codex_home.strip()
     if trigger_mode is not None:
         env["BOT_TRIGGER_MODE"] = trigger_mode.strip() or env.get("BOT_TRIGGER_MODE", "mention_or_dm")
     if allow_dms is not None:
@@ -671,6 +680,7 @@ def _update_claude_profile(
     discord_bot_token: str | None = None,
     bot_name: str | None = None,
     model: str | None = None,
+    claude_config_dir: str | None = None,
     trigger_mode: str | None = None,
     allow_dms: bool | None = None,
     allowed_user_ids: str | None = None,
@@ -689,6 +699,8 @@ def _update_claude_profile(
         env["RELAY_BOT_NAME"] = bot_name.strip()
     if model is not None:
         env["CLAUDE_MODEL"] = model.strip()
+    if claude_config_dir is not None:
+        env["CLAUDE_CONFIG_DIR"] = claude_config_dir.strip()
     if trigger_mode is not None:
         env["BOT_TRIGGER_MODE"] = trigger_mode.strip() or env.get("BOT_TRIGGER_MODE", "mention_or_dm")
     if allow_dms is not None:
@@ -736,6 +748,8 @@ def update_profile(
     discord_bot_token: str | None = None,
     bot_name: str | None = None,
     model: str | None = None,
+    codex_home: str | None = None,
+    claude_config_dir: str | None = None,
     trigger_mode: str | None = None,
     allow_dms: bool | None = None,
     allowed_user_ids: str | None = None,
@@ -757,6 +771,7 @@ def update_profile(
             discord_bot_token=discord_bot_token,
             bot_name=bot_name,
             model=model,
+            codex_home=codex_home,
             trigger_mode=trigger_mode,
             allow_dms=allow_dms,
             allowed_user_ids=allowed_user_ids,
@@ -777,6 +792,7 @@ def update_profile(
             discord_bot_token=discord_bot_token,
             bot_name=bot_name,
             model=model,
+            claude_config_dir=claude_config_dir,
             trigger_mode=trigger_mode,
             allow_dms=allow_dms,
             allowed_user_ids=allowed_user_ids,
@@ -967,6 +983,8 @@ def cmd_update(args: argparse.Namespace) -> int:
         discord_bot_token=getattr(args, "discord_bot_token", None),
         bot_name=getattr(args, "bot_name", None),
         model=getattr(args, "model", None),
+        codex_home=getattr(args, "codex_home", None),
+        claude_config_dir=getattr(args, "claude_config_dir", None),
         trigger_mode=getattr(args, "trigger_mode", None),
         allow_dms=allow_dms,
         operator_ids=getattr(args, "operator_ids", None),
@@ -1054,6 +1072,148 @@ def cmd_logs(args: argparse.Namespace) -> int:
         return 0
     print(text, end="")
     return 0
+
+
+def _doctor_command(command: list[str], *, cwd: Path | None = None) -> dict[str, Any]:
+    try:
+        result = subprocess.run(
+            command,
+            cwd=str(cwd) if cwd else None,
+            capture_output=True,
+            text=True,
+            check=False,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+    except Exception as exc:
+        return {"ok": False, "command": command, "error": str(exc)}
+    output = ((result.stdout or "") + (result.stderr or "")).strip()
+    return {"ok": result.returncode == 0, "command": command, "returncode": result.returncode, "output": output}
+
+
+def _doctor_version(name: str, command: list[str]) -> dict[str, Any]:
+    result = _doctor_command(command)
+    output = str(result.get("output", "")).splitlines()
+    return {
+        "name": name,
+        "ok": bool(result.get("ok")),
+        "version": output[0] if output else "",
+        "detail": result.get("error") or result.get("output", ""),
+    }
+
+
+def _doctor_codex_app_server_schema() -> dict[str, Any]:
+    with tempfile.TemporaryDirectory(prefix="cladex-codex-schema-") as temp_dir:
+        out_dir = Path(temp_dir)
+        result = _doctor_command(
+            [relayctl.resolve_codex_bin(), "app-server", "generate-json-schema", "--out", str(out_dir)]
+        )
+        schemas = sorted(item.name for item in out_dir.glob("*.json"))
+    ok = bool(result.get("ok")) and bool(schemas)
+    detail = str(result.get("error") or result.get("output") or "").strip()
+    if bool(result.get("ok")) and not schemas:
+        detail = "Codex app-server schema command succeeded but wrote no JSON schema files."
+    return {
+        "name": "codex-app-server-schema",
+        "ok": ok,
+        "version": f"{len(schemas)} schema file(s)" if ok else "",
+        "detail": detail,
+        "schemas": schemas,
+    }
+
+
+def _doctor_windows_powershell_shim(name: str) -> dict[str, Any]:
+    check_name = f"{name}-powershell-shim"
+    if os.name != "nt":
+        return {"name": check_name, "ok": True, "warning": False, "detail": "not applicable"}
+    powershell = shutil.which("powershell.exe") or shutil.which("pwsh.exe") or ""
+    if not powershell:
+        return {"name": check_name, "ok": True, "warning": False, "detail": "PowerShell not found"}
+    result = _doctor_command([powershell, "-NoProfile", "-Command", f"{name} --version"])
+    output = str(result.get("output", "")).strip()
+    ok = bool(result.get("ok"))
+    detail = output or str(result.get("error") or "").strip()
+    if not ok and "cannot be loaded because running scripts is disabled" in detail:
+        detail = (
+            f"PowerShell cannot invoke `{name}` because the npm .ps1 shim is blocked by execution policy. "
+            f"CLADEX uses the resolved executable internally; users can run `{name}.cmd` or adjust PowerShell policy."
+        )
+    return {"name": check_name, "ok": ok, "warning": not ok, "detail": detail}
+
+
+def _doctor_profiles() -> dict[str, Any]:
+    profiles = get_all_profiles()
+    ports: dict[str, list[str]] = {}
+    for profile in profiles:
+        if str(profile.get("_relay_type", "")).lower() != "codex":
+            continue
+        try:
+            env = relayctl._normalized_profile_env(relayctl._load_env_file(Path(str(profile.get("env_file", "")))))
+        except Exception:
+            continue
+        port = str(env.get("CODEX_APP_SERVER_PORT", "")).strip()
+        if port:
+            ports.setdefault(port, []).append(str(profile.get("name", "")))
+    duplicate_ports = {port: names for port, names in ports.items() if len(names) > 1}
+    return {
+        "count": len(profiles),
+        "codex": sum(1 for item in profiles if item.get("_relay_type") == "codex"),
+        "claude": sum(1 for item in profiles if item.get("_relay_type") == "claude"),
+        "running": [item.get("name", "") for item in profiles if item.get("_running")],
+        "duplicateCodexPorts": duplicate_ports,
+    }
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    checks = [
+        _doctor_version("node", ["node", "--version"]),
+        _doctor_version("npm", ["cmd", "/c", "npm", "--version"] if os.name == "nt" else ["npm", "--version"]),
+        {
+            "name": "python",
+            "ok": True,
+            "version": sys.version.split()[0],
+            "detail": sys.executable,
+        },
+        _doctor_version("codex", [relayctl.resolve_codex_bin(), "--version"]),
+        _doctor_version("claude", [claude_relay.claude_code_bin(), "--version"]),
+        _doctor_codex_app_server_schema(),
+    ]
+    warnings = [
+        _doctor_windows_powershell_shim("codex"),
+        _doctor_windows_powershell_shim("claude"),
+    ]
+    profiles = _doctor_profiles()
+    ok = all(bool(item.get("ok")) for item in checks) and not profiles["duplicateCodexPorts"]
+    payload = {
+        "ok": ok,
+        "repo": str(Path(__file__).resolve().parents[1]),
+        "checks": checks,
+        "warnings": warnings,
+        "profiles": profiles,
+        "ciCommands": [
+            "npm ci",
+            "npm audit",
+            "npm run lint",
+            "npm run build",
+            "python -m pip install -e \"backend[dev]\" -c backend/constraints.txt",
+            "python -m pytest --tb=short -q",
+        ],
+    }
+    if getattr(args, "json", False):
+        print(json.dumps(payload, indent=2))
+    else:
+        print(f"CLADEX doctor: {'ok' if ok else 'issues found'}")
+        for check in checks:
+            status = "ok" if check.get("ok") else "fail"
+            version = check.get("version") or check.get("detail") or "-"
+            print(f"- {check['name']}: {status} ({version})")
+        for warning in warnings:
+            if not warning.get("warning"):
+                continue
+            print(f"- warning {warning['name']}: {warning.get('detail') or '-'}")
+        print(f"- profiles: {profiles['count']} total, {profiles['running']} running")
+        if profiles["duplicateCodexPorts"]:
+            print(f"- duplicate Codex ports: {profiles['duplicateCodexPorts']}")
+    return 0 if ok else 1
 
 
 def cmd_chat(args: argparse.Namespace) -> int:
@@ -1363,6 +1523,8 @@ def build_parser() -> argparse.ArgumentParser:
     update_parser.add_argument("--discord-bot-token")
     update_parser.add_argument("--bot-name")
     update_parser.add_argument("--model")
+    update_parser.add_argument("--codex-home")
+    update_parser.add_argument("--claude-config-dir")
     update_parser.add_argument("--trigger-mode", choices=("all", "mention_or_dm", "dm_only"), default=None)
     update_parser.add_argument("--allow-dms", action="store_true", default=False)
     update_parser.add_argument("--deny-dms", action="store_true", default=False)
@@ -1385,6 +1547,10 @@ def build_parser() -> argparse.ArgumentParser:
     logs_parser.add_argument("--lines", type=int, default=80)
     logs_parser.add_argument("--json", action="store_true", help="Output logs as JSON")
     logs_parser.set_defaults(func=cmd_logs)
+
+    doctor_parser = subparsers.add_parser("doctor", help="Check local prerequisites and profile collisions.")
+    doctor_parser.add_argument("--json", action="store_true", help="Output as JSON for automation")
+    doctor_parser.set_defaults(func=cmd_doctor)
 
     chat_parser = subparsers.add_parser("chat", help="Send a local operator message through a running relay.")
     chat_parser.add_argument("name")

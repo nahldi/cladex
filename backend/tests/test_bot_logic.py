@@ -56,7 +56,38 @@ def test_allowed_channel_does_not_bypass_mention_mode() -> None:
     assert bot._message_targets_bot(mention_message, relay_user) is True
 
 
-def test_load_config_defaults_codex_model_to_gpt_5_4(tmp_path) -> None:
+def test_deliver_reply_suppresses_discord_mentions() -> None:
+    bot = _load_bot_module()
+    captured: list[tuple[str, str, dict]] = []
+
+    class FakeChannel:
+        id = 42
+
+        async def send(self, content: str, **kwargs):
+            captured.append(("send", content, kwargs))
+            return SimpleNamespace(id=1002)
+
+    class FakeMessage:
+        id = 1001
+        guild = object()
+        author = SimpleNamespace(id=7)
+        channel = FakeChannel()
+
+        async def reply(self, content: str, **kwargs):
+            captured.append(("reply", content, kwargs))
+            return SimpleNamespace(id=1003)
+
+    bot.DURABLE_RUNTIME = SimpleNamespace(claim_outbound_discord_reply=lambda *_args, **_kwargs: True)
+    turn = SimpleNamespace(latest_message=FakeMessage(), progress_message=None)
+
+    asyncio.run(bot._deliver_reply(turn, "hello <@123> @everyone"))
+
+    assert captured[0][0] == "reply"
+    assert captured[0][2]["mention_author"] is False
+    assert captured[0][2]["allowed_mentions"] is bot.SAFE_ALLOWED_MENTIONS
+
+
+def test_load_config_defaults_codex_model_to_cli_default(tmp_path) -> None:
     bot = _load_bot_module()
     env_path = tmp_path / "relay.env"
     env_path.write_text(
@@ -81,7 +112,8 @@ def test_load_config_defaults_codex_model_to_gpt_5_4(tmp_path) -> None:
         else:
             os.environ["ENV_FILE"] = original_env_file
 
-    assert config.codex_model == bot.DEFAULT_CODEX_MODEL
+    assert config.codex_model == ""
+    assert config.codex_full_access is False
 
 
 def test_load_config_disables_visible_terminal_on_stdio(tmp_path) -> None:
@@ -192,12 +224,14 @@ def test_channel_turn_input_prioritizes_latest_human_instruction() -> None:
     assert "continuing the same underlying work" not in update_prompt
 
 
-def test_open_visible_terminal_uses_dangerous_resume_flag(monkeypatch, tmp_path) -> None:
+def test_open_visible_terminal_uses_safe_resume_flags_by_default(monkeypatch, tmp_path) -> None:
     bot = _load_bot_module()
     session = bot.CodexSession("channel-visible-terminal")
     session.thread_id = "thread-123"
     session.visible_terminal_opened = False
     bot.CONFIG.open_visible_terminal = True
+    bot.CONFIG.codex_full_access = False
+    bot.CONFIG.codex_read_only = False
     bot.CONFIG.codex_workdir = tmp_path
     monkeypatch.setattr(bot, "APP_SERVER", SimpleNamespace(ws_url="ws://127.0.0.1:4040/codex"))
     bot.CODEX_BIN = "codex.exe"
@@ -222,7 +256,8 @@ def test_open_visible_terminal_uses_dangerous_resume_flag(monkeypatch, tmp_path)
 
     assert calls
     joined = " ".join(calls[0])
-    assert "--dangerously-bypass-approvals-and-sandbox resume" in joined
+    assert "'--sandbox' 'workspace-write' '--ask-for-approval' 'on-request' 'resume'" in joined
+    assert "--dangerously-bypass-approvals-and-sandbox" not in joined
 
 
 def test_reader_loop_ignores_non_json_stdio_stdout_and_continues(tmp_path) -> None:

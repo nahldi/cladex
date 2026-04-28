@@ -1,0 +1,96 @@
+{
+  "source": "codex-cli 0.125.0 stable JSON schema summary",
+  "methods": {
+    "thread/start": {
+      "schema": "v2/ThreadStartParams.json",
+      "allowedProperties": [
+        "approvalPolicy",
+        "approvalsReviewer",
+        "baseInstructions",
+        "config",
+        "cwd",
+        "developerInstructions",
+        "ephemeral",
+        "experimentalRawEvents",
+        "model",
+        "modelProvider",
+        "permissionProfile",
+        "persistExtendedHistory",
+        "personality",
+        "sandbox",
+        "serviceName",
+        "serviceTier"
+      ],
+      "required": []
+    },
+    "thread/resume": {
+      "schema": "v2/ThreadResumeParams.json",
+      "allowedProperties": [
+        "approvalPolicy",
+        "approvalsReviewer",
+        "baseInstructions",
+        "config",
+        "cwd",
+        "developerInstructions",
+        "history",
+        "model",
+        "modelProvider",
+        "path",
+        "permissionProfile",
+        "persistExtendedHistory",
+        "personality",
+        "sandbox",
+        "serviceTier",
+        "threadId"
+      ],
+      "required": ["threadId"]
+    },
+    "thread/list": {
+      "schema": "v2/ThreadListParams.json",
+      "allowedProperties": [
+        "archived",
+        "cwd",
+        "limit",
+        "modelProviders",
+        "searchTerm",
+        "sortKey",
+        "sourceKinds"
+      ],
+      "required": []
+    },
+    "turn/start": {
+      "schema": "v2/TurnStartParams.json",
+      "allowedProperties": [
+        "approvalPolicy",
+        "approvalsReviewer",
+        "collaborationMode",
+        "cwd",
+        "effort",
+        "input",
+        "model",
+        "outputSchema",
+        "permissionProfile",
+        "personality",
+        "sandboxPolicy",
+        "serviceTier",
+        "summary",
+        "threadId"
+      ],
+      "required": ["input", "threadId"]
+    },
+    "turn/steer": {
+      "schema": "v2/TurnSteerParams.json",
+      "allowedProperties": ["expectedTurnId", "input", "threadId"],
+      "required": ["expectedTurnId", "input", "threadId"]
+    },
+    "turn/interrupt": {
+      "schema": "v2/TurnInterruptParams.json",
+      "allowedProperties": ["threadId", "turnId"],
+      "required": ["threadId", "turnId"]
+    }
+  },
+  "exclusiveFields": [
+    ["permissionProfile", "sandbox"],
+    ["permissionProfile", "sandboxPolicy"]
+  ]
+}

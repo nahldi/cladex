@@ -42,6 +42,8 @@ interface Profile {
   state: 'idle' | 'working';
   provider?: string;
   model?: string;
+  codexHome?: string;
+  claudeConfigDir?: string;
   triggerMode?: string;
   effort?: string;
   botName?: string;
@@ -95,6 +97,8 @@ interface ProfileFormData {
   discordToken: string;
   channelId: string;
   model?: string;
+  codexHome?: string;
+  claudeConfigDir?: string;
   triggerMode?: string;
   allowDms?: boolean;
   operatorIds?: string;
@@ -123,6 +127,8 @@ interface ProfileSettingsData {
   discordToken?: string;
   botName: string;
   model: string;
+  codexHome?: string;
+  claudeConfigDir?: string;
   triggerMode: string;
   allowDms: boolean;
   channelId: string;
@@ -229,6 +235,13 @@ function workspaceFor(profile: Profile): string {
 
 function channelFor(profile: Profile): string {
   return profile.channelLabel || (profile.activeChannel ? `Channel ${profile.activeChannel}` : profile.discordChannel ? `Channel ${profile.discordChannel}` : 'Unassigned');
+}
+
+function accountHomeFor(profile: Profile): string {
+  if (profile.type === 'Codex') {
+    return profile.codexHome || 'Default Codex account';
+  }
+  return profile.claudeConfigDir || 'Default Claude account';
 }
 
 function relayCardNote(profile: Profile): string {
@@ -967,8 +980,9 @@ function LiveFeed({
                 <InspectorRow label="Relay" value={labelFor(activeProfile)} />
                 <InspectorRow label="Workspace" value={workspaceFor(activeProfile)} />
                 <InspectorRow label="Worktree" value={activeProfile.activeWorktree || activeProfile.workspace} mono />
+                <InspectorRow label={activeProfile.type === 'Codex' ? 'Codex home' : 'Claude config'} value={accountHomeFor(activeProfile)} mono />
                 <InspectorRow label="Backend" value={activeProfile.provider || 'Runtime'} />
-                <InspectorRow label="Model" value={activeProfile.model || (activeProfile.type === 'Codex' ? 'gpt-5.4' : 'Claude default')} mono />
+                <InspectorRow label="Model" value={activeProfile.model || (activeProfile.type === 'Codex' ? 'Codex default' : 'Claude default')} mono />
                 <InspectorRow label="Effort" value={activeProfile.effort || (activeProfile.type === 'Claude' ? 'Adaptive prompt policy' : 'Adaptive relay policy')} />
                 <InspectorRow label="Trigger" value={activeProfile.triggerMode || 'Mention or direct message'} />
                 <InspectorRow label="Direct messages" value={activeProfile.allowDms ? 'Enabled' : 'Disabled'} />
@@ -992,6 +1006,8 @@ function AddProfileModal({ onClose, onSubmit }: { onClose: () => void; onSubmit:
   const [discordToken, setDiscordToken] = useState('');
   const [channelId, setChannelId] = useState('');
   const [model, setModel] = useState('');
+  const [codexHome, setCodexHome] = useState('');
+  const [claudeConfigDir, setClaudeConfigDir] = useState('');
   const [triggerMode, setTriggerMode] = useState('mention_or_dm');
   const [allowDms, setAllowDms] = useState(false);
   const [operatorIds, setOperatorIds] = useState('');
@@ -1021,8 +1037,13 @@ function AddProfileModal({ onClose, onSubmit }: { onClose: () => void; onSubmit:
           <FormInput label="Discord bot token" value={discordToken} onChange={setDiscordToken} placeholder="Paste token" type="password" />
           <div className="grid gap-4 md:grid-cols-2">
             <FormInput label="Allowed channel IDs" value={channelId} onChange={setChannelId} placeholder="123456789012345678, 234567890123456789" mono />
-            <FormInput label="Model override" value={model} onChange={setModel} placeholder={codex ? 'gpt-5.4' : 'claude-opus-4-5-20251101'} mono />
+            <FormInput label="Model override" value={model} onChange={setModel} placeholder={codex ? 'Codex default' : 'Claude default'} mono />
           </div>
+          {codex ? (
+            <BrowseField label="Codex account home" value={codexHome} onChange={setCodexHome} placeholder="Optional CODEX_HOME for this relay account" />
+          ) : (
+            <BrowseField label="Claude config folder" value={claudeConfigDir} onChange={setClaudeConfigDir} placeholder="Optional CLAUDE_CONFIG_DIR for this relay account" />
+          )}
         </FormSection>
 
         <FormSection title="Access">
@@ -1067,6 +1088,8 @@ function AddProfileModal({ onClose, onSubmit }: { onClose: () => void; onSubmit:
                 discordToken,
                 channelId,
                 model,
+                codexHome: codex ? codexHome : '',
+                claudeConfigDir: codex ? '' : claudeConfigDir,
                 triggerMode,
                 allowDms,
                 operatorIds,
@@ -1094,6 +1117,8 @@ function EditProfileModal({ profile, onClose, onSubmit }: { profile: Profile; on
   const [discordToken, setDiscordToken] = useState('');
   const [botName, setBotName] = useState(profile.botName || profile.displayName || '');
   const [model, setModel] = useState(profile.model || '');
+  const [codexHome, setCodexHome] = useState(profile.codexHome || '');
+  const [claudeConfigDir, setClaudeConfigDir] = useState(profile.claudeConfigDir || '');
   const [triggerMode, setTriggerMode] = useState(profile.triggerMode || 'mention_or_dm');
   const [allowDms, setAllowDms] = useState(Boolean(profile.allowDms));
   const [channelId, setChannelId] = useState(profile.allowedChannelIds || profile.discordChannel || '');
@@ -1120,8 +1145,13 @@ function EditProfileModal({ profile, onClose, onSubmit }: { profile: Profile; on
           <FormInput label="Replace bot token" value={discordToken} onChange={setDiscordToken} placeholder="Leave blank to keep the current token" type="password" />
           <div className="grid gap-4 md:grid-cols-2">
             <FormInput label="Allowed channel IDs" value={channelId} onChange={setChannelId} placeholder="123456789012345678, 234567890123456789" mono />
-            <FormInput label="Model" value={model} onChange={setModel} placeholder={codex ? 'gpt-5.4' : 'claude-opus-4-5-20251101'} mono />
+            <FormInput label="Model" value={model} onChange={setModel} placeholder={codex ? 'Codex default' : 'Claude default'} mono />
           </div>
+          {codex ? (
+            <BrowseField label="Codex account home" value={codexHome} onChange={setCodexHome} placeholder="Optional CODEX_HOME for this relay account" />
+          ) : (
+            <BrowseField label="Claude config folder" value={claudeConfigDir} onChange={setClaudeConfigDir} placeholder="Optional CLAUDE_CONFIG_DIR for this relay account" />
+          )}
         </FormSection>
 
         <FormSection title="Access">
@@ -1164,6 +1194,8 @@ function EditProfileModal({ profile, onClose, onSubmit }: { profile: Profile; on
                 discordToken,
                 botName,
                 model,
+                codexHome: codex ? codexHome : '',
+                claudeConfigDir: codex ? '' : claudeConfigDir,
                 triggerMode,
                 allowDms,
                 channelId,

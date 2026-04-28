@@ -24,16 +24,16 @@ The shipped product is local-first:
 
 ### Fastest Path For Most People
 
-1. Install Node.js 18+ and Python 3.10+.
+1. Install Node.js 22.12+ and Python 3.10+.
 2. Install the AI CLIs you want to use:
    - `codex`
    - `claude`
 3. From this repo root, run:
 
 ```bash
-npm install
-py -m pip install -e backend
-npm run app
+cmd /c npm ci
+py -m pip install -e backend -c backend/constraints.txt
+cmd /c npm run app
 ```
 
 That gives you the desktop manager plus the Python relay commands:
@@ -50,14 +50,14 @@ Important for packaged users: the `.exe` bundles the CLADEX UI and bundled backe
 - a Discord bot token and target channel id
 
 ```bash
-npm install
-npm run app
+cmd /c npm ci
+cmd /c npm run app
 ```
 
 ### Development Mode
 
 ```bash
-npm run dev:stack  # Runs API server + Vite dev server
+cmd /c npm run dev:stack  # Runs API server + Vite dev server
 ```
 
 Optional desktop UI environment variables live in `.env.example`.
@@ -67,24 +67,26 @@ By default the local API binds to `127.0.0.1:3001`.
 ### Build Installer
 
 ```bash
-npm run electron:build  # Creates installer in release/
+cmd /c npm ci
+cmd /c npm run electron:build  # Creates installer in release/
 ```
 
 Packaged launchers produced by the build:
-- `release\CLADEX Setup 2.0.10.exe`
-- `release\CLADEX 2.0.10.exe`
+- `release\CLADEX Setup 2.1.0.exe`
+- `release\CLADEX 2.1.0.exe`
 - `release\win-unpacked\CLADEX.exe`
 
 Portable/installer first run:
 1. Install Python 3.10+.
 2. Install the AI CLI you want to use: `codex`, `claude`, or both.
 3. Launch `CLADEX.exe`.
-4. In the app, choose `Add Relay`, then enter the workspace path, Discord bot token, and allowed channel id.
+4. In the app, choose `Add Relay`, then enter the workspace path, Discord bot token, allowed channel id, and optional per-relay account home (`CODEX_HOME` or `CLAUDE_CONFIG_DIR`).
 5. Start the profile and verify it reaches `Ready` before testing in Discord.
 
 ## Security
 
 - CLADEX is intended for same-machine use. Do not expose the local API directly to your LAN or the public internet.
+- Non-loopback API requests require the CLADEX remote token, and remote filesystem browsing is scoped to saved profile workspaces/account homes plus `CLADEX_REMOTE_FS_ROOTS`.
 - Relay profile env files and relay logs can contain secrets and sensitive workspace metadata. Keep them local.
 - Use least-privilege Discord allowlists: `ALLOWED_CHANNEL_IDS`, `ALLOWED_USER_IDS`, `ALLOWED_BOT_IDS`, and related fields should stay as narrow as possible.
 - See [SECURITY.md](SECURITY.md) for the expected operating model and secret-handling guidance.
@@ -93,7 +95,7 @@ Portable/installer first run:
 
 ```bash
 cd backend
-pip install -e .
+pip install -e . -c constraints.txt
 cladex list
 cladex start --type claude
 cladex start --type codex
@@ -121,6 +123,7 @@ cladex/
 # Unified manager
 cladex list              # List all profiles
 cladex status            # Show running relays
+cladex doctor --json     # Check prerequisites, CLI shims, Codex app-server schema, and profile collisions
 cladex start --type X    # Start relay (claude/codex)
 cladex stop --type X     # Stop relay
 cladex gui               # Open the desktop relay manager
@@ -144,22 +147,26 @@ codex-discord stop
 
 ### Claude
 - Uses `DurableRuntime` for per-channel session binding
-- CLI: `claude -p --output-format stream-json --model claude-opus-4-5-20251101`
-- First turn: `--session-id <uuid>`
-- Later turns: `--resume <session_id>`
+- CLI: `claude -p --input-format stream-json --output-format stream-json --verbose`
+- Model override is optional. Blank means the installed Claude CLI chooses its configured/current default.
+- Set `CLAUDE_CONFIG_DIR` on a profile when it should use a separate Claude account/subscription home.
+- Permission mode defaults to Claude `default`; set `CLAUDE_PERMISSION_MODE=bypassPermissions` only when you deliberately want bypass behavior.
 - Adaptive effort policy through the relay: quick turns use `medium`, implementation and repair use `high`, and `xhigh` can be enabled explicitly
 - Turn artifacts recorded to STATUS.md, HANDOFF.md, TASKS.json
 - Auto-recovery on stale sessions
 
 ### Codex
 - App-server primary backend with CLI fallback
+- Model override is optional. Blank means the installed Codex CLI chooses its configured/current default.
+- Set `CODEX_HOME` on a profile when it should use a separate Codex account/subscription home.
+- New profiles default to `workspace-write` sandboxing with `on-request` app-server approvals; set `CODEX_FULL_ACCESS=true` only when the machine is externally sandboxed.
 - Adaptive reasoning effort (medium/high/xhigh)
 - Durable memory in SQLite + repo memory files
 - Per-channel worktree binding
 
 ## Requirements
 
-- Node.js 18+ (frontend/Electron)
+- Node.js 22.12+ and npm 10+ (frontend/Electron)
 - Python 3.10+ (backend)
 - Claude Code CLI (`claude`)
 - Codex CLI (`codex`)
@@ -172,7 +179,9 @@ codex-discord stop
 - The Python backend package name stays `discord-codex-relay` for command/package compatibility.
 - The desktop product name remains `CLADEX`.
 - The packaged desktop app uses a loopback-only local API. It is meant to manage relays on the same machine, not expose a remote control surface.
-- If you intentionally override the loopback-only API guard, you must provide your own authentication and network controls.
+- If you intentionally override the loopback-only API guard, set `CLADEX_ALLOW_REMOTE_API=1`, protect the remote token, and add any extra browse roots with `CLADEX_REMOTE_FS_ROOTS`.
+- `CLADEX_REMOTE_FS_UNRESTRICTED=1` restores arbitrary host browsing and should only be used on a trusted private machine.
+- Production roadmap and remaining release gates live in [ROADMAP.md](ROADMAP.md).
 
 ## License
 

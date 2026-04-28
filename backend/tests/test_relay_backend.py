@@ -37,8 +37,9 @@ def test_build_persistent_command_uses_stream_json(tmp_path: Path) -> None:
     assert "--input-format" in cmd
     assert "--output-format" in cmd
     assert "stream-json" in cmd
+    assert "--model" not in cmd
     assert "--permission-mode" in cmd
-    assert "bypassPermissions" in cmd
+    assert "default" in cmd
     assert "--resume" not in cmd
 
     # With session
@@ -96,8 +97,9 @@ def test_run_turn_uses_persistent_stream_json(tmp_path: Path) -> None:
     assert "--input-format" in cmd
     assert "--output-format" in cmd
     assert "stream-json" in cmd
+    assert "--model" not in cmd
     assert "--permission-mode" in cmd
-    assert "bypassPermissions" in cmd
+    assert "default" in cmd
 
 
 def test_process_message_retries_with_fresh_session_on_resume_failure(tmp_path: Path) -> None:

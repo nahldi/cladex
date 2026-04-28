@@ -9,13 +9,16 @@ CLADEX is designed for local, same-machine relay management.
 - The packaged app does not expose a remote management surface by default
 - Browser requests are restricted to local/file origins
 - Non-browser local callers without an `Origin` header are still allowed
+- Non-loopback API requests require the CLADEX remote token
 
 ## Safe defaults
 
 - `server.cjs` binds to `127.0.0.1` unless you deliberately change `API_HOST`
 - CLADEX now refuses to bind the API to a non-loopback host unless `CLADEX_ALLOW_REMOTE_API=1` is set
+- Remote filesystem browsing is scoped to saved profile workspaces/account homes and `CLADEX_REMOTE_FS_ROOTS`
 - The local API is not meant to sit directly on a public interface
 - If you deliberately override that guard, you are responsible for putting the API behind real authentication and network controls
+- `CLADEX_REMOTE_FS_UNRESTRICTED=1` restores arbitrary host filesystem browsing and should only be used on a trusted private machine
 
 ## Secrets
 

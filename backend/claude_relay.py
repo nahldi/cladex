@@ -52,6 +52,9 @@ ENV_KEY_ORDER = [
     "DISCORD_BOT_TOKEN",
     "RELAY_BOT_NAME",
     "CLAUDE_WORKDIR",
+    "CLAUDE_CONFIG_DIR",
+    "CLAUDE_MODEL",
+    "CLAUDE_PERMISSION_MODE",
     "STATE_NAMESPACE",
     "ALLOW_DMS",
     "BOT_TRIGGER_MODE",
@@ -126,6 +129,11 @@ def _profile_from_env(env: dict[str, str]) -> dict:
 
     normalized = dict(env)
     normalized["CLAUDE_WORKDIR"] = str(workspace)
+    claude_config_dir = str(normalized.get("CLAUDE_CONFIG_DIR", "")).strip()
+    if claude_config_dir:
+        normalized["CLAUDE_CONFIG_DIR"] = str(Path(claude_config_dir).expanduser().resolve())
+    else:
+        normalized.pop("CLAUDE_CONFIG_DIR", None)
     normalized["STATE_NAMESPACE"] = namespace
     normalized["ALLOW_DMS"] = "true" if normalized.get("ALLOW_DMS", "false").lower() in {"1", "true", "yes"} else "false"
     normalized["BOT_TRIGGER_MODE"] = normalized.get("BOT_TRIGGER_MODE", "mention_or_dm") or "mention_or_dm"
@@ -135,6 +143,7 @@ def _profile_from_env(env: dict[str, str]) -> dict:
     normalized["ALLOWED_BOT_IDS"] = _parse_csv_ids(normalized.get("ALLOWED_BOT_IDS", ""))
     normalized["ALLOWED_CHANNEL_IDS"] = _parse_csv_ids(normalized.get("ALLOWED_CHANNEL_IDS", ""))
     normalized["CLAUDE_MODEL"] = (normalized.get("CLAUDE_MODEL", "") or "").strip()
+    normalized["CLAUDE_PERMISSION_MODE"] = (normalized.get("CLAUDE_PERMISSION_MODE", "default") or "default").strip()
 
     PROFILES_DIR.mkdir(parents=True, exist_ok=True)
     _write_env_file(profile_env_path, normalized)
@@ -290,6 +299,7 @@ def cmd_register(args: argparse.Namespace) -> int:
         "DISCORD_BOT_TOKEN": args.discord_bot_token,
         "RELAY_BOT_NAME": args.bot_name or "",
         "CLAUDE_WORKDIR": str(workspace),
+        "CLAUDE_CONFIG_DIR": args.claude_config_dir or "",
         "OPERATOR_IDS": _parse_csv_ids(args.operator_ids or ""),
         "ALLOWED_USER_IDS": _parse_csv_ids(args.allowed_user_ids or args.operator_ids or ""),
         "ALLOWED_BOT_IDS": _parse_csv_ids(getattr(args, "allowed_bot_ids", "") or ""),
@@ -298,6 +308,7 @@ def cmd_register(args: argparse.Namespace) -> int:
         "ALLOWED_CHANNEL_IDS": _parse_csv_ids(args.allowed_channel_id or ""),
         "CHANNEL_HISTORY_LIMIT": str(args.channel_history_limit or 20),
         "CLAUDE_MODEL": (args.model or "").strip(),
+        "CLAUDE_PERMISSION_MODE": "default",
     }
 
     profile = _profile_from_env(env)
@@ -525,6 +536,7 @@ def main() -> int:
     reg_parser.add_argument("--allowed-channel-id")
     reg_parser.add_argument("--channel-history-limit", type=int, default=20)
     reg_parser.add_argument("--model", default="")
+    reg_parser.add_argument("--claude-config-dir", default="", help="Optional CLAUDE_CONFIG_DIR for this relay profile/account")
 
     # status
     subparsers.add_parser("status", help="Show status")

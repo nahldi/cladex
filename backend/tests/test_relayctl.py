@@ -23,6 +23,83 @@ def test_state_dir_is_not_repo_local() -> None:
     assert Path(__file__).resolve().parents[1] not in state_dir.parents
 
 
+def test_default_profile_port_allocator_avoids_registered_collisions(tmp_path: Path, monkeypatch) -> None:
+    used_ports: set[int] = set()
+    monkeypatch.setattr(relayctl, "_registered_profile_ports", lambda: set(used_ports))
+    monkeypatch.setattr(relayctl, "_port_is_available", lambda port: port not in used_ports)
+
+    for index in range(100):
+        port = relayctl._default_app_server_port_for_profile(tmp_path / f"agent-{index}", token=f"token-{index}")
+        assert port not in used_ports
+        assert relay_common.DEFAULT_APP_SERVER_PORT_START <= port < (
+            relay_common.DEFAULT_APP_SERVER_PORT_START + relay_common.DEFAULT_APP_SERVER_PORT_RANGE
+        )
+        used_ports.add(port)
+
+
+def test_register_handles_100_isolated_codex_profiles_without_port_or_account_collisions(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    config_root = tmp_path / "config"
+    profiles_dir = config_root / "profiles"
+    registry_path = config_root / "workspaces.json"
+    used_ports: set[int] = set()
+    monkeypatch.setattr(relayctl, "PROFILES_DIR", profiles_dir)
+    monkeypatch.setattr(relayctl, "REGISTRY_PATH", registry_path)
+    monkeypatch.setattr(relayctl, "_registered_profile_ports", lambda: set(used_ports))
+    monkeypatch.setattr(relayctl, "_port_is_available", lambda port: port not in used_ports)
+    parser = relayctl.build_parser()
+    seen_env_files: set[Path] = set()
+
+    for index in range(100):
+        workspace = tmp_path / "workspaces" / f"agent-{index:03d}"
+        codex_home = tmp_path / "accounts" / f"codex-{index:03d}"
+        workspace.mkdir(parents=True)
+        args = parser.parse_args(
+            [
+                "register",
+                "--workspace",
+                str(workspace),
+                "--discord-bot-token",
+                f"token-{index:03d}",
+                "--bot-name",
+                f"Agent {index:03d}",
+                "--allowed-channel-id",
+                str(10_000_000_000_000_000 + index),
+                "--codex-home",
+                str(codex_home),
+            ]
+        )
+        assert relayctl.cmd_register(args) == 0
+        new_env_files = [item for item in profiles_dir.glob("*.env") if item not in seen_env_files]
+        assert len(new_env_files) == 1
+        env_file = new_env_files[0]
+        seen_env_files.add(env_file)
+        env = relayctl._load_env_file(env_file)
+        port = int(env["CODEX_APP_SERVER_PORT"])
+        assert port not in used_ports
+        used_ports.add(port)
+
+    profiles = relayctl._all_registered_profiles()
+    envs = [relayctl._load_env_file(Path(profile["env_file"])) for profile in profiles]
+    names = {profile["name"] for profile in profiles}
+    ports = {env["CODEX_APP_SERVER_PORT"] for env in envs}
+    homes = {env["CODEX_HOME"] for env in envs}
+    workspaces = {env["CODEX_WORKDIR"] for env in envs}
+
+    assert len(profiles) == 100
+    assert len(names) == 100
+    assert len(ports) == 100
+    assert len(homes) == 100
+    assert len(workspaces) == 100
+    assert all(env["CODEX_APP_SERVER_TRANSPORT"] == "stdio" for env in envs)
+    assert all(env["CODEX_FULL_ACCESS"] == "false" for env in envs)
+    assert all(env["CODEX_READ_ONLY"] == "false" for env in envs)
+    assert "Registered" in capsys.readouterr().out
+
+
 def test_prepare_relay_codex_home_copies_auth_without_personal_config(tmp_path: Path) -> None:
     source_home = tmp_path / "source-home"
     target_home = tmp_path / "target-home"
@@ -70,6 +147,24 @@ def test_prepare_relay_codex_home_preserves_parallel_workspace_trusts(tmp_path: 
         assert f"[projects.{relay_common._toml_project_key(str(workspace.resolve()))}]" in config_text
 
 
+def test_relay_codex_env_respects_explicit_codex_home(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    explicit_home = tmp_path / "account-home"
+    default_home = tmp_path / "default-home"
+    workspace.mkdir()
+    default_home.mkdir()
+    (default_home / "auth.json").write_text('{"token":"default"}\n', encoding="utf-8")
+
+    env = relay_common.relay_codex_env(
+        workspace,
+        {"CODEX_HOME": str(explicit_home), "HOME": str(default_home), "USERPROFILE": str(default_home)},
+    )
+
+    assert env["CODEX_HOME"] == str(explicit_home.resolve())
+    assert (explicit_home / "config.toml").exists()
+    assert not (explicit_home / "auth.json").exists()
+
+
 def test_auto_skill_preferences_can_disable_and_reenable(tmp_path: Path) -> None:
     original_path = install_plugin.EXTRAS_PREFS_PATH
     install_plugin.EXTRAS_PREFS_PATH = tmp_path / "extras.json"
@@ -115,7 +210,8 @@ def test_profile_normalization_uses_publish_defaults(tmp_path: Path) -> None:
             "ALLOWED_CHANNEL_IDS": "1234567890",
         }
     )
-    assert env["CODEX_MODEL"] == relayctl.DEFAULT_CODEX_MODEL
+    assert env["CODEX_MODEL"] == ""
+    assert env["CODEX_FULL_ACCESS"] == "false"
     assert env["CODEX_APP_SERVER_TRANSPORT"] == "stdio"
     assert env["BOT_TRIGGER_MODE"] == "mention_or_dm"
     assert env["CODEX_READ_ONLY"] == "false"
@@ -139,6 +235,31 @@ def test_profile_normalization_preserves_optional_overrides(tmp_path: Path) -> N
     assert env["OPEN_VISIBLE_TERMINAL"] == "false"
     assert env["ALLOWED_CHANNEL_AUTHOR_IDS"] == "1,2,3,7,9"
     assert env["CHANNEL_NO_MENTION_AUTHOR_IDS"] == "7,9"
+
+
+def test_profile_normalization_preserves_explicit_full_access(tmp_path: Path) -> None:
+    env = relayctl._normalized_profile_env(
+        {
+            "DISCORD_BOT_TOKEN": "token-value",
+            "CODEX_WORKDIR": str(tmp_path),
+            "CODEX_FULL_ACCESS": "true",
+            "CODEX_MODEL": "gpt-explicit",
+        }
+    )
+    assert env["CODEX_FULL_ACCESS"] == "true"
+    assert env["CODEX_MODEL"] == "gpt-explicit"
+
+
+def test_profile_normalization_preserves_explicit_codex_home(tmp_path: Path) -> None:
+    account_home = tmp_path / "codex-account"
+    env = relayctl._normalized_profile_env(
+        {
+            "DISCORD_BOT_TOKEN": "token-value",
+            "CODEX_WORKDIR": str(tmp_path),
+            "CODEX_HOME": str(account_home),
+        }
+    )
+    assert env["CODEX_HOME"] == str(account_home.resolve())
 
 
 def test_profile_normalization_keeps_visible_terminal_only_for_websocket(tmp_path: Path) -> None:
@@ -176,9 +297,11 @@ def test_quarantine_stale_session_bindings_uses_relay_codex_home(tmp_path: Path,
     live_sessions.mkdir(parents=True)
     (live_sessions / "rollout-thread-live.jsonl").write_text("{}\n", encoding="utf-8")
 
-    monkeypatch.setattr(relayctl, "prepare_relay_codex_home", lambda workspace: relay_home)
-
-    moved = relayctl._quarantine_stale_session_bindings(state_dir, tmp_path / "workspace")
+    moved = relayctl._quarantine_stale_session_bindings(
+        state_dir,
+        tmp_path / "workspace",
+        {"CODEX_HOME": str(relay_home)},
+    )
 
     assert moved == 0
     assert session_file.exists()
@@ -202,9 +325,11 @@ def test_quarantine_stale_session_bindings_prunes_bad_session_history(tmp_path: 
 
     relay_home = tmp_path / "relay-home"
     (relay_home / "sessions").mkdir(parents=True)
-    monkeypatch.setattr(relayctl, "prepare_relay_codex_home", lambda workspace: relay_home)
-
-    moved = relayctl._quarantine_stale_session_bindings(state_dir, tmp_path / "workspace")
+    moved = relayctl._quarantine_stale_session_bindings(
+        state_dir,
+        tmp_path / "workspace",
+        {"CODEX_HOME": str(relay_home)},
+    )
 
     assert moved == 1
     assert len(list(bad_dir.glob("*.json"))) == relayctl.BAD_SESSION_MAX_FILES
@@ -650,7 +775,7 @@ def test_run_profile_launches_supervisor_via_local_script(tmp_path: Path) -> Non
         "startup_notice_marker_path": startup_notice_marker_path,
     }
     relayctl._ensure_codex_project_trusted = lambda workspace: None
-    relayctl._codex_login_status = lambda workspace: (True, "Logged in using ChatGPT")
+    relayctl._codex_login_status = lambda workspace, profile_env=None: (True, "Logged in using ChatGPT")
     relayctl._background_python_windowless_executable = lambda: "python-bg"
     relayctl.truncate_file_tail = lambda *args, **kwargs: None
     relayctl._wait_for_ready = lambda *args, **kwargs: None
@@ -1018,7 +1143,7 @@ def test_profile_runtime_state_clears_stale_auth_failure_marker_when_login_is_he
     relayctl._state_dir_for_profile = lambda _profile, env=None: state_dir
     relayctl._read_pid_file = lambda path: None
     relayctl.pid_exists = lambda pid: False
-    relayctl._codex_login_status = lambda workspace: (True, "Logged in using ChatGPT")
+    relayctl._codex_login_status = lambda workspace, profile_env=None: (True, "Logged in using ChatGPT")
     try:
         state = relayctl._profile_runtime_state(profile)
     finally:
@@ -1056,7 +1181,7 @@ def test_run_profile_waits_for_existing_launch_when_lock_is_held(tmp_path: Path)
 
     relayctl._acquire_pid_lock = lambda path: (_ for _ in ()).throw(OSError("busy"))
     relayctl._wait_for_inflight_launch = lambda item: called.append(item["name"]) or 0
-    relayctl._quarantine_stale_session_bindings = lambda path, workspace=None: 0
+    relayctl._quarantine_stale_session_bindings = lambda path, workspace=None, profile_env=None: 0
     relayctl._release_pid_lock = lambda handle: None
     try:
         result = relayctl._run_profile(profile)
@@ -1103,6 +1228,7 @@ def test_register_infers_mention_or_dm_for_channel_profiles(tmp_path: Path) -> N
     assert result == 0
     assert captured["env"]["BOT_TRIGGER_MODE"] == "mention_or_dm"
     assert captured["env"]["CODEX_WORKDIR"] == str(tmp_path.resolve())
+    assert captured["env"]["CODEX_HOME"] == ""
     assert captured["env"]["CHANNEL_NO_MENTION_AUTHOR_IDS"] == "999"
 
 
