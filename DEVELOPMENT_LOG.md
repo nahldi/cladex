@@ -32,7 +32,6 @@ Audit-driven follow-up to 2.2.0. No new architectural surface; tightens existing
 
 ### Known Cleanup Remaining
 
-- `_python_supports_module` and `_runtime_pip_install` in `backend/cladex.py` are leftovers from the SDK-install era and now have no callers (the test for `_python_supports_module` still references it). Safe to delete in a follow-up but left for a focused cleanup pass.
 - The "Unstructured reviewer notes" fallback in `parse_ai_findings` still wraps any non-JSON AI lane output as a medium-severity finding. Will be replaced by structured command-attempt evidence in the live-AI tranche.
 
 ## Current Direction

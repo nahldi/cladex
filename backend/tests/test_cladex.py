@@ -184,18 +184,6 @@ def test_claude_runtime_state_reads_status_json(tmp_path: Path, monkeypatch) -> 
     assert state["effort"] == "high"
 
 
-def test_python_supports_module_uses_windowless_run(monkeypatch) -> None:
-    commands: list[list[str]] = []
-    monkeypatch.setattr(
-        cladex,
-        "_windowless_run",
-        lambda command, cwd=None: commands.append(command) or SimpleNamespace(returncode=0, stdout="", stderr=""),
-    )
-
-    assert cladex._python_supports_module("python.exe", "discord") is True
-    assert commands == [["python.exe", "-c", "import discord"]]
-
-
 def test_stop_claude_profile_terminates_pid(monkeypatch) -> None:
     killed: list[int] = []
     monkeypatch.setattr(cladex, "_claude_profile_runtime_state", lambda profile: {"pid": 4321})

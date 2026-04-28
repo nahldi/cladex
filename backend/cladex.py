@@ -331,43 +331,12 @@ def _backend_script_path(name: str) -> str:
     return str(Path(__file__).parent / name)
 
 
-def _python_supports_module(python_exe: str | Path, module_name: str) -> bool:
-    probe = _windowless_run([str(python_exe), "-c", f"import {module_name}"])
-    return probe.returncode == 0
-
-
-def _runtime_pip_install(python_exe: str | Path, requirement: str) -> None:
-    env = os.environ.copy()
-    env["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
-    command = [str(python_exe), "-m", "pip", "install", "--upgrade", requirement]
-    kwargs: dict[str, Any] = {
-        "env": env,
-        "stdin": subprocess.DEVNULL,
-        "stdout": subprocess.PIPE,
-        "stderr": subprocess.PIPE,
-        "text": True,
-        "check": False,
-        "close_fds": True,
-    }
-    if os.name == "nt":
-        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    result = subprocess.run(command, **kwargs)
-    if result.returncode != 0:
-        message = ((result.stdout or "") + (result.stderr or "")).strip()
-        raise RuntimeError(message or f"Failed to install `{requirement}` into the CLADEX runtime.")
-
-
 def _ensure_claude_background_runtime() -> None:
-    """Ensure the Claude background runtime Python environment exists.
-
-    Note: As of the subprocess-based refactor, claude-code-sdk is no longer
-    required. The backend uses direct subprocess management with CREATE_NO_WINDOW
-    on Windows for headless Claude CLI execution.
-    """
+    """Ensure the Claude background runtime Python environment exists."""
     runtime_python = relayctl.install_plugin.runtime_python_path()
     if not runtime_python.exists():
         source = relayctl.install_plugin._install_source()
-        runtime_python = relayctl.install_plugin._ensure_runtime(source=source)
+        relayctl.install_plugin._ensure_runtime(source=source)
 
 
 def start_profile(profile: dict[str, Any], *, start_reason: str = "operator-start") -> None:
