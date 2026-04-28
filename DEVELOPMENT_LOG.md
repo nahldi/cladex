@@ -31,6 +31,7 @@ This tranche completes the April 2026 production-readiness roadmap for the Claud
 - Hardened API input handling: strict integer parsing keeps `agents: 0` invalid, string booleans parse deliberately, review/fix ids validate before filesystem use, fix/review errors map to 400/404 where appropriate, and CORS preflight allows `X-CLADEX-Access-Token`.
 - The desktop Review Project view now shows active fix runs, queued/running/done/failed/cancelled progress, backup/report/artifact/restore paths, task summaries, cancel controls, duplicate-start suppression, and a confirmation-gated **Fix Review** button on completed review jobs.
 - CI now includes a `cladex doctor --json` job and Electron package job. Backend package metadata now includes `fix_orchestrator`, `README.md`, and `constraints.txt`.
+- Electron packaging now passes `--publish never` so CI verifies installer/portable creation without requiring `GH_TOKEN` or attempting an implicit GitHub release publish.
 - Release metadata is aligned at 2.3.0 across `package.json`, `package-lock.json`, `backend/pyproject.toml`, plugin manifests, `server.cjs`, README, and INSTALL.
 
 ### Validation
