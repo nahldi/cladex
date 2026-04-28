@@ -2,6 +2,15 @@
 
 Items that started life on `ROADMAP.md` and have shipped. Newest tranches first. The active work-in-progress list lives in [ROADMAP.md](ROADMAP.md); release-by-release narrative lives in [DEVELOPMENT_LOG.md](DEVELOPMENT_LOG.md).
 
+## Completed For 2.3.2
+
+Final production closeout after the 2.3.1 verification sweep.
+
+- Fixed the desktop/API profile-create contract so scoped DM-only relay creation works instead of forcing a channel id. Codex still requires `--allow-dms` plus at least one approved user id; Claude requires a channel or approved user/operator allowlist.
+- Added Codex `register` support for explicit startup DM recipients (`--startup-dm-user-id` / `--startup-dm-user-ids`) and startup channel text (`--startup-channel-text`) so fields exposed by the React create form are persisted instead of ignored. Startup DM recipients are no longer inferred from `--allowed-user-id` unless DMs are enabled.
+- Added a Node API contract smoke gate (`npm run api:smoke`) and wired it into CI so profile-create access validation cannot silently drift again.
+- Updated public install/README/plugin examples so Codex DM examples include `--allowed-user-id`, matching the hardened CLI behavior.
+
 ## Completed For 2.3.1
 
 Audit closeout for the 2.3.0 push, driven by re-running the project's own review swarm on itself.

@@ -22,6 +22,7 @@ jobs:
       - run: npm audit
       - run: npm run lint
       - run: npm run build
+      - run: npm run api:smoke
 
   backend:
     runs-on: windows-latest

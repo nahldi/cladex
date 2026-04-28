@@ -89,6 +89,31 @@ function parseBooleanField(body, key, defaultValue) {
   return { ok: false, error: `${key} must be a boolean` };
 }
 
+function csvValues(value) {
+  return String(value || '')
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function profileCreateAccessError({ relayType, channelId, allowDms, operatorIds, allowedUserIds }) {
+  const hasChannel = csvValues(channelId).length > 0;
+  const hasApprovedUser = [...csvValues(operatorIds), ...csvValues(allowedUserIds)].length > 0;
+  if (allowDms && !hasApprovedUser) {
+    return 'allowDms requires at least one approved user or operator id';
+  }
+  if (relayType === 'codex' && !hasChannel && !allowDms) {
+    return 'channelId is required for Codex unless allowDms is true with an approved user';
+  }
+  if (relayType === 'codex' && !hasChannel && allowDms && !hasApprovedUser) {
+    return 'channelId is required unless allowDms is true with an approved user';
+  }
+  if (relayType === 'claude' && !hasChannel && !hasApprovedUser) {
+    return 'channelId or an approved user/operator id is required for Claude';
+  }
+  return '';
+}
+
 function isValidReviewId(value) {
   return /^review-\d{8}-\d{6}-[a-f0-9]{8}$/.test(String(value || '').trim());
 }
@@ -586,7 +611,7 @@ app.get('/api/runtime-info', async (req, res) => {
     backendDir: BACKEND_DIR,
     frontendDir: FRONTEND_DIR,
     packaged: process.env.NODE_ENV === 'production' || !!process.resourcesPath,
-    appVersion: process.env.npm_package_version || '2.3.1',
+    appVersion: process.env.npm_package_version || '2.3.2',
     remoteAccessProtected: true,
   };
   if (isLoopbackRequest(req)) {
@@ -867,12 +892,17 @@ app.post('/api/profiles', async (req, res) => {
   }
   const allowDms = allowDmsInput.value;
 
-  if (!name || !workspace || !discordToken || !channelId) {
-    res.status(400).json({ success: false, error: 'name, workspace, discordToken, and channelId are required' });
+  if (!name || !workspace || !discordToken) {
+    res.status(400).json({ success: false, error: 'name, workspace, and discordToken are required' });
     return;
   }
   if (relayType !== 'claude' && relayType !== 'codex') {
     res.status(400).json({ success: false, error: 'type must be Claude or Codex' });
+    return;
+  }
+  const accessError = profileCreateAccessError({ relayType, channelId, allowDms, operatorIds, allowedUserIds });
+  if (accessError) {
+    res.status(400).json({ success: false, error: accessError });
     return;
   }
 
@@ -882,14 +912,8 @@ app.post('/api/profiles', async (req, res) => {
   const tokenEnv = { CLADEX_REGISTER_DISCORD_BOT_TOKEN: discordToken };
   let result;
   if (relayType === 'codex') {
-    if (startupChannelText) {
-      console.warn('CLADEX: ignoring startupChannelText for Codex profile create — relayctl register has no --startup-channel-text yet.');
-    }
-    if (startupDmUserIds) {
-      console.warn('CLADEX: ignoring startupDmUserIds for Codex profile create — relayctl register has no startup-DM recipient flag yet.');
-    }
     const operatorAndUserIds = [operatorIds, allowedUserIds]
-      .flatMap((value) => value.split(',').map((id) => id.trim()).filter(Boolean));
+      .flatMap((value) => csvValues(value));
     const dedupedUserIds = Array.from(new Set(operatorAndUserIds));
     result = await runPython([
       'relayctl.py',
@@ -898,17 +922,18 @@ app.post('/api/profiles', async (req, res) => {
       absoluteWorkspace,
       '--bot-name',
       name,
-      '--allowed-channel-id',
-      channelId,
       '--trigger-mode',
       triggerMode,
+      ...(channelId ? ['--allowed-channel-id', channelId] : []),
       ...(allowDms ? ['--allow-dms'] : []),
       ...(model ? ['--model', model] : []),
       ...(codexHome ? ['--codex-home', codexHome] : []),
       ...(channelHistoryLimit ? ['--channel-history-limit', channelHistoryLimit] : []),
+      ...(startupDmUserIds ? ['--startup-dm-user-ids', startupDmUserIds] : []),
       ...(startupDmText ? ['--startup-dm-text', startupDmText] : []),
-      ...(allowedChannelAuthorIds ? allowedChannelAuthorIds.split(',').map((id) => id.trim()).filter(Boolean).flatMap((id) => ['--allowed-channel-author-id', id]) : []),
-      ...(channelNoMentionAuthorIds ? channelNoMentionAuthorIds.split(',').map((id) => id.trim()).filter(Boolean).flatMap((id) => ['--channel-no-mention-author-id', id]) : []),
+      ...(startupChannelText ? ['--startup-channel-text', startupChannelText] : []),
+      ...(allowedChannelAuthorIds ? csvValues(allowedChannelAuthorIds).flatMap((id) => ['--allowed-channel-author-id', id]) : []),
+      ...(channelNoMentionAuthorIds ? csvValues(channelNoMentionAuthorIds).flatMap((id) => ['--channel-no-mention-author-id', id]) : []),
       ...dedupedUserIds.flatMap((id) => ['--allowed-user-id', id]),
       ...(allowedBotIds ? ['--allowed-bot-ids', allowedBotIds] : []),
     ], BACKEND_DIR, tokenEnv);
@@ -920,10 +945,9 @@ app.post('/api/profiles', async (req, res) => {
       absoluteWorkspace,
       '--bot-name',
       name,
-      '--allowed-channel-id',
-      channelId,
       '--trigger-mode',
       triggerMode,
+      ...(channelId ? ['--allowed-channel-id', channelId] : []),
       ...(allowDms ? ['--allow-dms'] : []),
       ...(model ? ['--model', model] : []),
       ...(claudeConfigDir ? ['--claude-config-dir', claudeConfigDir] : []),
@@ -1240,6 +1264,8 @@ module.exports = {
   BACKEND_DIR,
   API_HOST,
   API_PORT,
+  csvValues,
+  profileCreateAccessError,
   startServer,
   stopServer,
 };

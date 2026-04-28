@@ -1233,6 +1233,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             "npm audit",
             "npm run lint",
             "npm run build",
+            "npm run api:smoke",
             "python -m pip install -e \"backend[dev]\" -c backend/constraints.txt",
             "python backend/relayctl.py privacy-audit --tracked-only .",
             "python -m pytest --tb=short -q",

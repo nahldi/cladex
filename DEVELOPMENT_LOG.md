@@ -2,6 +2,33 @@
 
 This file is tracked on purpose. It gives future Claude/Codex agents a concise source of truth for what has been done, what is in progress, and what still needs care. Runtime-only memory files under `memory/` are useful locally, but GitHub users and new agents need this public handoff too.
 
+## 2.3.2 Production Closeout (2026-04-28)
+
+Audit after the 2.3.1 self-review fixes found the codebase healthy but the profile-create surface still lagged behind backend behavior.
+
+### Fixes
+
+- Desktop/API relay creation no longer requires a channel id when the requested relay is safely scoped by direct-message allowlists. Codex DM-only creation requires `allowDms=true` plus an approved user/operator id; Claude creation requires either a channel id or an approved user/operator id.
+- Codex `register` now accepts explicit startup DM recipients (`--startup-dm-user-id` / `--startup-dm-user-ids`) and `--startup-channel-text`. The React create form now passes those fields through instead of the server warning and dropping them.
+- Codex register no longer infers startup DM recipients from `--allowed-user-id` unless DMs are enabled. Explicit startup recipients still work when the operator deliberately sets them.
+- Added `scripts/server-contract-smoke.cjs` plus `npm run api:smoke`, and CI now runs it after the frontend build.
+- Updated README/INSTALL/plugin examples so public commands match the hardened allowlist rules.
+
+### Validation
+
+- `cmd /c npm ci` -> clean install, 0 vulnerabilities reported by npm audit output (npm deprecation warnings only).
+- `.venv\Scripts\python.exe -m pip install -e "backend[dev]" -c backend\constraints.txt` -> `discord-codex-relay==2.3.2`.
+- `cmd /c npm audit` -> 0 vulnerabilities.
+- `cmd /c npm run lint`.
+- `cmd /c npm run build`.
+- `cmd /c npm run api:smoke` -> server contract smoke passed.
+- `.venv\Scripts\python.exe -m pytest backend\tests --tb=short -q` -> `261 passed, 1 skipped, 1 warning`.
+- `.venv\Scripts\python.exe backend\relayctl.py privacy-audit --tracked-only .` -> no findings.
+- `.venv\Scripts\python.exe backend\cladex.py doctor --json` -> ok=True; Codex CLI `0.125.0`; Claude Code `2.1.117`; expected Codex PowerShell shim warning; no unsafe workspaces.
+- CLI review/fix/backup smoke passed on a temp project: preflight review, review run, fix-plan generation, fix start, and backup create.
+- `git diff --check` -> clean.
+- `cmd /c npm run electron:build` -> produced `release\CLADEX Setup 2.3.2.exe`, `release\CLADEX 2.3.2.exe`, and `release\win-unpacked\CLADEX.exe`.
+
 ## 2.3.1 Post-2.3.0 Audit Closeout (2026-04-28)
 
 Two-phase pass driven by the project's own review swarm running on itself.

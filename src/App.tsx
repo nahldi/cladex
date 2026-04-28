@@ -278,6 +278,30 @@ declare global {
 const ACCESS_TOKEN_STORAGE_KEY = 'cladex-remote-access-token';
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1', '[::1]']);
 
+function hasCsvValue(value?: string): boolean {
+  return String(value || '')
+    .split(',')
+    .some((item) => item.trim().length > 0);
+}
+
+function profileCreateAccessError(type: ProfileType, channelId: string, allowDms: boolean, operatorIds: string, allowedUserIds: string): string {
+  const hasChannel = hasCsvValue(channelId);
+  const hasApprovedUser = hasCsvValue(operatorIds) || hasCsvValue(allowedUserIds);
+  if (allowDms && !hasApprovedUser) {
+    return 'Direct messages require an approved user or operator ID.';
+  }
+  if (type === 'Codex' && !hasChannel && !allowDms) {
+    return 'Codex needs an allowed channel unless direct messages are enabled for an approved user.';
+  }
+  if (type === 'Codex' && !hasChannel && allowDms && !hasApprovedUser) {
+    return 'Codex direct-message relays need an approved user ID.';
+  }
+  if (type === 'Claude' && !hasChannel && !hasApprovedUser) {
+    return 'Claude needs an allowed channel or an approved user/operator ID.';
+  }
+  return '';
+}
+
 function isTrustedApiOrigin(value: string): boolean {
   if (!value) return false;
   try {
@@ -306,14 +330,14 @@ const CLADEX_LOGO = new URL('../assets/icon.png', import.meta.url).href;
 const FIRST_RUN_REQUIREMENTS = [
   'Python 3.10+ installed and reachable from PATH.',
   'At least one AI CLI installed: `codex` for Codex relays and/or `claude` for Claude relays.',
-  'A Discord bot token plus the channel id you want the relay to watch.',
+  'A Discord bot token plus an allowed channel id or approved DM user/operator id.',
   'A local workspace folder for the relay to use.',
 ];
 const FIRST_RUN_STEPS = [
   'Open Add Relay.',
   'Choose Claude or Codex.',
   'Pick the workspace folder and paste the Discord bot token.',
-  'Set the allowed Discord channel id, then save the profile.',
+  'Set the allowed Discord channel id or scoped DM allowlist, then save the profile.',
   'Start the relay and confirm it reaches Ready.',
 ];
 
@@ -1768,6 +1792,8 @@ function AddProfileModal({ onClose, onSubmit }: { onClose: () => void; onSubmit:
   const [saving, setSaving] = useState(false);
 
   const codex = type === 'Codex';
+  const accessError = profileCreateAccessError(type, channelId, allowDms, operatorIds, allowedUserIds);
+  const canSave = Boolean(name.trim() && workspace.trim() && discordToken.trim() && !accessError);
 
   return (
     <ModalShell title="Add Relay" onClose={onClose} wide>
@@ -1821,10 +1847,16 @@ function AddProfileModal({ onClose, onSubmit }: { onClose: () => void; onSubmit:
           </FormSection>
         ) : null}
 
+        {accessError ? (
+          <div className="rounded-2xl border border-amber-500/25 bg-amber-500/10 px-4 py-3 text-sm font-medium text-amber-800 dark:text-amber-100">
+            {accessError}
+          </div>
+        ) : null}
+
         <div className="flex flex-col-reverse justify-end gap-3 pt-2 sm:flex-row">
           <SecondaryButton label="Cancel" onClick={onClose} />
           <PrimaryButton label={saving ? 'Saving...' : 'Save relay'} icon={saving ? <Loader2 size={16} className="animate-spin" /> : <Plus size={16} />} onClick={async () => {
-            if (!name || !workspace || !discordToken || !channelId) return;
+            if (!canSave) return;
             setSaving(true);
             try {
               await onSubmit({
@@ -1851,7 +1883,7 @@ function AddProfileModal({ onClose, onSubmit }: { onClose: () => void; onSubmit:
             } finally {
               setSaving(false);
             }
-          }} />
+          }} busy={saving} disabled={!canSave} />
         </div>
       </div>
     </ModalShell>
@@ -2038,7 +2070,7 @@ function SettingsModal({ runtimeInfo, onClose, onStopAll }: { runtimeInfo: Runti
           <ul className="space-y-2">
             <li>CLADEX manages local relays, but it still needs Python 3.10+ on the machine.</li>
             <li>Install `codex` if you want Codex relays, `claude` if you want Claude relays, or both.</li>
-            <li>Create a relay profile with a workspace path, Discord bot token, and allowed channel id.</li>
+            <li>Create a relay profile with a workspace path, Discord bot token, and an allowed channel id or scoped DM allowlist.</li>
             <li>Start the profile from the Relays view and confirm it reaches Ready before testing in Discord.</li>
           </ul>
           <div className="mt-3 text-xs text-slate-500 dark:text-gray-500">
@@ -2309,11 +2341,11 @@ function ActionButton({ label, icon, onClick, busy = false, tone = 'default', li
   return <button onClick={onClick} disabled={busy} className={`inline-flex items-center gap-2 rounded-2xl border px-4 py-2 text-sm font-semibold transition-colors disabled:opacity-50 ${tone === 'danger' ? 'border-red-500/25 bg-red-500/10 text-red-700 hover:bg-red-500/20 dark:text-red-200' : light ? 'border-slate-300 bg-white text-slate-800 hover:bg-slate-100' : 'border-white/10 bg-white/[0.04] text-white hover:bg-white/[0.08]'}`}>{busy ? <Loader2 size={16} className="animate-spin" /> : icon}{label}</button>;
 }
 
-function PrimaryButton({ label, icon, onClick, busy = false }: { label: string; icon: React.ReactNode; onClick: () => void; busy?: boolean }) {
+function PrimaryButton({ label, icon, onClick, busy = false, disabled = false }: { label: string; icon: React.ReactNode; onClick: () => void; busy?: boolean; disabled?: boolean }) {
   return (
     <button
       onClick={onClick}
-      disabled={busy}
+      disabled={busy || disabled}
       aria-busy={busy || undefined}
       className="inline-flex w-full items-center justify-center gap-2 rounded-2xl bg-indigo-600 px-4 py-2 text-sm font-semibold text-white transition-colors hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-60 disabled:hover:bg-indigo-600"
     >

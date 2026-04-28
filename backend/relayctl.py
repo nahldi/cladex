@@ -516,6 +516,14 @@ def _parse_csv_ids(value: str) -> str:
     return ",".join(valid)
 
 
+def _parse_many_csv_ids(values: list[str] | tuple[str, ...] | None, *, fallback: list[str] | None = None) -> str:
+    raw_values = [str(value or "") for value in (values or [])]
+    parsed = _parse_csv_ids(",".join(raw_values))
+    if parsed:
+        return parsed
+    return ",".join(fallback or [])
+
+
 def _registered_profile_ports() -> set[int]:
     ports: set[int] = set()
     for profile in _load_registry().get("profiles", []):
@@ -3197,6 +3205,13 @@ def cmd_register(args: argparse.Namespace) -> int:
             "Add an allowlist or drop --allow-dms."
         )
     inferred_trigger_mode = args.trigger_mode or "mention_or_dm"
+    explicit_startup_dm_user_ids = _parse_many_csv_ids(
+        [
+            *(getattr(args, "startup_dm_user_ids", []) or []),
+            getattr(args, "startup_dm_user_ids_csv", "") or "",
+        ]
+    )
+    default_startup_dm_user_ids = ",".join(args.allowed_user_ids) if args.allow_dms else ""
     env = {
         "DISCORD_BOT_TOKEN": args.discord_bot_token,
         "RELAY_BOT_NAME": args.bot_name or "",
@@ -3215,8 +3230,9 @@ def cmd_register(args: argparse.Namespace) -> int:
         "ALLOWED_BOT_IDS": _parse_csv_ids(getattr(args, "allowed_bot_ids", "") or ""),
         "ALLOWED_CHANNEL_AUTHOR_IDS": ",".join(args.allowed_channel_author_ids),
         "CHANNEL_NO_MENTION_AUTHOR_IDS": ",".join(args.channel_no_mention_author_ids),
-        "STARTUP_DM_USER_IDS": ",".join(args.allowed_user_ids),
+        "STARTUP_DM_USER_IDS": explicit_startup_dm_user_ids or default_startup_dm_user_ids,
         "STARTUP_DM_TEXT": args.startup_dm_text,
+        "STARTUP_CHANNEL_TEXT": getattr(args, "startup_channel_text", "") or "",
         "ALLOWED_CHANNEL_IDS": ",".join(args.allowed_channel_ids),
         "CHANNEL_HISTORY_LIMIT": str(args.channel_history_limit),
         "OPEN_VISIBLE_TERMINAL": "true" if args.open_visible_terminal else "false",
@@ -3929,7 +3945,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     register_parser.add_argument("--trigger-mode", choices=["all", "mention_or_dm", "dm_only"], default=None, help="How channel messages trigger the relay; defaults to `mention_or_dm` when a channel is configured")
     register_parser.add_argument("--channel-history-limit", type=int, default=20, help="Relevant messages included in a fresh channel bootstrap digest; use 0 for an unlimited backfill scan")
+    register_parser.add_argument("--startup-dm-user-id", dest="startup_dm_user_ids", action="append", default=[], metavar="USER_ID", help="User ID to receive the startup DM; repeat as needed")
+    register_parser.add_argument("--startup-dm-user-ids", dest="startup_dm_user_ids_csv", default="", help="Comma-separated startup DM recipient user IDs")
     register_parser.add_argument("--startup-dm-text", default="Discord relay online. DM me here to chat with Codex.", help="Optional startup DM text")
+    register_parser.add_argument("--startup-channel-text", default="", help="Optional message posted in the first allowed channel on startup")
     register_parser.add_argument("--allow-dms", action="store_true", default=False, help="Allow approved users to talk to this relay in DMs")
     register_parser.add_argument("--open-visible-terminal", action="store_true", default=False, help="Best-effort visible `codex resume` terminal after bootstrap")
     register_parser.set_defaults(func=cmd_register)

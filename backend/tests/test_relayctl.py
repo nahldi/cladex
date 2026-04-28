@@ -157,6 +157,97 @@ def test_register_requires_token_via_arg_or_env(tmp_path: Path, monkeypatch) -> 
         raise AssertionError("cmd_register must require a token")
 
 
+def test_register_persists_explicit_startup_fields(tmp_path: Path, monkeypatch) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    profiles_dir = tmp_path / "profiles"
+    profiles_dir.mkdir()
+    monkeypatch.setattr(relayctl, "PROFILES_DIR", profiles_dir)
+    monkeypatch.setattr(relayctl, "_register_profile", lambda profile: None)
+    parser = relayctl.build_parser()
+    args = parser.parse_args(
+        [
+            "register",
+            "--workspace",
+            str(workspace),
+            "--discord-bot-token",
+            "token",
+            "--allowed-channel-id",
+            "1234567890",
+            "--allowed-user-id",
+            "1111111111",
+            "--startup-dm-user-ids",
+            "2222222222,3333333333",
+            "--startup-channel-text",
+            "Codex relay online.",
+        ]
+    )
+
+    assert relayctl.cmd_register(args) == 0
+    env_files = list(profiles_dir.glob("*.env"))
+    assert env_files
+    env = relayctl._load_env_file(env_files[0])
+    assert env["ALLOWED_USER_IDS"] == "1111111111"
+    assert env["STARTUP_DM_USER_IDS"] == "2222222222,3333333333"
+    assert env["STARTUP_CHANNEL_TEXT"] == "Codex relay online."
+
+
+def test_register_startup_dm_recipients_default_to_allowed_users(tmp_path: Path, monkeypatch) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    profiles_dir = tmp_path / "profiles"
+    profiles_dir.mkdir()
+    monkeypatch.setattr(relayctl, "PROFILES_DIR", profiles_dir)
+    monkeypatch.setattr(relayctl, "_register_profile", lambda profile: None)
+    parser = relayctl.build_parser()
+    args = parser.parse_args(
+        [
+            "register",
+            "--workspace",
+            str(workspace),
+            "--discord-bot-token",
+            "token",
+            "--allowed-channel-id",
+            "1234567890",
+            "--allowed-user-id",
+            "1111111111",
+            "--allow-dms",
+        ]
+    )
+
+    assert relayctl.cmd_register(args) == 0
+    env = relayctl._load_env_file(next(profiles_dir.glob("*.env")))
+    assert env["STARTUP_DM_USER_IDS"] == "1111111111"
+
+
+def test_register_does_not_send_implicit_startup_dm_when_dms_disabled(tmp_path: Path, monkeypatch) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    profiles_dir = tmp_path / "profiles"
+    profiles_dir.mkdir()
+    monkeypatch.setattr(relayctl, "PROFILES_DIR", profiles_dir)
+    monkeypatch.setattr(relayctl, "_register_profile", lambda profile: None)
+    parser = relayctl.build_parser()
+    args = parser.parse_args(
+        [
+            "register",
+            "--workspace",
+            str(workspace),
+            "--discord-bot-token",
+            "token",
+            "--allowed-channel-id",
+            "1234567890",
+            "--allowed-user-id",
+            "1111111111",
+        ]
+    )
+
+    assert relayctl.cmd_register(args) == 0
+    env = relayctl._load_env_file(next(profiles_dir.glob("*.env")))
+    assert env["ALLOW_DMS"] == "false"
+    assert env["STARTUP_DM_USER_IDS"] == ""
+
+
 def test_register_rejects_allow_dms_without_user_allowlist(tmp_path: Path, monkeypatch) -> None:
     """F0034: `--allow-dms` without `--allowed-user-id` would expose the
     Codex relay to any DM sender. cmd_register must refuse this case."""

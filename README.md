@@ -48,7 +48,7 @@ Important for packaged users: the `.exe` bundles the CLADEX UI and bundled backe
 - Python 3.10+
 - `codex` for Codex relays, installed and logged in with your own account/subscription
 - `claude` for Claude relays, installed and logged in with your own account/subscription
-- a Discord bot token and target channel id
+- a Discord bot token plus an allowed channel id or approved DM user/operator id
 
 ```bash
 cmd /c npm ci
@@ -73,15 +73,15 @@ cmd /c npm run electron:build  # Creates installer in release/
 ```
 
 Packaged launchers produced by the build:
-- `release\CLADEX Setup 2.3.1.exe`
-- `release\CLADEX 2.3.1.exe`
+- `release\CLADEX Setup 2.3.2.exe`
+- `release\CLADEX 2.3.2.exe`
 - `release\win-unpacked\CLADEX.exe`
 
 Portable/installer first run:
 1. Install Python 3.10+.
 2. Install the AI CLI you want to use: `codex`, `claude`, or both.
 3. Launch `CLADEX.exe`.
-4. In the app, choose `Add Relay`, then enter the workspace path, Discord bot token, allowed channel id, and optional per-relay account home (`CODEX_HOME` or `CLAUDE_CONFIG_DIR`).
+4. In the app, choose `Add Relay`, then enter the workspace path, Discord bot token, allowed channel id or scoped DM allowlist, and optional per-relay account home (`CODEX_HOME` or `CLAUDE_CONFIG_DIR`).
 5. Start the profile and verify it reaches `Ready` before testing in Discord.
 
 Project reviews do not require a Discord relay profile. Open `Review Project`, choose a folder, select Codex or Claude, set 1-50 reviewer lanes, and start the swarm. CLADEX gives every lane a different focus and shard, queues AI lanes behind a bounded worker pool, creates a local source snapshot when enabled, runs reviewers against a scratch copy where possible, and merges results into one report plus a fix plan.
@@ -153,7 +153,8 @@ claude-discord stop
 
 # Codex relay
 codex-discord setup
-codex-discord register --discord-bot-token <token>
+codex-discord register --discord-bot-token <token> --allowed-channel-id <channel_id>
+codex-discord register --discord-bot-token <token> --allow-dms --allowed-user-id <user_id>
 codex-discord run
 codex-discord status
 codex-discord stop

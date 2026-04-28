@@ -26,7 +26,8 @@ codex-discord self-update
 codex-discord skill list
 codex-discord skill install --name <skill_name>
 codex-discord register --discord-bot-token <token> --allowed-channel-id <channel_id>
-codex-discord register --discord-bot-token <token> --allowed-channel-id <channel_id> --allow-dms
+codex-discord register --discord-bot-token <token> --allow-dms --allowed-user-id <user_id>
+codex-discord register --discord-bot-token <token> --allowed-channel-id <channel_id> --allow-dms --allowed-user-id <user_id>
 ```
 
 Notes:
