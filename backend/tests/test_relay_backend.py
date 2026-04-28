@@ -49,6 +49,87 @@ def test_build_persistent_command_uses_stream_json(tmp_path: Path) -> None:
     assert "test-session" in cmd_with_session
 
 
+def test_idle_processes_are_evicted_after_ttl(tmp_path: Path, monkeypatch) -> None:
+    """A relay covering many channels should release per-channel Claude
+    subprocesses once they go idle so process count doesn't grow forever."""
+    import asyncio
+    import time as _time
+    from claude_backend import PersistentClaudeProcess
+
+    backend = ClaudeBackend(
+        workspace=tmp_path,
+        state_dir=tmp_path / "state",
+        on_response=lambda msg: None,
+    )
+    monkeypatch.setenv("CLADEX_CLAUDE_WORKER_IDLE_TTL", "5")
+
+    fresh = PersistentClaudeProcess(session=backend._session_for_channel("fresh", tmp_path), worktree=tmp_path)
+    stale = PersistentClaudeProcess(session=backend._session_for_channel("stale", tmp_path), worktree=tmp_path)
+    stale.last_used_at = _time.monotonic() - 60.0
+    backend._persistent_processes["fresh"] = fresh
+    backend._persistent_processes["stale"] = stale
+
+    terminated: list[str] = []
+
+    async def fake_terminate(persistent):
+        for key, value in list(backend._persistent_processes.items()):
+            if value is persistent:
+                terminated.append(key)
+                break
+
+    monkeypatch.setattr(backend, "_terminate_process", fake_terminate)
+
+    asyncio.run(backend._evict_idle_processes(except_channel=None))
+
+    assert "stale" in terminated
+    assert "fresh" not in terminated
+
+
+def test_lru_cap_evicts_least_recently_used_inactive_channel(tmp_path: Path, monkeypatch) -> None:
+    """When the live process count exceeds the cap, the LRU inactive channel
+    must be evicted to make room for an active channel's new process."""
+    import asyncio
+    import time as _time
+    from types import SimpleNamespace
+    from claude_backend import PersistentClaudeProcess
+
+    backend = ClaudeBackend(
+        workspace=tmp_path,
+        state_dir=tmp_path / "state",
+        on_response=lambda msg: None,
+    )
+    monkeypatch.setenv("CLADEX_CLAUDE_WORKER_MAX_LIVE", "2")
+
+    def make(channel: str, age: float) -> PersistentClaudeProcess:
+        proc = PersistentClaudeProcess(
+            session=backend._session_for_channel(channel, tmp_path),
+            worktree=tmp_path,
+        )
+        proc.process = SimpleNamespace(returncode=None)
+        proc.last_used_at = _time.monotonic() - age
+        backend._persistent_processes[channel] = proc
+        return proc
+
+    make("oldest", 100.0)
+    make("middle", 50.0)
+    make("newest", 1.0)
+
+    terminated: list[str] = []
+
+    async def fake_terminate(persistent):
+        for key, value in list(backend._persistent_processes.items()):
+            if value is persistent:
+                terminated.append(key)
+                break
+
+    monkeypatch.setattr(backend, "_terminate_process", fake_terminate)
+
+    asyncio.run(backend._enforce_worker_max_live(except_channel="newest"))
+
+    # Cap is 2 with 3 live processes; oldest inactive must go first.
+    assert terminated == ["oldest"]
+
+
 def test_run_turn_uses_persistent_stream_json(tmp_path: Path) -> None:
     """Verify _run_turn uses persistent stdin/stdout streaming."""
     backend = ClaudeBackend(

@@ -130,6 +130,19 @@ interface ReviewAgentRecord {
   detail: string;
 }
 
+interface ReviewFinding {
+  id?: string;
+  severity?: 'high' | 'medium' | 'low';
+  category?: string;
+  path?: string;
+  line?: number;
+  title?: string;
+  detail?: string;
+  recommendation?: string;
+  agentId?: string;
+  seenByAgents?: string[];
+}
+
 interface ReviewJob {
   id: string;
   title: string;
@@ -520,6 +533,7 @@ const api = {
     fetchJson<BackupRecord>(`${API_BASE}/backups`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }),
   createFixPlan: (id: string) => fetchJson<ReviewJob>(`${API_BASE}/reviews/${id}/fix-plan`, { method: 'POST' }),
   cancelReview: (id: string) => fetchJson<ReviewJob>(`${API_BASE}/reviews/${id}/cancel`, { method: 'POST' }),
+  reviewFindings: (id: string) => fetchJson<{ jobId: string; findings: ReviewFinding[] }>(`${API_BASE}/reviews/${id}/findings`),
   listDirectories: (currentPath = '') => fetchJson<DirectoryListResponse>(`${API_BASE}/fs/list${currentPath ? `?path=${encodeURIComponent(currentPath)}` : ''}`),
 };
 
@@ -1537,7 +1551,148 @@ function ReviewJobCard({
           <pre className="mt-3 max-h-80 overflow-y-auto whitespace-pre-wrap rounded-2xl border border-white/5 bg-black p-4 text-xs leading-relaxed text-gray-300">{job.reportPreview}</pre>
         </details>
       ) : null}
+
+      {(job.status === 'completed' || job.status === 'completed_with_warnings' || job.status === 'failed') ? (
+        <FindingsExplorer jobId={job.id} totalFindings={totalFindings} />
+      ) : null}
     </div>
+  );
+}
+
+function FindingsExplorer({ jobId, totalFindings }: { jobId: string; totalFindings: number }) {
+  const [open, setOpen] = useState(false);
+  const [findings, setFindings] = useState<ReviewFinding[] | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [errorText, setErrorText] = useState('');
+  const [severityFilter, setSeverityFilter] = useState<Record<'high' | 'medium' | 'low', boolean>>({
+    high: true,
+    medium: true,
+    low: true,
+  });
+  const [categoryFilter, setCategoryFilter] = useState<string>('');
+
+  useEffect(() => {
+    if (!open || findings !== null || loading) return;
+    let cancelled = false;
+    setLoading(true);
+    setErrorText('');
+    api
+      .reviewFindings(jobId)
+      .then((payload) => {
+        if (!cancelled) setFindings(payload?.findings || []);
+      })
+      .catch((err) => {
+        if (!cancelled) setErrorText(err instanceof Error ? err.message : 'Failed to load findings.');
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [open, findings, loading, jobId]);
+
+  const categories = Array.from(new Set((findings || []).map((item) => item.category || 'unknown'))).sort();
+  const filtered = (findings || []).filter((item) => {
+    const sev = (item.severity || 'medium') as 'high' | 'medium' | 'low';
+    if (!severityFilter[sev]) return false;
+    if (categoryFilter && (item.category || '') !== categoryFilter) return false;
+    return true;
+  });
+
+  const handleExport = () => {
+    if (!findings) return;
+    const blob = new Blob([JSON.stringify({ jobId, findings }, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${jobId}-findings.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  return (
+    <details className="mt-4" open={open} onToggle={(event) => setOpen((event.currentTarget as HTMLDetailsElement).open)}>
+      <summary className="cursor-pointer text-sm font-semibold text-indigo-300">
+        Findings explorer{totalFindings > 0 ? ` (${totalFindings})` : ''}
+      </summary>
+      <div className="mt-3 rounded-2xl border border-white/5 bg-black/40 p-4">
+        {loading ? <div className="text-xs text-gray-400">Loading findings...</div> : null}
+        {errorText ? <div className="text-xs text-red-300">{errorText}</div> : null}
+        {findings !== null && !loading && !errorText ? (
+          <>
+            <div className="flex flex-wrap items-center gap-2 text-[11px]">
+              {(['high', 'medium', 'low'] as const).map((sev) => (
+                <button
+                  key={sev}
+                  onClick={() => setSeverityFilter((prev) => ({ ...prev, [sev]: !prev[sev] }))}
+                  className={`rounded-full border px-2.5 py-1 font-semibold transition-colors ${
+                    severityFilter[sev]
+                      ? sev === 'high'
+                        ? 'border-red-500/60 bg-red-500/20 text-red-100'
+                        : sev === 'medium'
+                          ? 'border-amber-500/60 bg-amber-500/20 text-amber-100'
+                          : 'border-slate-500/60 bg-slate-500/20 text-slate-100'
+                      : 'border-white/10 bg-white/[0.03] text-gray-400'
+                  }`}
+                >
+                  {sev}
+                </button>
+              ))}
+              <select
+                value={categoryFilter}
+                onChange={(event) => setCategoryFilter(event.target.value)}
+                className="rounded-full border border-white/10 bg-white/[0.04] px-3 py-1 text-[11px] text-gray-200"
+              >
+                <option value="">All categories</option>
+                {categories.map((cat) => (
+                  <option key={cat} value={cat}>{cat}</option>
+                ))}
+              </select>
+              <span className="ml-auto flex items-center gap-2">
+                <span className="text-gray-400">{filtered.length} / {findings.length} shown</span>
+                <button
+                  onClick={handleExport}
+                  className="rounded-full border border-indigo-500/40 bg-indigo-500/20 px-2.5 py-1 font-semibold text-indigo-100 hover:bg-indigo-500/30"
+                >
+                  Export JSON
+                </button>
+              </span>
+            </div>
+            {filtered.length === 0 ? (
+              <div className="mt-3 text-xs text-gray-500">No findings match the selected filters.</div>
+            ) : (
+              <ul className="mt-3 max-h-80 space-y-2 overflow-y-auto">
+                {filtered.slice(0, 200).map((item, index) => (
+                  <li key={item.id || `${item.path}:${item.line}:${index}`} className="rounded-xl border border-white/5 bg-white/[0.02] px-3 py-2">
+                    <div className="flex flex-wrap items-baseline gap-2 text-[11px]">
+                      <span className={`rounded-full px-2 py-0.5 font-bold uppercase tracking-[0.18em] ${
+                        item.severity === 'high' ? 'bg-red-500/30 text-red-100'
+                          : item.severity === 'medium' ? 'bg-amber-500/30 text-amber-100'
+                          : 'bg-slate-500/30 text-slate-100'
+                      }`}>{item.severity || 'medium'}</span>
+                      <span className="font-mono text-gray-300">{item.id || ''}</span>
+                      <span className="text-gray-400">{item.category || 'uncategorized'}</span>
+                      {item.agentId ? <span className="text-gray-500">via {item.agentId}</span> : null}
+                    </div>
+                    <div className="mt-1 text-sm font-semibold text-white">{item.title || 'Finding'}</div>
+                    <div className="mt-0.5 break-all font-mono text-[11px] text-gray-400">{item.path || '.'}{item.line ? `:${item.line}` : ''}</div>
+                    {item.recommendation ? (
+                      <div className="mt-1 text-xs text-gray-300">→ {item.recommendation}</div>
+                    ) : null}
+                  </li>
+                ))}
+                {filtered.length > 200 ? (
+                  <li className="text-xs text-gray-500">... showing first 200 of {filtered.length}. Export JSON for the full set.</li>
+                ) : null}
+              </ul>
+            )}
+          </>
+        ) : null}
+      </div>
+    </details>
   );
 }
 

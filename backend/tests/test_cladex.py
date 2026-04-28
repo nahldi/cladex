@@ -133,6 +133,55 @@ def test_stop_codex_profile_delegates_to_relayctl(monkeypatch) -> None:
     assert calls == [profile]
 
 
+def test_doctor_codex_account_falls_back_to_warning_when_binary_missing(monkeypatch) -> None:
+    """Doctor surfaces account/rate-limit info as a warning when codex is
+    absent or the app-server can't be reached, never as a hard failure."""
+    monkeypatch.setattr(cladex.relayctl, "resolve_codex_bin", lambda: "")
+    result = cladex._doctor_codex_account()
+    assert result["name"] == "codex-account"
+    assert result["ok"] is True
+    assert result["warning"] is True
+    assert result["account"] == {}
+    assert result["rateLimits"] == {}
+
+
+def test_doctor_codex_account_parses_app_server_responses(monkeypatch) -> None:
+    """Doctor pings codex app-server with initialize + getAccount +
+    getAccountRateLimits and parses the responses into the warning entry."""
+    sequence = iter([
+        {"jsonrpc": "2.0", "id": 1, "result": {"capabilities": {}}},
+        {"jsonrpc": "2.0", "id": 2, "result": {"accountType": "ChatGPT", "planType": "Plus"}},
+        {"jsonrpc": "2.0", "id": 3, "result": {"primary": {"used": 12, "limit": 100, "windowMinutes": 60}}},
+    ])
+
+    class FakePopen:
+        def __init__(self, *args, **kwargs) -> None:
+            self.stdin = SimpleNamespace(write=lambda data: None, flush=lambda: None, close=lambda: None, closed=False)
+            self.stdout = SimpleNamespace(readline=lambda: (json.dumps(next(sequence)) + "\n").encode("utf-8"))
+            self.stderr = SimpleNamespace(read=lambda: b"")
+
+        def terminate(self) -> None:
+            pass
+
+        def wait(self, timeout: float | None = None) -> int:
+            return 0
+
+        def kill(self) -> None:
+            pass
+
+    monkeypatch.setattr(cladex.relayctl, "resolve_codex_bin", lambda: "codex")
+    monkeypatch.setattr(cladex.subprocess, "Popen", FakePopen)
+
+    result = cladex._doctor_codex_account()
+    assert result["name"] == "codex-account"
+    assert result["ok"] is True
+    assert result["warning"] is False
+    assert result["account"]["accountType"] == "ChatGPT"
+    assert result["account"]["planType"] == "Plus"
+    assert result["rateLimits"]["primary"]["limit"] == 100
+    assert "plan=Plus" in result["detail"]
+
+
 def test_update_claude_profile_persists_via_local_save(tmp_path: Path, monkeypatch) -> None:
     """`_update_claude_profile` historically called a bare `_save_registry`
     that was undefined in `cladex.py`, so the path crashed at runtime with

@@ -2,6 +2,53 @@
 
 This file is tracked on purpose. It gives future Claude/Codex agents a concise source of truth for what has been done, what is in progress, and what still needs care. Runtime-only memory files under `memory/` are useful locally, but GitHub users and new agents need this public handoff too.
 
+## 2.4.0 Roadmap Closeout — Non-Blocking Items (2026-04-28)
+
+The "Non-Blocking Future Work" section that has lived on the roadmap since 2.2.x is now empty. Each item shipped or has an explicit recorded decision.
+
+### Provider observability — Codex account/rate-limit/model in `cladex doctor`
+
+`cladex doctor --json` now spawns `codex app-server` over stdio and drives a short JSON-RPC sequence: `initialize` → `account/read` → `account/rateLimits/read`. Account type, plan, email (when exposed), and rate-limit windows land in a new `codex-account` warning entry alongside the existing PowerShell shim warnings. Errors collapse to soft warnings (`ok: True, warning: True`) rather than hard fail so a non-Codex install still passes doctor.
+
+Method names were verified against the live Codex CLI 0.125.0 schema (`generate-json-schema`); the `getAccount` / `getAccountRateLimits` names from older docs do not exist in the current protocol.
+
+### Supervisor pooling — Claude worker lifecycle (F0004 closeout)
+
+`PersistentClaudeProcess` gained a `last_used_at` timestamp. `_persistent_process_for_channel` now:
+
+- Calls `_evict_idle_processes` first to drop any process that has been idle past `CLADEX_CLAUDE_WORKER_IDLE_TTL` seconds (default 1800).
+- For new channel allocations, calls `_enforce_worker_max_live` to LRU-evict the oldest inactive channel when live process count would exceed `CLADEX_CLAUDE_WORKER_MAX_LIVE` (default 16).
+- Updates `last_used_at` whenever a turn starts on a process so active channels are never picked for eviction.
+
+`_run_turn` also stamps `last_used_at` so a long-running turn keeps its slot warm.
+
+This closes the F0004 supervisor-fanout finding from the verification reviews. Two regression tests cover the idle-TTL drop and the LRU cap.
+
+### Interactive review findings filter + export
+
+- New backend command `cladex review findings <id>` and API endpoint `GET /api/reviews/:id/findings` return the structured findings JSON from `findings.json` for a given review id.
+- Desktop Review Project view ships a "Findings explorer" expander on completed/`completed_with_warnings`/failed jobs. Severity toggles (high/medium/low), category dropdown, and "Export JSON" download (browser blob, no server hop). Inline list shows up to 200 matching findings with severity pill, id, category, agent, file path/line, and recommendation.
+- Lazy-loads on first open so the extra endpoint isn't called for in-flight reviews.
+
+### Claude Code Channels evaluation
+
+Documented in `backend/docs/CLAUDE_CHANNELS_EVALUATION.md` and recorded in `memory/DECISIONS.md`. Decision: do not adopt as a Claude transport in 2.4.0. Reasons: research-preview status, Claude.ai-login coupling, no clean multi-account `CLAUDE_CONFIG_DIR` mapping, org-policy gating risk, and the existing `claude -p` stream-json bridge already covers the bridge surface. Re-evaluation criteria spelled out for future agents.
+
+### Tests
+
+- 261 → **265 passed**, 1 skipped, 1 warning. Four new tests:
+  - `test_doctor_codex_account_falls_back_to_warning_when_binary_missing` — doctor never hard-fails when codex is unreachable.
+  - `test_doctor_codex_account_parses_app_server_responses` — JSON-RPC initialize+account/read+account/rateLimits/read flow drives the warning entry correctly.
+  - `test_idle_processes_are_evicted_after_ttl` — Claude per-channel processes drop after the configured idle TTL.
+  - `test_lru_cap_evicts_least_recently_used_inactive_channel` — once over `CLADEX_CLAUDE_WORKER_MAX_LIVE`, the oldest inactive channel is evicted, the active channel is preserved.
+
+### Validation
+
+- `cmd /c npm ci`, `cmd /c npm audit` (0 vulnerabilities), `cmd /c npm run lint`, `cmd /c npm run build`, `cmd /c npm run api:smoke` (server contract smoke passed).
+- Backend full suite `265 passed, 1 skipped, 1 warning`.
+- `python backend/relayctl.py privacy-audit --tracked-only .` -> no findings.
+- `python backend/cladex.py doctor --json` -> ok=True; new `codex-account` warning entry surfaces real account/rate-limit data when codex is logged in.
+
 ## 2.3.3 Polish Tranche (2026-04-28)
 
 Three small residual items the prior verification rounds surfaced but didn't fix. All small, all bounded, no behavior change for the happy path.

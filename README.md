@@ -73,8 +73,8 @@ cmd /c npm run electron:build  # Creates installer in release/
 ```
 
 Packaged launchers produced by the build:
-- `release\CLADEX Setup 2.3.3.exe`
-- `release\CLADEX 2.3.3.exe`
+- `release\CLADEX Setup 2.4.0.exe`
+- `release\CLADEX 2.4.0.exe`
 - `release\win-unpacked\CLADEX.exe`
 
 Portable/installer first run:

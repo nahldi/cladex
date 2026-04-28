@@ -2,6 +2,15 @@
 
 Items that started life on `ROADMAP.md` and have shipped. Newest tranches first. The active work-in-progress list lives in [ROADMAP.md](ROADMAP.md); release-by-release narrative lives in [DEVELOPMENT_LOG.md](DEVELOPMENT_LOG.md).
 
+## Completed For 2.4.0
+
+Closes the four "non-blocking future work" items previously listed on the roadmap, leaving nothing else to do.
+
+- **Provider-native Codex account / rate-limit / model surfacing.** `cladex doctor --json` now spawns `codex app-server`, sends `initialize` + `account/read` + `account/rateLimits/read` over JSON-RPC, parses the responses, and surfaces account type / plan / rate-limit windows in the doctor warnings list. Reachability errors collapse to a soft warning (never a hard fail) so a non-Codex install still passes doctor.
+- **Supervisor pooling — Claude worker lifecycle.** Per-channel Claude subprocesses now have an idle TTL eviction (`CLADEX_CLAUDE_WORKER_IDLE_TTL`, default 1800 s) and an LRU live-process cap (`CLADEX_CLAUDE_WORKER_MAX_LIVE`, default 16). Active channels are never evicted while serving a turn; least-recently-used inactive channels release their process when the cap is exceeded so a multi-channel relay no longer accumulates processes forever.
+- **Interactive review findings filter + export.** New `GET /api/reviews/:id/findings` endpoint and `cladex review findings <id>` CLI surface the structured findings JSON. The desktop Review Project view ships a "Findings explorer" expander on completed/failed jobs with severity toggles, category dropdown, an "Export JSON" download button, and an inline list of the matching findings (capped at 200 with an "export for the full set" hint).
+- **Claude Code Channels evaluation.** Decision recorded: do not adopt as a Claude transport in 2.4.0. Full rationale and re-evaluation criteria in [backend/docs/CLAUDE_CHANNELS_EVALUATION.md](backend/docs/CLAUDE_CHANNELS_EVALUATION.md). Channels stays in research preview, requires Claude.ai login, doesn't map cleanly onto our per-profile `CLAUDE_CONFIG_DIR` model, and the existing `claude -p` stream-json bridge already covers the bridge surface.
+
 ## Completed For 2.3.3
 
 Three small residuals from the verification reviews that earlier tranches didn't reach.

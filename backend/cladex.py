@@ -1124,6 +1124,156 @@ def _doctor_codex_app_server_schema() -> dict[str, Any]:
     }
 
 
+def _codex_app_server_request(
+    proc: subprocess.Popen,
+    *,
+    request_id: int,
+    method: str,
+    params: dict[str, Any] | None = None,
+    timeout: float = 8.0,
+) -> dict[str, Any]:
+    """Send one JSON-RPC request to a running codex app-server and read the matching response."""
+    payload = {
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": method,
+        "params": params or {},
+    }
+    line = json.dumps(payload) + "\n"
+    if proc.stdin is None:
+        raise RuntimeError("codex app-server stdin not available")
+    proc.stdin.write(line.encode("utf-8"))
+    proc.stdin.flush()
+    deadline = time.monotonic() + timeout
+    if proc.stdout is None:
+        raise RuntimeError("codex app-server stdout not available")
+    while time.monotonic() < deadline:
+        raw = proc.stdout.readline()
+        if not raw:
+            break
+        try:
+            message = json.loads(raw.decode("utf-8", errors="replace"))
+        except json.JSONDecodeError:
+            continue
+        if message.get("id") == request_id:
+            return message
+    raise TimeoutError(f"codex app-server response timeout for {method}")
+
+
+def _doctor_codex_account() -> dict[str, Any]:
+    """Best-effort summary of the Codex account/rate-limit/model surfaces.
+
+    Drives `codex app-server` over stdio with a short JSON-RPC sequence:
+    `initialize` -> `getAccount` -> `getAccountRateLimits`. Any error or
+    timeout collapses to a warning (`ok: True, warning: True`) rather than
+    a hard fail so a non-Codex install still passes doctor.
+    """
+    name = "codex-account"
+    codex_bin = relayctl.resolve_codex_bin()
+    if not codex_bin:
+        return {"name": name, "ok": True, "warning": True, "detail": "Codex CLI not installed", "account": {}, "rateLimits": {}}
+    creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    proc: subprocess.Popen | None = None
+    try:
+        proc = subprocess.Popen(
+            [codex_bin, "app-server"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            creationflags=creationflags,
+        )
+    except (OSError, FileNotFoundError) as exc:
+        return {"name": name, "ok": True, "warning": True, "detail": f"Could not launch codex app-server: {exc}", "account": {}, "rateLimits": {}}
+
+    account: dict[str, Any] = {}
+    rate_limits: dict[str, Any] = {}
+    detail = ""
+    warning = False
+    try:
+        try:
+            init_response = _codex_app_server_request(
+                proc,
+                request_id=1,
+                method="initialize",
+                params={
+                    "clientInfo": {"name": "cladex-doctor", "version": "1.0"},
+                    "capabilities": {},
+                },
+                timeout=10.0,
+            )
+        except (TimeoutError, RuntimeError) as exc:
+            warning = True
+            detail = f"initialize timed out or failed: {exc}"
+            return {"name": name, "ok": True, "warning": True, "detail": detail, "account": {}, "rateLimits": {}}
+        if init_response.get("error"):
+            warning = True
+            detail = f"initialize returned error: {init_response.get('error')}"
+            return {"name": name, "ok": True, "warning": True, "detail": detail, "account": {}, "rateLimits": {}}
+        try:
+            account_msg = _codex_app_server_request(proc, request_id=2, method="account/read", timeout=8.0)
+            if isinstance(account_msg.get("result"), dict):
+                account = dict(account_msg["result"])
+            elif account_msg.get("error"):
+                detail = f"account/read error: {account_msg.get('error')}"
+                warning = True
+        except (TimeoutError, RuntimeError) as exc:
+            warning = True
+            detail = f"account/read unavailable: {exc}"
+        try:
+            rate_msg = _codex_app_server_request(proc, request_id=3, method="account/rateLimits/read", timeout=8.0)
+            if isinstance(rate_msg.get("result"), dict):
+                rate_limits = dict(rate_msg["result"])
+            elif rate_msg.get("error"):
+                if not detail:
+                    detail = f"account/rateLimits/read error: {rate_msg.get('error')}"
+                warning = True
+        except (TimeoutError, RuntimeError) as exc:
+            warning = True
+            if not detail:
+                detail = f"account/rateLimits/read unavailable: {exc}"
+    finally:
+        if proc is not None:
+            try:
+                if proc.stdin and not proc.stdin.closed:
+                    proc.stdin.close()
+            except Exception:
+                pass
+            try:
+                proc.terminate()
+                proc.wait(timeout=3)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+    if not detail:
+        # Codex 0.125+ wraps the account object under `account`; older
+        # builds returned the fields at the top level. Handle both.
+        nested = account.get("account") if isinstance(account.get("account"), dict) else None
+        source = nested or account
+        plan = str(source.get("planType") or source.get("plan") or "")
+        account_type = str(source.get("accountType") or source.get("type") or "")
+        email = str(source.get("email") or "")
+        bits = []
+        if account_type:
+            bits.append(f"type={account_type}")
+        if plan:
+            bits.append(f"plan={plan}")
+        if email:
+            bits.append(f"email={email}")
+        detail = ", ".join(bits) if bits else "Codex app-server reachable; no account fields exposed."
+
+    return {
+        "name": name,
+        "ok": True,
+        "warning": warning,
+        "detail": detail,
+        "account": account,
+        "rateLimits": rate_limits,
+    }
+
+
 def _doctor_windows_powershell_shim(name: str) -> dict[str, Any]:
     check_name = f"{name}-powershell-shim"
     if os.name != "nt":
@@ -1215,6 +1365,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     warnings = [
         _doctor_windows_powershell_shim("codex"),
         _doctor_windows_powershell_shim("claude"),
+        _doctor_codex_account(),
     ]
     profiles = _doctor_profiles()
     ok = (
@@ -1475,6 +1626,30 @@ def cmd_review_run(args: argparse.Namespace) -> int:
         print(json.dumps(record))
     else:
         print(f"Review `{record['id']}` is {record.get('status')}.")
+    return 0
+
+
+def cmd_review_findings(args: argparse.Namespace) -> int:
+    try:
+        review_swarm.validate_review_id(args.id)
+    except Exception as exc:
+        print(f"invalid review id: {exc}", file=sys.stderr)
+        return 1
+    findings_path = review_swarm.findings_json_path(args.id)
+    if not findings_path.exists():
+        print(json.dumps({"jobId": args.id, "findings": []}))
+        return 0
+    try:
+        text = findings_path.read_text(encoding="utf-8")
+        payload = json.loads(text or "{}")
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"could not read findings: {exc}", file=sys.stderr)
+        return 1
+    if not isinstance(payload, dict):
+        payload = {"jobId": args.id, "findings": []}
+    payload.setdefault("jobId", args.id)
+    payload.setdefault("findings", [])
+    print(json.dumps(payload))
     return 0
 
 
@@ -1902,6 +2077,10 @@ def build_parser() -> argparse.ArgumentParser:
     review_run_parser.add_argument("id")
     review_run_parser.add_argument("--json", action="store_true", help="Output as JSON for API")
     review_run_parser.set_defaults(func=cmd_review_run)
+
+    review_findings_parser = review_subparsers.add_parser("findings", help="Print structured findings JSON for a review job.")
+    review_findings_parser.add_argument("id")
+    review_findings_parser.set_defaults(func=cmd_review_findings)
 
     review_show_parser = review_subparsers.add_parser("show", help="Show one project review job.")
     review_show_parser.add_argument("id")

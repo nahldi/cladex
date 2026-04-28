@@ -2,7 +2,13 @@
 
 CLADEX stays focused on Claude Code and OpenAI Codex relays. Shipped work is tracked in [DONE_ROADMAP.md](DONE_ROADMAP.md); release narrative lives in [DEVELOPMENT_LOG.md](DEVELOPMENT_LOG.md).
 
-As of 2.3.2, the production-blocking roadmap from the April 2026 audit is complete for clone-to-run setup, review swarms, guarded Fix Review, local security, CI gates, profile create flows, and visible queue/concurrency limits.
+As of **2.4.0**, the entire April 2026 roadmap is closed — production-blocking AND non-blocking items have either shipped or have an explicit recorded decision.
+
+- Clone-to-run setup, review swarms, Fix Review orchestration, local security, CI gates, and visible queue/concurrency limits all shipped (2.1.0 through 2.3.3).
+- Provider-native Codex account/rate-limit surfacing is wired into `cladex doctor --json` via the app-server `account/read` and `account/rateLimits/read` RPCs (2.4.0).
+- Claude relay subprocess pooling now ships with idle TTL + LRU cap on per-channel persistent processes (`CLADEX_CLAUDE_WORKER_IDLE_TTL`, `CLADEX_CLAUDE_WORKER_MAX_LIVE`) so a multi-channel relay no longer accumulates processes forever (2.4.0).
+- Interactive review-finding filter (severity, category) + JSON export ship in the desktop Review Project view, backed by `GET /api/reviews/:id/findings` and `cladex review findings <id>` (2.4.0).
+- Claude Code Channels was evaluated and explicitly **not adopted**. Rationale and re-evaluation criteria are documented in [backend/docs/CLAUDE_CHANNELS_EVALUATION.md](backend/docs/CLAUDE_CHANNELS_EVALUATION.md) (2.4.0).
 
 ## Current Production Contract
 
@@ -12,16 +18,16 @@ As of 2.3.2, the production-blocking roadmap from the April 2026 audit is comple
 - Fix Review creates a mandatory backup, converts review findings into fix tasks, runs provider workers against the selected project, records validation results, and exposes the exact CLI restore command on failure.
 - Fix Review is idempotent for active runs: repeated starts for the same review return the active run instead of launching duplicate write workers.
 - CLADEX self-review/self-fix remains explicit. Normal relays and review/fix jobs are still blocked from targeting the CLADEX runtime repo unless the operator opts into CLADEX development mode; write-capable self-fix requires a separate self-fix approval after self-review.
+- Per-channel Claude subprocesses are evicted by idle TTL and capped by an LRU live-process limit so a multi-channel relay does not accumulate processes forever.
+- `cladex doctor --json` reports Codex account type/plan and rate-limit windows when the Codex app-server is reachable, and surfaces it as a soft warning (never a hard fail) when it isn't.
+- The desktop Review Project view exposes interactive findings filtering (severity + category) and JSON export per review job.
 - No release claim promises unlimited provider capacity. Codex/Claude account plans, local CPU/RAM, Discord limits, and provider rate limits still control how much real work can run at once.
 
-## Non-Blocking Future Work
+## Open Roadmap Items
 
-These are product enhancements, not release blockers:
+None. Every item from the April 2026 roadmap, including the previously non-blocking enhancements, has shipped or has an explicit recorded decision in [DONE_ROADMAP.md](DONE_ROADMAP.md) or [backend/docs/](backend/docs/).
 
-- Provider-native account/rate-limit dashboards using Codex/Claude APIs when those local surfaces are stable enough to rely on.
-- A deeper supervisor rewrite that pools Discord clients and provider workers across many always-on relay profiles. Current CLADEX handles high-count review swarms through bounded queues and serializes write-capable fix phases for safety; live relay pooling remains an optimization, not a prerequisite for safe use.
-- Interactive report filtering/export/retry controls beyond the current markdown/JSON artifacts and progress cards.
-- Optional Claude Code Channels evaluation once preview stability, multi-profile behavior, and org-policy controls are proven.
+Future enhancements should be opened as new roadmap entries with their own scope, not picked up from a stale "future" list.
 
 ## Release Gates
 
@@ -34,8 +40,8 @@ These are product enhancements, not release blockers:
 - `py backend\relayctl.py privacy-audit --tracked-only .`
 - `py -m pytest --tb=short -q` from `backend/`
 - `py backend\cladex.py doctor --json`
-- CLI smoke for review/fix/backup
-- API smoke for review/fix/backup
+- CLI smoke for review/fix/backup/findings
+- API smoke for review/fix/backup/findings
 - `cmd /c npm run electron:build`
 
 The public repo must contain no personal profile env files, auth homes, relay logs, local memory, generated release output, or user-specific paths.

@@ -137,6 +137,7 @@ class PersistentClaudeProcess:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     response_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
     closing: bool = False
+    last_used_at: float = field(default_factory=time.monotonic)
 
 
 class ClaudeSession:
@@ -614,16 +615,100 @@ class ClaudeBackend:
             cmd.extend(["--resume", session_id])
         return cmd
 
+    def _claude_worker_idle_ttl_seconds(self) -> float:
+        """Per-channel Claude subprocess idle eviction TTL.
+
+        A relay covering many Discord channels would otherwise accumulate one
+        live Claude CLI per channel forever. Idle channels release their
+        process after this many seconds; the next message recreates one. Set
+        to 0 (or any non-positive value) to disable idle eviction entirely.
+        Override via `CLADEX_CLAUDE_WORKER_IDLE_TTL` (seconds).
+        """
+        try:
+            value = float(os.environ.get("CLADEX_CLAUDE_WORKER_IDLE_TTL") or 1800)
+        except (TypeError, ValueError):
+            value = 1800.0
+        return max(value, 0.0)
+
+    def _claude_worker_max_live(self) -> int:
+        """Maximum number of live per-channel Claude subprocesses.
+
+        Once exceeded, the least-recently-used inactive channel's process is
+        terminated to make room for the active channel. The active channel
+        is never evicted while serving a turn. Override via
+        `CLADEX_CLAUDE_WORKER_MAX_LIVE` (positive int, default 16).
+        """
+        try:
+            value = int(os.environ.get("CLADEX_CLAUDE_WORKER_MAX_LIVE") or 16)
+        except (TypeError, ValueError):
+            value = 16
+        return max(value, 1)
+
+    async def _evict_idle_processes(self, *, except_channel: str | None = None) -> None:
+        """Drop persistent processes that have been idle too long.
+
+        Called before allocating a fresh process so an idle eviction can
+        free a slot for the new channel. Iterates over a snapshot of the
+        dict because termination mutates `_persistent_processes`.
+        """
+        ttl = self._claude_worker_idle_ttl_seconds()
+        if ttl <= 0:
+            return
+        now = time.monotonic()
+        for channel_key, persistent in list(self._persistent_processes.items()):
+            if channel_key == except_channel:
+                continue
+            if persistent.lock.locked():
+                continue
+            if now - persistent.last_used_at < ttl:
+                continue
+            try:
+                await self._terminate_process(persistent)
+            except Exception:
+                logger.exception("Failed to evict idle Claude process for channel %s", channel_key)
+            self._persistent_processes.pop(channel_key, None)
+
+    async def _enforce_worker_max_live(self, *, except_channel: str) -> None:
+        """If too many live processes exist, drop the LRU inactive one."""
+        cap = self._claude_worker_max_live()
+        live = [
+            (key, persistent)
+            for key, persistent in self._persistent_processes.items()
+            if persistent.process is not None and persistent.process.returncode is None
+        ]
+        if len(live) < cap:
+            return
+        candidates = [
+            (key, persistent.last_used_at)
+            for key, persistent in live
+            if key != except_channel and not persistent.lock.locked()
+        ]
+        if not candidates:
+            return
+        candidates.sort(key=lambda item: item[1])
+        evict_key = candidates[0][0]
+        persistent = self._persistent_processes.get(evict_key)
+        if persistent is None:
+            return
+        try:
+            await self._terminate_process(persistent)
+        except Exception:
+            logger.exception("Failed to LRU-evict Claude process for channel %s", evict_key)
+        self._persistent_processes.pop(evict_key, None)
+
     async def _persistent_process_for_channel(self, channel_key: str, prompt_workspace: Path) -> PersistentClaudeProcess:
         """Get or create a persistent Claude subprocess for a channel."""
+        await self._evict_idle_processes(except_channel=channel_key)
         session = self._session_for_channel(channel_key, prompt_workspace)
         persistent = self._persistent_processes.get(channel_key)
         current_loop_id = id(asyncio.get_running_loop())
         if persistent is None:
+            await self._enforce_worker_max_live(except_channel=channel_key)
             persistent = PersistentClaudeProcess(session=session, worktree=prompt_workspace)
             self._persistent_processes[channel_key] = persistent
             return persistent
         persistent.session = session
+        persistent.last_used_at = time.monotonic()
         if persistent.worktree != prompt_workspace:
             await self._terminate_process(persistent)
             persistent.worktree = prompt_workspace
@@ -762,6 +847,7 @@ class ClaudeBackend:
 
         async with persistent.lock:
             persistent.worktree = cwd
+            persistent.last_used_at = time.monotonic()
 
             try:
                 process = await self._ensure_persistent_process(persistent)
