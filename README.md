@@ -194,7 +194,7 @@ codex-discord stop
 - `CLADEX_REMOTE_FS_UNRESTRICTED=1` restores arbitrary host browsing and should only be used on a trusted private machine.
 - Project Review artifacts and source snapshots are stored under the local CLADEX data directory, not written into the reviewed project. Review workers do not apply fixes; applying fixes is a separate explicit implementation phase.
 - Set `CLADEX_REVIEW_MAX_PARALLEL` if a machine/account pool can safely run more reviewer CLI processes than the default.
-- Production roadmap and remaining release gates live in [ROADMAP.md](ROADMAP.md).
+- Production roadmap and remaining release gates live in [ROADMAP.md](ROADMAP.md). Items that have shipped move to [DONE_ROADMAP.md](DONE_ROADMAP.md).
 
 ## License
 

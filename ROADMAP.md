@@ -2,112 +2,95 @@
 
 CLADEX stays focused on Claude Code and OpenAI Codex relays. The current production path is to keep clone-to-run setup clean, keep model/account behavior provider-led, and add scaling only after compatibility and load tests prove the lower layers.
 
-## Completed For 2.2.3
+Everything that has shipped is tracked in [DONE_ROADMAP.md](DONE_ROADMAP.md). This file is only the remaining work, ordered by what unlocks what.
 
-- Frontend security: file-mode `?apiBase=` is now validated against an http(s) loopback allowlist before use, and `X-CLADEX-Access-Token` is only attached to same-origin or loopback fetches.
-- Frontend UX: Review Project tracks Codex/Claude account-home values separately and submits only the one matching the active provider; Review and "Save snapshot only" buttons disable while in flight or when the workspace is empty.
-- Review correctness: report markdown is rendered after the final job state is saved (no more `Status: running` on completed reports), AI-finding paths normalize against both the original workspace and the scratch copy, traversal segments collapse to `.`, and `_review_artifact_ignore` no longer drops symlinks unconditionally so backups round-trip correctly.
-- Review concurrency: `run_review_job` now takes a per-job exclusive run lock (PID-aware reclaim of stale locks), short-circuits if the job is already finished, and runs AI lanes through `Popen` with a 1-second cancel-poll loop so cancellation terminates the in-flight subprocess instead of waiting on the timeout.
-- Review noise: smarter `has_secret_token_segment` only flags credential-prefix + token compounds (`auth-token`, `api-key`) so framework files like `vite-env.d.ts` stop tripping the scanner; line-pattern rules skip docs/config (`.md`, `.toml`, `.yaml`, …) and the rule-definition files (`review_swarm.py`, `test_review_swarm.py`).
-- Backend correctness: `install_plugin._ensure_runtime` always passes `-c constraints.txt` when the file is present so end-user runtime installs match CI; `_codex_login_status` runs with a 15s timeout and surfaces structured errors instead of hanging; Claude profile readiness now requires a non-error `status.json` rather than a bare PID; channel-history bootstrap caps the raw scan at `max(limit*10, 200)` and treats `channel_history_limit=0` as the default 20 unless `RELAY_UNLIMITED_HISTORY_SCAN=1` is explicitly set.
-- API contract: `server.cjs` profile-create no longer forwards the unsupported `--startup-channel-text` flag and no longer mis-maps `startupDmUserIds` to the DM allowlist. Operator/user IDs deduplicate before they reach `relayctl register`.
-- Crash-recovery: `claude_bot` reclaims orphaned `.processing` operator requests at startup so callers never wait for a response a crashed worker will never deliver. `relay_common.replace_directory` rolls back to its backup if the temp swap fails so plugin/asset installs cannot leave the destination missing.
-- CI hardening: `.github/workflows/ci.yml` sets a top-level `permissions: contents: read`. Vite dev server proxies `/api` to the backend port so `npm run dev:stack` works without a `VITE_API_BASE` override.
+---
 
-## Completed For 2.2.2
+## 1. Fix Review (orchestrator + button)
 
-- Fixed `claude-discord run` launching the Codex bot (`backend/bot.py`) instead of the Claude bot (`backend/claude_bot.py`). The packaged manager already routed correctly; only the documented direct-CLI path was broken.
-- Added `review_swarm` and `api_runner` to `[tool.setuptools].py-modules` in `backend/pyproject.toml`. Non-editable wheel/sdist installs now actually carry the modules `cladex.py` imports at startup.
-- Hardened the local API auth gate against `Host` / `X-Forwarded-Host` spoofing. `isLoopbackRequest` now derives loopback status from `req.socket.remoteAddress` and treats the presence of any `X-Forwarded-*` header as a proxy signal that requires the remote token. `/api/runtime-info` no longer hands out the remote access token to clients that merely claim to be local.
-- Required at least one allowed channel or allowed user when registering a Claude relay, and required a user/operator allowlist when `--allow-dms` is set. Empty allowlists are now rejected with exit code 2 and a clear error.
-- Drained Claude subprocess stderr in the background to remove the deadlock window where stderr-heavy output could block the persistent process. On turn timeout the process is now terminated so the next turn starts on a fresh subprocess. Last 50 stderr lines are kept as a bounded tail for diagnostics.
-- Returned structured AI reviewer outcomes from `review_swarm._run_cli`. Timeout, missing binary, and nonzero exit now mark the lane `failed` with the underlying error instead of being silently wrapped as an "Unstructured reviewer notes" finding.
-- Stripped inherited credentials from AI reviewer subprocesses. Lanes now run with a small allowlisted environment (PATH, locale, temp dirs, account-home overrides) instead of `os.environ.copy()`. Removed `Bash` from Claude reviewer tools since `--permission-mode dontAsk` plus Bash could write outside the scratch workspace.
-- Broadened `_review_artifact_ignore` to skip common local-credential files and directories (`.npmrc`, `.pypirc`, `.netrc`, `.git-credentials`, `.ssh`, `.aws`, `.gnupg`, `.kube`, etc.) so source backups and reviewer scratch trees don't carry host secrets.
-- Bootstrapped the managed Python backend runtime on the first `server.cjs` `runPython` call. A fresh packaged install now installs the bundled backend into `%LOCALAPPDATA%\discord-codex-relay\runtime\` automatically; subsequent calls short-circuit. `CLADEX_SKIP_BACKEND_BOOTSTRAP=1` opts out.
+The current Project Review swarm finds problems but does not fix them. The user-visible deliverable here is a single **Fix Review** button that appears next to the existing Fix Plan / Cancel controls on a completed review job card and turns the swarm's findings into actual source edits, end to end.
 
-## Completed For 2.2.1
+### Behavior the user sees
 
-- Dropped the dead `claude-code-sdk` runtime dependency from `backend/pyproject.toml` and regenerated `backend/constraints.txt`. Trims 27 transitive packages (`mcp`, `pydantic*`, `httpx*`, `starlette`, `uvicorn`, `cryptography`, `cffi`, `pycparser`, `jsonschema*`, etc.) that were pulled in only for the SDK chain. Source has used a subprocess-based Claude transport for several releases, so no import path needs the package.
-- Stopped the project review swarm from flagging template/sample env files. `.env.example`, `.env.template`, `.env.sample`, `secrets.example.json`, and similar conventional placeholders are now allowlisted (any `.example/.sample/.template/.tmpl/.dist` segment) while the underlying secret-filename match still triggers on `.env`, `secrets.json`, etc.
-- Tightened the TODO/FIXME/HACK/XXX maintenance marker rule. Substring matches like `podcast`, `shack`, doc string mentions of "todo", or marker tokens inside string literals no longer fire. The rule now requires a word boundary around the marker AND a comment context (`#`, `//`, `/*`, `<!--`, `;`, `-- `, `* `).
-- Added cross-lane finding deduplication. Findings sharing category + path + line + title from multiple reviewer lanes collapse to a single entry that lists every contributor in `seenByAgents` and is promoted to the highest severity any contributor reported.
-- Added review job cancellation. `cladex review cancel <id>` (CLI) and `POST /api/reviews/:id/cancel` (API) write a per-job `cancel.flag` file. Queued jobs are marked cancelled immediately; running jobs stop launching further AI lanes and finalize as `cancelled`. Cancel control surfaced in the desktop UI alongside Fix Plan.
-- Surfaced severity counts on review jobs. Backend `_public_job` now returns `severityCounts: {high, medium, low}` and the desktop UI renders colored severity pills on the review job card once any finding has been recorded.
-- Wired the backup management UI that was previously plumbed only at the API layer. Desktop `Review Project` view now lists CLADEX-managed source snapshots, polls them with the rest of state, and exposes a "Save snapshot only" button next to "Review Project". Restore stays CLI-only and confirmation-gated.
-- Hardened `_atomic_write_text` against transient Windows `PermissionError` during concurrent rename. Five-attempt 50ms backoff covers the race window, then re-raises so a real lockout still surfaces fast.
+- Run the review swarm against any project (existing flow). Lanes report findings into the universal `CLADEX_PROJECT_REVIEW.md` and `findings.json`.
+- When the job's status is `completed`, a **Fix Review** button appears on the job card. (Hidden on `running`, `queued`, `failed`, `cancelled` jobs.)
+- Clicking **Fix Review** does the following without further user dialog beyond the initial confirm:
+  1. Spawns a single high-reasoning **orchestrator agent**.
+  2. Orchestrator reads `findings.json` plus the project shape (file inventory, `package.json`/`pyproject.toml`/`Cargo.toml`/etc., language mix, test targets) and decides the best route to fix everything.
+  3. Orchestrator outputs a structured **fix plan** that names every change as one or more **fix tasks**, with for each task: target file(s), provider choice (Codex or Claude — chosen per task based on task fit, project language, and currently-available provider authentication), reasoning effort, validation command, dependency on earlier tasks.
+  4. Orchestrator decides how many concurrent **fix-worker agents** to spawn, and which provider per worker.
+  5. Workers execute their assigned tasks against the project workspace (or a per-task git worktree) with a mandatory source backup taken first.
+  6. After each phase, the orchestrator runs the validation commands the project ships (`npm run lint`, `npm run build`, `pytest`, `cargo test`, etc.) and either advances to the next phase or asks a worker to repair.
+  7. On a phase that fails to validate after the planned repair budget, the orchestrator stops, reports what was tried, and offers `cladex backup restore`.
 
-## Completed For 2.2.0
+### Why this design
 
-- Updated GitHub Actions workflow references to official Node 24-based action majors (`actions/checkout@v6`, `actions/setup-node@v6`, and `actions/setup-python@v6`) after verifying the action metadata.
-- Added the Project Review swarm foundation:
-  - desktop `Review Project` view with folder picker, Codex/Claude selector, account-home field, explicit CLADEX self-review toggle, source-backup toggle, and a 1-50 reviewer slider,
-  - API and CLI review job commands,
-  - durable job state under the local CLADEX data directory,
-  - deterministic file sharding, generated/vendor/secret-heavy folder skips, internal preflight heuristics, and per-lane progress,
-  - distinct reviewer lane focuses covering security, runtime, testing, concurrency, backend, frontend, release, dependencies, performance, and data integrity,
-  - AI reviewer execution against a CLADEX-owned scratch copy where possible so smoke/stress experiments do not touch the selected source tree,
-  - bounded AI reviewer concurrency by default so 1-50 lane jobs queue safely instead of bursting every lane at once,
-  - one universal `CLADEX_PROJECT_REVIEW.md` report plus structured `findings.json`,
-  - a separate `CLADEX_FIX_PLAN.md` generator that does not edit source.
-- Added source snapshot support:
-  - review jobs can create local snapshots under the CLADEX data directory,
-  - CLADEX self-review requires explicit opt-in and creates a backup before the job is launched,
-  - CLI backup commands can list, create, and restore snapshots with exact-id confirmation,
-  - restore removes stale nested source files while preserving ignored dependency/cache folders and secret-like local files.
-- Kept review workers from applying fixes. Codex and Claude review lanes use a scratch workspace and no approval escalation; Claude write/edit tools are disabled while Bash remains available for safe validation commands in scratch.
-- Validated review/backup ids before mapping them into local artifact paths.
-- Tightened protected-root parsing so `CLADEX_PROTECTED_ROOT` and `CLADEX_PROTECTED_ROOTS` combine instead of overriding each other.
+- One button — no project-specific configuration knobs. Every project gets the same flow.
+- The orchestrator decides Codex vs Claude per task because each is better at different things (Codex for code-grounded refactors with shell access; Claude for narrative reasoning, tests, and docs). The user does not pick.
+- The orchestrator decides agent count because a project with 4 high-severity bugs in one file is one task, but a project with 30 medium findings spread across 12 files can fan out.
+- The orchestrator owns sequencing so dependency-heavy fixes (regenerate constraints → reinstall → rerun tests) don't race.
 
-## Completed For 2.1.1
+### Deliverables
 
-- Added shared workspace guardrails for Codex and Claude profiles. Registration, profile update, GUI/CLI start, and doctor now block workspaces that overlap the CLADEX runtime repo unless explicitly enabled for CLADEX development.
-- Added compact workspace-local rule/skill discovery to Codex and Claude prompt context so agents see AGENTS/CLAUDE files, Codex skills, Claude subagents, and slash commands without dumping full files every turn.
-- Added `cladex doctor` profile health checks for unsafe workspaces, duplicate Codex app-server ports, and shared account homes.
-- Added a tracked-file privacy gate with `codex-discord privacy-audit --tracked-only .`; CI now fails on committed profile env files, logs, personal path literals, or other public-repo hygiene leaks.
-- Documented that CLADEX never ships maintainer Codex/Claude credentials. Each user must install and authenticate their own `codex` and `claude` CLIs.
+- **Backend orchestrator module** (`backend/fix_orchestrator.py`):
+  - `start_fix_run(review_id)` — claims a per-review run lock, creates a mandatory source backup, plans, persists state under the local CLADEX data directory.
+  - Plan persisted as `CLADEX_FIX_RUN.md` (human readable) plus `fix_run.json` (structured: phases, tasks, provider, status, dependencies, validation results).
+  - Worker pool launches `cladex fix run-task <run-id> <task-id>` subprocesses, mirroring the review-swarm subprocess model.
+  - Phase-level validate after every batch, with bounded retries; restore offered on hard failure.
+- **CLI**:
+  - `cladex fix start --review <review-id> [--max-agents N] [--no-backup]`
+  - `cladex fix list --json`
+  - `cladex fix show <run-id> --json`
+  - `cladex fix run-task <run-id> <task-id> --json` (used by the worker pool)
+  - `cladex fix cancel <run-id>`
+- **API**:
+  - `POST /api/reviews/:id/fix` → kicks off a fix run, returns `{ runId, plan }`.
+  - `GET /api/fix-runs` → list.
+  - `GET /api/fix-runs/:id` → status + per-task progress + which provider each worker is using + last validation output.
+  - `POST /api/fix-runs/:id/cancel` → terminate in-flight workers.
+- **UI** (`src/App.tsx` — Review Project view):
+  - **Fix Review** button on completed review cards.
+  - Confirmation modal that shows the orchestrator's plan before any worker is spawned (what tasks, how many agents of each provider, source backup id), with **Confirm and start fixing** / **Cancel** options.
+  - Live fix-run progress card that mirrors review job cards: total tasks, running, done, failed, cancelled; per-task status, assigned provider, last validation output; **Cancel run** button.
+  - **Restore from backup** action surfaced when a run finishes with status `failed` or `cancelled`, gated behind the same confirm-the-id flow CLI uses.
 
-## Completed For 2.1.0
+### Safety contract
 
-- Modernized the desktop stack and CI baseline for Node 22, npm 10, Vite 8, Express 5, React 19, Electron 41, and TypeScript 6.
-- Removed stale model pins. Blank model fields now let installed Claude/Codex CLIs choose their defaults.
-- Switched to safer default permissions: Codex profiles default away from full bypass, and Claude profiles default to normal permission mode unless explicitly changed.
-- Added per-profile account homes:
-  - Codex: `CODEX_HOME` / `codexHome`
-  - Claude: `CLAUDE_CONFIG_DIR` / `claudeConfigDir`
-- Scoped remote filesystem browsing for non-loopback callers to saved profile workspaces/account homes and explicit `CLADEX_REMOTE_FS_ROOTS`.
-- Added Discord mention suppression defaults with `AllowedMentions.none()` for relay-authored sends/replies.
-- Added `cladex doctor --json` checks for Node, npm, Python, Claude, Codex, Codex app-server schema generation, profile port collisions, and Windows PowerShell shim warnings.
-- Added Codex app-server payload builders and schema-summary fixture tests for the stable thread/turn request shapes.
-- Added fake high-count coverage for 100 isolated Codex profiles with unique account homes and collision-free app-server ports.
-- Removed stale source entrypoints: `server.ts` and `electron/main.ts`. Runtime and packaging use `server.cjs` and `electron/main.cjs`.
-- Added Python dependency constraints for reproducible local and CI installs.
+- Mandatory source backup before any worker edits.
+- Workers edit only assigned files in the targeted project workspace; never CLADEX itself unless `--allow-cladex-self-review` plus `--allow-cladex-self-fix` are both explicit.
+- Each phase validates before the next phase runs. If validation fails twice, the run halts.
+- The orchestrator never invents project-wide rewrites; every change must trace back to a specific finding id from `findings.json`.
+- Cancellation terminates the in-flight subprocess like review cancel does.
 
-## Remaining Work
+---
 
-- Advance Project Review from the safe foundation to a full production repair loop:
-  - planner shards by package boundaries, recent git hotspots, test surfaces, and security-sensitive paths instead of only deterministic file distribution,
-  - reducer de-duplicates findings by evidence, agent focus, and recommended fix as well (current 2.2.1 reducer is title/path/line/category exact-match),
-  - live AI review lanes should emit validated structured JSON findings with command-attempt evidence,
-  - expose queue/concurrency controls and clearer rate-limit/account-pressure reporting,
-  - UI should grow retry/export, richer interactive severity/category/agent filtering, and a snapshot restore button gated behind explicit confirmation (CLI restore stays the source of truth).
-- Add a guarded fix phase for review reports:
-  - one planner converts findings into ordered fix phases,
-  - user approval is required before edits,
-  - write workers edit only assigned project workspaces/worktrees,
-  - source backup is mandatory before edits,
-  - planner validates diffs and tests between phases before continuing,
-  - restore command remains explicit and confirmation-gated.
-- Build the full supervisor/queue/account-pooling runtime:
-  - pool Discord clients by bot token where safe,
-  - pool Codex app-server workers by account home where safe,
-  - launch Claude workers on demand with idle shutdown,
-  - add per-account and global concurrency limits.
+## 2. Project Review reducer / sharding / evidence improvements
+
+- Planner shards by package boundaries, recent git hotspots, test surfaces, and security-sensitive paths instead of only deterministic file distribution.
+- Reducer de-duplicates findings by evidence, agent focus, and recommended fix as well (current reducer is title/path/line/category exact-match).
+- Live AI review lanes emit validated structured JSON findings with command-attempt evidence (stop wrapping any non-JSON tail as an "Unstructured reviewer notes" finding).
+- Expose queue/concurrency controls and clearer rate-limit/account-pressure reporting in the UI.
+- UI grows interactive severity/category/agent filtering, retry, and export. Snapshot restore button surfaced behind explicit confirmation (CLI restore stays the source of truth).
+
+## 3. Supervisor / queue / account-pooling runtime
+
+- Pool Discord clients by bot token where safe.
+- Pool Codex app-server workers by account home where safe.
+- Launch Claude workers on demand with idle TTL shutdown.
+- Add per-account and global concurrency limits.
 - Expand provider fake tests from registry/load checks to full queued-turn simulations.
-- Surface Codex account/rate-limit/model discovery from app-server RPCs in profile health and the UI.
-- Add remote-token rotation/revoke controls.
-- Add Discord gateway, invalid-request, and backpressure metrics.
-- Evaluate Claude Code Channels as an optional Claude transport only after preview stability and access-control behavior are proven.
+
+## 4. Provider observability
+
+- Surface Codex account / rate-limit / model discovery from app-server RPCs in profile health and the UI.
+- Add Discord gateway, invalid-request, and backpressure metrics with auto-throttle on repeated 401/403/429.
+- Expose remote-token rotation and revoke controls in the UI.
+
+## 5. Optional Claude Code Channels evaluation
+
+Evaluate Channels as an alternate Claude transport once preview stability and access-control behavior are proven. Do not replace the existing custom Claude bridge until org-policy and multi-profile behavior are confirmed.
+
+---
 
 ## Release Gates
 
@@ -121,5 +104,4 @@ CLADEX stays focused on Claude Code and OpenAI Codex relays. The current product
 - `py backend\cladex.py doctor --json`
 - `cmd /c npm run electron:build`
 
-The GitHub CI mirrors the source validation path and runs backend tests across Python 3.10, 3.11, and 3.12.
-The public repo must contain no personal profile env files, auth homes, relay logs, local memory, generated release output, or user-specific paths. Users bring their own locally installed and logged-in `codex` and `claude` CLIs.
+The GitHub CI mirrors the source validation path and runs backend tests across Python 3.10, 3.11, and 3.12. The public repo must contain no personal profile env files, auth homes, relay logs, local memory, generated release output, or user-specific paths. Users bring their own locally installed and logged-in `codex` and `claude` CLIs.
