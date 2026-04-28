@@ -2,6 +2,18 @@
 
 CLADEX stays focused on Claude Code and OpenAI Codex relays. The current production path is to keep clone-to-run setup clean, keep model/account behavior provider-led, and add scaling only after compatibility and load tests prove the lower layers.
 
+## Completed For 2.2.2
+
+- Fixed `claude-discord run` launching the Codex bot (`backend/bot.py`) instead of the Claude bot (`backend/claude_bot.py`). The packaged manager already routed correctly; only the documented direct-CLI path was broken.
+- Added `review_swarm` and `api_runner` to `[tool.setuptools].py-modules` in `backend/pyproject.toml`. Non-editable wheel/sdist installs now actually carry the modules `cladex.py` imports at startup.
+- Hardened the local API auth gate against `Host` / `X-Forwarded-Host` spoofing. `isLoopbackRequest` now derives loopback status from `req.socket.remoteAddress` and treats the presence of any `X-Forwarded-*` header as a proxy signal that requires the remote token. `/api/runtime-info` no longer hands out the remote access token to clients that merely claim to be local.
+- Required at least one allowed channel or allowed user when registering a Claude relay, and required a user/operator allowlist when `--allow-dms` is set. Empty allowlists are now rejected with exit code 2 and a clear error.
+- Drained Claude subprocess stderr in the background to remove the deadlock window where stderr-heavy output could block the persistent process. On turn timeout the process is now terminated so the next turn starts on a fresh subprocess. Last 50 stderr lines are kept as a bounded tail for diagnostics.
+- Returned structured AI reviewer outcomes from `review_swarm._run_cli`. Timeout, missing binary, and nonzero exit now mark the lane `failed` with the underlying error instead of being silently wrapped as an "Unstructured reviewer notes" finding.
+- Stripped inherited credentials from AI reviewer subprocesses. Lanes now run with a small allowlisted environment (PATH, locale, temp dirs, account-home overrides) instead of `os.environ.copy()`. Removed `Bash` from Claude reviewer tools since `--permission-mode dontAsk` plus Bash could write outside the scratch workspace.
+- Broadened `_review_artifact_ignore` to skip common local-credential files and directories (`.npmrc`, `.pypirc`, `.netrc`, `.git-credentials`, `.ssh`, `.aws`, `.gnupg`, `.kube`, etc.) so source backups and reviewer scratch trees don't carry host secrets.
+- Bootstrapped the managed Python backend runtime on the first `server.cjs` `runPython` call. A fresh packaged install now installs the bundled backend into `%LOCALAPPDATA%\discord-codex-relay\runtime\` automatically; subsequent calls short-circuit. `CLADEX_SKIP_BACKEND_BOOTSTRAP=1` opts out.
+
 ## Completed For 2.2.1
 
 - Dropped the dead `claude-code-sdk` runtime dependency from `backend/pyproject.toml` and regenerated `backend/constraints.txt`. Trims 27 transitive packages (`mcp`, `pydantic*`, `httpx*`, `starlette`, `uvicorn`, `cryptography`, `cffi`, `pycparser`, `jsonschema*`, etc.) that were pulled in only for the SDK chain. Source has used a subprocess-based Claude transport for several releases, so no import path needs the package.

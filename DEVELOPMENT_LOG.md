@@ -2,6 +2,36 @@
 
 This file is tracked on purpose. It gives future Claude/Codex agents a concise source of truth for what has been done, what is in progress, and what still needs care. Runtime-only memory files under `memory/` are useful locally, but GitHub users and new agents need this public handoff too.
 
+## 2.2.2 Self-Review Findings Pass (2026-04-28)
+
+After 2.2.1 shipped, the project's own review swarm was run on the project (10 Codex lanes, `--allow-cladex-self-review`, with a backup snapshot before launch). The review surfaced 70 high-severity items, mostly secret-pattern hits in code that just names those concepts, but several real bugs landed in this tranche.
+
+### Real bugs fixed
+
+- **Wrong bot launched from `claude-discord run`** (`backend/claude_relay.py`). `cmd_run` was launching `bot.py` (the Codex bot), not `claude_bot.py`. The packaged-via-cladex path always launched `claude_bot.py` correctly, so this only affected callers using the documented `claude-discord run` console script directly. Now launches `claude_bot.py`.
+- **`review_swarm` and `api_runner` missing from the Python package** (`backend/pyproject.toml`). `cladex.py` imports `review_swarm` at module load time and `server.cjs` invokes `api_runner.py`, but neither was listed in `[tool.setuptools].py-modules`. A non-editable wheel/sdist install would fail before any `cladex` command could run. Both modules added.
+- **Host-header spoofing could bypass the remote-API token** (`server.cjs`). `isLoopbackRequest` based the loopback decision on `Host` / `X-Forwarded-Host`, both client-controlled. A remote caller could send `Host: 127.0.0.1` or `X-Forwarded-Host: 127.0.0.1`, omit `Origin`, be classified as loopback, and have `/api/runtime-info` echo the remote access token. The check now derives loopback from `req.socket.remoteAddress` only, treats any forwarded header as proxy presence (token required), and still validates `Origin` against loopback.
+- **Claude relay `register` could create open allowlists** (`backend/claude_relay.py`). `cmd_register` accepted empty `--allowed-channel-id` and could enable `--allow-dms` without any operator/user allowlist. Now requires at least one of channel/user allowlist, and `--allow-dms` requires a user allowlist; both rules covered by tests.
+- **Claude subprocess stderr was never drained** (`backend/claude_backend.py`). The persistent Claude process spawned with `stderr=PIPE` but `_run_turn` only read stdout, so stderr-heavy output could fill the pipe and deadlock the child. Added a per-process stderr drain task with a bounded 50-line tail for diagnostics, cancellation alongside `reader_task`, and process termination on turn timeout so the next turn restarts cleanly.
+- **AI reviewer failures masqueraded as completed reviews** (`backend/review_swarm.py`). `_run_cli` returned plain text on timeout, missing-binary, and nonzero-exit, which `parse_ai_findings` wrapped as a medium-severity "Unstructured reviewer notes" finding. Lanes that crashed at startup looked like clean reviews. Now `_run_cli` returns a structured `AIRunResult(text, ok, error)`, `process_agent` raises on `ok=False`, and the lane is marked `failed` with the underlying error.
+- **AI reviewer subprocesses inherited the host environment** (`backend/review_swarm.py`). Codex/Claude review lanes received `os.environ.copy()`, which carries Discord tokens, AWS credentials, Anthropic/OpenAI API keys, and the CLADEX remote token into every reviewer process — and into review artifacts via stdout/stderr. New `_minimal_reviewer_env` drops everything except a small allowlist (PATH, USERPROFILE, TEMP, locale, etc.) and the explicit account-home override. `Bash` is also removed from the Claude reviewer toolset since it could write outside the scratch workspace under `--permission-mode dontAsk`.
+- **Source backups copied non-env local secrets** (`backend/review_swarm.py`). `_review_artifact_ignore` only skipped fixed cache dirs, `.env*`, and names matching the secret-filename regex, so files like `.npmrc`, `.pypirc`, `.netrc`, `.git-credentials`, and directories like `.ssh`, `.aws`, `.gnupg`, `.kube` could be copied into CLADEX backups and reviewer scratch trees. New `LOCAL_SECRET_FILE_NAMES` and `LOCAL_SECRET_DIR_NAMES` sets cover the common credential locations and feed both `_review_artifact_ignore` and `_preserve_on_restore`.
+- **Packaged desktop app did not bootstrap Python backend deps** (`server.cjs`). A fresh install would call `python backend/cladex.py list --json` against the system Python, which lacks `psutil`, `discord.py`, etc., before the user could create any profile. Added `bootstrapBackendRuntime()` that runs once on the first `runPython` call and creates the managed runtime venv via `install_plugin._ensure_runtime`. Subsequent calls short-circuit. `CLADEX_SKIP_BACKEND_BOOTSTRAP=1` opts out for environments that manage Python differently.
+
+### Tests
+
+- 217 → 223 passed (+6: register allowlist x3, reviewer failure propagation, reviewer env stripping, local-credential ignore).
+
+### Validation
+
+- `cmd /c npm ci`, `cmd /c npm audit` (0 vulnerabilities), `cmd /c npm run lint`, `cmd /c npm run build`.
+- Fresh-venv `pip install -e backend[dev]` reproduces the trimmed 20-package constraints.
+- Backend full suite `223 passed, 1 warning`.
+- `python backend/relayctl.py privacy-audit --tracked-only .` -> no findings.
+- `python backend/cladex.py doctor --json` -> ok=True.
+- `cmd /c npm run electron:build` -> `release/CLADEX Setup 2.2.2.exe`, `release/CLADEX 2.2.2.exe`.
+- 10-agent self-review (job `review-20260428-142423-7261b80f`) re-run is recommended after this tranche to confirm the high-severity items are gone.
+
 ## Post-2.2.0 Cleanup Tranche (2026-04-28)
 
 Audit-driven follow-up to 2.2.0. No new architectural surface; tightens existing review/backup behavior and clears one stale runtime dependency. Versions aligned at 2.2.1 for delivery.

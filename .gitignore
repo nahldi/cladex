@@ -5,6 +5,7 @@ release/
 coverage/
 /AGENTS.md
 /memory/
+/.claude/
 .DS_Store
 *.log
 .env*

@@ -260,6 +260,70 @@ def test_show_review_includes_severity_counts(tmp_path: Path, monkeypatch: pytes
     assert counts["low"] >= 1
 
 
+def test_review_artifact_ignore_skips_local_credential_files_and_dirs(tmp_path: Path) -> None:
+    project = tmp_path / "target"
+    project.mkdir()
+    (project / "src").mkdir()
+    (project / ".npmrc").write_text("", encoding="utf-8")
+    (project / ".pypirc").write_text("", encoding="utf-8")
+    (project / ".netrc").write_text("", encoding="utf-8")
+    (project / ".git-credentials").write_text("", encoding="utf-8")
+    (project / ".ssh").mkdir()
+    (project / ".aws").mkdir()
+    (project / "app.py").write_text("ok", encoding="utf-8")
+
+    names = sorted(child.name for child in project.iterdir())
+    ignored = review_swarm._review_artifact_ignore(str(project), names)
+
+    assert ".npmrc" in ignored
+    assert ".pypirc" in ignored
+    assert ".netrc" in ignored
+    assert ".git-credentials" in ignored
+    assert ".ssh" in ignored
+    assert ".aws" in ignored
+    assert "src" not in ignored
+    assert "app.py" not in ignored
+
+
+def test_ai_reviewer_failure_marks_agent_failed_not_completed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    project = tmp_path / "target"
+    project.mkdir()
+    (project / "app.py").write_text("print('ok')\n", encoding="utf-8")
+    monkeypatch.setattr(review_swarm, "REVIEW_DATA_ROOT", tmp_path / "reviews")
+
+    def failing_ai(_job: dict, _agent: dict, _files):
+        return review_swarm.AIRunResult(text="", ok=False, error="AI reviewer binary not found: codex")
+
+    monkeypatch.setattr(review_swarm, "_run_codex_ai_review", failing_ai)
+
+    job = review_swarm.start_review(project, provider="codex", agents=2, preflight_only=False, launch=False)
+    finished = review_swarm.run_review_job(job["id"])
+
+    assert finished["status"] == "failed"
+    assert all(agent["status"] == "failed" for agent in finished["agents"])
+    assert all("AI reviewer binary not found" in agent["detail"] for agent in finished["agents"])
+
+
+def test_minimal_reviewer_env_strips_inherited_secrets(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "should-not-leak")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "should-not-leak")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "should-not-leak")
+    monkeypatch.setenv("OPENAI_API_KEY", "should-not-leak")
+    monkeypatch.setenv("CLADEX_REMOTE_ACCESS_TOKEN", "should-not-leak")
+    monkeypatch.setenv("PATH", "/usr/bin")
+
+    env = review_swarm._minimal_reviewer_env(account_home={"CODEX_HOME": "/tmp/account"})
+
+    assert "DISCORD_BOT_TOKEN" not in env
+    assert "AWS_SECRET_ACCESS_KEY" not in env
+    assert "ANTHROPIC_API_KEY" not in env
+    assert "OPENAI_API_KEY" not in env
+    assert "CLADEX_REMOTE_ACCESS_TOKEN" not in env
+    assert env.get("PATH") == "/usr/bin"
+    assert env.get("CODEX_HOME") == "/tmp/account"
+    assert env.get("CLADEX_REVIEW_LANE") == "1"
+
+
 def test_review_and_backup_ids_reject_path_traversal() -> None:
     with pytest.raises(ValueError, match="invalid review id"):
         review_swarm.load_job("..\\outside")
@@ -279,7 +343,7 @@ def test_ai_review_defaults_to_bounded_parallelism(tmp_path: Path, monkeypatch: 
     running = 0
     max_running = 0
 
-    def fake_ai_review(_job: dict, _agent: dict, _files: list[Path]) -> str:
+    def fake_ai_review(_job: dict, _agent: dict, _files: list[Path]) -> review_swarm.AIRunResult:
         nonlocal running, max_running
         with lock:
             running += 1
@@ -287,7 +351,7 @@ def test_ai_review_defaults_to_bounded_parallelism(tmp_path: Path, monkeypatch: 
         time.sleep(0.02)
         with lock:
             running -= 1
-        return '{"summary":"ok","findings":[]}'
+        return review_swarm.AIRunResult(text='{"summary":"ok","findings":[]}', ok=True)
 
     monkeypatch.setattr(review_swarm, "_run_codex_ai_review", fake_ai_review)
 

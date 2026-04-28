@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -96,6 +97,33 @@ SKIP_DIRS = {
     "vendor",
     "venv",
 }
+LOCAL_SECRET_FILE_NAMES = frozenset({
+    ".npmrc",
+    ".pypirc",
+    ".netrc",
+    ".curlrc",
+    ".wgetrc",
+    ".git-credentials",
+    ".dockercfg",
+    ".terraformrc",
+    ".kube-config",
+    ".gemrc",
+    ".pgpass",
+    ".my.cnf",
+})
+LOCAL_SECRET_DIR_NAMES = frozenset({
+    ".ssh",
+    ".aws",
+    ".gnupg",
+    ".gcp",
+    ".gcloud",
+    ".azure",
+    ".kube",
+    ".docker",
+    ".terraform.d",
+    ".chef",
+    ".vault-token",
+})
 REVIEW_EXTENSIONS = {
     ".bat",
     ".c",
@@ -412,7 +440,13 @@ def load_backup(backup_id: str) -> dict[str, Any]:
 
 def _preserve_on_restore(name: str) -> bool:
     lower = name.lower()
-    return lower in SKIP_DIRS or lower.startswith(".env") or bool(SECRET_FILENAME_RE.search(name))
+    if lower in SKIP_DIRS:
+        return True
+    if lower.startswith(".env"):
+        return True
+    if lower in LOCAL_SECRET_FILE_NAMES or lower in LOCAL_SECRET_DIR_NAMES:
+        return True
+    return bool(SECRET_FILENAME_RE.search(name))
 
 
 def restore_backup(backup_id: str, *, confirm: str) -> dict[str, Any]:
@@ -866,7 +900,16 @@ def _review_artifact_ignore(_directory: str, names: list[str]) -> set[str]:
     for name in names:
         lower = name.lower()
         path = Path(_directory) / name
-        if path.is_symlink() or lower in SKIP_DIRS or lower.startswith(".env") or SECRET_FILENAME_RE.search(name):
+        if path.is_symlink():
+            ignored.add(name)
+            continue
+        if (
+            lower in SKIP_DIRS
+            or lower.startswith(".env")
+            or lower in LOCAL_SECRET_FILE_NAMES
+            or lower in LOCAL_SECRET_DIR_NAMES
+            or SECRET_FILENAME_RE.search(name)
+        ):
             ignored.add(name)
     return ignored
 
@@ -918,7 +961,14 @@ def _ai_prompt(job: dict[str, Any], agent: dict[str, Any], files: list[Path]) ->
     )
 
 
-def _run_codex_ai_review(job: dict[str, Any], agent: dict[str, Any], files: list[Path]) -> str:
+@dataclass
+class AIRunResult:
+    text: str
+    ok: bool
+    error: str = ""
+
+
+def _run_codex_ai_review(job: dict[str, Any], agent: dict[str, Any], files: list[Path]) -> AIRunResult:
     import relayctl
 
     output_path = job_dir(job["id"]) / f"{agent['id']}-codex.md"
@@ -938,16 +988,14 @@ def _run_codex_ai_review(job: dict[str, Any], agent: dict[str, Any], files: list
         str(output_path),
         "-",
     ]
-    env = os.environ.copy()
-    if job.get("accountHome"):
-        env["CODEX_HOME"] = str(job["accountHome"])
+    env = _minimal_reviewer_env(account_home={"CODEX_HOME": str(job.get("accountHome"))} if job.get("accountHome") else {})
     result = _run_cli(command, _ai_prompt(job, agent, files), env=env)
-    if output_path.exists():
-        return output_path.read_text(encoding="utf-8", errors="replace")
+    if result.ok and output_path.exists():
+        return AIRunResult(text=output_path.read_text(encoding="utf-8", errors="replace"), ok=True)
     return result
 
 
-def _run_claude_ai_review(job: dict[str, Any], agent: dict[str, Any], files: list[Path]) -> str:
+def _run_claude_ai_review(job: dict[str, Any], agent: dict[str, Any], files: list[Path]) -> AIRunResult:
     import claude_relay
 
     command = [
@@ -956,21 +1004,68 @@ def _run_claude_ai_review(job: dict[str, Any], agent: dict[str, Any], files: lis
         "--permission-mode",
         "dontAsk",
         "--tools",
-        "Read,Grep,Glob,LS,Bash",
+        "Read,Grep,Glob,LS",
         "--disallowedTools",
-        "Edit,MultiEdit,Write,NotebookEdit",
+        "Bash,Edit,MultiEdit,Write,NotebookEdit",
         "--no-session-persistence",
         "--output-format",
         "text",
         _ai_prompt(job, agent, files),
     ]
-    env = os.environ.copy()
+    extra_env: dict[str, str] = {}
     if job.get("accountHome"):
-        env["CLAUDE_CONFIG_DIR"] = str(job["accountHome"])
+        extra_env["CLAUDE_CONFIG_DIR"] = str(job["accountHome"])
+    env = _minimal_reviewer_env(account_home=extra_env)
     return _run_cli(command, "", env=env, cwd=Path(str(job.get("scratchWorkspace") or job["workspace"])))
 
 
-def _run_cli(command: list[str], prompt: str, *, env: dict[str, str], cwd: Path | None = None) -> str:
+_REVIEWER_ENV_PASSTHROUGH = (
+    "PATH",
+    "PATHEXT",
+    "SystemRoot",
+    "SYSTEMROOT",
+    "TEMP",
+    "TMP",
+    "TMPDIR",
+    "USERPROFILE",
+    "HOME",
+    "LOCALAPPDATA",
+    "APPDATA",
+    "ProgramFiles",
+    "ProgramFiles(x86)",
+    "ProgramData",
+    "PYTHONIOENCODING",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TERM",
+    "WINDIR",
+    "COMSPEC",
+)
+
+
+def _minimal_reviewer_env(*, account_home: dict[str, str] | None = None) -> dict[str, str]:
+    """Build a minimal reviewer subprocess environment.
+
+    Strips inherited credentials (Discord tokens, API keys, AWS creds, etc.) by
+    default and only carries through entries needed to actually run the CLI on
+    the host. Account-home overrides for the chosen provider are passed
+    explicitly via `account_home`.
+    """
+    base: dict[str, str] = {}
+    for key in _REVIEWER_ENV_PASSTHROUGH:
+        value = os.environ.get(key)
+        if value is not None:
+            base[key] = value
+    base["CLADEX_REVIEW_LANE"] = "1"
+    if account_home:
+        for key, value in account_home.items():
+            if value:
+                base[key] = value
+    return base
+
+
+def _run_cli(command: list[str], prompt: str, *, env: dict[str, str], cwd: Path | None = None) -> AIRunResult:
     timeout = _safe_int(os.environ.get("CLADEX_REVIEW_AGENT_TIMEOUT"), 1800)
     output_limit = max(_safe_int(os.environ.get("CLADEX_REVIEW_AGENT_OUTPUT_LIMIT"), DEFAULT_AGENT_OUTPUT_LIMIT), 1000)
     kwargs: dict[str, Any] = {
@@ -989,15 +1084,18 @@ def _run_cli(command: list[str], prompt: str, *, env: dict[str, str], cwd: Path 
     try:
         result = subprocess.run(command, **kwargs)
     except subprocess.TimeoutExpired:
-        return "AI reviewer timed out before producing a complete result."
+        return AIRunResult(text="", ok=False, error="AI reviewer timed out before producing a complete result.")
+    except FileNotFoundError as exc:
+        return AIRunResult(text="", ok=False, error=f"AI reviewer binary not found: {exc}")
     except Exception as exc:
-        return f"AI reviewer failed to start: {exc}"
+        return AIRunResult(text="", ok=False, error=f"AI reviewer failed to start: {exc}")
     text = "\n".join(part for part in (result.stdout, result.stderr) if part)
-    if result.returncode != 0 and not text.strip():
-        text = f"AI reviewer exited with code {result.returncode}."
     if len(text) > output_limit:
         text = text[:output_limit].rstrip() + "\n...[truncated by CLADEX]"
-    return text
+    if result.returncode != 0:
+        error = text.strip() or f"AI reviewer exited with code {result.returncode}."
+        return AIRunResult(text=text, ok=False, error=error)
+    return AIRunResult(text=text, ok=True)
 
 
 def _agent_finding_prefix(agent_id: str, provider: str, findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1182,10 +1280,12 @@ def run_review_job(job_id: str) -> dict[str, Any]:
                     agent_findings.extend(scan_file(path, workspace))
                 if not job.get("preflightOnly") and not _cancel_requested(job["id"]):
                     if str(job.get("provider")) == "codex":
-                        ai_output = _run_codex_ai_review(job, agent, shard)
+                        ai_result = _run_codex_ai_review(job, agent, shard)
                     else:
-                        ai_output = _run_claude_ai_review(job, agent, shard)
-                    agent_findings.extend(parse_ai_findings(ai_output, workspace=workspace, agent=agent))
+                        ai_result = _run_claude_ai_review(job, agent, shard)
+                    if not ai_result.ok:
+                        raise RuntimeError(ai_result.error or "AI reviewer failed")
+                    agent_findings.extend(parse_ai_findings(ai_result.text, workspace=workspace, agent=agent))
                 prefixed = _agent_finding_prefix(agent["id"], str(job["provider"]), agent_findings)
                 with lock:
                     findings.extend(prefixed)

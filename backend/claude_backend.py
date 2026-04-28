@@ -22,6 +22,7 @@ import re
 import subprocess
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -130,6 +131,8 @@ class PersistentClaudeProcess:
     worktree: Path
     process: asyncio.subprocess.Process | None = None
     reader_task: asyncio.Task | None = None
+    stderr_task: asyncio.Task | None = None
+    stderr_tail: deque = field(default_factory=lambda: deque(maxlen=50))
     loop_id: int | None = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     response_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
@@ -665,6 +668,10 @@ class ClaudeBackend:
         persistent.process = process
         persistent.loop_id = current_loop_id
         persistent.closing = False
+        persistent.stderr_tail.clear()
+        persistent.stderr_task = asyncio.create_task(
+            self._drain_stderr(process, persistent.stderr_tail)
+        )
 
         # Clear the response queue for fresh session
         while not persistent.response_queue.empty():
@@ -674,6 +681,28 @@ class ClaudeBackend:
                 break
 
         return process
+
+    async def _drain_stderr(self, process: asyncio.subprocess.Process, tail: deque) -> None:
+        """Continuously read stderr so the pipe never blocks the child process.
+
+        Keeps the most recent lines in `tail` for diagnostics; everything else is
+        dropped on the floor. Returns silently when the stream closes.
+        """
+        if process.stderr is None:
+            return
+        try:
+            while True:
+                line = await process.stderr.readline()
+                if not line:
+                    return
+                try:
+                    tail.append(line.decode("utf-8", errors="replace").rstrip())
+                except Exception:
+                    continue
+        except (asyncio.CancelledError, BrokenPipeError):
+            raise
+        except Exception:
+            logger.debug("Claude stderr drain exited", exc_info=True)
 
     async def _terminate_process(self, persistent: PersistentClaudeProcess) -> None:
         """Terminate a Claude subprocess and clean up."""
@@ -689,6 +718,14 @@ class ClaudeBackend:
             except asyncio.CancelledError:
                 pass
             persistent.reader_task = None
+
+        if persistent.stderr_task is not None:
+            persistent.stderr_task.cancel()
+            try:
+                await persistent.stderr_task
+            except asyncio.CancelledError:
+                pass
+            persistent.stderr_task = None
 
         if process is None:
             return
@@ -810,11 +847,16 @@ class ClaudeBackend:
                             stderr_parts.append(line)
 
                 except asyncio.TimeoutError:
+                    stderr_tail = "\n".join(persistent.stderr_tail)
+                    timeout_message = "Claude turn timed out after 10 minutes"
+                    if stderr_tail:
+                        timeout_message = f"{timeout_message}\n{stderr_tail}"
+                    await self._terminate_process(persistent)
                     return CommandResult(
                         args=cmd_display,
                         returncode=1,
                         stdout="\n".join(stdout_lines),
-                        stderr="Claude turn timed out after 10 minutes",
+                        stderr=timeout_message,
                         used_resume=used_resume,
                     )
 

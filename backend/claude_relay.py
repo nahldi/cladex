@@ -308,17 +308,36 @@ def cmd_register(args: argparse.Namespace) -> int:
     if not allow_cladex_workspace:
         _require_workspace_allowed(workspace)
 
+    allowed_channel_ids = _parse_csv_ids(args.allowed_channel_id or "")
+    allowed_user_ids = _parse_csv_ids(args.allowed_user_ids or args.operator_ids or "")
+    allow_dms = bool(args.allow_dms)
+    if not allowed_channel_ids and not allowed_user_ids:
+        print(
+            "[ERR] Refusing to register a Claude relay with empty allowlists. "
+            "Provide at least one --allowed-channel-id or --allowed-user-ids/--operator-ids "
+            "so the bot only responds to authorized senders.",
+            file=sys.stderr,
+        )
+        return 2
+    if allow_dms and not allowed_user_ids:
+        print(
+            "[ERR] --allow-dms requires --allowed-user-ids or --operator-ids so direct messages "
+            "are scoped to a known operator. Add an allowlist or drop --allow-dms.",
+            file=sys.stderr,
+        )
+        return 2
+
     env = {
         "DISCORD_BOT_TOKEN": args.discord_bot_token,
         "RELAY_BOT_NAME": args.bot_name or "",
         "CLAUDE_WORKDIR": str(workspace),
         "CLAUDE_CONFIG_DIR": args.claude_config_dir or "",
         "OPERATOR_IDS": _parse_csv_ids(args.operator_ids or ""),
-        "ALLOWED_USER_IDS": _parse_csv_ids(args.allowed_user_ids or args.operator_ids or ""),
+        "ALLOWED_USER_IDS": allowed_user_ids,
         "ALLOWED_BOT_IDS": _parse_csv_ids(getattr(args, "allowed_bot_ids", "") or ""),
-        "ALLOW_DMS": "true" if args.allow_dms else "false",
+        "ALLOW_DMS": "true" if allow_dms else "false",
         "BOT_TRIGGER_MODE": args.trigger_mode or "mention_or_dm",
-        "ALLOWED_CHANNEL_IDS": _parse_csv_ids(args.allowed_channel_id or ""),
+        "ALLOWED_CHANNEL_IDS": allowed_channel_ids,
         "CHANNEL_HISTORY_LIMIT": str(args.channel_history_limit or 20),
         "CLAUDE_MODEL": (args.model or "").strip(),
         "CLAUDE_PERMISSION_MODE": "default",
@@ -498,7 +517,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     run_env["STATE_NAMESPACE"] = profile.get("state_namespace", "")
 
     # Run the Python bot
-    bot_module = Path(__file__).parent / "bot.py"
+    bot_module = Path(__file__).parent / "claude_bot.py"
 
     try:
         with open(log_file, "a") as log:

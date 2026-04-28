@@ -153,10 +153,46 @@ function requestBase(req) {
   return `${proto}://${host}`;
 }
 
+function socketRemoteAddress(req) {
+  const raw = String(
+    (req.socket && req.socket.remoteAddress) ||
+    (req.connection && req.connection.remoteAddress) ||
+    ''
+  ).trim();
+  if (!raw) {
+    return '';
+  }
+  if (raw.toLowerCase().startsWith('::ffff:')) {
+    return raw.slice(7);
+  }
+  if (raw.startsWith('[') && raw.endsWith(']')) {
+    return raw.slice(1, -1);
+  }
+  return raw;
+}
+
+function hasForwardedHeaders(req) {
+  return Boolean(
+    String(req.headers['x-forwarded-for'] || '').trim() ||
+    String(req.headers['x-forwarded-host'] || '').trim() ||
+    String(req.headers['x-forwarded-proto'] || '').trim() ||
+    String(req.headers['forwarded'] || '').trim()
+  );
+}
+
 function isLoopbackRequest(req) {
-  const host = requestHost(req);
+  const remoteAddr = socketRemoteAddress(req);
+  if (!remoteAddr || !isLoopbackHost(remoteAddr)) {
+    return false;
+  }
+  if (hasForwardedHeaders(req)) {
+    return false;
+  }
   const origin = String(req.headers.origin || '').trim();
-  return (!host || isLoopbackHost(host)) && (!origin || isLoopbackOrigin(origin));
+  if (origin && !isLoopbackOrigin(origin)) {
+    return false;
+  }
+  return true;
 }
 
 function requiresRemoteAccessToken(req) {
@@ -217,7 +253,60 @@ function resolvePythonwLaunchers() {
   return launchers;
 }
 
+function managedRuntimePythonPath() {
+  const localAppData = process.env.LOCALAPPDATA || '';
+  if (!localAppData) {
+    return '';
+  }
+  if (process.platform === 'win32') {
+    return path.join(localAppData, 'discord-codex-relay', 'runtime', 'Scripts', 'python.exe');
+  }
+  return path.join(localAppData, 'discord-codex-relay', 'runtime', 'bin', 'python');
+}
+
+let backendBootstrapPromise = null;
+
+function bootstrapBackendRuntime() {
+  if (backendBootstrapPromise) {
+    return backendBootstrapPromise;
+  }
+  backendBootstrapPromise = (async () => {
+    const managed = managedRuntimePythonPath();
+    if (managed && fsSync.existsSync(managed)) {
+      return managed;
+    }
+    if (process.env.CLADEX_SKIP_BACKEND_BOOTSTRAP === '1') {
+      return '';
+    }
+    const candidates = process.platform === 'win32'
+      ? ['py', 'python', 'python3']
+      : ['python3', 'python'];
+    let lastError = '';
+    for (const launcher of candidates) {
+      try {
+        await execFileAsync(
+          launcher,
+          ['-c', 'import sys; sys.path.insert(0, "."); from install_plugin import _ensure_runtime; _ensure_runtime()'],
+          { cwd: BACKEND_DIR, windowsHide: true, timeout: 240000 }
+        );
+        return managed;
+      } catch (err) {
+        if (err && err.code === 'ENOENT') {
+          continue;
+        }
+        lastError = err && (err.stderr || err.message) ? String(err.stderr || err.message) : String(err);
+      }
+    }
+    if (lastError) {
+      console.warn(`CLADEX backend runtime bootstrap failed: ${lastError}`);
+    }
+    return '';
+  })();
+  return backendBootstrapPromise;
+}
+
 async function runPython(args, cwd = BACKEND_DIR) {
+  await bootstrapBackendRuntime();
   if (process.platform === 'win32') {
     const pythonwLaunchers = resolvePythonwLaunchers();
     for (const launcher of pythonwLaunchers) {
@@ -396,7 +485,7 @@ app.get('/api/runtime-info', async (req, res) => {
     backendDir: BACKEND_DIR,
     frontendDir: FRONTEND_DIR,
     packaged: process.env.NODE_ENV === 'production' || !!process.resourcesPath,
-    appVersion: process.env.npm_package_version || '2.2.1',
+    appVersion: process.env.npm_package_version || '2.2.2',
     remoteAccessProtected: true,
   };
   if (isLoopbackRequest(req)) {
