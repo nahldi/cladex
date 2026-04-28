@@ -84,12 +84,12 @@ def _load_cladex_projects() -> dict[str, Any]:
 
 def _save_cladex_projects(payload: dict[str, Any]) -> None:
     CLADEX_CONFIG_ROOT.mkdir(parents=True, exist_ok=True)
-    CLADEX_PROJECTS_PATH.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    relayctl.atomic_write_text(CLADEX_PROJECTS_PATH, json.dumps(payload, indent=2) + "\n")
 
 
 def _save_claude_registry(registry: dict[str, Any]) -> None:
     CLAUDE_CONFIG_ROOT.mkdir(parents=True, exist_ok=True)
-    CLAUDE_REGISTRY_PATH.write_text(json.dumps(registry, indent=2) + "\n", encoding="utf-8")
+    relayctl.atomic_write_text(CLAUDE_REGISTRY_PATH, json.dumps(registry, indent=2) + "\n")
 
 
 def _load_claude_env(profile: dict[str, Any]) -> dict[str, str]:

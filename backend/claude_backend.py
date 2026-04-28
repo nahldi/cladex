@@ -1053,14 +1053,27 @@ class ClaudeBackend:
         return session
 
     def _git_status(self, cwd: Path) -> list[str]:
+        # Bounded so a wedged git or a network-mounted repo cannot hang the
+        # Claude turn forever. `--untracked-files=no` keeps the call cheap on
+        # large repos with many untracked artifacts. Override the timeout via
+        # `CLADEX_CLAUDE_GIT_STATUS_TIMEOUT` if a real repo legitimately
+        # needs longer.
+        try:
+            timeout = max(int(os.environ.get("CLADEX_CLAUDE_GIT_STATUS_TIMEOUT") or 30), 5)
+        except (TypeError, ValueError):
+            timeout = 30
         try:
             result = subprocess.run(
-                ["git", "-C", str(cwd), "status", "--short"],
+                ["git", "-C", str(cwd), "status", "--short", "--untracked-files=no"],
                 capture_output=True,
                 text=True,
                 check=False,
+                timeout=timeout,
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
             )
+        except subprocess.TimeoutExpired:
+            logger.warning("Claude turn git status timed out after %ss; treating as no diff.", timeout)
+            return []
         except Exception:
             return []
         if result.returncode != 0:

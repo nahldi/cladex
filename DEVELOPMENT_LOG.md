@@ -2,6 +2,21 @@
 
 This file is tracked on purpose. It gives future Claude/Codex agents a concise source of truth for what has been done, what is in progress, and what still needs care. Runtime-only memory files under `memory/` are useful locally, but GitHub users and new agents need this public handoff too.
 
+## 2.3.3 Polish Tranche (2026-04-28)
+
+Three small residual items the prior verification rounds surfaced but didn't fix. All small, all bounded, no behavior change for the happy path.
+
+- **F0089 atomic projects.json**: `_save_cladex_projects` and `_save_claude_registry` now write through `relayctl.atomic_write_text` (write-temp-then-rename) instead of plain `Path.write_text`. A crash mid-write can no longer leave a half-truncated registry/workgroups file.
+- **F0058 Claude git status timeout**: `ClaudeBackend._git_status` was unbounded — a wedged git process or a slow network-mounted repo could hang the entire Claude turn. Now passes `timeout=` (default 30s, override `CLADEX_CLAUDE_GIT_STATUS_TIMEOUT`), uses `--untracked-files=no` to keep the call cheap on big repos, and treats `TimeoutExpired` as "no diff" with a warning log.
+- **F0084 dashboard polling overlap**: the 5s `loadAll(silent=true)` interval could stack up if a refresh took longer than 5s (slow backend bootstrap, slow `Promise.all`). Added a `loadAllInFlight` ref guard so concurrent silent refreshes are dropped instead of queued.
+
+### Validation
+
+- `cmd /c npm ci`, `cmd /c npm audit` (0 vulnerabilities), `cmd /c npm run lint`, `cmd /c npm run build`, `cmd /c npm run api:smoke` (server contract smoke passed).
+- Backend full suite still `261 passed, 1 skipped, 1 warning`.
+- `python backend/relayctl.py privacy-audit --tracked-only .` -> no findings.
+- `python backend/cladex.py doctor --json` -> ok=True.
+
 ## 2.3.2 Production Closeout (2026-04-28)
 
 Audit after the 2.3.1 self-review fixes found the codebase healthy but the profile-create surface still lagged behind backend behavior.

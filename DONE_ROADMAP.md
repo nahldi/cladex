@@ -2,6 +2,14 @@
 
 Items that started life on `ROADMAP.md` and have shipped. Newest tranches first. The active work-in-progress list lives in [ROADMAP.md](ROADMAP.md); release-by-release narrative lives in [DEVELOPMENT_LOG.md](DEVELOPMENT_LOG.md).
 
+## Completed For 2.3.3
+
+Three small residuals from the verification reviews that earlier tranches didn't reach.
+
+- F0089: `_save_cladex_projects` and `_save_claude_registry` now use atomic write-temp-then-rename via `relayctl.atomic_write_text` so a crash mid-write cannot leave a half-truncated registry/workgroups file.
+- F0058: `ClaudeBackend._git_status` is bounded by a 30s timeout (override `CLADEX_CLAUDE_GIT_STATUS_TIMEOUT`) and uses `--untracked-files=no` so a wedged git or large untracked tree no longer hangs a Claude turn.
+- F0084: dashboard `loadAll` polling guards against concurrent silent refreshes via a `loadAllInFlight` ref so a slow backend cannot queue a backlog of polls.
+
 ## Completed For 2.3.2
 
 Final production closeout after the 2.3.1 verification sweep.

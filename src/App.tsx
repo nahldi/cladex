@@ -540,6 +540,7 @@ export default function App() {
   const [remoteAuthRequired, setRemoteAuthRequired] = useState(false);
   const [remoteAccessTokenDraft, setRemoteAccessTokenDraft] = useState(() => getStoredAccessToken());
   const bootFailureCount = useRef(0);
+  const loadAllInFlight = useRef(false);
   const isDark = true;
 
   useEffect(() => {
@@ -547,6 +548,12 @@ export default function App() {
   }, [isDark]);
 
   const loadAll = useCallback(async (silent = false) => {
+    // Skip overlapping silent refreshes so a slow Promise.all (e.g. backend
+    // bootstrap on first run) doesn't queue up a backlog of polls.
+    if (silent && loadAllInFlight.current) {
+      return;
+    }
+    loadAllInFlight.current = true;
     let keepLoading = false;
     if (!silent) {
       setLoading(true);
@@ -591,6 +598,7 @@ export default function App() {
         setErrorText(message);
       }
     } finally {
+      loadAllInFlight.current = false;
       if (!silent) {
         setLoading(keepLoading ? true : false);
       }
