@@ -67,6 +67,10 @@ def test_claude_subprocess_env_filters_relay_and_codex_secrets(tmp_path: Path, m
     monkeypatch.setenv("CLADEX_REMOTE_ACCESS_TOKEN", "remote-secret")
     monkeypatch.setenv("OPENAI_API_KEY", "openai-secret")
     monkeypatch.setenv("CODEX_HOME", "codex-home")
+    # ANTHROPIC_API_KEY must NOT pass through to a Discord/workspace-driven
+    # Claude subprocess. The CLI uses local credentials in CLAUDE_CONFIG_DIR;
+    # forwarding an API key here is a credential-exfiltration path because
+    # the spawned model can read its own process env via Bash.
     monkeypatch.setenv("ANTHROPIC_API_KEY", "anthropic-secret")
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-config"))
     monkeypatch.setenv("PATH", os.environ.get("PATH", ""))
@@ -75,8 +79,8 @@ def test_claude_subprocess_env_filters_relay_and_codex_secrets(tmp_path: Path, m
 
     assert env["CLADEX_ACTIVE_WORKTREE"] == str(tmp_path)
     assert env["CLAUDE_CODE_ENTRYPOINT"] == "cladex-relay"
-    assert env["ANTHROPIC_API_KEY"] == "anthropic-secret"
     assert env["CLAUDE_CONFIG_DIR"] == str(tmp_path / "claude-config")
+    assert "ANTHROPIC_API_KEY" not in env
     assert "DISCORD_BOT_TOKEN" not in env
     assert "CLADEX_REMOTE_ACCESS_TOKEN" not in env
     assert "OPENAI_API_KEY" not in env

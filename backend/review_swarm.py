@@ -186,6 +186,17 @@ LOCAL_SECRET_DIR_NAMES = frozenset({
     ".terraform.d",
     ".chef",
     ".vault-token",
+    # AI/agent-tool local config dirs. These carry pre-approved tool
+    # permissions, prior-session transcripts, MCP server tokens, and other
+    # operator-trust state. Treat them as local secrets so they never enter
+    # source snapshots, scratch lane workspaces, or restore targets.
+    ".claude",
+    ".codex",
+    ".cursor",
+    ".aider",
+    ".continue",
+    ".windsurf",
+    ".copilot",
 })
 REVIEW_EXTENSIONS = {
     ".bat",
@@ -3059,14 +3070,21 @@ def _run_review_job_locked(job_id: str) -> dict[str, Any]:
         # Synthesizer pass: cross-cutting reviewer that reads every lane's
         # findings + the source and emits issues that require multiple
         # lanes' evidence to see. Best-effort — never blocks finalization.
-        # Skip if everything was cancelled, every lane failed, or no lane
-        # produced any findings to correlate.
-        if (
-            findings
-            and not _cancel_requested(job_id)
-            and not job.get("preflightOnly")
-            and any(str(item.get("status")) == "done" for item in job["agents"])
-        ):
+        # Skip if everything was cancelled, every lane failed, the provider
+        # account already hit a rate limit (lane workers stop on that signal,
+        # so the synthesizer must too), or no lane produced findings.
+        synth_skip_reason = ""
+        if not findings:
+            synth_skip_reason = "no findings to synthesize"
+        elif _cancel_requested(job_id):
+            synth_skip_reason = "review cancelled"
+        elif job.get("preflightOnly"):
+            synth_skip_reason = "preflight-only run"
+        elif not any(str(item.get("status")) == "done" for item in job["agents"]):
+            synth_skip_reason = "no lane completed successfully"
+        elif provider_limit_reached.is_set() or job.get("providerLimit"):
+            synth_skip_reason = "provider rate limit reached"
+        if not synth_skip_reason:
             try:
                 with lock:
                     job["synthesizerStatus"] = "running"
@@ -3075,7 +3093,7 @@ def _run_review_job_locked(job_id: str) -> dict[str, Any]:
                     job,
                     findings,
                     scratch=scratch,
-                    cancel_check=lambda: _cancel_requested(job_id),
+                    cancel_check=lambda: _cancel_requested(job_id) or provider_limit_reached.is_set(),
                 )
                 with lock:
                     if synth_findings:
@@ -3092,6 +3110,12 @@ def _run_review_job_locked(job_id: str) -> dict[str, Any]:
                         job["warnings"].append(detail)
                     save_job(job)
             findings = _persist_findings(job_id, findings)
+        else:
+            with lock:
+                job["synthesizerStatus"] = "skipped"
+                job["synthesizerFindings"] = 0
+                job["synthesizerSkipReason"] = synth_skip_reason
+                save_job(job)
 
         statuses = [str(item.get("status")) for item in job["agents"]]
         cancelled = sum(1 for status in statuses if status == "cancelled")

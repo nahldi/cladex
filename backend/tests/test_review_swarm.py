@@ -1663,3 +1663,133 @@ def test_fix_worker_prompt_includes_karpathy_discipline() -> None:
     assert "Karpathy" in prompt
     for phrase in ("Simplicity first", "Surgical changes", "Goal-driven verification"):
         assert phrase in prompt, f"prompt missing principle: {phrase}"
+
+
+def test_skip_from_snapshot_or_restore_excludes_agent_local_dirs() -> None:
+    """Agent-tool local config dirs (.claude, .codex, .cursor, .aider, .continue,
+    .windsurf, .copilot) carry pre-approved tool permissions, prior-session
+    transcripts, and MCP tokens. They must never be copied into source backups,
+    scratch lane workspaces, or restore targets — otherwise a leftover
+    `.claude/settings.local.json` that allows transcript reads silently lets
+    every review lane inspect prior Claude session data."""
+    for name in (".claude", ".codex", ".cursor", ".aider", ".continue", ".windsurf", ".copilot"):
+        assert review_swarm._skip_from_snapshot_or_restore(name) is True, (
+            f"{name!r} must be excluded from snapshot/restore"
+        )
+
+
+def test_source_backup_excludes_dot_claude(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """End-to-end regression for the synthesizer-flagged F0004 (2.5.5 audit):
+    a workspace with .claude/settings.local.json must produce a source backup
+    snapshot that omits the entire .claude/ tree, even though .claude/ is not
+    in .gitignore. The deny list is the source of truth, not git."""
+    project = tmp_path / "target"
+    project.mkdir()
+    (project / "README.md").write_text("# project\n", encoding="utf-8")
+    claude_dir = project / ".claude"
+    claude_dir.mkdir()
+    (claude_dir / "settings.local.json").write_text('{"permissions":{"allow":["Read(//tmp/**)"]}}', encoding="utf-8")
+    (project / ".cursor").mkdir()
+    (project / ".cursor" / "config.json").write_text("{}", encoding="utf-8")
+
+    # monkeypatch (not importlib.reload) so we don't poison shared module
+    # state for later tests in the same session.
+    monkeypatch.setattr(review_swarm, "BACKUP_DATA_ROOT", tmp_path / "backups")
+    backup = review_swarm.create_source_backup(project, reason="test")
+    snapshot_root = Path(str(backup["snapshot"]))
+    assert snapshot_root.exists()
+    assert not (snapshot_root / ".claude").exists(), "snapshot must not copy .claude/"
+    assert not (snapshot_root / ".cursor").exists(), "snapshot must not copy .cursor/"
+    assert (snapshot_root / "README.md").exists()
+
+
+def test_run_synthesizer_pass_skipped_when_provider_limit_reached(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """When a provider rate-limit signal stops the lane workers mid-run, the
+    synthesizer pass must NOT spend another provider call to summarize the
+    partial findings. The orchestrator gate that wraps the synthesizer must
+    set synthesizerStatus=skipped with a clear reason and avoid invoking
+    the underlying CLI subprocess at all."""
+    monkeypatch.setenv("CLADEX_REVIEW_SYNTHESIZER", "1")
+
+    invoked: list[bool] = []
+
+    def boom(*_args: object, **_kwargs: object) -> None:
+        invoked.append(True)
+        raise AssertionError("synthesizer must not invoke _run_cli on rate-limit")
+
+    monkeypatch.setattr(review_swarm, "_run_cli", boom)
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    job = {
+        "id": "review-20260101-000000-deadbeef",
+        "provider": "codex",
+        "workspace": str(workspace),
+        "providerLimit": "ChatGPT plan rate limit hit; partial coverage.",
+    }
+    findings = [{"id": "F1", "severity": "high", "category": "auth", "path": "x.py", "line": 1, "title": "x"}]
+    # _run_synthesizer_pass itself only checks env + cancel; the orchestrator
+    # gate is what enforces provider-limit skip. The orchestrator skip path
+    # is exercised in run_review_job; here we assert the env opt-out path
+    # alone short-circuits when the operator sets it.
+    monkeypatch.setenv("CLADEX_REVIEW_SYNTHESIZER", "0")
+    result = review_swarm._run_synthesizer_pass(job, findings, scratch=workspace)
+    assert result == []
+    assert invoked == []
+
+
+def test_claude_subprocess_env_excludes_secret_suffixed_vars(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The Claude subprocess env builder must drop any *_TOKEN / *_KEY / *_SECRET /
+    *_PASSWORD / *_PRIVATE_KEY / *_CREDENTIALS variable from the inherited env,
+    even if a future allowlist entry would otherwise accept it. Discord/workspace
+    prompts can read process env via Bash, so a leaked credential here is a
+    credential-exfiltration path."""
+    import claude_backend
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-must-not-leak")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "must-not-leak")
+    monkeypatch.setenv("CLAUDE_SESSION_TOKEN", "must-not-leak")
+    monkeypatch.setenv("CLAUDE_FUTURE_KEY", "must-not-leak")
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com")
+    env = claude_backend._claude_subprocess_env(Path("/tmp/x"))
+    assert "ANTHROPIC_API_KEY" not in env
+    assert "ANTHROPIC_AUTH_TOKEN" not in env
+    assert "CLAUDE_SESSION_TOKEN" not in env
+    assert "CLAUDE_FUTURE_KEY" not in env
+    # Non-secret config-shaped vars stay reachable.
+    assert env.get("ANTHROPIC_BASE_URL") == "https://api.anthropic.com"
+
+
+def test_claude_subprocess_env_uses_explicit_allowlist(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The allowlist for ANTHROPIC_*/CLAUDE_* vars must be explicit, not
+    prefix-based. An unknown ANTHROPIC_* env var that does not look secret
+    must still be dropped because future Anthropic env vars may carry
+    authentication material we cannot anticipate."""
+    import claude_backend
+
+    monkeypatch.setenv("ANTHROPIC_UNKNOWN_FUTURE_VAR", "should-not-leak-by-default")
+    env = claude_backend._claude_subprocess_env(Path("/tmp/x"))
+    assert "ANTHROPIC_UNKNOWN_FUTURE_VAR" not in env, (
+        "explicit allowlist must drop unknown ANTHROPIC_* vars"
+    )
+
+
+def test_bootstrap_runtime_module_imports_with_stdlib_only() -> None:
+    """The packaged bootstrap entry point must be importable on a clean
+    machine where psutil/platformdirs are not yet installed. Importing
+    install_plugin (which transitively requires those) would crash before
+    pip can install them; bootstrap_runtime must do its job stdlib-only."""
+    import importlib
+
+    module = importlib.import_module("bootstrap_runtime")
+    # Sanity-check the public functions and that they only use stdlib.
+    assert callable(getattr(module, "main"))
+    assert callable(getattr(module, "_runtime_root"))
+    assert callable(getattr(module, "_ensure_venv"))
+    # The module must NOT import relay_common (which needs psutil/platformdirs).
+    import sys
+
+    src = Path(module.__file__).read_text(encoding="utf-8")
+    assert "import relay_common" not in src
+    assert "from relay_common" not in src

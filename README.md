@@ -73,8 +73,8 @@ cmd /c npm run electron:build  # Creates installer in release/
 ```
 
 Packaged launchers produced by the build:
-- `release\CLADEX Setup 2.5.5.exe`
-- `release\CLADEX 2.5.5.exe`
+- `release\CLADEX Setup 2.5.6.exe`
+- `release\CLADEX 2.5.6.exe`
 - `release\win-unpacked\CLADEX.exe`
 
 Portable/installer first run:
@@ -206,6 +206,9 @@ codex-discord stop
 - Review Swarm artifacts, coordination notes, scratch workspaces, fix-run reports, and source snapshots are stored under the local CLADEX data directory. Review workers do not apply fixes and do not create working folders inside the selected project by default. **Fix Review** is a separate explicit action that creates a backup before any fix worker edits the selected project. Write-capable CLADEX self-fix requires the completed self-review job plus a separate self-fix approval.
 - The Review Swarm page is for the selected project. The session-only override that allows targeting the CLADEX app repo itself lives in Runtime settings and should stay off for normal project reviews.
 - Set `CLADEX_REVIEW_MAX_PARALLEL` if a machine/account pool can safely run more reviewer CLI processes than the default. The UI shows the effective parallel limit and queues requested lanes behind it.
+- Reviewer subprocesses use generous defaults: 30-min idle timeout (`CLADEX_REVIEW_AGENT_IDLE_TIMEOUT`), 1-hour initial-idle grace (`CLADEX_REVIEW_AGENT_INITIAL_IDLE_TIMEOUT`), and a 6-hour absolute wall-clock ceiling (`CLADEX_REVIEW_AGENT_MAX_RUNTIME`). Set `CLADEX_REVIEW_AGENT_MAX_RUNTIME=0` to disable the absolute ceiling for very deep audits; cancel and idle remain the only kill paths in that mode.
+- Each AI lane retries once on transient failure (`CLADEX_REVIEW_AGENT_MAX_RETRIES`, default `1`; set to `0` to disable). Operator cancel and provider rate-limit errors short-circuit retries.
+- A best-effort cross-cutting synthesizer pass runs after the lanes and emits findings that need multiple lanes' evidence (contradictions, half-fixes, doc/code drift). Set `CLADEX_REVIEW_SYNTHESIZER=0` to disable it on tightly rate-limited accounts.
 
 ## License
 

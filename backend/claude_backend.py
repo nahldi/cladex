@@ -152,7 +152,26 @@ def _claude_subprocess_env(worktree: Path) -> dict[str, str]:
         "XDG_CONFIG_HOME",
         "XDG_DATA_HOME",
     }
-    allowed_prefixes = ("ANTHROPIC_", "CLAUDE_")
+    # Explicit allowlist of known-non-secret Anthropic/Claude config vars.
+    # Prefix-based allowlists (ANTHROPIC_*, CLAUDE_*) historically swept in
+    # future-named secrets like ANTHROPIC_API_KEY or CLAUDE_*_TOKEN. Discord/
+    # workspace prompts can read process env via Bash, so a leaked credential
+    # here is a credential-exfiltration path. Keep the list narrow and add
+    # deny-by-suffix as a second layer for any future env var that falls
+    # through.
+    allowed_anthropic_config = {
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_DEFAULT_MODEL",
+        "ANTHROPIC_LOG",
+        "ANTHROPIC_MODEL",
+        "ANTHROPIC_SMALL_FAST_MODEL",
+        "ANTHROPIC_TIMEOUT_MS",
+        "CLAUDE_CODE_ENABLE_TELEMETRY",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+        "CLAUDE_CONFIG_DIR",
+        "CLAUDE_DEBUG",
+    }
     blocked_names = {
         "CLAUDE_CODE_ENTRYPOINT",
         "CLADEX_ACTIVE_WORKTREE",
@@ -164,12 +183,17 @@ def _claude_subprocess_env(worktree: Path) -> dict[str, str]:
         "NPM_TOKEN",
         "OPENAI_API_KEY",
     }
+    secret_suffixes = ("_TOKEN", "_KEY", "_SECRET", "_PASSWORD", "_PRIVATE_KEY", "_CREDENTIALS")
     env: dict[str, str] = {}
     for key, value in os.environ.items():
         upper = key.upper()
         if upper in blocked_names:
             continue
-        if upper in allowed_names or any(upper.startswith(prefix) for prefix in allowed_prefixes):
+        if any(upper.endswith(suffix) for suffix in secret_suffixes):
+            # Any *_TOKEN/_KEY/_SECRET/_PASSWORD/_PRIVATE_KEY/_CREDENTIALS env
+            # var is denied even if a future allowlist entry would accept it.
+            continue
+        if upper in allowed_names or upper in allowed_anthropic_config:
             env[key] = value
     env["CLADEX_ACTIVE_WORKTREE"] = str(worktree)
     env["CLAUDE_CODE_ENTRYPOINT"] = "cladex-relay"

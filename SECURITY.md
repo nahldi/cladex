@@ -69,6 +69,8 @@ A packaged user still needs those installed and authenticated locally before sta
 
 CLADEX relays can read and act within the configured workspace through the installed model CLIs. Only point a relay at a workspace and machine you trust for that model to access.
 
+The Codex relay copies the user's `auth.json` and `cap_sid` from `~/.codex` into a managed relay `CODEX_HOME` and writes a `config.toml` that marks the workspace as trusted (and on Windows, sets `sandbox = "elevated"`). This is intentional so the relayed Codex CLI can authenticate and act on the workspace without prompting for approval per command; treat the managed relay home as the same trust boundary as `~/.codex`. Discord-driven Codex prompts inside the relay can read their own `CODEX_HOME`, so do not point the relay at workspaces or accounts you would not trust the operator to use through the same Codex CLI directly.
+
 ## Project Review swarm
 
 - Review jobs read project source and write artifacts only under the local CLADEX data directory.

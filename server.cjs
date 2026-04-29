@@ -459,9 +459,9 @@ function packageVersion() {
   }
   try {
     const payload = JSON.parse(fsSync.readFileSync(path.join(__dirname, 'package.json'), 'utf8'));
-    return String(payload.version || '').trim() || '2.5.5';
+    return String(payload.version || '').trim() || '2.5.6';
   } catch {
-    return '2.5.5';
+    return '2.5.6';
   }
 }
 
@@ -565,7 +565,7 @@ function bootstrapBackendRuntime() {
       try {
         await execFileAsync(
           launcher,
-          ['-c', 'import sys; sys.path.insert(0, "."); from install_plugin import _ensure_runtime; _ensure_runtime()'],
+          ['bootstrap_runtime.py'],
           { cwd: BACKEND_DIR, windowsHide: true, timeout: backendBootstrapTimeoutMs() }
         );
         writeBackendRuntimeManifest();
