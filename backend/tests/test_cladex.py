@@ -77,11 +77,13 @@ def test_get_all_profiles_uses_codex_runtime_state(monkeypatch) -> None:
     assert profiles[0]["_provider"] == "codex-app-server"
 
 
-def test_start_codex_profile_delegates_to_relayctl(monkeypatch) -> None:
+def test_start_codex_profile_delegates_to_relayctl(tmp_path: Path, monkeypatch) -> None:
     calls: list[dict] = []
     monkeypatch.setattr(cladex.relayctl, "_run_profile", lambda profile: calls.append(profile) or 0)
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
 
-    profile = {"name": "codex-one", "_relay_type": "codex", "workspace": "C:/repo"}
+    profile = {"name": "codex-one", "_relay_type": "codex", "workspace": str(workspace)}
     cladex.start_profile(profile)
 
     assert calls == [profile]

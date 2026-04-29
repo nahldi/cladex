@@ -1013,7 +1013,7 @@ def test_install_source_uses_direct_url_for_installed_local_source(tmp_path: Pat
     )
     install_plugin.importlib.metadata.distribution = lambda _name: type("FakeDist", (), {"_path": dist_info})()
     try:
-        assert install_plugin._install_source() == "C:\\Users\\exampleuser\\projects\\discord-codex-relay"
+        assert install_plugin._install_source().replace("\\", "/") == "C:/Users/exampleuser/projects/discord-codex-relay"
     finally:
         install_plugin.REPO_ROOT = original_repo_root
         install_plugin.importlib.metadata.distribution = original_distribution

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import subprocess
 import json
+import shutil
 import threading
 from pathlib import Path
 
@@ -63,6 +64,22 @@ def test_worktree_manager_rebuilds_partial_existing_directory(tmp_path: Path) ->
     assert branch.startswith("relay/")
     assert (worktree_path / ".git").exists()
     assert not (worktree_path / "BROKEN.txt").exists()
+
+
+def test_worktree_manager_prunes_stale_existing_branch(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    state = tmp_path / "state"
+    _init_git_repo(repo)
+    manager = WorktreeManager(state / "worktrees")
+
+    first_path, first_branch = manager.ensure(repo, project_id="project-one", channel_id="channel-one")
+    shutil.rmtree(first_path)
+
+    second_path, second_branch = manager.ensure(repo, project_id="project-one", channel_id="channel-one")
+
+    assert second_path == first_path
+    assert second_branch == first_branch
+    assert (second_path / ".git").exists()
 
 
 def test_runtime_persists_primary_thread_mapping(tmp_path: Path) -> None:

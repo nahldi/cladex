@@ -1348,6 +1348,13 @@ class WorktreeManager:
             if worktree_path.exists():
                 return worktree_path, _repo_branch(worktree_path)
             try:
+                subprocess.run(
+                    ["git", "-C", str(repo_root), "worktree", "prune"],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+                )
                 branch_exists = subprocess.run(
                     ["git", "-C", str(repo_root), "branch", "--list", branch_name],
                     check=True,

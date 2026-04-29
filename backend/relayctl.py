@@ -460,18 +460,25 @@ def _can_use_external_windows_update(update_target: str) -> bool:
     return _runtime_venv_root() == runtime_root
 
 
+def _resolve_path_best_effort(path: Path) -> Path:
+    try:
+        return path.expanduser().resolve()
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return Path(os.path.abspath(os.path.expanduser(str(path))))
+
+
 def _launch_external_windows_update_background(
     update_target: str,
     *,
     restarted_profiles: list[dict],
 ) -> None:
-    base_python = Path(_background_python_windowless_executable()).resolve()
+    base_python = _resolve_path_best_effort(Path(_background_python_windowless_executable()))
     if not base_python.exists():
         raise SystemExit(
             "Windows self-update requires a working Python interpreter, but it was not found at "
             f"{base_python}."
         )
-    source_root = Path(update_target).expanduser().resolve()
+    source_root = _resolve_path_best_effort(Path(update_target))
     if not _is_relay_source_tree(source_root):
         raise SystemExit(f"Local update source is not a relay source tree: {source_root}")
     helper_code = """
@@ -2285,10 +2292,8 @@ def _compact_live_path(value: str, *, limit: int = 68) -> str:
 
 def _last_path_token(text: str) -> str:
     token = text.strip().strip("'\"")
-    try:
-        return Path(token).name or token
-    except Exception:
-        return token
+    parts = [part for part in re.split(r"[\\/]+", token) if part]
+    return parts[-1] if parts else token
 
 
 def _describe_command(command: str) -> str:
@@ -2389,7 +2394,7 @@ def _summarize_app_log_text(text: str) -> list[str]:
         if "cannot find path" in lowered:
             match = re.search(r"Cannot find path '([^']+)'", line)
             if match:
-                missing = Path(match.group(1)).name
+                missing = _last_path_token(match.group(1))
                 if last_command_summary:
                     events.append(f"{last_command_summary}, but {missing} is missing")
                 else:
