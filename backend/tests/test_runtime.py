@@ -82,6 +82,22 @@ def test_worktree_manager_prunes_stale_existing_branch(tmp_path: Path) -> None:
     assert (second_path / ".git").exists()
 
 
+def test_worktree_manager_uses_fallback_branch_when_branch_checked_out_elsewhere(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    state = tmp_path / "state"
+    _init_git_repo(repo)
+
+    first_manager = WorktreeManager(state / "first-worktrees")
+    first_path, first_branch = first_manager.ensure(repo, project_id="project-one", channel_id="channel-one")
+    second_manager = WorktreeManager(state / "second-worktrees")
+
+    second_path, second_branch = second_manager.ensure(repo, project_id="project-one", channel_id="channel-one")
+
+    assert first_path != second_path
+    assert second_branch.startswith(f"{first_branch}-")
+    assert (second_path / ".git").exists()
+
+
 def test_runtime_persists_primary_thread_mapping(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     state = tmp_path / "state"

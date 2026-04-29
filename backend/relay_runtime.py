@@ -1336,6 +1336,7 @@ class WorktreeManager:
         worktree_root.mkdir(parents=True, exist_ok=True)
         worktree_path = worktree_root / slugify(channel_id)
         branch_name = f"relay/{slugify(project_id)}-{slugify(channel_id)}"
+        fallback_branch_name = f"{branch_name}-{hashlib.sha1(str(worktree_path).encode('utf-8')).hexdigest()[:8]}"
         with _serialize_path(worktree_path):
             if worktree_path.exists():
                 if not self._valid_git_worktree(worktree_path):
@@ -1355,29 +1356,46 @@ class WorktreeManager:
                     text=True,
                     creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
                 )
-                branch_exists = subprocess.run(
-                    ["git", "-C", str(repo_root), "branch", "--list", branch_name],
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
-                ).stdout.strip()
-                if branch_exists:
+                def _branch_exists(name: str) -> bool:
+                    return bool(
+                        subprocess.run(
+                            ["git", "-C", str(repo_root), "branch", "--list", name],
+                            check=True,
+                            capture_output=True,
+                            text=True,
+                            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+                        ).stdout.strip()
+                    )
+
+                def _add_existing_branch(name: str) -> None:
                     subprocess.run(
-                        ["git", "-C", str(repo_root), "worktree", "add", str(worktree_path), branch_name],
+                        ["git", "-C", str(repo_root), "worktree", "add", str(worktree_path), name],
                         check=True,
                         capture_output=True,
                         text=True,
                         creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
                     )
-                else:
+
+                def _add_new_branch(name: str) -> None:
                     subprocess.run(
-                        ["git", "-C", str(repo_root), "worktree", "add", "-b", branch_name, str(worktree_path), "HEAD"],
+                        ["git", "-C", str(repo_root), "worktree", "add", "-b", name, str(worktree_path), "HEAD"],
                         check=True,
                         capture_output=True,
                         text=True,
                         creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
-                )
+                    )
+
+                branch_exists = _branch_exists(branch_name)
+                if branch_exists:
+                    try:
+                        _add_existing_branch(branch_name)
+                    except subprocess.CalledProcessError:
+                        if _branch_exists(fallback_branch_name):
+                            _add_existing_branch(fallback_branch_name)
+                        else:
+                            _add_new_branch(fallback_branch_name)
+                else:
+                    _add_new_branch(branch_name)
                 return worktree_path, _repo_branch(worktree_path)
             except Exception:
                 if self._valid_git_worktree(worktree_path):

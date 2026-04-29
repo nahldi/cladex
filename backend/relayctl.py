@@ -55,6 +55,9 @@ else:
     import fcntl
 
 
+NATIVE_PATH_CLASS = type(Path.cwd())
+
+
 ENV_KEY_ORDER = [
     "DISCORD_BOT_TOKEN",
     "RELAY_BOT_NAME",
@@ -464,7 +467,7 @@ def _resolve_path_best_effort(path: Path) -> Path:
     try:
         return path.expanduser().resolve()
     except (OSError, RuntimeError, TypeError, ValueError):
-        return Path(os.path.abspath(os.path.expanduser(str(path))))
+        return NATIVE_PATH_CLASS(os.path.abspath(os.path.expanduser(str(path))))
 
 
 def _launch_external_windows_update_background(
@@ -472,13 +475,13 @@ def _launch_external_windows_update_background(
     *,
     restarted_profiles: list[dict],
 ) -> None:
-    base_python = _resolve_path_best_effort(Path(_background_python_windowless_executable()))
+    base_python = _resolve_path_best_effort(NATIVE_PATH_CLASS(_background_python_windowless_executable()))
     if not base_python.exists():
         raise SystemExit(
             "Windows self-update requires a working Python interpreter, but it was not found at "
             f"{base_python}."
         )
-    source_root = _resolve_path_best_effort(Path(update_target))
+    source_root = _resolve_path_best_effort(NATIVE_PATH_CLASS(update_target))
     if not _is_relay_source_tree(source_root):
         raise SystemExit(f"Local update source is not a relay source tree: {source_root}")
     helper_code = """
@@ -516,7 +519,7 @@ for profile in profiles:
         close_fds=True,
     )
 """
-    helper_path = Path(tempfile.gettempdir()) / f"codex-discord-update-{os.getpid()}.py"
+    helper_path = NATIVE_PATH_CLASS(tempfile.gettempdir()) / f"codex-discord-update-{os.getpid()}.py"
     atomic_write_text(helper_path, helper_code)
     command = [
         str(base_python),
