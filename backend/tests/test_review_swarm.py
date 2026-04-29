@@ -117,6 +117,24 @@ def test_scan_file_todo_marker_requires_word_boundary_and_comment_context(tmp_pa
     assert all("TODO" in item["detail"] or "FIXME" in item["detail"] or "HACK" in item["detail"] for item in maintenance)
 
 
+def test_scan_file_secret_detection_ignores_type_annotations(tmp_path: Path) -> None:
+    project = tmp_path / "target"
+    project.mkdir()
+    sample = project / "lib.py"
+    sample.write_text(
+        "def token_fingerprint(token: str) -> str:\n"
+        "    return token[:2]\n"
+        "token = os.environ.get('DISCORD_BOT_TOKEN', '')\n"
+        "auth_token = 'live-looking-secret-1234567890'\n",
+        encoding="utf-8",
+    )
+
+    findings = review_swarm.scan_file(sample, project)
+    secret_lines = [item["line"] for item in findings if item["category"] == "secret-hygiene"]
+
+    assert secret_lines == [4]
+
+
 def test_dedup_findings_merges_duplicate_lanes_and_keeps_highest_severity() -> None:
     raw = [
         {"category": "maintenance", "path": "src/app.py", "line": 12, "title": "Marker", "severity": "low", "agentId": "agent-01"},
@@ -243,9 +261,50 @@ def test_claude_ai_review_sends_large_prompt_through_stdin(tmp_path: Path, monke
     assert result.ok is True
     assert isinstance(command, list)
     assert all("Threat model the project." * 100 not in str(part) for part in command)
+    assert "--allowedTools" in command
+    assert "--tools" not in command
     assert command[-1] == "Read the review instructions from stdin and return only the requested JSON findings."
     assert "Threat model the project." in prompt
     assert captured["cwd"] == scratch
+
+
+def test_codex_ai_review_uses_read_only_sandbox(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    project = tmp_path / "target"
+    scratch = tmp_path / "scratch" / "agent-01" / "workspace"
+    project.mkdir()
+    scratch.mkdir(parents=True)
+    job = {
+        "id": "review-20260428-120000-abcdef12",
+        "workspace": str(project),
+        "provider": "codex",
+        "strategy": review_swarm.REVIEW_STRATEGY,
+    }
+    agent = {
+        "id": "agent-01",
+        "focus": "security",
+        "focusPrompt": "Threat model the project.",
+        "scratchWorkspace": str(scratch),
+    }
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(review_swarm, "REVIEW_DATA_ROOT", tmp_path / "reviews")
+
+    def fake_run_cli(command: list[str], prompt: str, **kwargs: object) -> review_swarm.AIRunResult:
+        captured["command"] = command
+        output_path = tmp_path / "reviews" / job["id"] / "agent-01-codex.md"
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text("[]", encoding="utf-8")
+        return review_swarm.AIRunResult(text="[]", ok=True)
+
+    monkeypatch.setattr("relayctl.resolve_codex_bin", lambda: "codex")
+    monkeypatch.setattr(review_swarm, "_run_cli", fake_run_cli)
+
+    result = review_swarm._run_codex_ai_review(job, agent, [])
+
+    command = captured["command"]
+    assert result.ok is True
+    assert isinstance(command, list)
+    assert command[command.index("--sandbox") + 1] == "read-only"
+    assert command[command.index("--ask-for-approval") + 1] == "never"
 
 
 def test_review_swarm_rejects_invalid_agent_counts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -259,15 +318,92 @@ def test_review_swarm_rejects_invalid_agent_counts(tmp_path: Path, monkeypatch: 
         review_swarm.start_review(project, agents=51, launch=False)
 
 
+def test_start_review_reuses_active_same_workspace_job(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    project = tmp_path / "target"
+    project.mkdir()
+    (project / "app.py").write_text("print('ok')\n", encoding="utf-8")
+    monkeypatch.setattr(review_swarm, "REVIEW_DATA_ROOT", tmp_path / "reviews")
+
+    first = review_swarm.start_review(project, provider="codex", agents=4, launch=False)
+    duplicate = review_swarm.start_review(project, provider="claude", agents=9, launch=False)
+
+    assert duplicate["id"] == first["id"]
+    assert duplicate["agentCount"] == 4
+    assert duplicate["returnedActiveReview"] is True
+    assert len(list((tmp_path / "reviews").glob("*/job.json"))) == 1
+
+    review_swarm.cancel_review(first["id"])
+    next_job = review_swarm.start_review(project, provider="claude", agents=2, launch=False)
+
+    assert next_job["id"] != first["id"]
+    assert next_job["provider"] == "claude"
+    assert len(list((tmp_path / "reviews").glob("*/job.json"))) == 2
+
+
+def test_start_review_marks_stale_active_job_and_allows_new_scan(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    project = tmp_path / "target"
+    project.mkdir()
+    (project / "app.py").write_text("print('ok')\n", encoding="utf-8")
+    monkeypatch.setattr(review_swarm, "REVIEW_DATA_ROOT", tmp_path / "reviews")
+    monkeypatch.setenv("CLADEX_REVIEW_ACTIVE_STALE_SECONDS", "60")
+
+    first = review_swarm.start_review(project, provider="codex", agents=2, launch=False)
+    stale = review_swarm.load_job(first["id"])
+    stale["updatedAt"] = "2000-01-01T00:00:00+00:00"
+    stale["createdAt"] = "2000-01-01T00:00:00+00:00"
+    review_swarm._write_json(review_swarm.job_json_path(first["id"]), stale)
+
+    next_job = review_swarm.start_review(project, provider="claude", agents=1, launch=False)
+
+    assert next_job["id"] != first["id"]
+    old_job = review_swarm.load_job(first["id"])
+    assert old_job["status"] == "failed"
+    assert "stale" in old_job["error"]
+
+
+def test_provider_limit_stops_launching_remaining_ai_lanes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    project = tmp_path / "target"
+    project.mkdir()
+    for index in range(3):
+        (project / f"app{index}.py").write_text("print('ok')\n", encoding="utf-8")
+    monkeypatch.setattr(review_swarm, "REVIEW_DATA_ROOT", tmp_path / "reviews")
+    monkeypatch.setenv("CLADEX_REVIEW_MAX_PARALLEL", "1")
+    calls = 0
+
+    def fake_codex(*_args: object, **_kwargs: object) -> review_swarm.AIRunResult:
+        nonlocal calls
+        calls += 1
+        return review_swarm.AIRunResult(
+            text="",
+            ok=False,
+            error="ERROR: You've hit your usage limit. Try again at 4:54 AM.\n" + ("prompt noise\n" * 200),
+        )
+
+    monkeypatch.setattr(review_swarm, "_run_codex_ai_review", fake_codex)
+
+    job = review_swarm.start_review(project, provider="codex", agents=3, preflight_only=False, launch=False)
+    finished = review_swarm.run_review_job(job["id"])
+
+    assert calls == 1
+    assert finished["status"] == "failed"
+    assert "account limit" in finished["error"].lower()
+    assert finished["providerLimit"]
+    assert all(agent["status"] == "failed" for agent in finished["agents"])
+    assert all("prompt noise" not in agent["detail"] for agent in finished["agents"])
+    assert all("remaining reviewer lanes were not launched" in agent["detail"] for agent in finished["agents"])
+    report = Path(finished["reportPath"]).read_text(encoding="utf-8")
+    assert "## Provider Account Limit" in report
+
+
 def test_review_swarm_sanitizes_assignment_values() -> None:
-    text = "password = 'supersecretvalue'\napi_key: sk-test-secret\nplain text"
+    text = "password = 'supersecretvalue'\n\"api_key\": \"sk-test-secret\"\nplain text"
 
     sanitized = review_swarm.sanitize_text(text)
 
     assert "supersecretvalue" not in sanitized
     assert "sk-test-secret" not in sanitized
-    assert "password=[REDACTED]" in sanitized
-    assert "api_key=[REDACTED]" in sanitized
+    assert "password = [REDACTED]" in sanitized
+    assert "\"api_key\": [REDACTED]" in sanitized
 
 
 def test_review_swarm_fix_plan_is_separate_from_report(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -311,8 +447,10 @@ def test_review_swarm_self_review_requires_explicit_allow_and_creates_backup(
     )
 
     assert job["selfReview"] is True
-    assert job["sourceBackup"]["id"].startswith("backup-")
-    assert Path(job["sourceBackup"]["snapshot"]).exists()
+    assert job["sourceBackup"] == {}
+    finished = review_swarm.run_review_job(job["id"])
+    assert finished["sourceBackup"]["id"].startswith("backup-")
+    assert Path(finished["sourceBackup"]["snapshot"]).exists()
 
 
 def test_backup_restore_requires_confirmation_and_preserves_skip_dirs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -400,6 +538,38 @@ def test_cancel_review_during_run_stops_subsequent_lanes(tmp_path: Path, monkeyp
     assert finished["status"] == "cancelled"
     assert all(agent["status"] == "cancelled" for agent in finished["agents"])
     assert finished["progress"]["cancelled"] == 4
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows console-window flags are platform-specific")
+def test_process_tree_termination_hides_windows_taskkill(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeProcess:
+        pid = 12345
+
+        def poll(self) -> None:
+            return None
+
+        def wait(self, timeout: float) -> int:
+            return 0
+
+        def kill(self) -> None:
+            raise AssertionError("taskkill path should not fall back to process.kill")
+
+    def fake_run(command: list[str], **kwargs: object) -> object:
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return review_swarm.subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(review_swarm.subprocess, "run", fake_run)
+
+    review_swarm._terminate_process_tree(FakeProcess())  # type: ignore[arg-type]
+
+    assert captured["command"] == ["taskkill", "/F", "/T", "/PID", "12345"]
+    kwargs = captured["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert kwargs.get("creationflags") == review_swarm.subprocess.CREATE_NO_WINDOW
+    assert kwargs.get("startupinfo") is not None
 
 
 def test_relativize_finding_path_falls_back_to_scratch(tmp_path: Path) -> None:
@@ -554,6 +724,14 @@ def test_review_artifact_ignore_skips_local_credential_files_and_dirs(tmp_path: 
     (project / ".git-credentials").write_text("", encoding="utf-8")
     (project / ".ssh").mkdir()
     (project / ".aws").mkdir()
+    (project / ".playwright-cli").mkdir()
+    (project / ".playwright-mcp").mkdir()
+    (project / ".pytest-basetemp").mkdir()
+    (project / ".pytest-tmp").mkdir()
+    (project / "manual-mode-test").mkdir()
+    (project / "memory").mkdir()
+    (project / "output").mkdir()
+    (project / "tmp").mkdir()
     (project / "app.py").write_text("ok", encoding="utf-8")
 
     names = sorted(child.name for child in project.iterdir())
@@ -565,6 +743,14 @@ def test_review_artifact_ignore_skips_local_credential_files_and_dirs(tmp_path: 
     assert ".git-credentials" in ignored
     assert ".ssh" in ignored
     assert ".aws" in ignored
+    assert ".playwright-cli" in ignored
+    assert ".playwright-mcp" in ignored
+    assert ".pytest-basetemp" in ignored
+    assert ".pytest-tmp" in ignored
+    assert "manual-mode-test" in ignored
+    assert "memory" in ignored
+    assert "output" in ignored
+    assert "tmp" in ignored
     assert "src" not in ignored
     assert "app.py" not in ignored
 
@@ -587,6 +773,74 @@ def test_scratch_workspace_skips_symlinks_to_keep_ai_inside_copy(tmp_path: Path,
 
     assert not (scratch / "outside-link.txt").exists()
     assert (scratch / "app.py").exists()
+
+
+def test_scratch_workspace_rebuilds_partial_copy_without_ready_marker(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    project = tmp_path / "target"
+    project.mkdir()
+    (project / "app.py").write_text("print('ok')\n", encoding="utf-8")
+    monkeypatch.setattr(review_swarm, "REVIEW_DATA_ROOT", tmp_path / "reviews")
+
+    job = review_swarm.start_review(project, provider="codex", agents=1, preflight_only=True, launch=False)
+    scratch = review_swarm.agent_scratch_workspace_path(job, job["agents"][0])
+    scratch.mkdir(parents=True)
+    (scratch / "stale.txt").write_text("partial\n", encoding="utf-8")
+
+    base = review_swarm.prepare_scratch_workspace(job)
+    rebuilt = review_swarm.prepare_agent_scratch_workspace(job, job["agents"][0], base)
+
+    assert rebuilt == scratch
+    assert not (rebuilt / "stale.txt").exists()
+    assert (rebuilt / "app.py").read_text(encoding="utf-8") == "print('ok')\n"
+    assert (rebuilt / review_swarm.SCRATCH_READY_MARKER).exists()
+
+
+def test_agent_scratch_uses_hardlinks_when_supported(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    project = tmp_path / "target"
+    project.mkdir()
+    (project / "app.py").write_text("print('ok')\n", encoding="utf-8")
+    monkeypatch.setattr(review_swarm, "REVIEW_DATA_ROOT", tmp_path / "reviews")
+    monkeypatch.setenv("CLADEX_REVIEW_AGENT_SCRATCH_MODE", "hardlink")
+    if not review_swarm._hardlink_supported_for(tmp_path / "probe"):
+        pytest.skip("hardlinks are unavailable in this environment")
+
+    job = review_swarm.start_review(project, provider="codex", agents=1, preflight_only=True, launch=False)
+    base = review_swarm.prepare_scratch_workspace(job)
+    rebuilt = review_swarm.prepare_agent_scratch_workspace(job, job["agents"][0], base)
+
+    assert os.stat(base / "app.py").st_ino == os.stat(rebuilt / "app.py").st_ino
+
+
+def test_global_ai_lane_slot_cleans_stale_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(review_swarm, "REVIEW_DATA_ROOT", tmp_path / "reviews")
+    lane_dir = review_swarm.global_review_lane_dir()
+    lane_dir.mkdir(parents=True)
+    (lane_dir / "slot-0.lock").write_text(json.dumps({"pid": 999999999, "label": "dead"}), encoding="utf-8")
+    monkeypatch.setattr(review_swarm, "_pid_alive", lambda _pid: False)
+
+    with review_swarm._global_ai_lane_slot(1, label="live"):
+        payload = json.loads((lane_dir / "slot-0.lock").read_text(encoding="utf-8"))
+        assert payload["label"] == "live"
+
+    assert not (lane_dir / "slot-0.lock").exists()
+
+
+def test_global_ai_lane_slot_respects_cancel_while_waiting(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(review_swarm, "REVIEW_DATA_ROOT", tmp_path / "reviews")
+
+    with review_swarm._global_ai_lane_slot(1, label="first"):
+        with pytest.raises(RuntimeError, match="Cancelled"):
+            with review_swarm._global_ai_lane_slot(1, label="second", cancel_check=lambda: True):
+                pass
+
+
+def test_global_ai_lane_slots_are_scoped_by_provider_account(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(review_swarm, "REVIEW_DATA_ROOT", tmp_path / "reviews")
+
+    with review_swarm._global_ai_lane_slot(1, label="codex-a", provider="codex", account_home=str(tmp_path / "a")):
+        with review_swarm._global_ai_lane_slot(1, label="codex-b", provider="codex", account_home=str(tmp_path / "b")):
+            scoped_locks = sorted((tmp_path / "reviews" / "_global-ai-slots").glob("codex-*/*.lock"))
+            assert len(scoped_locks) == 2
 
 
 def test_ai_reviewer_failure_marks_agent_failed_not_completed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -662,6 +916,35 @@ def test_partial_ai_lane_failure_completes_with_warnings_and_keeps_report(
     assert [agent["status"] for agent in finished["agents"]].count("failed") == 1
     assert Path(finished["reportPath"]).exists()
     assert planned["fixPlanPath"]
+
+
+def test_failed_ai_lane_keeps_deterministic_findings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = tmp_path / "target"
+    project.mkdir()
+    (project / "app.py").write_text("import subprocess\nsubprocess.run('echo hi', shell=True)\n", encoding="utf-8")
+    monkeypatch.setattr(review_swarm, "REVIEW_DATA_ROOT", tmp_path / "reviews")
+
+    def failing_ai(_job: dict, _agent: dict, _files, **_kwargs):
+        return review_swarm.AIRunResult(text="", ok=False, error="provider failed")
+
+    monkeypatch.setattr(review_swarm, "_run_codex_ai_review", failing_ai)
+
+    job = review_swarm.start_review(
+        project,
+        provider="codex",
+        agents=1,
+        preflight_only=False,
+        launch=False,
+        backup_before_review=False,
+    )
+    finished = review_swarm.run_review_job(job["id"])
+    findings = json.loads(Path(finished["findingsPath"]).read_text(encoding="utf-8"))["findings"]
+
+    assert finished["status"] == "failed"
+    assert any(item["category"] == "command-execution" for item in findings)
 
 
 def test_ai_lanes_use_distinct_scratch_workspaces(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -771,6 +1054,19 @@ def test_review_and_backup_ids_reject_path_traversal() -> None:
         review_swarm.load_backup("../outside")
 
 
+def test_job_run_lock_recovers_empty_stale_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(review_swarm, "REVIEW_DATA_ROOT", tmp_path / "reviews")
+    job_id = "review-20260429-000000-abcdef12"
+    lock_path = review_swarm.job_dir(job_id) / "run.lock"
+    lock_path.parent.mkdir(parents=True)
+    lock_path.write_text("", encoding="utf-8")
+    old_time = time.time() - review_swarm.STALE_JOB_RUN_LOCK_SECONDS - 5
+    os.utime(lock_path, (old_time, old_time))
+
+    assert review_swarm._acquire_job_run_lock(job_id) is True
+    review_swarm._release_job_run_lock(job_id)
+
+
 def test_ai_review_defaults_to_bounded_parallelism(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     project = tmp_path / "target"
     project.mkdir()
@@ -844,6 +1140,69 @@ def test_extract_json_payload_prefers_largest_balanced_object() -> None:
     payload = review_swarm._extract_json_payload(text)
     assert isinstance(payload, dict)
     assert payload.get("summary") == "main"
+
+
+def test_parse_ai_findings_reads_large_json_before_sanitizing(tmp_path: Path) -> None:
+    workspace = tmp_path / "target"
+    workspace.mkdir()
+    findings = [
+        {
+            "severity": "medium",
+            "category": "bulk",
+            "path": "app.py",
+            "line": index,
+            "title": f"Finding {index}",
+            "detail": "x" * 500,
+            "recommendation": "Inspect and fix.",
+        }
+        for index in range(20)
+    ]
+    text = json.dumps({"findings": findings})
+
+    parsed = review_swarm.parse_ai_findings(text, workspace=workspace, agent={"id": "agent-01", "focus": "testing"})
+
+    assert len(parsed) == 20
+    assert parsed[0]["title"] == "Finding 0"
+
+
+def test_parse_ai_findings_redacts_all_free_text_fields(tmp_path: Path) -> None:
+    workspace = tmp_path / "target"
+    workspace.mkdir()
+    text = json.dumps(
+        {
+            "findings": [
+                {
+                    "severity": "high",
+                    "category": "token: sk-category-secret",
+                    "path": "token: sk-path-secret",
+                    "line": 1,
+                    "title": "api_key: sk-title-secret",
+                    "detail": "\"token\": \"sk-detail-secret\"",
+                    "recommendation": "password = sk-recommendation-secret",
+                    "confidence": "high",
+                }
+            ]
+        }
+    )
+
+    parsed = review_swarm.parse_ai_findings(text, workspace=workspace, agent={"id": "agent-01", "focus": "security"})
+    serialized = json.dumps(parsed)
+
+    assert "sk-category-secret" not in serialized
+    assert "sk-path-secret" not in serialized
+    assert "sk-title-secret" not in serialized
+    assert "sk-detail-secret" not in serialized
+    assert "sk-recommendation-secret" not in serialized
+    assert "[REDACTED]" in serialized
+
+
+def test_linear_json_extraction_handles_many_unmatched_braces_quickly() -> None:
+    text = "{" * 20_000
+    started = time.monotonic()
+    payload = review_swarm._extract_json_payload(text)
+
+    assert payload is None
+    assert time.monotonic() - started < 1.0
 
 
 def test_run_cli_uses_idle_timeout_not_short_wall_clock(monkeypatch: pytest.MonkeyPatch) -> None:

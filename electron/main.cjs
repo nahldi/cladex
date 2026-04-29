@@ -2,6 +2,7 @@ const { app, BrowserWindow, shell, ipcMain, dialog } = require('electron');
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+require('dotenv').config({ path: path.join(__dirname, '..', '.env'), quiet: true });
 
 let mainWindow = null;
 let apiServer = null;
@@ -44,14 +45,7 @@ async function startApiServer() {
       return apiServer;
     } catch (error) {
       if (error && error.code === 'EADDRINUSE') {
-        const claDexRuntime = await readRuntimeInfo(port).catch(() => null);
-        if (claDexRuntime) {
-          activeApiPort = port;
-          logDesktop(`API port ${port} already in use by CLADEX, reusing existing server`);
-          await waitForApi(port);
-          return null;
-        }
-        logDesktop(`API port ${port} already in use by a different service, trying next port`);
+        logDesktop(`API port ${port} already in use, trying next port`);
         continue;
       }
       logDesktop(`API start failed: ${error && error.stack ? error.stack : error}`);
@@ -142,14 +136,21 @@ function createWindow() {
     mainWindow?.show();
   });
 
-  // Load built files (production mode)
-  const indexPath = path.join(__dirname, '..', 'dist', 'index.html');
-  console.log('Loading:', indexPath);
-  mainWindow.loadFile(indexPath, { query: { apiBase: `http://${API_HOST}:${activeApiPort}/api` } });
+  // Load the built UI from the loopback API server so the renderer is
+  // same-origin with `/api`. This avoids exposing the remote API bearer token
+  // to a file:// renderer while keeping browser/remote callers token-gated.
+  const appUrl = `http://${API_HOST}:${activeApiPort}/`;
+  console.log('Loading:', appUrl);
+  mainWindow.loadURL(appUrl);
 
   // Open external links in browser
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    shell.openExternal(url);
+    try {
+      const parsed = new URL(url);
+      if (parsed.protocol === 'https:' || parsed.protocol === 'http:') {
+        shell.openExternal(url);
+      }
+    } catch {}
     return { action: 'deny' };
   });
 

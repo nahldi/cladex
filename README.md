@@ -73,8 +73,8 @@ cmd /c npm run electron:build  # Creates installer in release/
 ```
 
 Packaged launchers produced by the build:
-- `release\CLADEX Setup 2.5.2.exe`
-- `release\CLADEX 2.5.2.exe`
+- `release\CLADEX Setup 2.5.3.exe`
+- `release\CLADEX 2.5.3.exe`
 - `release\win-unpacked\CLADEX.exe`
 
 Portable/installer first run:
@@ -83,6 +83,10 @@ Portable/installer first run:
 3. Launch `CLADEX.exe`.
 4. In the app, choose `Add Relay`, then enter the workspace path, Discord bot token, allowed channel id or scoped DM allowlist, and optional per-relay account home (`CODEX_HOME` or `CLAUDE_CONFIG_DIR`).
 5. Start the profile and verify it reaches `Ready` before testing in Discord.
+
+The packaged app bootstraps its bundled Python backend into a local runtime on first launch using the pinned backend constraints. That first bootstrap may need normal `pip` package-index access unless dependencies are already cached. If it fails, close CLADEX, verify `py --version` works, check proxy/firewall access for `pip`, then run the source install command from this repo root: `py -m pip install -e backend -c backend/constraints.txt`. Slow networks can raise the bootstrap ceiling with `CLADEX_BACKEND_BOOTSTRAP_TIMEOUT_MS`.
+
+Optional Codex skill auto-install is disabled by default so setup cannot stall on a long list of network downloads. Set `CLADEX_AUTO_INSTALL_OPTIONAL_SKILLS=1` only when you want the installer to attempt recommended skill installs.
 
 Project reviews do not require a Discord relay profile. Open `Review Swarm`, choose a target folder, and let Project Scout inspect the project shape before launch. CLADEX recommends a reviewer count, pre-fills the scan title/provider, gives every lane a different focus and shard, queues AI lanes behind a bounded worker pool, creates a local source snapshot when enabled, runs reviewers against CLADEX-managed scratch copies instead of editing the target project, and merges results into one report plus a fix plan. Completed scans live under the History tab; the active pane only shows scans that are queued or running.
 
@@ -146,15 +150,16 @@ cladex backup restore <backup-id> --confirm <backup-id>
 
 # Claude relay
 claude-discord setup
-claude-discord register --discord-bot-token <token> --operator-ids <id>
+# Prefer CLADEX_REGISTER_DISCORD_BOT_TOKEN over --discord-bot-token so the token is not written to shell history.
+CLADEX_REGISTER_DISCORD_BOT_TOKEN=<token> claude-discord register --operator-ids <id>
 claude-discord run
 claude-discord status
 claude-discord stop
 
 # Codex relay
 codex-discord setup
-codex-discord register --discord-bot-token <token> --allowed-channel-id <channel_id>
-codex-discord register --discord-bot-token <token> --allow-dms --allowed-user-id <user_id>
+CLADEX_REGISTER_DISCORD_BOT_TOKEN=<token> codex-discord register --allowed-channel-id <channel_id>
+CLADEX_REGISTER_DISCORD_BOT_TOKEN=<token> codex-discord register --allow-dms --allowed-user-id <user_id>
 codex-discord run
 codex-discord status
 codex-discord stop

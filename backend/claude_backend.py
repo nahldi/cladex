@@ -126,6 +126,56 @@ def _windows_hidden_subprocess_kwargs() -> dict[str, object]:
     return {"creationflags": subprocess.CREATE_NO_WINDOW}
 
 
+def _claude_subprocess_env(worktree: Path) -> dict[str, str]:
+    """Build a narrow environment for Claude Code child processes."""
+    allowed_names = {
+        "APPDATA",
+        "COMSPEC",
+        "HOME",
+        "HTTPS_PROXY",
+        "HTTP_PROXY",
+        "LANG",
+        "LC_ALL",
+        "LOCALAPPDATA",
+        "NO_PROXY",
+        "PATH",
+        "PATHEXT",
+        "PROGRAMDATA",
+        "SSL_CERT_FILE",
+        "SYSTEMDRIVE",
+        "SYSTEMROOT",
+        "TEMP",
+        "TMP",
+        "USERPROFILE",
+        "WINDIR",
+        "XDG_CACHE_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+    }
+    allowed_prefixes = ("ANTHROPIC_", "CLAUDE_")
+    blocked_names = {
+        "CLAUDE_CODE_ENTRYPOINT",
+        "CLADEX_ACTIVE_WORKTREE",
+        "CLADEX_REGISTER_DISCORD_BOT_TOKEN",
+        "CLADEX_REMOTE_ACCESS_TOKEN",
+        "DISCORD_BOT_TOKEN",
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "NPM_TOKEN",
+        "OPENAI_API_KEY",
+    }
+    env: dict[str, str] = {}
+    for key, value in os.environ.items():
+        upper = key.upper()
+        if upper in blocked_names:
+            continue
+        if upper in allowed_names or any(upper.startswith(prefix) for prefix in allowed_prefixes):
+            env[key] = value
+    env["CLADEX_ACTIVE_WORKTREE"] = str(worktree)
+    env["CLAUDE_CODE_ENTRYPOINT"] = "cladex-relay"
+    return env
+
+
 def _safe_int_env(name: str, default: int, *, minimum: int = 1) -> int:
     try:
         value = int(os.environ.get(name) or default)
@@ -575,6 +625,12 @@ class ClaudeBackend:
     def claim_inbound_discord_message(self, channel_key: str, message_id: str | int | None) -> bool:
         return self.runtime.claim_inbound_discord_message(channel_key, message_id)
 
+    def release_inbound_discord_message(self, channel_key: str, message_id: str | int | None) -> None:
+        self.runtime.release_inbound_discord_message(channel_key, message_id)
+
+    def has_inbound_discord_message(self, channel_key: str, message_id: str | int | None) -> bool:
+        return self.runtime.has_inbound_discord_message(channel_key, message_id)
+
     def claim_outbound_discord_reply(
         self,
         channel_key: str,
@@ -589,6 +645,12 @@ class ClaudeBackend:
             content,
             force=force,
         )
+
+    def has_outbound_discord_reply(self, channel_key: str, source_message_id: str | int | None, content: str) -> bool:
+        return self.runtime.has_outbound_discord_reply(channel_key, source_message_id, content)
+
+    def release_outbound_discord_reply(self, channel_key: str, source_message_id: str | int | None, content: str) -> None:
+        self.runtime.release_outbound_discord_reply(channel_key, source_message_id, content)
 
     def _format_prompt(self, msg: InboundMessage, prompt_workspace: Path, durable_bundle: str) -> str:
         effort = self._effort_for_message(msg.content)
@@ -815,17 +877,21 @@ class ClaudeBackend:
         session_id = persistent.session.session_id if persistent.session.initialized else None
         cmd = self._build_persistent_command(cwd=persistent.worktree, session_id=session_id)
 
-        env = os.environ.copy()
-        env["CLADEX_ACTIVE_WORKTREE"] = str(persistent.worktree)
-        env["CLAUDE_CODE_ENTRYPOINT"] = "cladex-relay"
+        env = _claude_subprocess_env(persistent.worktree)
 
         logger.info("Starting persistent Claude process: %s", " ".join(cmd[:6]) + "...")
+        stream_limit = _safe_int_env(
+            "CLADEX_CLAUDE_STREAM_LIMIT_BYTES",
+            DEFAULT_CLAUDE_TURN_MAX_OUTPUT_BYTES + 64 * 1024,
+            minimum=128 * 1024,
+        )
 
         process = await asyncio.create_subprocess_exec(
             *cmd,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            limit=stream_limit,
             cwd=str(persistent.worktree),
             env=env,
             **_windows_hidden_subprocess_kwargs(),
@@ -1517,6 +1583,12 @@ class RelayBackend:
     def claim_inbound_discord_message(self, channel_id: str, message_id: str | int | None) -> bool:
         return self._claude.claim_inbound_discord_message(channel_id, message_id)
 
+    def release_inbound_discord_message(self, channel_id: str, message_id: str | int | None) -> None:
+        self._claude.release_inbound_discord_message(channel_id, message_id)
+
+    def has_inbound_discord_message(self, channel_id: str, message_id: str | int | None) -> bool:
+        return self._claude.has_inbound_discord_message(channel_id, message_id)
+
     def claim_outbound_discord_reply(
         self,
         channel_id: str,
@@ -1531,6 +1603,12 @@ class RelayBackend:
             content,
             force=force,
         )
+
+    def has_outbound_discord_reply(self, channel_id: str, source_message_id: str | int | None, content: str) -> bool:
+        return self._claude.has_outbound_discord_reply(channel_id, source_message_id, content)
+
+    def release_outbound_discord_reply(self, channel_id: str, source_message_id: str | int | None, content: str) -> None:
+        self._claude.release_outbound_discord_reply(channel_id, source_message_id, content)
 
     async def start(self) -> bool:
         if not self._claude.start():
@@ -1624,6 +1702,10 @@ class RelayBackend:
             except Exception as exc:
                 logger.exception("Error processing message")
                 self._on_status(f"ERROR: {exc}")
+                if msg is not None and msg.channel_type == ChannelType.GUI:
+                    future = self._pending_local.get(msg.message_id)
+                    if future and not future.done():
+                        future.set_exception(RuntimeError(f"Claude local operator turn failed: {exc}"))
             finally:
                 if msg is not None:
                     self._message_queue.task_done()

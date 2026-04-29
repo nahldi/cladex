@@ -1,6 +1,6 @@
 {
   "name": "cladex-codex-relay",
-  "version": "2.5.2",
+  "version": "2.5.3",
   "description": "Launch the CLADEX Codex relay from the current workspace.",
   "author": {
     "name": "CLADEX Contributors"
@@ -12,7 +12,7 @@
     "relay",
     "workspace"
   ],
-  "skills": "./skills/",
+  "skills": "./discord_codex_relay_plugin/bundle/skills/",
   "interface": {
     "displayName": "CLADEX Codex Relay",
     "shortDescription": "Run a workspace-local Codex relay through Discord with CLADEX.",
@@ -29,7 +29,7 @@
       "Register this workspace for Discord relay."
     ],
     "brandColor": "#2563EB",
-    "composerIcon": "./assets/icon.svg",
-    "logo": "./assets/logo.svg"
+    "composerIcon": "./discord_codex_relay_plugin/bundle/assets/icon.svg",
+    "logo": "./discord_codex_relay_plugin/bundle/assets/logo.svg"
   }
 }

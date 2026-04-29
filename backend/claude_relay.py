@@ -222,9 +222,18 @@ def _is_profile_running(profile: dict) -> bool:
         return False
     try:
         pid = int(pid_file.read_text().strip())
-        return pid_exists(pid)
+        return pid_exists(pid) and _pid_matches_claude_relay(pid)
     except Exception:
         return False
+
+
+def _pid_matches_claude_relay(pid: int) -> bool:
+    try:
+        process = psutil.Process(pid)
+        command_line = " ".join(process.cmdline()).lower()
+    except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+        return False
+    return "claude_bot.py" in command_line or "claude_relay.py" in command_line or "claude-discord" in command_line
 
 
 def _package_version() -> str:
@@ -508,11 +517,16 @@ def cmd_stop(args: argparse.Namespace) -> int:
 
     try:
         pid = int(pid_file.read_text().strip())
+        if not _pid_matches_claude_relay(pid):
+            print(f"Removed stale relay PID file (PID {pid} is not a Claude relay).")
+            pid_file.unlink(missing_ok=True)
+            return 0
         if terminate_process_tree(pid):
             print(f"[OK] Stopped relay (PID {pid})")
             pid_file.unlink(missing_ok=True)
         else:
             print("Relay was not running.")
+            pid_file.unlink(missing_ok=True)
     except Exception as e:
         print(f"Failed to stop relay: {e}")
         return 1
@@ -602,6 +616,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     # Run the Python bot
     bot_module = Path(__file__).parent / "claude_bot.py"
 
+    process: subprocess.Popen | None = None
     try:
         with open(log_file, "a") as log:
             process = subprocess.Popen(
@@ -613,8 +628,11 @@ def cmd_run(args: argparse.Namespace) -> int:
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
             )
             process.wait()
+            return process.returncode or 0
     except KeyboardInterrupt:
         print("\nStopping relay...")
+        if process is not None and process.poll() is None:
+            terminate_process_tree(process.pid)
 
     return 0
 

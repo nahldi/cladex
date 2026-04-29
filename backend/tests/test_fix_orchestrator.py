@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import threading
 import time
@@ -128,6 +129,8 @@ def test_fix_task_success_is_rejected_when_worker_edits_outside_assigned_files(t
     assert task["status"] == "failed"
     assert "outside assigned task scope" in task["error"]
     assert task["changedFiles"] == ["other.py"]
+    assert task["restoredFiles"] == ["other.py"]
+    assert not Path(review["workspace"], "other.py").exists()
 
 
 def test_fix_task_success_allows_transient_outside_scope_snapshot(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -321,6 +324,7 @@ def test_ai_planner_adds_residual_task_for_skipped_findings(tmp_path: Path, monk
         {"id": "F0001", "severity": "high", "path": "a.py", "title": "a", "recommendation": "fix a"},
         {"id": "F0002", "severity": "high", "path": "b.py", "title": "b", "recommendation": "fix b"},
         {"id": "F0003", "severity": "low", "path": "c.py", "title": "c", "recommendation": "fix c"},
+        {"id": "F0004", "severity": "high", "path": "d.py", "title": "d", "recommendation": "fix d"},
     ]
     plan_payload = {
         "summary": "skip last",
@@ -338,6 +342,9 @@ def test_ai_planner_adds_residual_task_for_skipped_findings(tmp_path: Path, monk
     assert any(t.get("category") == "planner-residual" for t in tasks)
     residual = next(t for t in tasks if t.get("category") == "planner-residual")
     assert "F0003" in residual["findingIds"]
+    assert "F0004" in residual["findingIds"]
+    assert residual["files"] == ["c.py", "d.py"]
+    assert residual["severity"] == "high"
 
 
 def test_ai_planner_salvages_tasks_without_findingids_when_files_match(
@@ -454,6 +461,64 @@ def test_ai_planner_remaps_planner_named_dependencies_to_canonical_task_ids(
     # `["task-0001"]` so Fix Review's phase scheduler waits for the code
     # task before launching the docs task.
     assert docs_task["dependsOn"] == ["task-0001"]
+
+
+def test_claude_planner_uses_allowed_tools_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run_cli(command: list[str], prompt: str, **_kwargs: object) -> review_swarm.AIRunResult:
+        captured["command"] = command
+        captured["prompt"] = prompt
+        return review_swarm.AIRunResult(
+            text=json.dumps({"summary": "empty", "tasks": [], "recommendedAgentCount": 1}),
+            ok=True,
+        )
+
+    monkeypatch.setattr(claude_relay, "claude_code_bin", lambda: "claude")
+    monkeypatch.setattr(review_swarm, "_run_cli", fake_run_cli)
+
+    fix_orchestrator._run_claude_planner("plan this", account_home=None)
+
+    command = captured["command"]
+    assert isinstance(command, list)
+    assert "--allowedTools" in command
+    assert "--tools" not in command
+
+
+def test_discover_validation_commands_includes_backend_tests(tmp_path: Path) -> None:
+    (tmp_path / "backend" / "tests").mkdir(parents=True)
+    (tmp_path / "package.json").write_text(
+        json.dumps({"scripts": {"lint": "eslint .", "build": "vite build"}}),
+        encoding="utf-8",
+    )
+
+    commands = fix_orchestrator.discover_validation_commands(tmp_path)
+
+    assert [sys.executable, "-m", "pytest", "backend/tests", "--tb=short", "-q"] in commands
+
+
+def test_fix_run_honors_same_phase_task_dependencies(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    review = _review_with_findings(tmp_path, monkeypatch)
+    run = fix_orchestrator.start_fix_run(review["id"], launch=False)
+    base = dict(run["tasks"][0])
+    run["tasks"] = [
+        {**base, "id": "task-0002", "title": "dependent", "dependsOn": ["task-0001"], "status": "queued"},
+        {**base, "id": "task-0001", "title": "prerequisite", "dependsOn": [], "status": "queued"},
+    ]
+    fix_orchestrator._save_run(run)
+    order: list[str] = []
+
+    def fake_worker(_run: dict, task: dict) -> review_swarm.AIRunResult:
+        order.append(str(task["id"]))
+        return review_swarm.AIRunResult(text=str(task["id"]), ok=True)
+
+    monkeypatch.setattr(fix_orchestrator, "_run_provider_fix_task", fake_worker)
+    monkeypatch.setattr(fix_orchestrator, "_run_validation_commands", lambda _run, **_kwargs: [])
+
+    finished = fix_orchestrator.run_fix_run(run["id"])
+
+    assert finished["status"] == "completed"
+    assert order == ["task-0001", "task-0002"]
 
 
 def test_workspace_touched_detects_edits_to_already_dirty_files(tmp_path: Path) -> None:
@@ -650,6 +715,38 @@ def test_validation_command_cancel_terminates_promptly(tmp_path: Path) -> None:
 
     assert time.monotonic() - started < 5
     assert results[0]["status"] == "cancelled"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows console-window flags are platform-specific")
+def test_validation_command_launch_hides_windows_console(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeProcess:
+        returncode = 0
+
+        def communicate(self, timeout: float) -> tuple[str, str]:
+            captured["timeout"] = timeout
+            return "", ""
+
+    def fake_popen(command: list[str], **kwargs: object) -> FakeProcess:
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return FakeProcess()
+
+    monkeypatch.setattr(fix_orchestrator.subprocess, "Popen", fake_popen)
+
+    status, returncode, output = fix_orchestrator._run_one_validation_command(
+        [sys.executable, "-c", "print('ok')"],
+        workspace=tmp_path,
+    )
+
+    assert status == "passed"
+    assert returncode == 0
+    assert output == ""
+    kwargs = captured["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert kwargs.get("creationflags") == fix_orchestrator.subprocess.CREATE_NO_WINDOW
+    assert kwargs.get("startupinfo") is not None
 
 
 def test_discover_validation_commands_uses_existing_project_scripts(tmp_path: Path) -> None:

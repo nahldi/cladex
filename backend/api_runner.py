@@ -4,6 +4,7 @@ import argparse
 import contextlib
 import io
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -17,14 +18,54 @@ MODULES = {
     "claude_relay.py": claude_relay,
     "relayctl.py": relayctl,
 }
+DEFAULT_CAPTURE_LIMIT = 2 * 1024 * 1024
+
+
+def _capture_limit() -> int:
+    raw = os.environ.get("CLADEX_API_RUNNER_CAPTURE_LIMIT", "")
+    try:
+        value = int(raw) if raw else DEFAULT_CAPTURE_LIMIT
+    except ValueError:
+        value = DEFAULT_CAPTURE_LIMIT
+    return max(16 * 1024, min(value, 16 * 1024 * 1024))
+
+
+class BoundedTextCapture(io.TextIOBase):
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self._buffer = io.StringIO()
+        self._size = 0
+        self.truncated = False
+
+    def writable(self) -> bool:
+        return True
+
+    def write(self, value: str) -> int:
+        text = str(value)
+        incoming = len(text)
+        remaining = self.limit - self._size
+        if remaining > 0:
+            kept = text[:remaining]
+            self._buffer.write(kept)
+            self._size += len(kept)
+        if incoming > remaining:
+            self.truncated = True
+        return incoming
+
+    def getvalue(self) -> str:
+        text = self._buffer.getvalue()
+        if self.truncated:
+            text = text.rstrip() + "\n...[truncated by CLADEX api_runner]"
+        return text
 
 
 def _run_module(target: str, argv: list[str]) -> dict[str, object]:
     module = MODULES.get(target)
     if module is None:
         raise RuntimeError(f"Unsupported backend target: {target}")
-    stdout_buffer = io.StringIO()
-    stderr_buffer = io.StringIO()
+    capture_limit = _capture_limit()
+    stdout_buffer = BoundedTextCapture(capture_limit)
+    stderr_buffer = BoundedTextCapture(capture_limit)
     exit_code = 0
     previous_argv = sys.argv
     try:
@@ -36,13 +77,21 @@ def _run_module(target: str, argv: list[str]) -> dict[str, object]:
                     exit_code = result
             except SystemExit as exc:
                 code = exc.code
-                exit_code = int(code) if isinstance(code, int) else 1
+                if isinstance(code, int):
+                    exit_code = code
+                else:
+                    exit_code = 1
+                    if code:
+                        stderr_buffer.write(str(code))
+                        stderr_buffer.write("\n")
     finally:
         sys.argv = previous_argv
     return {
         "stdout": stdout_buffer.getvalue(),
         "stderr": stderr_buffer.getvalue(),
         "code": exit_code,
+        "stdoutTruncated": stdout_buffer.truncated,
+        "stderrTruncated": stderr_buffer.truncated,
     }
 
 

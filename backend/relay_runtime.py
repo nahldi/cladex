@@ -5,6 +5,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import sqlite3
 import subprocess
 import threading
@@ -256,12 +257,35 @@ def _glob_prefix(value: str) -> str:
     return prefix.strip("/").lower()
 
 
+def _glob_is_broad(value: str) -> bool:
+    normalized = value.replace("\\", "/").strip().strip("/")
+    return normalized in {"", "*", "**", "**/*"}
+
+
 def _globs_conflict(left: str, right: str) -> bool:
+    if _glob_is_broad(left) or _glob_is_broad(right):
+        return True
     lprefix = _glob_prefix(left)
     rprefix = _glob_prefix(right)
     if not lprefix or not rprefix:
-        return left == right
-    return lprefix.startswith(rprefix) or rprefix.startswith(lprefix)
+        left_norm = left.replace("\\", "/").strip().lower()
+        right_norm = right.replace("\\", "/").strip().lower()
+        if left_norm == right_norm:
+            return True
+        if left_norm.startswith("**/*."):
+            return right_norm.endswith(left_norm[4:])
+        if right_norm.startswith("**/*."):
+            return left_norm.endswith(right_norm[4:])
+        return False
+    return _path_prefixes_overlap(lprefix, rprefix)
+
+
+def _path_prefixes_overlap(left: str, right: str) -> bool:
+    left = left.strip("/").lower()
+    right = right.strip("/").lower()
+    if left == right:
+        return True
+    return left.startswith(f"{right}/") or right.startswith(f"{left}/")
 
 
 def _extract_bullets(text: str, patterns: tuple[str, ...], *, limit: int = 6) -> list[str]:
@@ -639,7 +663,18 @@ class RuntimeStore:
             self._ensure_column(conn, "turn_records", "completed_at", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "turn_records", "backend", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "turn_records", "degraded", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(conn, "turn_records", "side_effects_synced_at", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "turn_records", "side_effects_claimed_at", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "channels", "last_rebind_at", "TEXT")
+            conn.execute(
+                """
+                DELETE FROM turn_records
+                WHERE rowid NOT IN (
+                    SELECT MIN(rowid) FROM turn_records GROUP BY turn_id
+                )
+                """
+            )
+            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_turn_records_turn_id ON turn_records(turn_id)")
 
     def _ensure_column(self, conn: sqlite3.Connection, table: str, column: str, spec: str) -> None:
         columns = {str(row["name"]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -700,9 +735,68 @@ class RuntimeStore:
                     """,
                     (direction, channel_id, normalized_key, fingerprint, _now_iso()),
                 )
+                self._prune_message_receipts(conn, direction=direction, channel_id=channel_id)
                 return True
             except sqlite3.IntegrityError:
                 return False
+
+    def _prune_message_receipts(self, conn: sqlite3.Connection, *, direction: str, channel_id: str) -> None:
+        try:
+            max_per_channel = int(os.environ.get("CLADEX_RELAY_RECEIPT_MAX_PER_CHANNEL", "1000") or "1000")
+        except ValueError:
+            max_per_channel = 1000
+        try:
+            max_age_days = int(os.environ.get("CLADEX_RELAY_RECEIPT_MAX_AGE_DAYS", "14") or "14")
+        except ValueError:
+            max_age_days = 14
+        max_per_channel = max(max_per_channel, 100)
+        max_age_days = max(max_age_days, 1)
+        cutoff = _now_iso_from_ts(time.time() - (max_age_days * 24 * 60 * 60))
+        conn.execute(
+            "DELETE FROM relay_message_receipts WHERE created_at < ?",
+            (cutoff,),
+        )
+        conn.execute(
+            """
+            DELETE FROM relay_message_receipts
+            WHERE direction = ? AND channel_id = ?
+              AND rowid NOT IN (
+                SELECT rowid FROM relay_message_receipts
+                WHERE direction = ? AND channel_id = ?
+                ORDER BY created_at DESC, rowid DESC
+                LIMIT ?
+              )
+            """,
+            (direction, channel_id, direction, channel_id, max_per_channel),
+        )
+
+    def has_message_receipt(self, *, direction: str, channel_id: str, receipt_key: str) -> bool:
+        normalized_key = str(receipt_key or "").strip()
+        if not normalized_key:
+            return False
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT 1 FROM relay_message_receipts
+                WHERE direction = ? AND channel_id = ? AND receipt_key = ?
+                LIMIT 1
+                """,
+                (direction, channel_id, normalized_key),
+            ).fetchone()
+            return row is not None
+
+    def release_message_receipt(self, *, direction: str, channel_id: str, receipt_key: str) -> None:
+        normalized_key = str(receipt_key or "").strip()
+        if not normalized_key:
+            return
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                DELETE FROM relay_message_receipts
+                WHERE direction = ? AND channel_id = ? AND receipt_key = ?
+                """,
+                (direction, channel_id, normalized_key),
+            )
 
     def record_restart(self, agent_name: str, reason: str = "normal") -> None:
         """Record a relay restart event for churn detection."""
@@ -793,16 +887,9 @@ class RuntimeStore:
     ) -> bool:
         """Record a turn. Returns False if turn_id was already recorded (dedup)."""
         with self._lock, self._connect() as conn:
-            # Check for duplicate turn_id first
-            existing = conn.execute(
-                "SELECT 1 FROM turn_records WHERE turn_id = ? LIMIT 1",
-                (turn_id,),
-            ).fetchone()
-            if existing:
-                return False
-            conn.execute(
+            cursor = conn.execute(
                 """
-                INSERT INTO turn_records(
+                INSERT OR IGNORE INTO turn_records(
                     id, thread_id, turn_id, summary, files_changed_json, commands_run_json, validations_json,
                     next_step, created_at, command_exit_codes_json, cwd, approvals_json, blocker,
                     error_category, started_at, completed_at, backend, degraded
@@ -830,6 +917,8 @@ class RuntimeStore:
                     1 if degraded else 0,
                 ),
             )
+            if cursor.rowcount == 0:
+                return False
             conn.execute(
                 "UPDATE codex_threads SET last_turn_id = ?, updated_at = ? WHERE thread_id = ?",
                 (turn_id, _now_iso(), thread_id),
@@ -945,6 +1034,43 @@ class RuntimeStore:
                     last_status_sync_at=excluded.last_status_sync_at
                 """,
                 (project_id, payload["last_memory_sync_at"], payload["last_handoff_sync_at"], payload["last_status_sync_at"]),
+            )
+
+    def turn_side_effects_synced(self, turn_id: str) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT side_effects_synced_at FROM turn_records WHERE turn_id = ? LIMIT 1",
+                (turn_id,),
+            ).fetchone()
+        return bool(row and row["side_effects_synced_at"])
+
+    def claim_turn_side_effects(self, turn_id: str, *, stale_after_seconds: int = 600) -> bool:
+        cutoff = _now_iso_from_ts(time.time() - max(stale_after_seconds, 1))
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE turn_records
+                SET side_effects_claimed_at = ?
+                WHERE turn_id = ?
+                  AND side_effects_synced_at = ''
+                  AND (side_effects_claimed_at = '' OR side_effects_claimed_at < ?)
+                """,
+                (_now_iso(), turn_id, cutoff),
+            )
+            return cursor.rowcount > 0
+
+    def clear_turn_side_effect_claim(self, turn_id: str) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE turn_records SET side_effects_claimed_at = '' WHERE turn_id = ? AND side_effects_synced_at = ''",
+                (turn_id,),
+            )
+
+    def mark_turn_side_effects_synced(self, turn_id: str) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE turn_records SET side_effects_synced_at = ?, side_effects_claimed_at = '' WHERE turn_id = ?",
+                (_now_iso(), turn_id),
             )
 
     def record_claim(self, *, source_agent: str, message_ref: str, claim_text: str, claim_type: str, verification_status: str) -> str:
@@ -1106,15 +1232,16 @@ class RuntimeStore:
             conn.execute("DELETE FROM file_ownership WHERE task_id = ?", (task_id,))
 
     def active_task(self, channel_id: str) -> dict[str, Any] | None:
+        now = _now_iso_from_ts(time.time())
         with self._connect() as conn:
             row = conn.execute(
                 """
                 SELECT * FROM task_leases
-                WHERE channel_id = ? AND status = 'claimed'
+                WHERE channel_id = ? AND status = 'claimed' AND lease_expires_at >= ?
                 ORDER BY heartbeat_at DESC, rowid DESC
                 LIMIT 1
                 """,
-                (channel_id,),
+                (channel_id, now),
             ).fetchone()
         return dict(row) if row else None
 
@@ -1185,6 +1312,22 @@ class WorktreeManager:
         self.root = root
         self.root.mkdir(parents=True, exist_ok=True)
 
+    @staticmethod
+    def _valid_git_worktree(path: Path) -> bool:
+        if not path.exists() or not path.is_dir():
+            return False
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(path), "rev-parse", "--is-inside-work-tree"],
+                check=False,
+                capture_output=True,
+                text=True,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            )
+        except Exception:
+            return False
+        return result.returncode == 0 and result.stdout.strip().lower() == "true"
+
     def ensure(self, repo_path: Path, *, project_id: str, channel_id: str) -> tuple[Path, str]:
         repo_root = workspace_root(repo_path)
         if not (repo_root / ".git").exists() and not (repo_root / ".git").is_file():
@@ -1194,6 +1337,14 @@ class WorktreeManager:
         worktree_path = worktree_root / slugify(channel_id)
         branch_name = f"relay/{slugify(project_id)}-{slugify(channel_id)}"
         with _serialize_path(worktree_path):
+            if worktree_path.exists():
+                if not self._valid_git_worktree(worktree_path):
+                    if worktree_path.is_dir():
+                        shutil.rmtree(worktree_path)
+                    else:
+                        worktree_path.unlink()
+                else:
+                    return worktree_path, _repo_branch(worktree_path)
             if worktree_path.exists():
                 return worktree_path, _repo_branch(worktree_path)
             try:
@@ -1219,10 +1370,10 @@ class WorktreeManager:
                         capture_output=True,
                         text=True,
                         creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
-                    )
+                )
                 return worktree_path, _repo_branch(worktree_path)
             except Exception:
-                if worktree_path.exists():
+                if self._valid_git_worktree(worktree_path):
                     return worktree_path, _repo_branch(worktree_path)
                 raise
 
@@ -1473,8 +1624,28 @@ class DurableRuntime:
             "backend": backend,
             "degraded": degraded,
         }
-        with artifact_path.open("a", encoding="utf-8") as handle:
+        with _serialize_path(artifact_path), artifact_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, ensure_ascii=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+
+    def _turn_artifact_exists(self, binding: ChannelBinding, turn_id: str) -> bool:
+        artifact_path = self.turn_artifacts_dir / f"{binding.project_id}.jsonl"
+        if not artifact_path.exists():
+            return False
+        try:
+            for line in artifact_path.read_text(encoding="utf-8", errors="replace").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if str(payload.get("turn_id") or "") == str(turn_id):
+                    return True
+        except OSError:
+            return False
+        return False
 
     def _upsert_memory_fact(
         self,
@@ -1626,6 +1797,28 @@ class DurableRuntime:
             fingerprint="",
         )
 
+    def has_inbound_discord_message(self, channel_key: str, message_id: str | int | None) -> bool:
+        normalized = str(message_id or "").strip()
+        if not normalized:
+            return False
+        binding = self.ensure_binding(channel_key)
+        return self.store.has_message_receipt(
+            direction="discord-inbound",
+            channel_id=binding.channel_id,
+            receipt_key=normalized,
+        )
+
+    def release_inbound_discord_message(self, channel_key: str, message_id: str | int | None) -> None:
+        normalized = str(message_id or "").strip()
+        if not normalized:
+            return
+        binding = self.ensure_binding(channel_key)
+        self.store.release_message_receipt(
+            direction="discord-inbound",
+            channel_id=binding.channel_id,
+            receipt_key=normalized,
+        )
+
     def claim_outbound_discord_reply(
         self,
         channel_key: str,
@@ -1646,6 +1839,40 @@ class DurableRuntime:
             channel_id=binding.channel_id,
             receipt_key=f"{source_key}:{reply_hash}",
             fingerprint=reply_hash,
+        )
+
+    def release_outbound_discord_reply(
+        self,
+        channel_key: str,
+        source_message_id: str | int | None,
+        content: str,
+    ) -> None:
+        binding = self.ensure_binding(channel_key)
+        reply_hash = self._reply_fingerprint(content)
+        if not reply_hash:
+            return
+        source_key = str(source_message_id or "").strip() or "no-source"
+        self.store.release_message_receipt(
+            direction="discord-outbound",
+            channel_id=binding.channel_id,
+            receipt_key=f"{source_key}:{reply_hash}",
+        )
+
+    def has_outbound_discord_reply(
+        self,
+        channel_key: str,
+        source_message_id: str | int | None,
+        content: str,
+    ) -> bool:
+        binding = self.ensure_binding(channel_key)
+        reply_hash = self._reply_fingerprint(content)
+        if not reply_hash:
+            return False
+        source_key = str(source_message_id or "").strip() or "no-source"
+        return self.store.has_message_receipt(
+            direction="discord-outbound",
+            channel_id=binding.channel_id,
+            receipt_key=f"{source_key}:{reply_hash}",
         )
 
     def observe_incoming_message(
@@ -1928,7 +2155,8 @@ class DurableRuntime:
     ) -> bool:
         """Record turn result. Returns False if turn_id was already recorded (dedup)."""
         binding = self.ensure_binding(channel_key)
-        # Dedup: if turn already recorded, skip all side effects (handoff, status, etc.)
+        completed_at_value = completed_at or _now_iso()
+        next_step_value = next_step or "Continue from STATUS.md and HANDOFF.md."
         if not self.store.record_turn(
             thread_id=thread_id,
             turn_id=turn_id,
@@ -1936,18 +2164,57 @@ class DurableRuntime:
             files_changed=files_changed,
             commands_run=commands_run,
             validations=validations,
-            next_step=next_step or "Continue from STATUS.md and HANDOFF.md.",
+            next_step=next_step_value,
             command_exit_codes=command_exit_codes,
             cwd=cwd or str(binding.worktree_path),
             approvals=approvals,
             blocker=blocker,
             error_category=error_category,
             started_at=started_at,
-            completed_at=completed_at or _now_iso(),
+            completed_at=completed_at_value,
             backend=backend or binding.backend,
             degraded=degraded,
         ):
-            return False  # Duplicate turn_id, skip all side effects
+            recovered_artifact = False
+            missing_side_effects = not self.store.turn_side_effects_synced(turn_id)
+            if not self._turn_artifact_exists(binding, turn_id):
+                self._append_turn_artifact(
+                    binding,
+                    thread_id=thread_id,
+                    turn_id=turn_id,
+                    summary=summary,
+                    files_changed=files_changed,
+                    commands_run=commands_run,
+                    validations=validations,
+                    next_step=next_step_value,
+                    command_exit_codes=command_exit_codes,
+                    cwd=cwd or str(binding.worktree_path),
+                    approvals=approvals,
+                    blocker=blocker,
+                    error_category=error_category,
+                    started_at=started_at,
+                    completed_at=completed_at_value,
+                    backend=backend or binding.backend,
+                    degraded=degraded,
+                )
+                recovered_artifact = True
+            if (recovered_artifact or missing_side_effects) and self.store.claim_turn_side_effects(turn_id):
+                try:
+                    self._record_turn_side_effects(
+                        binding,
+                        channel_key=channel_key,
+                        summary=summary,
+                        files_changed=files_changed,
+                        commands_run=commands_run,
+                        validations=validations,
+                        blocker=blocker,
+                        next_step=next_step,
+                    )
+                except Exception:
+                    self.store.clear_turn_side_effect_claim(turn_id)
+                    raise
+                self.store.mark_turn_side_effects_synced(turn_id)
+            return False
         self._append_turn_artifact(
             binding,
             thread_id=thread_id,
@@ -1956,17 +2223,47 @@ class DurableRuntime:
             files_changed=files_changed,
             commands_run=commands_run,
             validations=validations,
-            next_step=next_step or "Continue from STATUS.md and HANDOFF.md.",
+            next_step=next_step_value,
             command_exit_codes=command_exit_codes,
             cwd=cwd or str(binding.worktree_path),
             approvals=approvals,
             blocker=blocker,
             error_category=error_category,
             started_at=started_at,
-            completed_at=completed_at or _now_iso(),
+            completed_at=completed_at_value,
             backend=backend or binding.backend,
             degraded=degraded,
         )
+        if self.store.claim_turn_side_effects(turn_id):
+            try:
+                self._record_turn_side_effects(
+                    binding,
+                    channel_key=channel_key,
+                    summary=summary,
+                    files_changed=files_changed,
+                    commands_run=commands_run,
+                    validations=validations,
+                    blocker=blocker,
+                    next_step=next_step,
+                )
+            except Exception:
+                self.store.clear_turn_side_effect_claim(turn_id)
+                raise
+            self.store.mark_turn_side_effects_synced(turn_id)
+        return True
+
+    def _record_turn_side_effects(
+        self,
+        binding: ChannelBinding,
+        *,
+        channel_key: str,
+        summary: str,
+        files_changed: list[str],
+        commands_run: list[str],
+        validations: list[str],
+        blocker: str,
+        next_step: str,
+    ) -> None:
         active = self.store.active_task(channel_key)
         if active:
             self.store.heartbeat_task(str(active["task_id"]))
@@ -2028,7 +2325,6 @@ class DurableRuntime:
             next_step=next_step or "Continue from STATUS.md.",
         )
         self.store.upsert_sync_state(binding.project_id, handoff=True, status=True)
-        return True
 
     def record_shutdown(self, channel_key: str, *, reason: str) -> None:
         binding = self.ensure_binding(channel_key)

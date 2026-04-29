@@ -8,11 +8,38 @@ import sys
 
 
 PACKAGE_NAME = "discord-codex-relay"
+DEFAULT_TIMEOUT_SECONDS = 900
+MAX_CAPTURED_OUTPUT = 12000
+
+
+def _timeout_seconds() -> int:
+    raw = os.environ.get("CLADEX_BOOTSTRAP_TIMEOUT_SECONDS") or os.environ.get("CLADEX_INSTALL_SUBPROCESS_TIMEOUT")
+    try:
+        value = int(str(raw or "").strip(), 10)
+    except ValueError:
+        return DEFAULT_TIMEOUT_SECONDS
+    return value if value > 0 else DEFAULT_TIMEOUT_SECONDS
 
 
 def _run(command: list[str]) -> int:
     print("$ " + " ".join(command))
-    return subprocess.run(command, check=False).returncode
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            text=True,
+            capture_output=True,
+            timeout=_timeout_seconds(),
+        )
+    except subprocess.TimeoutExpired:
+        print(f"Command timed out after {_timeout_seconds()}s: {' '.join(command)}", file=sys.stderr)
+        return 124
+    output = "\n".join(part for part in (result.stdout, result.stderr) if part)
+    if output:
+        if len(output) > MAX_CAPTURED_OUTPUT:
+            output = output[:MAX_CAPTURED_OUTPUT].rstrip() + "\n...[truncated by CLADEX]"
+        print(output, end="" if output.endswith("\n") else "\n")
+    return result.returncode
 
 
 def _install_with_pipx(spec: str) -> int:

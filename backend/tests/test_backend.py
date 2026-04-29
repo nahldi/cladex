@@ -31,6 +31,8 @@ class _FakeSession:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict | None]] = []
         self.config = SimpleNamespace(codex_full_access=True)
+        self.sandbox_mode = "danger-full-access"
+        self.approval_policy = "never"
 
     async def _request(self, method: str, params: dict | None) -> dict:
         self.calls.append((method, params))
@@ -52,10 +54,10 @@ class _FakeSession:
         return "gpt-explicit"
 
     def _approval_policy(self) -> str:
-        return "never"
+        return self.approval_policy
 
     def _sandbox_mode(self) -> str:
-        return "danger-full-access"
+        return self.sandbox_mode
 
     def _developer_instructions(self) -> str:
         return "developer"
@@ -142,7 +144,7 @@ def test_app_server_backend_uses_current_protocol_shapes() -> None:
     assert (
         "thread/list",
         {
-            "cwd": "C:\\relay-worktree",
+            "cwd": str(Path("C:/relay-worktree")),
             "limit": 50,
             "archived": False,
             "sourceKinds": [],
@@ -161,6 +163,20 @@ def test_app_server_backend_uses_current_protocol_shapes() -> None:
         },
     ) in session.calls
     assert ("thread/name/set", {"threadId": "thread-1", "name": "relay thread"}) in session.calls
+
+
+def test_cli_resume_fallback_honors_read_only_permissions() -> None:
+    session = _FakeSession()
+    session.config.codex_full_access = False
+    session.sandbox_mode = "read-only"
+    session.approval_policy = "never"
+    backend = CliResumeCodexBackend(session, state_store=SimpleNamespace())
+
+    command = backend._base_command(resume_thread_id=None)
+
+    assert "--dangerously-bypass-approvals-and-sandbox" not in command
+    assert command[command.index("--sandbox") + 1] == "read-only"
+    assert command[command.index("--ask-for-approval") + 1] == "never"
 
 
 def test_app_server_backend_interrupt_uses_active_turn_when_available() -> None:
@@ -221,9 +237,15 @@ def test_cli_resume_backend_builds_real_exec_commands(monkeypatch: pytest.Monkey
     resumed = backend._base_command(resume_thread_id="thread-1")
     review = backend._base_command(resume_thread_id="thread-1", review=True)
 
-    assert fresh[:2] == ["codex.exe", "exec"]
-    assert resumed[:4] == ["codex.exe", "exec", "resume", "thread-1"]
-    assert review[:2] == ["codex.exe", "review"]
+    assert fresh[0] == "codex.exe"
+    assert fresh[fresh.index("exec")] == "exec"
+    resume_index = resumed.index("exec")
+    assert resumed[resume_index : resume_index + 3] == ["exec", "resume", "thread-1"]
+    review_index = review.index("exec")
+    assert review[review_index : review_index + 2] == ["exec", "review"]
+    assert fresh.index("--cd") < fresh.index("exec")
+    assert resumed.index("--cd") < resumed.index("exec")
+    assert review.index("--cd") < review.index("exec")
     assert "--json" in fresh
     assert "--dangerously-bypass-approvals-and-sandbox" in fresh
 

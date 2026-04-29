@@ -10,6 +10,9 @@ coverage/
 /DEVELOPMENT_LOG.md
 /.claude/
 /tmp/
+/output/
+/review-*.png
+/review-*.jpg
 .playwright-cli/
 .playwright-mcp/
 .pytest-basetemp/

@@ -1,4 +1,5 @@
 import argparse
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -279,6 +280,242 @@ def test_claude_bot_should_respond_allows_dm_for_operator_id(monkeypatch) -> Non
     assert bound_should_respond(dm_message) is True
 
 
+def test_claude_bot_operator_only_channel_rejects_unapproved_author(monkeypatch) -> None:
+    import importlib
+
+    claude_bot = importlib.import_module("claude_bot")
+    bot_user = SimpleNamespace(id=999)
+    fake = SimpleNamespace(
+        config=SimpleNamespace(
+            allow_dms=False,
+            allowed_user_ids=set(),
+            allowed_bot_ids=set(),
+            allowed_channel_ids={"42"},
+            operator_ids={"7"},
+            trigger_mode="mention_or_dm",
+            prefix="!cladex",
+        ),
+        user=bot_user,
+    )
+    operator_message = SimpleNamespace(
+        author=SimpleNamespace(id=7, bot=False),
+        channel=SimpleNamespace(id=42),
+        content=f"<@{bot_user.id}> hi",
+        mentions=[bot_user],
+    )
+    stranger_message = SimpleNamespace(
+        author=SimpleNamespace(id=8, bot=False),
+        channel=SimpleNamespace(id=42),
+        content=f"<@{bot_user.id}> hi",
+        mentions=[bot_user],
+    )
+
+    bot_user.mentioned_in = lambda message: any(getattr(m, "id", None) == bot_user.id for m in getattr(message, "mentions", []))
+
+    bound_should_respond = claude_bot.ClaudeRelayBot._should_respond.__get__(fake)
+    assert bound_should_respond(operator_message) is True
+    assert bound_should_respond(stranger_message) is False
+
+
+def test_claude_bot_claims_outbound_receipt_before_discord_send(monkeypatch) -> None:
+    import importlib
+
+    claude_bot = importlib.import_module("claude_bot")
+    events: list[str] = []
+
+    class FakeBackend:
+        def claim_outbound_discord_reply(self, channel_id, reply_to, content):
+            events.append("claim")
+            return True
+
+        def release_outbound_discord_reply(self, channel_id, reply_to, content):
+            events.append("release")
+
+    class FakeChannel:
+        async def send(self, content, **kwargs):
+            events.append("send")
+
+    fake = SimpleNamespace(
+        _backend=FakeBackend(),
+        get_channel=lambda channel_id: FakeChannel(),
+        fetch_channel=lambda channel_id: FakeChannel(),
+        _split_message=lambda content: [content],
+    )
+
+    bound_send = claude_bot.ClaudeRelayBot._send_discord_response.__get__(fake)
+    asyncio.run(bound_send("123", "hello", ""))
+
+    assert events == ["claim", "send"]
+
+
+def test_claude_bot_releases_outbound_receipt_when_send_fails(monkeypatch) -> None:
+    import importlib
+
+    claude_bot = importlib.import_module("claude_bot")
+    events: list[str] = []
+
+    class FakeBackend:
+        def claim_outbound_discord_reply(self, channel_id, reply_to, content):
+            events.append("claim")
+            return True
+
+        def release_outbound_discord_reply(self, channel_id, reply_to, content):
+            events.append("release")
+
+    class FakeChannel:
+        async def send(self, content, **kwargs):
+            events.append("send")
+            raise RuntimeError("discord down")
+
+    fake = SimpleNamespace(
+        _backend=FakeBackend(),
+        get_channel=lambda channel_id: FakeChannel(),
+        fetch_channel=lambda channel_id: FakeChannel(),
+        _split_message=lambda content: [content],
+    )
+
+    bound_send = claude_bot.ClaudeRelayBot._send_discord_response.__get__(fake)
+    asyncio.run(bound_send("123", "hello", ""))
+
+    assert events == ["claim", "send", "release"]
+
+
+def test_claude_bot_does_not_release_outbound_receipt_after_partial_chunk_send(monkeypatch) -> None:
+    import importlib
+
+    claude_bot = importlib.import_module("claude_bot")
+    events: list[str] = []
+
+    class FakeBackend:
+        def claim_outbound_discord_reply(self, channel_id, reply_to, content):
+            events.append("claim")
+            return True
+
+        def release_outbound_discord_reply(self, channel_id, reply_to, content):
+            events.append("release")
+
+    class FakeChannel:
+        async def send(self, content, **kwargs):
+            events.append(f"send:{content}")
+            if content == "two":
+                raise RuntimeError("discord down")
+
+    fake = SimpleNamespace(
+        _backend=FakeBackend(),
+        get_channel=lambda channel_id: FakeChannel(),
+        fetch_channel=lambda channel_id: FakeChannel(),
+        _split_message=lambda content: ["one", "two"],
+    )
+
+    bound_send = claude_bot.ClaudeRelayBot._send_discord_response.__get__(fake)
+    asyncio.run(bound_send("123", "hello", ""))
+
+    assert events == ["claim", "send:one", "send:two"]
+
+
+def test_claude_bot_claims_inbound_before_queue_and_releases_on_reject(monkeypatch) -> None:
+    import importlib
+
+    claude_bot = importlib.import_module("claude_bot")
+    events: list[str] = []
+
+    class FakeBackend:
+        def claim_inbound_discord_message(self, channel_id, message_id):
+            events.append("claim")
+            return True
+
+        def release_inbound_discord_message(self, channel_id, message_id):
+            events.append("release")
+
+        async def send_discord_message(self, **kwargs):
+            events.append("queue")
+            return False
+
+    class FakeTyping:
+        async def __aenter__(self):
+            events.append("typing")
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeChannel:
+        id = 123
+
+        def typing(self):
+            return FakeTyping()
+
+        async def send(self, content, **kwargs):
+            events.append("busy-send")
+
+    fake = SimpleNamespace(
+        _backend=FakeBackend(),
+        _should_respond=lambda message: True,
+        _clean_content=lambda message: "hello",
+        _write_status=lambda *args, **kwargs: None,
+    )
+    message = SimpleNamespace(
+        id=456,
+        channel=FakeChannel(),
+        author=SimpleNamespace(id=7, display_name="Finn"),
+    )
+
+    bound_on_message = claude_bot.ClaudeRelayBot.on_message.__get__(fake)
+    asyncio.run(bound_on_message(message))
+
+    assert events == ["claim", "typing", "queue", "busy-send", "release"]
+
+
+def test_claude_bot_releases_inbound_when_typing_setup_fails(monkeypatch) -> None:
+    import importlib
+
+    claude_bot = importlib.import_module("claude_bot")
+    events: list[str] = []
+
+    class FakeBackend:
+        def claim_inbound_discord_message(self, channel_id, message_id):
+            events.append("claim")
+            return True
+
+        def release_inbound_discord_message(self, channel_id, message_id):
+            events.append("release")
+
+        async def send_discord_message(self, **kwargs):
+            events.append("queue")
+            return True
+
+    class FakeTyping:
+        async def __aenter__(self):
+            events.append("typing-enter")
+            raise RuntimeError("typing failed")
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeChannel:
+        id = 123
+
+        def typing(self):
+            return FakeTyping()
+
+    fake = SimpleNamespace(
+        _backend=FakeBackend(),
+        _should_respond=lambda message: True,
+        _clean_content=lambda message: "hello",
+        _write_status=lambda *args, **kwargs: None,
+    )
+    message = SimpleNamespace(
+        id=456,
+        channel=FakeChannel(),
+        author=SimpleNamespace(id=7, display_name="Finn"),
+    )
+
+    bound_on_message = claude_bot.ClaudeRelayBot.on_message.__get__(fake)
+    with pytest.raises(RuntimeError, match="typing failed"):
+        asyncio.run(bound_on_message(message))
+
+    assert events == ["claim", "typing-enter", "release"]
+
+
 def test_profile_from_env_marks_backend(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(claude_relay, "PROFILES_DIR", tmp_path / "profiles")
     env = {
@@ -329,3 +566,64 @@ def test_claude_relay_run_rejects_existing_empty_allowlists(tmp_path: Path, monk
         claude_relay.cmd_run(SimpleNamespace())
 
     assert excinfo.value.code
+
+
+def test_claude_relay_run_returns_child_exit_code(tmp_path: Path, monkeypatch) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    env_file = tmp_path / "profile.env"
+    env_file.write_text(
+        "\n".join(
+            [
+                "DISCORD_BOT_TOKEN=token",
+                f"CLAUDE_WORKDIR={workspace}",
+                "ALLOW_DMS=false",
+                "ALLOWED_CHANNEL_IDS=123",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    profile = {
+        "name": "exit-code",
+        "workspace": str(workspace),
+        "env_file": str(env_file),
+        "state_namespace": "exit-code",
+    }
+    monkeypatch.chdir(workspace)
+    monkeypatch.setattr(claude_relay, "_get_profile_for_workspace", lambda _workspace: profile)
+
+    class FakeProcess:
+        pid = 9999
+        returncode = 17
+
+        def wait(self):
+            return self.returncode
+
+        def poll(self):
+            return self.returncode
+
+    monkeypatch.setattr(claude_relay.subprocess, "Popen", lambda *args, **kwargs: FakeProcess())
+
+    assert claude_relay.cmd_run(SimpleNamespace()) == 17
+
+
+def test_claude_relay_stop_removes_stale_pid_without_killing(tmp_path: Path, monkeypatch) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    (state_dir / "relay.pid").write_text("12345", encoding="utf-8")
+    profile = {"name": "stale", "workspace": str(workspace), "state_namespace": "stale"}
+    killed: list[int] = []
+
+    monkeypatch.chdir(workspace)
+    monkeypatch.setattr(claude_relay, "_get_profile_for_workspace", lambda _workspace: profile)
+    monkeypatch.setattr(claude_relay, "state_dir_for_namespace", lambda _namespace: state_dir)
+    monkeypatch.setattr(claude_relay, "_pid_matches_claude_relay", lambda _pid: False)
+    monkeypatch.setattr(claude_relay, "terminate_process_tree", lambda pid: killed.append(pid) or True)
+
+    assert claude_relay.cmd_stop(SimpleNamespace()) == 0
+
+    assert killed == []
+    assert not (state_dir / "relay.pid").exists()

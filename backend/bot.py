@@ -31,6 +31,7 @@ from relay_common import (
     relay_codex_env,
     resolve_codex_bin,
     state_dir_for_namespace,
+    terminate_process_tree,
     truncate_file_tail,
 )
 from relay_runtime import DurableRuntime, RELAY_PROJECT_ROOT, TaskLeaseConflictError
@@ -106,6 +107,14 @@ def _bounded_int_env(name: str, default: int, *, min_value: int, max_value: int)
         print(f"Invalid {name}={raw!r}; expected {min_value}-{max_value}, using safe default {default}.")
         return default
     return value
+
+
+APP_SERVER_REQUEST_TIMEOUT_SECONDS = _bounded_int_env(
+    "CODEX_APP_SERVER_REQUEST_TIMEOUT_SECONDS",
+    180,
+    min_value=5,
+    max_value=3600,
+)
 
 
 def _load_soul_markdown() -> str:
@@ -405,6 +414,7 @@ class Config:
     allow_dms: bool
     trigger_mode: str
     allowed_user_ids: set[int]
+    allowed_bot_ids: set[int]
     allowed_channel_author_ids: set[int]
     channel_no_mention_author_ids: set[int]
     startup_dm_user_ids: set[int]
@@ -449,6 +459,12 @@ def _load_config() -> Config:
     allowed_users = {
         int(value.strip())
         for value in allowed_users_raw.split(",")
+        if value.strip().isdigit()
+    }
+    allowed_bots_raw = os.environ.get("ALLOWED_BOT_IDS", "").strip()
+    allowed_bots = {
+        int(value.strip())
+        for value in allowed_bots_raw.split(",")
         if value.strip().isdigit()
     }
     allowed_channel_authors_raw = os.environ.get("ALLOWED_CHANNEL_AUTHOR_IDS", "").strip()
@@ -520,6 +536,7 @@ def _load_config() -> Config:
         allow_dms=allow_dms,
         trigger_mode=trigger_mode,
         allowed_user_ids=allowed_users,
+        allowed_bot_ids=allowed_bots,
         allowed_channel_author_ids=allowed_channel_authors,
         channel_no_mention_author_ids=channel_no_mention_authors,
         startup_dm_user_ids=startup_dm_users,
@@ -1732,6 +1749,8 @@ def _message_is_observable_by_relay(message: discord.Message, bot_user: discord.
             return False
         return True
 
+    if message.author.bot and message.author.id not in CONFIG.allowed_bot_ids:
+        return False
     if not CONFIG.allowed_channel_ids:
         return False
     if message.channel.id not in CONFIG.allowed_channel_ids:
@@ -3819,7 +3838,17 @@ class CodexSession:
         if self.app_server_process is not None and self.app_server_process.returncode is None:
             _clear_app_server_pid(self.key, self.app_server_process.pid)
             self.app_server_process.terminate()
-            await self.app_server_process.wait()
+            try:
+                await asyncio.wait_for(self.app_server_process.wait(), timeout=5.0)
+            except asyncio.TimeoutError:
+                terminate_process_tree(self.app_server_process.pid)
+                try:
+                    await asyncio.wait_for(self.app_server_process.wait(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    with contextlib.suppress(ProcessLookupError):
+                        self.app_server_process.kill()
+                    with contextlib.suppress(Exception):
+                        await asyncio.wait_for(self.app_server_process.wait(), timeout=2.0)
         self.app_server_process = None
         self.closing_intentionally = False
 
@@ -3852,7 +3881,16 @@ class CodexSession:
         self.pending_requests[request_id] = future
         await self._send_transport_payload({"id": request_id, "method": method, "params": params})
         try:
-            return await future
+            return await asyncio.wait_for(future, timeout=APP_SERVER_REQUEST_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError as exc:
+            self.pending_requests.pop(request_id, None)
+            if not future.done():
+                future.cancel()
+            await self._close_connection_locked()
+            raise RelayError(
+                f"Timed out waiting for Codex app-server method `{method}` after "
+                f"{APP_SERVER_REQUEST_TIMEOUT_SECONDS}s. The connection was reset."
+            ) from exc
         except JsonRpcError as exc:
             if exc.code == -32601:
                 raise RelayError(
@@ -5353,6 +5391,9 @@ async def on_message(message: discord.Message) -> None:
     if _mark_message_seen(message.id):
         return
 
+    if not _message_is_observable_by_relay(message, client.user):
+        return
+
     if (message.content or "").strip() == "!reset":
         key = _history_key(message)
         session = SESSIONS.get(key)
@@ -5365,8 +5406,6 @@ async def on_message(message: discord.Message) -> None:
         )
         return
 
-    if not _message_is_observable_by_relay(message, client.user):
-        return
     if not _message_has_relayable_content(message, client.user):
         return
 

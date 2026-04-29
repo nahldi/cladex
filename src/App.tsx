@@ -385,7 +385,7 @@ const FILE_MODE_API_BASE = readFileModeApiBase();
 const API_BASE = typeof window !== 'undefined'
   ? (window.location.protocol !== 'file:' ? `${window.location.origin}/api` : (FILE_MODE_API_BASE || 'http://127.0.0.1:3001/api'))
   : 'http://127.0.0.1:3001/api';
-const API_REQUEST_TIMEOUT_MS = 120000;
+const API_REQUEST_TIMEOUT_MS = 900000;
 const API_POLL_TIMEOUT_MS = 8000;
 const CLADEX_LOGO = new URL('../assets/icon.png', import.meta.url).href;
 const FIRST_RUN_REQUIREMENTS = [
@@ -426,7 +426,7 @@ class ApiRequestTimeoutError extends Error {
   }
 }
 
-type ApiFetchInit = RequestInit & { timeoutMs?: number };
+type ApiFetchInit = RequestInit & { timeoutMs?: number; accessToken?: string };
 
 function getStoredAccessToken(): string {
   try {
@@ -444,6 +444,13 @@ function storeAccessToken(token: string) {
       window.localStorage.removeItem(ACCESS_TOKEN_STORAGE_KEY);
     }
   } catch {}
+}
+
+function maskSecret(value: string): string {
+  const text = value.trim();
+  if (!text) return '';
+  if (text.length <= 8) return '********';
+  return `${text.slice(0, 4)}****${text.slice(-4)}`;
 }
 
 async function chooseWorkspaceFolder(currentValue = ''): Promise<string> {
@@ -483,6 +490,10 @@ function workspaceFor(profile: Profile): string {
   return profile.workspaceLabel || profile.workspace.split(/[\\/]/).filter(Boolean).pop() || profile.workspace;
 }
 
+function profileKey(profile: Profile): string {
+  return `${profile.relayType}:${profile.id}`;
+}
+
 function channelFor(profile: Profile): string {
   return profile.channelLabel || (profile.activeChannel ? `Channel ${profile.activeChannel}` : profile.discordChannel ? `Channel ${profile.discordChannel}` : 'Unassigned');
 }
@@ -498,7 +509,10 @@ function relayCardNote(profile: Profile): string {
   if (profile.statusText) {
     return profile.statusText;
   }
-  if (profile.running) {
+  if (profile.running && !profile.ready) {
+    return 'Starting and waiting for the provider handshake.';
+  }
+  if (profile.running && profile.ready) {
     return 'Ready for the next Discord turn.';
   }
   return 'Relay is offline until you start it.';
@@ -531,12 +545,13 @@ function fetchTargetIsTrusted(url: string): boolean {
 async function fetchJson<T>(url: string, init?: ApiFetchInit): Promise<T> {
   const {
     timeoutMs = API_REQUEST_TIMEOUT_MS,
+    accessToken: accessTokenOverride,
     signal: callerSignal,
     headers: initHeaders,
     ...fetchInit
   } = init || {};
   const headers = new Headers(initHeaders || {});
-  const accessToken = getStoredAccessToken();
+  const accessToken = accessTokenOverride ?? getStoredAccessToken();
   if (accessToken && fetchTargetIsTrusted(url)) {
     headers.set('X-CLADEX-Access-Token', accessToken);
   }
@@ -799,21 +814,23 @@ export default function App() {
       setSelectedProfileId(null);
       return;
     }
-    if (!selectedProfileId || !profiles.some((profile) => profile.id === selectedProfileId)) {
-      setSelectedProfileId(profiles[0].id);
+    if (!selectedProfileId || !profiles.some((profile) => profileKey(profile) === selectedProfileId)) {
+      setSelectedProfileId(profileKey(profiles[0]));
     }
   }, [profiles, selectedProfileId]);
 
-  const selectedProfile = profiles.find((profile) => profile.id === selectedProfileId) || null;
+  const selectedProfile = profiles.find((profile) => profileKey(profile) === selectedProfileId) || null;
 
-  async function runAction(key: string, action: () => Promise<unknown>) {
+  async function runAction(key: string, action: () => Promise<unknown>): Promise<boolean> {
     setBusyKey(key);
     try {
       await action();
       await loadAll(true);
       setErrorText('');
+      return true;
     } catch (error) {
       setErrorText(error instanceof Error ? error.message : 'Action failed.');
+      return false;
     } finally {
       setBusyKey(null);
     }
@@ -853,16 +870,16 @@ export default function App() {
                 busyKey={busyKey}
                 errorText={errorText}
                 onRefresh={() => void loadAll()}
-                onStart={(profile) => void runAction(`start-${profile.id}`, () => api.startRelay(profile.id, profile.relayType))}
-                onStop={(profile) => void runAction(`stop-${profile.id}`, () => api.stopRelay(profile.id, profile.relayType))}
-                onRestart={(profile) => void runAction(`restart-${profile.id}`, () => api.restartRelay(profile.id, profile.relayType))}
-                onDelete={(profile) => void runAction(`delete-${profile.id}`, () => api.deleteProfile(profile.id, profile.relayType))}
+                onStart={(profile) => void runAction(`start-${profileKey(profile)}`, () => api.startRelay(profile.id, profile.relayType))}
+                onStop={(profile) => void runAction(`stop-${profileKey(profile)}`, () => api.stopRelay(profile.id, profile.relayType))}
+                onRestart={(profile) => void runAction(`restart-${profileKey(profile)}`, () => api.restartRelay(profile.id, profile.relayType))}
+                onDelete={(profile) => void runAction(`delete-${profileKey(profile)}`, () => api.deleteProfile(profile.id, profile.relayType))}
                 onEdit={(profile) => {
-                  setSelectedProfileId(profile.id);
+                  setSelectedProfileId(profileKey(profile));
                   setActiveModal('edit');
                 }}
                 onLogs={(profile) => {
-                  setSelectedProfileId(profile.id);
+                  setSelectedProfileId(profileKey(profile));
                   setActiveModal('logs');
                 }}
               />
@@ -922,13 +939,18 @@ export default function App() {
             token={remoteAccessTokenDraft}
             onChangeToken={setRemoteAccessTokenDraft}
             onSubmit={async () => {
-              storeAccessToken(remoteAccessTokenDraft);
+              const token = remoteAccessTokenDraft.trim();
+              await fetchJson<RuntimeInfo>(`${API_BASE}/runtime-info`, {
+                timeoutMs: API_POLL_TIMEOUT_MS,
+                accessToken: token,
+              });
+              storeAccessToken(token);
               await loadAll();
             }}
           />
         ) : null}
-        {activeModal === 'add' ? <AddProfileModal onClose={() => setActiveModal(null)} onSubmit={async (data) => { await runAction('create-profile', () => api.createProfile(data)); setActiveModal(null); }} /> : null}
-        {activeModal === 'edit' && selectedProfile ? <EditProfileModal profile={selectedProfile} onClose={() => setActiveModal(null)} onSubmit={async (data) => { await runAction(`update-${selectedProfile.id}`, () => api.updateProfile(selectedProfile.id, selectedProfile.relayType, data)); setActiveModal(null); }} /> : null}
+        {activeModal === 'add' ? <AddProfileModal onClose={() => setActiveModal(null)} onSubmit={async (data) => { if (await runAction('create-profile', () => api.createProfile(data))) setActiveModal(null); }} /> : null}
+        {activeModal === 'edit' && selectedProfile ? <EditProfileModal profile={selectedProfile} onClose={() => setActiveModal(null)} onSubmit={async (data) => { if (await runAction(`update-${selectedProfile.id}`, () => api.updateProfile(selectedProfile.id, selectedProfile.relayType, data))) setActiveModal(null); }} /> : null}
         {activeModal === 'logs' && selectedProfile ? <LogsModal profile={selectedProfile} onClose={() => setActiveModal(null)} /> : null}
         {activeModal === 'settings' ? (
           <SettingsModal
@@ -939,7 +961,7 @@ export default function App() {
             onStopAll={() => void runAction('stop-all', api.stopAll)}
           />
         ) : null}
-        {activeModal === 'workgroup' ? <WorkgroupModal profiles={profiles} onClose={() => setActiveModal(null)} onSubmit={async (name, members) => { await runAction(`workgroup-${name}`, () => api.createProject(name, members)); setActiveModal(null); }} /> : null}
+        {activeModal === 'workgroup' ? <WorkgroupModal profiles={profiles} onClose={() => setActiveModal(null)} onSubmit={async (name, members) => { if (await runAction(`workgroup-${name}`, () => api.createProject(name, members))) setActiveModal(null); }} /> : null}
       </AnimatePresence>
     </div>
   );
@@ -1000,10 +1022,10 @@ function RelayDashboard({
       ) : (
         <div className="grid auto-rows-fr gap-4 sm:gap-6 md:grid-cols-2 xl:grid-cols-3">
           {profiles.map((profile) => (
-            <React.Fragment key={profile.id}>
+            <React.Fragment key={profileKey(profile)}>
               <RelayCard
                 profile={profile}
-                busy={Boolean(busyKey?.includes(profile.id))}
+                busy={Boolean(busyKey?.includes(profileKey(profile)))}
                 onStart={() => onStart(profile)}
                 onStop={() => onStop(profile)}
                 onRestart={() => onRestart(profile)}
@@ -1289,34 +1311,68 @@ function ReviewProjectView({
   }
 
   return (
-    <div className="mx-auto flex w-full max-w-7xl flex-1 flex-col px-4 pb-8 pt-6 sm:px-8 sm:pt-8">
-      <div className="mb-6 flex flex-col gap-4 sm:mb-8 lg:flex-row lg:items-end lg:justify-between">
-        <div>
-          <div className="text-[10px] font-bold uppercase tracking-[0.24em] text-slate-500 dark:text-gray-500">Review swarm</div>
-          <h2 className="mt-2 text-3xl font-black tracking-tight text-slate-900 dark:text-white">Launch targeted swarm scans.</h2>
-          <p className="mt-2 max-w-3xl text-sm text-slate-600 dark:text-gray-400">Choose the folder on the left, then send read-only Codex or Claude lanes through isolated scratch copies. Completed scans stay in History.</p>
+    <div className="review-swarm-page mx-auto flex w-full max-w-[1500px] flex-1 flex-col px-4 pb-8 pt-5 sm:px-8 sm:pt-7">
+      <div className="mb-5 grid gap-4 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-end">
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="text-[10px] font-bold uppercase tracking-[0.24em] text-emerald-700 dark:text-emerald-300">Review Swarm</div>
+            <MetaPill label="read-only lanes" />
+            <MetaPill label="scratch-copy reviews" />
+          </div>
+          <h2 className="mt-2 text-2xl font-black tracking-tight text-slate-950 dark:text-white sm:text-3xl">Swarm control room</h2>
+          <p className="mt-2 max-w-3xl select-none text-sm leading-relaxed text-slate-600 dark:text-gray-400">Pick a project folder, let Project Scout size the run, then dispatch Codex or Claude reviewers into isolated copies. Live work stays here; finished scans move behind History.</p>
         </div>
-        <div className="flex flex-wrap gap-2">
-          <MetaPill label={`${activeJobs} active review${activeJobs === 1 ? '' : 's'}`} />
-          <MetaPill label={`${activeFixRuns} active fix run${activeFixRuns === 1 ? '' : 's'}`} />
+        <div className="grid grid-cols-2 gap-2 sm:flex sm:flex-wrap sm:justify-end">
+          <div className="select-none rounded-[14px] border border-slate-200/80 bg-white/70 px-3 py-2 text-right dark:border-white/10 dark:bg-white/[0.035]">
+            <div className="font-mono text-lg font-semibold text-slate-950 dark:text-white">{activeJobs}</div>
+            <div className="text-[10px] font-bold uppercase tracking-[0.18em] text-slate-500 dark:text-gray-500">scans live</div>
+          </div>
+          <div className="select-none rounded-[14px] border border-slate-200/80 bg-white/70 px-3 py-2 text-right dark:border-white/10 dark:bg-white/[0.035]">
+            <div className="font-mono text-lg font-semibold text-slate-950 dark:text-white">{activeFixRuns}</div>
+            <div className="text-[10px] font-bold uppercase tracking-[0.18em] text-slate-500 dark:text-gray-500">fix runs</div>
+          </div>
         </div>
       </div>
 
-      <div className="grid gap-5 xl:grid-cols-[420px_minmax(0,1fr)]">
-        <div className="space-y-4">
-          <FormSection title="Launch target">
-            <BrowseField
-              label="Target folder"
-              value={workspace}
-              onChange={(value) => {
-                setWorkspace(value);
-                setAnalysis(null);
-                setAnalysisError('');
-              }}
-              onPicked={(value) => void analyzeTarget(value)}
-              placeholder="C:\\Projects\\target-repo"
-              buttonLabel="Choose target folder"
-            />
+      <div className="grid min-h-0 gap-5 xl:grid-cols-[390px_minmax(0,1fr)]">
+        <aside className="swarm-control-rail min-w-0 rounded-[22px] border border-slate-200/80 bg-white/75 p-4 shadow-[0_18px_50px_rgba(15,23,42,0.07)] dark:border-white/10 dark:bg-[#070908]/80 dark:shadow-[0_24px_80px_rgba(0,0,0,0.28)]">
+          <div className="space-y-4">
+            <div>
+              <div className="mb-3 flex items-center justify-between gap-3">
+                <div>
+                  <div className="text-[10px] font-bold uppercase tracking-[0.22em] text-slate-500 dark:text-gray-500">Target folder</div>
+                  <div className="mt-1 text-sm font-semibold text-slate-900 dark:text-white">Project under review</div>
+                </div>
+                <div className="flex shrink-0 items-center gap-2">
+                  {analysis ? <MetaPill label={`${analysis.fileCount} files`} mono /> : null}
+                  <button
+                    type="button"
+                    disabled={reviewBusy || backupBusy || !workspaceFilled}
+                    onClick={() => {
+                      if (!workspaceFilled || reviewBusy || backupBusy) return;
+                      setActivityTab('active');
+                      onStart({ workspace, provider, agents, title, accountHome, allowSelfReview: allowCladexSelfReview, backupBeforeReview });
+                    }}
+                    className="inline-flex min-h-9 items-center justify-center gap-2 rounded-[12px] border border-emerald-400/35 bg-emerald-400/12 px-3 py-2 text-xs font-black text-emerald-800 transition-colors hover:bg-emerald-400/20 disabled:cursor-not-allowed disabled:opacity-45 dark:text-emerald-100"
+                  >
+                    {reviewBusy ? <Loader2 size={14} className="animate-spin" /> : <SearchCheck size={14} />}
+                    Scan
+                  </button>
+                </div>
+              </div>
+              <BrowseField
+                label="Folder path"
+                value={workspace}
+                onChange={(value) => {
+                  setWorkspace(value);
+                  setAnalysis(null);
+                  setAnalysisError('');
+                }}
+                onPicked={(value) => void analyzeTarget(value)}
+                placeholder="C:\\Projects\\target-repo"
+                buttonLabel="Choose target folder"
+              />
+            </div>
             <ProjectScoutCard
               workspaceFilled={workspaceFilled}
               analysis={analysis}
@@ -1324,65 +1380,81 @@ function ReviewProjectView({
               busy={analyzing}
               onAnalyze={() => void analyzeTarget()}
             />
-            <FormInput label="Run title" value={title} onChange={setTitle} placeholder="Production readiness pass" />
-            <div className="rounded-2xl border border-emerald-400/20 bg-emerald-500/[0.06] px-4 py-3">
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                <div className="text-[10px] font-bold uppercase tracking-[0.22em] text-emerald-700 dark:text-emerald-200">Swarm workspace</div>
-                <MetaPill label="CLADEX scratch copies" />
-              </div>
-              <div className="mt-2 text-sm text-slate-600 dark:text-gray-400">
-                Review lanes inspect isolated copies of the target folder. The selected project is not edited during review.
-              </div>
-            </div>
-            <ToggleRow checked={backupBeforeReview} onChange={setBackupBeforeReview} label="Create backup before scan" />
-          </FormSection>
 
-          <FormSection title="Swarm lanes">
-            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-              <TypeButton active={provider === 'codex'} label="Codex" icon={<Terminal size={18} />} onClick={() => selectProvider('codex')} tone="emerald" />
-              <TypeButton active={provider === 'claude'} label="Claude Code" icon={<Bot size={18} />} onClick={() => selectProvider('claude')} tone="orange" />
+            <div className="border-t border-slate-200/80 pt-4 dark:border-white/10">
+              <FormInput label="Run title" value={title} onChange={setTitle} placeholder="Production readiness pass" />
             </div>
-            <label className="block">
-              <div className="mb-2 flex items-center justify-between gap-3">
-                <div className="text-[10px] font-bold uppercase tracking-[0.22em] text-slate-500 dark:text-gray-500">Reviewer count</div>
-                <div className="font-mono text-sm text-slate-700 dark:text-gray-300">{agents}</div>
+
+            <div className="rounded-[18px] border border-emerald-400/25 bg-emerald-500/[0.055] px-4 py-3">
+              <div className="flex flex-wrap items-start justify-between gap-2">
+                <div>
+                  <div className="text-[10px] font-bold uppercase tracking-[0.22em] text-emerald-700 dark:text-emerald-200">Swarm workspace</div>
+                  <div className="mt-1 text-sm text-slate-600 dark:text-gray-400">Reviewers work in CLADEX scratch copies. The selected project stays untouched during review.</div>
+                </div>
+                <MetaPill label="isolated" />
               </div>
-              <input
-                type="range"
-                min={1}
-                max={50}
-                value={agents}
-                onChange={(event) => setAgents(Number(event.target.value))}
-                className="w-full accent-emerald-500"
-              />
-            </label>
-            <details className="rounded-2xl border border-slate-200/80 bg-white/60 px-4 py-3 dark:border-white/10 dark:bg-black/20">
-              <summary className="cursor-pointer text-sm font-semibold text-slate-700 dark:text-gray-300">Advanced provider account options</summary>
-              <div className="mt-4 space-y-4">
-                <BrowseField
-                  label={provider === 'codex' ? 'Codex login/config folder' : 'Claude login/config folder'}
-                  value={accountHome}
-                  onChange={setAccountHome}
-                  placeholder={provider === 'codex' ? 'Optional CODEX_HOME for a separate Codex account' : 'Optional CLAUDE_CONFIG_DIR for a separate Claude account'}
-                  buttonLabel="Choose account folder"
-                  stacked
+            </div>
+
+            <section className="border-t border-slate-200/80 pt-4 dark:border-white/10">
+              <div className="mb-3 flex items-center justify-between gap-3">
+                <div>
+                  <div className="text-[10px] font-bold uppercase tracking-[0.22em] text-slate-500 dark:text-gray-500">Swarm lanes</div>
+                  <div className="mt-1 text-sm font-semibold text-slate-900 dark:text-white">Provider and lane count</div>
+                </div>
+                <div className="font-mono text-lg font-semibold text-slate-900 dark:text-white">{agents}</div>
+              </div>
+              <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                <TypeButton active={provider === 'codex'} label="Codex" icon={<Terminal size={18} />} onClick={() => selectProvider('codex')} tone="emerald" />
+                <TypeButton active={provider === 'claude'} label="Claude Code" icon={<Bot size={18} />} onClick={() => selectProvider('claude')} tone="orange" />
+              </div>
+              <label className="mt-4 block">
+                <div className="mb-2 flex items-center justify-between gap-3">
+                  <div className="text-[10px] font-bold uppercase tracking-[0.22em] text-slate-500 dark:text-gray-500">Reviewer count</div>
+                  <div className="font-mono text-sm text-slate-700 dark:text-gray-300">1-50 lanes</div>
+                </div>
+                <input
+                  type="range"
+                  min={1}
+                  max={50}
+                  value={agents}
+                  onChange={(event) => setAgents(Number(event.target.value))}
+                  className="w-full accent-emerald-500"
                 />
-              </div>
-            </details>
-          </FormSection>
+              </label>
+              <details className="mt-4 rounded-[16px] border border-slate-200/80 bg-white/55 px-4 py-3 dark:border-white/10 dark:bg-black/25">
+                <summary className="cursor-pointer text-sm font-semibold text-slate-700 dark:text-gray-300">Provider account folder</summary>
+                <div className="mt-4 space-y-4">
+                  <BrowseField
+                    label={provider === 'codex' ? 'Codex login/config folder' : 'Claude login/config folder'}
+                    value={accountHome}
+                    onChange={setAccountHome}
+                    placeholder={provider === 'codex' ? 'Optional CODEX_HOME for a separate Codex account' : 'Optional CLAUDE_CONFIG_DIR for a separate Claude account'}
+                    buttonLabel="Choose account folder"
+                    stacked
+                  />
+                </div>
+              </details>
+            </section>
 
-          <div className="rounded-[26px] border border-slate-200/80 bg-white/70 p-4 shadow-[0_18px_45px_rgba(15,23,42,0.08)] dark:border-white/10 dark:bg-white/[0.03] dark:shadow-2xl">
-            <div className="space-y-3">
-              <PrimaryButton
-                label={reviewBusy ? 'Starting...' : analysis ? 'Scan Now' : 'Start Review Swarm'}
-                icon={reviewBusy ? <Loader2 size={16} className="animate-spin" /> : <SearchCheck size={16} />}
-                busy={reviewBusy || backupBusy || !workspaceFilled}
+            <div className="border-t border-slate-200/80 pt-4 dark:border-white/10">
+              <ToggleRow checked={backupBeforeReview} onChange={setBackupBeforeReview} label="Create backup before scan" />
+            </div>
+
+            <div className="sticky bottom-4 z-20 -mx-1 space-y-3 rounded-[18px] border border-slate-200/80 bg-white/88 p-3 shadow-[0_18px_45px_rgba(15,23,42,0.14)] backdrop-blur-xl dark:border-white/10 dark:bg-[#070908]/92 dark:shadow-[0_18px_55px_rgba(0,0,0,0.45)]">
+              <button
+                type="button"
+                disabled={reviewBusy || backupBusy || !workspaceFilled}
+                aria-busy={reviewBusy || undefined}
                 onClick={() => {
                   if (!workspaceFilled || reviewBusy || backupBusy) return;
                   setActivityTab('active');
                   onStart({ workspace, provider, agents, title, accountHome, allowSelfReview: allowCladexSelfReview, backupBeforeReview });
                 }}
-              />
+                className="inline-flex min-h-12 w-full items-center justify-center gap-2 rounded-[18px] bg-emerald-400 px-4 py-3 text-sm font-black text-[#03130d] transition-colors hover:bg-emerald-300 disabled:cursor-not-allowed disabled:opacity-55 disabled:hover:bg-emerald-400"
+              >
+                {reviewBusy ? <Loader2 size={16} className="animate-spin" /> : <SearchCheck size={16} />}
+                {reviewBusy ? 'Dispatching...' : 'Scan Now'}
+              </button>
               <SecondaryButton
                 label={backupBusy ? 'Saving snapshot...' : 'Save snapshot only'}
                 busy={backupBusy || reviewBusy || !workspaceFilled}
@@ -1393,7 +1465,7 @@ function ReviewProjectView({
               />
             </div>
           </div>
-        </div>
+        </aside>
 
         <SwarmActivityPanel
           activeTab={activityTab}
@@ -1447,6 +1519,13 @@ function SwarmActivityPanel({
     { id: 'fixes', label: 'Fix runs', count: fixRuns.length, icon: <Wrench size={15} /> },
     { id: 'snapshots', label: 'Snapshots', count: backups.length, icon: <FolderKanban size={15} /> },
   ];
+  const panelTitle = activeTab === 'active'
+    ? (activeJobs.length ? `${activeJobs.length} scan${activeJobs.length === 1 ? '' : 's'} in motion` : 'Standby deck')
+    : activeTab === 'history'
+      ? 'Scan history'
+      : activeTab === 'fixes'
+        ? 'Fix run queue'
+        : 'Source snapshots';
 
   const renderReviewJob = (job: ReviewJob) => (
     <ReviewJobCard
@@ -1463,13 +1542,11 @@ function SwarmActivityPanel({
   );
 
   return (
-    <section className="min-w-0 rounded-[30px] border border-slate-200/80 bg-white/75 p-4 shadow-[0_18px_45px_rgba(15,23,42,0.08)] dark:border-white/10 dark:bg-white/[0.03] dark:shadow-2xl sm:p-5">
-      <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+    <section className="swarm-activity-shell min-w-0 overflow-hidden rounded-[24px] border border-slate-200/80 bg-white/70 p-4 shadow-[0_18px_55px_rgba(15,23,42,0.08)] dark:border-white/10 dark:bg-[#060706]/80 dark:shadow-[0_28px_90px_rgba(0,0,0,0.35)] sm:p-5">
+      <div className="flex flex-col gap-4 border-b border-slate-200/80 pb-4 dark:border-white/10 lg:flex-row lg:items-center lg:justify-between">
         <div>
           <div className="text-[10px] font-bold uppercase tracking-[0.22em] text-slate-500 dark:text-gray-500">Swarm activity</div>
-          <div className="mt-1 text-lg font-bold tracking-tight text-slate-900 dark:text-white">
-            {activeJobs.length ? `${activeJobs.length} scan${activeJobs.length === 1 ? '' : 's'} in motion` : 'Standby'}
-          </div>
+          <div className="mt-1 text-xl font-black tracking-tight text-slate-900 dark:text-white">{panelTitle}</div>
         </div>
         <div className="grid grid-cols-2 gap-2 sm:flex sm:flex-wrap sm:justify-end">
           {tabs.map((tab) => (
@@ -1546,8 +1623,9 @@ function ProjectScoutCard({
   const topLanguages = analysis?.languages?.slice(0, 4) || [];
   const topMarkers = analysis?.markers?.slice(0, 4) || [];
   const laneFocuses = recommendation?.laneFocuses?.slice(0, 6) || [];
+  const scoutWarnings = recommendation?.limits?.warnings || [];
   return (
-    <div className="rounded-2xl border border-amber-400/20 bg-amber-500/[0.06] px-4 py-3">
+    <div className="rounded-[18px] border border-amber-400/25 bg-amber-500/[0.055] px-4 py-3">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <div className="text-[10px] font-bold uppercase tracking-[0.22em] text-amber-700 dark:text-amber-200">Project Scout</div>
@@ -1559,7 +1637,7 @@ function ProjectScoutCard({
           type="button"
           onClick={onAnalyze}
           disabled={!workspaceFilled || busy}
-          className="inline-flex min-h-10 items-center justify-center gap-2 rounded-2xl border border-amber-400/25 bg-amber-500/10 px-3 py-2 text-sm font-semibold text-amber-800 transition-colors hover:bg-amber-500/15 disabled:cursor-not-allowed disabled:opacity-50 dark:text-amber-100"
+          className="inline-flex min-h-10 items-center justify-center gap-2 rounded-[14px] border border-amber-400/30 bg-amber-500/10 px-3 py-2 text-sm font-semibold text-amber-800 transition-colors hover:bg-amber-500/15 disabled:cursor-not-allowed disabled:opacity-50 dark:text-amber-100"
         >
           {busy ? <Loader2 size={15} className="animate-spin" /> : <SearchCheck size={15} />}
           {analysis ? 'Rescan' : 'Scout'}
@@ -1568,7 +1646,7 @@ function ProjectScoutCard({
       {errorText ? <div className="mt-3 rounded-xl border border-red-500/20 bg-red-500/10 px-3 py-2 text-xs text-red-700 dark:text-red-200">{errorText}</div> : null}
       {analysis && recommendation ? (
         <div className="mt-4 space-y-3">
-          <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+          <div className="grid grid-cols-2 gap-2">
             <ScoutMetric label="Files" value={String(analysis.fileCount)} />
             <ScoutMetric label="Lanes" value={String(recommendation.agents)} />
             <ScoutMetric label="Provider" value={recommendation.provider} />
@@ -1589,6 +1667,11 @@ function ProjectScoutCard({
               {recommendation.reasons.slice(0, 4).map((reason) => <li key={reason}>- {reason}</li>)}
             </ul>
           ) : null}
+          {scoutWarnings.length ? (
+            <div className="rounded-[12px] border border-amber-400/25 bg-amber-400/10 px-3 py-2 text-xs leading-relaxed text-amber-900 dark:text-amber-100">
+              {scoutWarnings.slice(0, 3).map((warning) => <div key={warning}>- {warning}</div>)}
+            </div>
+          ) : null}
           {laneFocuses.length ? (
             <div className="flex flex-wrap gap-2">
               {laneFocuses.map((lane) => <MetaPill key={lane.focus} label={lane.focus} />)}
@@ -1602,7 +1685,7 @@ function ProjectScoutCard({
 
 function ScoutMetric({ label, value }: { label: string; value: string }) {
   return (
-    <div className="rounded-xl border border-white/10 bg-black/[0.08] px-3 py-2 dark:bg-black/20">
+    <div className="rounded-[12px] border border-slate-200/70 bg-white/45 px-3 py-2 dark:border-white/10 dark:bg-black/25">
       <div className="text-[9px] font-bold uppercase tracking-[0.18em] text-slate-500 dark:text-gray-500">{label}</div>
       <div className="mt-1 truncate font-mono text-sm text-slate-800 dark:text-gray-100">{value}</div>
     </div>
@@ -1627,15 +1710,15 @@ function ActivityTabButton({
       type="button"
       onClick={onClick}
       aria-pressed={active}
-      className={`inline-flex min-h-10 items-center justify-center gap-2 rounded-2xl border px-3 py-2 text-xs font-semibold transition-colors ${
+      className={`inline-flex min-h-10 items-center justify-center gap-2 rounded-[14px] border px-3 py-2 text-xs font-semibold transition-colors ${
         active
-          ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-100 shadow-[0_0_24px_rgba(16,185,129,0.18)]'
+          ? 'border-emerald-500/45 bg-emerald-500/[0.14] text-emerald-900 dark:text-emerald-100'
           : 'border-slate-200/80 bg-white/60 text-slate-600 hover:bg-white dark:border-white/10 dark:bg-black/20 dark:text-gray-400 dark:hover:bg-white/[0.06] dark:hover:text-white'
       }`}
     >
       {icon}
       <span className="truncate">{label}</span>
-      <span className={`rounded-full px-2 py-0.5 font-mono text-[10px] ${active ? 'bg-white/15 text-white' : 'bg-slate-200/70 text-slate-600 dark:bg-white/10 dark:text-gray-300'}`}>{count}</span>
+      <span className={`rounded-full px-2 py-0.5 font-mono text-[10px] ${active ? 'bg-emerald-950/10 text-emerald-950 dark:bg-white/15 dark:text-white' : 'bg-slate-200/70 text-slate-600 dark:bg-white/10 dark:text-gray-300'}`}>{count}</span>
     </button>
   );
 }
@@ -1673,36 +1756,36 @@ function HiveStandby({ historyCount }: { historyCount: number }) {
   const shouldReduceMotion = useReducedMotion();
 
   return (
-    <div className="relative min-h-[440px] overflow-hidden rounded-[28px] border border-dashed border-amber-300/35 bg-slate-50/60 p-5 dark:border-amber-300/20 dark:bg-black/20 sm:p-6">
-      <div className="relative z-10 flex min-h-[390px] flex-col justify-between">
+    <div className="swarm-standby-field relative min-h-[410px] overflow-hidden rounded-[20px] border border-dashed border-emerald-300/35 bg-slate-50/60 p-5 dark:border-emerald-300/20 dark:bg-black/25 sm:p-6">
+      <div className="relative z-10 flex min-h-[350px] flex-col">
         <div className="max-w-sm">
-          <div className="inline-flex items-center gap-2 rounded-full border border-amber-400/30 bg-amber-500/10 px-3 py-1 text-[10px] font-bold uppercase tracking-[0.22em] text-amber-700 dark:text-amber-200">
+          <div className="inline-flex items-center gap-2 rounded-full border border-emerald-400/30 bg-emerald-500/10 px-3 py-1 text-[10px] font-bold uppercase tracking-[0.22em] text-emerald-700 dark:text-emerald-200">
             <Activity size={14} />
-            Swarm standby
+            Standby
           </div>
-          <h3 className="mt-4 text-2xl font-black tracking-tight text-slate-900 dark:text-white">No active scan running.</h3>
-          <p className="mt-2 text-sm leading-relaxed text-slate-600 dark:text-gray-400">Start a review from the launch controls and live lane progress will take over this pane.</p>
-        </div>
-        <div className="flex flex-wrap gap-2">
-          <MetaPill label="read-only reviewers" />
-          <MetaPill label="scratch workspaces" />
-          <MetaPill label={`${historyCount} in history`} mono />
+          <h3 className="mt-4 text-2xl font-black tracking-tight text-slate-900 dark:text-white">Waiting for a target scan.</h3>
+          <p className="mt-2 text-sm leading-relaxed text-slate-600 dark:text-gray-400">Dispatch a swarm from the control rail and this space becomes the live lane board.</p>
+          <div className="mt-5 flex flex-wrap gap-2">
+            <MetaPill label="read-only reviewers" />
+            <MetaPill label="scratch workspaces" />
+            <MetaPill label={`${historyCount} in history`} mono />
+          </div>
         </div>
       </div>
-      <div className="pointer-events-none absolute inset-0 opacity-95">
+      <div className="swarm-hive-layer pointer-events-none absolute bottom-12 right-4 top-10 w-[62%] max-w-[540px] opacity-95 max-sm:inset-x-4 max-sm:bottom-20 max-sm:top-44 max-sm:w-auto">
         {HIVE_CELLS.map((cell, index) => (
           <motion.div
             key={`cell-${index}`}
-            className="absolute h-16 w-16 border border-amber-400/25 bg-amber-400/[0.04] dark:border-amber-300/20 dark:bg-amber-300/[0.04]"
+            className="absolute h-20 w-20 border border-amber-300/30 bg-amber-300/[0.055] shadow-[inset_0_0_22px_rgba(251,191,36,0.05)] dark:border-amber-200/[0.18] dark:bg-amber-200/[0.04]"
             style={{ left: `${cell.left}%`, top: `${cell.top}%`, clipPath: 'polygon(25% 6%, 75% 6%, 100% 50%, 75% 94%, 25% 94%, 0 50%)' }}
-            animate={shouldReduceMotion ? { opacity: 0.42, scale: 1 } : { opacity: [0.28, 0.58, 0.28], scale: [0.98, 1.03, 0.98] }}
+            animate={shouldReduceMotion ? { opacity: 0.52, scale: 1 } : { opacity: [0.38, 0.72, 0.38], scale: [0.98, 1.04, 0.98] }}
             transition={shouldReduceMotion ? undefined : { duration: 5.5, delay: cell.delay, repeat: Infinity, ease: 'easeInOut' }}
           />
         ))}
         {SWARM_DOTS.map((dot, index) => (
           <motion.span
             key={`dot-${index}`}
-            className="absolute h-2.5 w-2.5 rounded-full bg-emerald-300/80 shadow-[0_0_16px_rgba(110,231,183,0.55)]"
+            className="absolute h-2.5 w-2.5 rounded-full bg-emerald-300/85 shadow-[0_0_18px_rgba(110,231,183,0.68)]"
             style={{ left: `${dot.left}%`, top: `${dot.top}%` }}
             animate={shouldReduceMotion ? { x: 0, y: 0, opacity: 0.72 } : { x: [0, 10, -5, 0], y: [0, -8, 6, 0], opacity: [0.35, 1, 0.55, 0.35] }}
             transition={shouldReduceMotion ? undefined : { duration: 6, delay: dot.delay, repeat: Infinity, ease: 'easeInOut' }}
@@ -1820,13 +1903,21 @@ function progressFor(progress: ReviewProgress | undefined, fallbackTotal: number
 }
 
 function ProgressCounts({ progress, total }: { progress: ReviewProgress; total: number }) {
+  const rows = [
+    ['Queued', progress.queued || 0],
+    ['Running', progress.running || 0],
+    ['Done', progress.done || 0],
+    ['Failed', progress.failed || 0],
+    ['Cancelled', progress.cancelled || 0],
+  ] as const;
   return (
-    <div className="mb-2 flex flex-wrap items-center justify-between gap-2 text-sm text-slate-600 dark:text-gray-400">
-      <span>Queued {progress.queued || 0}/{total}</span>
-      <span>Running {progress.running || 0}/{total}</span>
-      <span>Done {progress.done || 0}/{total}</span>
-      <span>Failed {progress.failed || 0}/{total}</span>
-      <span>Cancelled {progress.cancelled || 0}/{total}</span>
+    <div className="mb-3 grid grid-cols-2 gap-2 text-sm sm:grid-cols-5">
+      {rows.map(([label, value]) => (
+        <div key={label} className="rounded-[12px] border border-slate-200/70 bg-white/55 px-3 py-2 dark:border-white/10 dark:bg-black/25">
+          <div className="font-mono text-base font-semibold text-slate-900 dark:text-white">{value}/{total}</div>
+          <div className="text-[10px] font-bold uppercase tracking-[0.16em] text-slate-500 dark:text-gray-500">{label}</div>
+        </div>
+      ))}
     </div>
   );
 }
@@ -1840,7 +1931,7 @@ function LimitNotice({ record, requested }: { record: LimitAwareRecord; requeste
   }
 
   return (
-    <div className="mt-4 rounded-2xl border border-amber-500/25 bg-amber-500/10 px-4 py-3 text-sm text-amber-100">
+    <div className="mt-4 rounded-[16px] border border-amber-500/25 bg-amber-500/[0.09] px-4 py-3 text-sm text-amber-800 dark:text-amber-100">
       <div className="flex items-start gap-2">
         <AlertTriangle size={16} className="mt-0.5 shrink-0" />
         <div>
@@ -2127,118 +2218,160 @@ function ReviewJobCard({
   const severity = job.severityCounts || { high: 0, medium: 0, low: 0 };
   const totalFindings = reviewFindingTotal(job);
   const lanes = reviewAgentVisibility(job.agents || []);
-  const renderAgentCard = (agent: ReviewAgentRecord) => (
-    <div key={agent.id} className="rounded-2xl border border-slate-200/80 bg-white/70 px-3 py-3 dark:border-white/5 dark:bg-black/30">
-      <div className="flex items-center justify-between gap-3">
-        <div className="font-mono text-xs text-slate-700 dark:text-gray-300">{agent.id}</div>
-        <div className="text-[10px] font-bold uppercase tracking-[0.18em] text-slate-500 dark:text-gray-500">{agent.status}</div>
+  const renderAgentCard = (agent: ReviewAgentRecord) => {
+    const showDetail = agent.detail && ['failed', 'cancelled'].includes(agent.status);
+    return (
+    <div key={agent.id} className="grid grid-cols-[74px_minmax(0,1fr)_76px] items-center gap-3 border-b border-slate-200/70 px-1 py-2.5 last:border-b-0 dark:border-white/[0.08]">
+      <div className="font-mono text-xs font-semibold text-slate-800 dark:text-gray-200">{agent.id}</div>
+      <div className="min-w-0">
+        <div className="truncate text-sm font-semibold text-slate-800 dark:text-gray-200">{agent.focus || 'review'}</div>
+        <div className="mt-0.5 text-xs text-slate-500 dark:text-gray-500">
+          {agent.assignedFiles} files{showDetail ? ` - ${agent.detail}` : ''}
+        </div>
       </div>
-      <div className="mt-1 text-xs text-slate-500 dark:text-gray-500">{agent.focus || 'review'} - {agent.assignedFiles} files, {agent.findings} findings</div>
+      <div className="text-right">
+        <div className="text-[10px] font-bold uppercase tracking-[0.16em] text-slate-500 dark:text-gray-500">{agent.status}</div>
+        <div className="mt-0.5 font-mono text-xs text-slate-700 dark:text-gray-300">{agent.findings} found</div>
+      </div>
     </div>
   );
+  };
 
   return (
-    <div className="rounded-[30px] border border-slate-200/80 bg-white/80 p-5 shadow-[0_18px_45px_rgba(15,23,42,0.08)] dark:border-white/10 dark:bg-white/[0.03] dark:shadow-2xl">
-      <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+    <article className="swarm-run-card rounded-[20px] border border-slate-200/80 bg-white/[0.78] p-4 shadow-[0_18px_48px_rgba(15,23,42,0.08)] dark:border-white/10 dark:bg-white/[0.035] dark:shadow-[0_22px_70px_rgba(0,0,0,0.32)] sm:p-5">
+      <div className="grid gap-5 lg:grid-cols-[minmax(0,1fr)_320px]">
         <div className="min-w-0">
           <div className="flex flex-wrap items-center gap-2">
-            <span className={`rounded-full border px-2.5 py-1 text-[10px] font-bold uppercase tracking-[0.22em] ${statusTone(job.status)}`}>{reviewDisplayStatus(job)}</span>
+            <span className={`rounded-full border px-2.5 py-1 text-[10px] font-bold uppercase tracking-[0.2em] ${statusTone(job.status)}`}>{reviewDisplayStatus(job)}</span>
             <MetaPill label={`${job.provider} swarm`} mono />
             <MetaPill label={`${job.agentCount} lane${job.agentCount === 1 ? '' : 's'}`} mono />
             {job.selfReview ? <MetaPill label="CLADEX self-review" /> : null}
             {job.cancelRequested && inFlight ? <MetaPill label="cancel pending" /> : null}
             {partialCancelled ? <MetaPill label="partial findings" /> : null}
           </div>
-          <h3 className="mt-3 text-xl font-bold tracking-tight text-slate-900 dark:text-white">{job.title || job.id}</h3>
+          <h3 className="mt-3 text-xl font-black tracking-tight text-slate-900 dark:text-white">{job.title || job.id}</h3>
           <div className="mt-2 break-all font-mono text-xs text-slate-500 dark:text-gray-500">{job.workspace}</div>
-        </div>
-        <div className="flex flex-wrap gap-2">
-          <ActionButton
-            label={fixPlanBusy ? 'Planning...' : 'Fix Plan'}
-            icon={fixPlanBusy ? <Loader2 size={16} className="animate-spin" /> : <FileText size={16} />}
-            busy={fixPlanBusy || inFlight}
-            onClick={onFixPlan}
-          />
-          {canFixReview ? (
-            <ActionButton
-              label={activeFixRun ? 'Fix running' : fixReviewBusy ? 'Starting fix...' : 'Fix Review'}
-              icon={fixReviewBusy ? <Loader2 size={16} className="animate-spin" /> : <Wrench size={16} />}
-              busy={fixReviewBusy || Boolean(activeFixRun)}
-              onClick={() => {
-                const message = job.selfReview
-                  ? 'Start write-capable CLADEX self-fix? This is separate from self-review and creates a source backup before edits.'
-                  : 'Start a guarded Fix Review run? CLADEX will create a source backup before any worker edits.';
-                if (window.confirm(message)) {
-                  onFixReview({ allowSelfFix: job.selfReview === true });
-                }
-              }}
-            />
-          ) : null}
-          {inFlight ? (
-            <ActionButton
-              label={cancelBusy ? 'Cancelling...' : 'Cancel'}
-              icon={cancelBusy ? <Loader2 size={16} className="animate-spin" /> : <X size={16} />}
-              busy={cancelBusy || job.cancelRequested === true}
-              tone="danger"
-              onClick={onCancel}
-            />
-          ) : null}
-        </div>
-      </div>
 
-      {totalFindings > 0 ? (
-        <div className="mt-4 flex flex-wrap items-center gap-2 text-[11px]">
-          <span className="rounded-full border border-red-500/25 bg-red-500/10 px-2.5 py-1 font-semibold text-red-200">High {severity.high}</span>
-          <span className="rounded-full border border-amber-500/25 bg-amber-500/10 px-2.5 py-1 font-semibold text-amber-200">Medium {severity.medium}</span>
-          <span className="rounded-full border border-slate-500/25 bg-slate-500/10 px-2.5 py-1 font-semibold text-slate-200">Low {severity.low}</span>
-        </div>
-      ) : null}
-
-      <div className="mt-5">
-        <ProgressCounts progress={progress} total={total} />
-        <div className="h-2 overflow-hidden rounded-full bg-slate-200 dark:bg-white/10">
-          <div className="h-full rounded-full bg-indigo-500 transition-all" style={{ width: `${percent}%` }} />
-        </div>
-      </div>
-
-      <LimitNotice record={job} requested={job.agentCount || total} />
-
-      <div className="mt-5 grid gap-3 lg:grid-cols-2">
-        <InspectorRow label="Report" value={job.reportPath || 'Pending'} mono />
-        <InspectorRow label="Fix plan" value={job.fixPlanPath || 'Not generated'} mono />
-        <InspectorRow label="Backup" value={job.sourceBackup?.id || job.sourceBackup?.error || 'Not created'} mono />
-      </div>
-
-      {job.error ? <div className="mt-4 rounded-2xl border border-red-500/25 bg-red-500/10 px-4 py-3 text-sm text-red-100">{job.error}</div> : null}
-
-      {lanes.total ? (
-        <div className="mt-5 space-y-2">
-          <div className="grid gap-2 md:grid-cols-2">
-            {lanes.visible.map(renderAgentCard)}
+          <div className="mt-5">
+            <ProgressCounts progress={progress} total={total} />
+            <div className="h-2 overflow-hidden rounded-full bg-slate-200 dark:bg-white/10">
+              <div className="h-full rounded-full bg-emerald-400 transition-all" style={{ width: `${percent}%` }} />
+            </div>
           </div>
-          {lanes.overflow.length ? (
-            <details className="rounded-2xl border border-slate-200/80 bg-white/60 px-3 py-3 dark:border-white/5 dark:bg-black/20">
-              <summary className="cursor-pointer text-xs font-semibold text-indigo-700 dark:text-indigo-300">
-                Show all {lanes.total} lanes ({lanes.overflow.length} more)
-              </summary>
-              <div className="mt-3 grid gap-2 md:grid-cols-2">
-                {lanes.overflow.map(renderAgentCard)}
+
+          <LimitNotice record={job} requested={job.agentCount || total} />
+
+          {job.error ? <div className="mt-4 rounded-[16px] border border-red-500/25 bg-red-500/10 px-4 py-3 text-sm text-red-700 dark:text-red-100">{job.error}</div> : null}
+
+          {lanes.total ? (
+            <div className="mt-5 rounded-[16px] border border-slate-200/80 bg-white/55 p-3 dark:border-white/[0.08] dark:bg-black/20">
+              <div className="mb-2 flex items-center justify-between gap-3">
+                <div className="text-[10px] font-bold uppercase tracking-[0.2em] text-slate-500 dark:text-gray-500">Lane board</div>
+                <MetaPill label={`${finished}/${total} settled`} mono />
               </div>
-            </details>
+              <div>
+                {lanes.visible.map(renderAgentCard)}
+              </div>
+              {lanes.overflow.length ? (
+                <details className="mt-2 rounded-[12px] border border-dashed border-slate-200/80 px-3 py-2 dark:border-white/10">
+                  <summary className="cursor-pointer text-xs font-semibold text-emerald-700 dark:text-emerald-300">
+                    Show all {lanes.total} lanes ({lanes.overflow.length} more)
+                  </summary>
+                  <div className="mt-2">
+                    {lanes.overflow.map(renderAgentCard)}
+                  </div>
+                </details>
+              ) : null}
+            </div>
           ) : null}
         </div>
-      ) : null}
+
+        <aside className="space-y-3 rounded-[18px] border border-slate-200/80 bg-slate-50/70 p-4 dark:border-white/[0.08] dark:bg-black/25">
+          <div className="flex flex-wrap gap-2">
+            <ActionButton
+              label={fixPlanBusy ? 'Planning...' : 'Fix Plan'}
+              icon={fixPlanBusy ? <Loader2 size={16} className="animate-spin" /> : <FileText size={16} />}
+              busy={fixPlanBusy}
+              disabled={inFlight}
+              onClick={onFixPlan}
+            />
+            {canFixReview ? (
+              <ActionButton
+                label={activeFixRun ? 'Fix running' : fixReviewBusy ? 'Starting fix...' : 'Fix Review'}
+                icon={fixReviewBusy ? <Loader2 size={16} className="animate-spin" /> : <Wrench size={16} />}
+                busy={fixReviewBusy || Boolean(activeFixRun)}
+                onClick={() => {
+                  const message = job.selfReview
+                    ? 'Start write-capable CLADEX self-fix? This is separate from self-review and creates a source backup before edits.'
+                    : 'Start a guarded Fix Review run? CLADEX will create a source backup before any worker edits.';
+                  if (window.confirm(message)) {
+                    onFixReview({ allowSelfFix: job.selfReview === true });
+                  }
+                }}
+              />
+            ) : null}
+            {inFlight ? (
+              <ActionButton
+                label={cancelBusy ? 'Cancelling...' : 'Cancel'}
+                icon={cancelBusy ? <Loader2 size={16} className="animate-spin" /> : <X size={16} />}
+                busy={cancelBusy || job.cancelRequested === true}
+                tone="danger"
+                onClick={onCancel}
+              />
+            ) : null}
+          </div>
+
+          <div className="rounded-[14px] border border-slate-200/80 bg-white/60 px-3 py-3 dark:border-white/[0.08] dark:bg-black/25">
+            <div className="text-[10px] font-bold uppercase tracking-[0.2em] text-slate-500 dark:text-gray-500">Findings</div>
+            <div className="mt-2 grid grid-cols-3 gap-2 text-center">
+              <SeverityCounter label="High" value={severity.high || 0} tone="red" />
+              <SeverityCounter label="Medium" value={severity.medium || 0} tone="amber" />
+              <SeverityCounter label="Low" value={severity.low || 0} tone="slate" />
+            </div>
+          </div>
+
+          <div className="rounded-[14px] border border-slate-200/80 bg-white/60 px-3 py-3 dark:border-white/[0.08] dark:bg-black/25">
+            <div className="mb-2 text-[10px] font-bold uppercase tracking-[0.2em] text-slate-500 dark:text-gray-500">Artifacts</div>
+            <ArtifactLine label="Report" value={job.reportPath || 'Pending'} />
+            <ArtifactLine label="Fix plan" value={job.fixPlanPath || 'Not generated'} />
+            <ArtifactLine label="Backup" value={job.sourceBackup?.id || job.sourceBackup?.error || 'Not created'} />
+          </div>
+        </aside>
+      </div>
 
       {job.reportPreview ? (
         <details className="mt-5">
           <summary className="cursor-pointer text-sm font-semibold text-indigo-300">Report preview</summary>
-          <pre className="mt-3 max-h-80 overflow-y-auto whitespace-pre-wrap rounded-2xl border border-white/5 bg-black p-4 text-xs leading-relaxed text-gray-300">{job.reportPreview}</pre>
+          <pre className="mt-3 max-h-80 overflow-y-auto whitespace-pre-wrap rounded-[16px] border border-white/5 bg-black p-4 text-xs leading-relaxed text-gray-300">{job.reportPreview}</pre>
         </details>
       ) : null}
 
       {canExploreFindings ? (
         <FindingsExplorer jobId={job.id} totalFindings={totalFindings} partial={partialCancelled} />
       ) : null}
+    </article>
+  );
+}
+
+function SeverityCounter({ label, value, tone }: { label: string; value: number; tone: 'red' | 'amber' | 'slate' }) {
+  const toneClass = tone === 'red'
+    ? 'text-red-700 dark:text-red-200'
+    : tone === 'amber'
+      ? 'text-amber-700 dark:text-amber-200'
+      : 'text-slate-700 dark:text-gray-200';
+  return (
+    <div>
+      <div className={`font-mono text-lg font-semibold ${toneClass}`}>{value}</div>
+      <div className="text-[10px] font-bold uppercase tracking-[0.14em] text-slate-500 dark:text-gray-500">{label}</div>
+    </div>
+  );
+}
+
+function ArtifactLine({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="grid grid-cols-[70px_minmax(0,1fr)] gap-2 border-t border-slate-200/70 py-2 first:border-t-0 dark:border-white/[0.08]">
+      <div className="text-[10px] font-bold uppercase tracking-[0.16em] text-slate-500 dark:text-gray-500">{label}</div>
+      <div className="break-all font-mono text-xs text-slate-700 dark:text-gray-300">{value}</div>
     </div>
   );
 }
@@ -2247,6 +2380,7 @@ function FindingsExplorer({ jobId, totalFindings, partial = false }: { jobId: st
   const [open, setOpen] = useState(false);
   const [findings, setFindings] = useState<ReviewFinding[] | null>(null);
   const [loading, setLoading] = useState(false);
+  const [requested, setRequested] = useState(false);
   const [errorText, setErrorText] = useState('');
   const [severityFilter, setSeverityFilter] = useState<Record<'high' | 'medium' | 'low', boolean>>({
     high: true,
@@ -2256,8 +2390,16 @@ function FindingsExplorer({ jobId, totalFindings, partial = false }: { jobId: st
   const [categoryFilter, setCategoryFilter] = useState<string>('');
 
   useEffect(() => {
-    if (!open || findings !== null || loading) return;
+    setFindings(null);
+    setErrorText('');
+    setRequested(false);
+    setCategoryFilter('');
+  }, [jobId]);
+
+  useEffect(() => {
+    if (!open || findings !== null || loading || requested) return;
     let cancelled = false;
+    setRequested(true);
     setLoading(true);
     setErrorText('');
     api
@@ -2274,7 +2416,7 @@ function FindingsExplorer({ jobId, totalFindings, partial = false }: { jobId: st
     return () => {
       cancelled = true;
     };
-  }, [open, findings, loading, jobId]);
+  }, [open, findings, loading, requested, jobId]);
 
   const categories = Array.from(new Set((findings || []).map((item) => item.category || 'unknown'))).sort();
   const filtered = (findings || []).filter((item) => {
@@ -2304,7 +2446,20 @@ function FindingsExplorer({ jobId, totalFindings, partial = false }: { jobId: st
       </summary>
       <div className="mt-3 rounded-2xl border border-white/5 bg-black/40 p-4">
         {loading ? <div className="text-xs text-gray-400">Loading findings...</div> : null}
-        {errorText ? <div className="text-xs text-red-300">{errorText}</div> : null}
+        {errorText ? (
+          <div className="flex flex-wrap items-center gap-3 text-xs text-red-300">
+            <span>{errorText}</span>
+            <button
+              onClick={() => {
+                setErrorText('');
+                setRequested(false);
+              }}
+              className="rounded-full border border-red-400/40 bg-red-500/10 px-2.5 py-1 font-semibold text-red-100 hover:bg-red-500/20"
+            >
+              Retry
+            </button>
+          </div>
+        ) : null}
         {findings !== null && !loading && !errorText ? (
           <>
             <div className="flex flex-wrap items-center gap-2 text-[11px]">
@@ -2363,6 +2518,9 @@ function FindingsExplorer({ jobId, totalFindings, partial = false }: { jobId: st
                     </div>
                     <div className="mt-1 text-sm font-semibold text-white">{item.title || 'Finding'}</div>
                     <div className="mt-0.5 break-all font-mono text-[11px] text-gray-400">{item.path || '.'}{item.line ? `:${item.line}` : ''}</div>
+                    {item.detail ? (
+                      <div className="mt-1 whitespace-pre-wrap break-words text-xs leading-relaxed text-gray-400">{item.detail}</div>
+                    ) : null}
                     {item.recommendation ? (
                       <div className="mt-1 text-xs text-gray-300">→ {item.recommendation}</div>
                     ) : null}
@@ -2393,10 +2551,12 @@ function LiveFeed({
   const [activeWorkspace, setActiveWorkspace] = useState(workspaces[0] || '');
   const [messages, setMessages] = useState<ChatMessageRecord[]>([]);
   const [loading, setLoading] = useState(false);
+  const [historyError, setHistoryError] = useState('');
   const [sending, setSending] = useState(false);
   const [draft, setDraft] = useState('');
   const workspaceProfiles = profiles.filter((profile) => profile.workspace === activeWorkspace);
-  const activeProfile = workspaceProfiles.find((profile) => profile.id === selectedProfileId) || workspaceProfiles[0] || null;
+  const activeProfile = workspaceProfiles.find((profile) => profileKey(profile) === selectedProfileId) || workspaceProfiles[0] || null;
+  const activeProfileCanChat = Boolean(activeProfile?.running && activeProfile?.ready);
 
   useEffect(() => {
     if (!workspaces.length) {
@@ -2409,8 +2569,8 @@ function LiveFeed({
   }, [activeWorkspace, workspaces]);
 
   useEffect(() => {
-    if (activeProfile && activeProfile.id !== selectedProfileId) {
-      onSelectProfile(activeProfile.id);
+    if (activeProfile && profileKey(activeProfile) !== selectedProfileId) {
+      onSelectProfile(profileKey(activeProfile));
     }
   }, [activeProfile, onSelectProfile, selectedProfileId]);
 
@@ -2426,6 +2586,11 @@ function LiveFeed({
         const payload = await api.chatHistory(activeProfile.id, activeProfile.relayType);
         if (!cancelled) {
           setMessages(payload.messages || []);
+          setHistoryError('');
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setHistoryError(error instanceof Error ? error.message : 'Failed to load local chat history.');
         }
       } finally {
         if (!cancelled) {
@@ -2442,7 +2607,7 @@ function LiveFeed({
   }, [activeProfile]);
 
   async function sendMessage() {
-    if (!activeProfile || !draft.trim() || sending) {
+    if (!activeProfile || !activeProfileCanChat || !draft.trim() || sending) {
       return;
     }
     const content = draft.trim();
@@ -2509,7 +2674,7 @@ function LiveFeed({
             <div className="text-[10px] font-bold uppercase tracking-[0.22em] text-slate-500 dark:text-gray-500">Relays in this workspace</div>
             <div className="mt-4 space-y-3">
               {workspaceProfiles.map((profile) => (
-                <button key={profile.id} onClick={() => onSelectProfile(profile.id)} className={`w-full rounded-2xl border px-4 py-3 text-left transition-colors ${activeProfile?.id === profile.id ? 'border-indigo-500/30 bg-indigo-500/10' : 'border-slate-200 bg-white/70 hover:bg-slate-50 dark:border-white/5 dark:bg-white/[0.02] dark:hover:bg-white/[0.06]'}`}>
+                <button key={profileKey(profile)} onClick={() => onSelectProfile(profileKey(profile))} className={`w-full rounded-2xl border px-4 py-3 text-left transition-colors ${activeProfile && profileKey(activeProfile) === profileKey(profile) ? 'border-indigo-500/30 bg-indigo-500/10' : 'border-slate-200 bg-white/70 hover:bg-slate-50 dark:border-white/5 dark:bg-white/[0.02] dark:hover:bg-white/[0.06]'}`}>
                   <div className="flex items-center justify-between gap-3">
                     <div>
                       <div className="text-sm font-semibold text-slate-900 dark:text-white">{labelFor(profile)}</div>
@@ -2529,7 +2694,7 @@ function LiveFeed({
                   <div className="text-[10px] font-bold uppercase tracking-[0.22em] text-slate-500 dark:text-gray-500">Local operator chat</div>
                   <div className="mt-2 text-2xl font-bold tracking-tight text-slate-900 dark:text-white">{labelFor(activeProfile)}</div>
                   <div className="mt-2 text-sm text-slate-600 dark:text-gray-400">
-                    Chat with the same running relay session from inside CLADEX. Discord is still live; this is just the local operator surface.
+                    {activeProfileCanChat ? 'Chat with the same running relay session from inside CLADEX. Discord is still live; this is just the local operator surface.' : 'Start this relay before sending a local operator message.'}
                   </div>
                 </>
               ) : (
@@ -2542,6 +2707,8 @@ function LiveFeed({
                 <EmptyState title="No relay selected." detail="Pick a relay on the left to inspect its feed." compact />
               ) : loading && !messages.length ? (
                 <div className="flex items-center gap-2 text-indigo-500 dark:text-indigo-300"><Loader2 size={16} className="animate-spin" /> Loading local chat history...</div>
+              ) : historyError ? (
+                <EmptyState title="Could not load local chat." detail={historyError} compact />
               ) : messages.length ? (
                 <div className="space-y-4">
                   {messages.map((message) => {
@@ -2573,13 +2740,13 @@ function LiveFeed({
                         void sendMessage();
                       }
                     }}
-                    placeholder={activeProfile ? `Message ${labelFor(activeProfile)} here instead of Discord...` : 'Select a relay first'}
-                    disabled={!activeProfile || sending}
+                    placeholder={activeProfile ? (activeProfileCanChat ? `Message ${labelFor(activeProfile)} here instead of Discord...` : 'Start this relay to enable local operator chat') : 'Select a relay first'}
+                    disabled={!activeProfile || !activeProfileCanChat || sending}
                     className="min-h-[88px] flex-1 resize-none rounded-[22px] border border-slate-200 bg-white/85 px-4 py-3 text-sm text-slate-900 outline-none transition-colors focus:border-indigo-500 dark:border-white/10 dark:bg-black/40 dark:text-white"
                   />
                   <button
                     onClick={() => void sendMessage()}
-                    disabled={!activeProfile || !draft.trim() || sending}
+                    disabled={!activeProfile || !activeProfileCanChat || !draft.trim() || sending}
                     className="inline-flex min-w-[120px] items-center justify-center gap-2 self-stretch rounded-[22px] bg-indigo-600 px-4 py-3 text-sm font-semibold text-white transition-colors hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-50 sm:self-end"
                   >
                     {sending ? <Loader2 size={16} className="animate-spin" /> : <MessageSquare size={16} />}
@@ -2865,8 +3032,8 @@ function WorkgroupModal({
           <div className="text-[10px] font-bold uppercase tracking-[0.22em] text-gray-500">Included relays</div>
           <div className="mt-4 grid gap-3 md:grid-cols-2">
             {profiles.map((profile) => (
-              <label key={profile.id} className="flex items-start gap-3 rounded-2xl border border-white/5 bg-white/[0.03] px-4 py-3">
-                <input type="checkbox" checked={Boolean(selectedIds[profile.id])} onChange={(event) => setSelectedIds((current) => ({ ...current, [profile.id]: event.target.checked }))} className="mt-1 h-4 w-4 accent-indigo-500" />
+              <label key={profileKey(profile)} className="flex items-start gap-3 rounded-2xl border border-white/5 bg-white/[0.03] px-4 py-3">
+                <input type="checkbox" checked={Boolean(selectedIds[profileKey(profile)])} onChange={(event) => setSelectedIds((current) => ({ ...current, [profileKey(profile)]: event.target.checked }))} className="mt-1 h-4 w-4 accent-indigo-500" />
                 <div>
                   <div className="text-sm font-semibold text-white">{labelFor(profile)}</div>
                   <div className="text-xs text-gray-500">{workspaceFor(profile)} · {profile.type}</div>
@@ -2878,7 +3045,7 @@ function WorkgroupModal({
         <div className="flex flex-col-reverse justify-end gap-3 pt-2 sm:flex-row">
           <SecondaryButton label="Cancel" onClick={onClose} />
           <PrimaryButton label={saving ? 'Saving...' : 'Save workgroup'} icon={saving ? <Loader2 size={16} className="animate-spin" /> : <FolderKanban size={16} />} onClick={async () => {
-            const members = profiles.filter((profile) => selectedIds[profile.id]).map((profile) => ({ id: profile.id, relayType: profile.relayType }));
+            const members = profiles.filter((profile) => selectedIds[profileKey(profile)]).map((profile) => ({ id: profile.id, relayType: profile.relayType }));
             if (!name || !members.length) return;
             setSaving(true);
             try {
@@ -2924,7 +3091,7 @@ function SettingsModal({
         {runtimeInfo?.frontendDir ? <InspectorRow label="Frontend path" value={runtimeInfo.frontendDir} mono /> : null}
         <InspectorRow label="App version" value={runtimeInfo?.appVersion || 'Loading...'} />
         <InspectorRow label="Packaging" value={runtimeInfo?.packaged ? 'Packaged desktop build' : 'Source build'} />
-        {runtimeInfo?.remoteAccessToken ? <InspectorRow label="Remote token" value={runtimeInfo.remoteAccessToken} mono /> : null}
+        {runtimeInfo?.remoteAccessToken ? <InspectorRow label="Remote token" value={maskSecret(runtimeInfo.remoteAccessToken)} mono /> : null}
         <div className="rounded-2xl border border-slate-200/80 bg-white/70 p-4 text-sm text-slate-600 dark:border-white/10 dark:bg-black/30 dark:text-gray-400">
           <div className="mb-2 text-[10px] font-bold uppercase tracking-[0.22em] text-slate-500 dark:text-gray-500">Runtime notes</div>
           <ul className="space-y-2">
@@ -2968,6 +3135,7 @@ function SettingsModal({
 function LogsModal({ profile, onClose }: { profile: Profile; onClose: () => void }) {
   const [logs, setLogs] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
+  const [errorText, setErrorText] = useState('');
 
   useEffect(() => {
     let cancelled = false;
@@ -2976,6 +3144,11 @@ function LogsModal({ profile, onClose }: { profile: Profile; onClose: () => void
         const payload = await api.logs(profile.id, profile.relayType);
         if (!cancelled) {
           setLogs(payload.logs || []);
+          setErrorText('');
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setErrorText(error instanceof Error ? error.message : 'Failed to load logs.');
         }
       } finally {
         if (!cancelled) {
@@ -2994,7 +3167,7 @@ function LogsModal({ profile, onClose }: { profile: Profile; onClose: () => void
   return (
     <ModalShell title={`Live logs · ${labelFor(profile)}`} onClose={onClose} wide>
       <div className="h-80 overflow-y-auto rounded-2xl border border-white/5 bg-black p-4 font-mono text-xs text-gray-300">
-        {loading ? <div className="flex items-center gap-2 text-indigo-300"><Loader2 size={14} className="animate-spin" /> Loading logs...</div> : logs.length ? logs.map((line, index) => <div key={`${profile.id}-${index}`}>{line}</div>) : <div className="text-gray-500">No log lines recorded yet for this relay.</div>}
+        {loading ? <div className="flex items-center gap-2 text-indigo-300"><Loader2 size={14} className="animate-spin" /> Loading logs...</div> : errorText ? <div className="text-amber-300">{errorText}</div> : logs.length ? logs.map((line, index) => <div key={`${profile.id}-${index}`}>{line}</div>) : <div className="text-gray-500">No log lines recorded yet for this relay.</div>}
       </div>
     </ModalShell>
   );
@@ -3100,12 +3273,12 @@ function FormSelect({ label, value, onChange, options }: { label: string; value:
 }
 
 function ToggleRow({ checked, onChange, label }: { checked: boolean; onChange: (checked: boolean) => void; label: string }) {
-  return <label className="flex items-center gap-3 rounded-2xl border border-slate-200/80 bg-white/80 px-4 py-3 text-sm text-slate-700 dark:border-white/10 dark:bg-black/30 dark:text-gray-300"><input type="checkbox" checked={checked} onChange={(event) => onChange(event.target.checked)} className="h-4 w-4 accent-indigo-500" />{label}</label>;
+  return <label className="flex items-center gap-3 rounded-[16px] border border-slate-200/80 bg-white/80 px-4 py-3 text-sm text-slate-700 dark:border-white/10 dark:bg-black/30 dark:text-gray-300"><input type="checkbox" checked={checked} onChange={(event) => onChange(event.target.checked)} className="h-4 w-4 accent-emerald-500" />{label}</label>;
 }
 
 function TypeButton({ active, label, icon, onClick, tone }: { active: boolean; label: string; icon: React.ReactNode; onClick: () => void; tone: 'orange' | 'emerald' }) {
-  const activeStyles = tone === 'orange' ? 'border-orange-500/40 bg-orange-500/10 text-orange-200' : 'border-emerald-500/40 bg-emerald-500/10 text-emerald-200';
-  return <button type="button" onClick={onClick} className={`flex items-center justify-center gap-3 rounded-2xl border px-4 py-4 font-semibold transition-colors ${active ? activeStyles : 'border-white/10 bg-white/[0.03] text-gray-400 hover:bg-white/[0.06]'}`}>{icon}{label}</button>;
+  const activeStyles = tone === 'orange' ? 'border-orange-500/40 bg-orange-500/10 text-orange-800 dark:text-orange-200' : 'border-emerald-500/40 bg-emerald-500/10 text-emerald-800 dark:text-emerald-200';
+  return <button type="button" onClick={onClick} className={`flex min-h-12 items-center justify-center gap-3 rounded-[16px] border px-4 py-3 font-semibold transition-colors ${active ? activeStyles : 'border-slate-200/80 bg-white/55 text-slate-500 hover:bg-white dark:border-white/10 dark:bg-white/[0.03] dark:text-gray-400 dark:hover:bg-white/[0.06]'}`}>{icon}{label}</button>;
 }
 
 function RemoteAccessModal({
@@ -3118,6 +3291,7 @@ function RemoteAccessModal({
   onSubmit: () => Promise<void>;
 }) {
   const [submitting, setSubmitting] = useState(false);
+  const [errorText, setErrorText] = useState('');
   return (
     <ModalShell title="Remote Access Token" onClose={() => undefined}>
       <div className="space-y-4">
@@ -3125,12 +3299,16 @@ function RemoteAccessModal({
           This CLADEX instance is being opened from a non-local origin. Enter the CLADEX remote access token from the local Runtime panel to continue.
         </p>
         <FormInput label="Access token" value={token} onChange={onChangeToken} placeholder="Paste the CLADEX remote access token" mono type="password" />
+        {errorText ? <div className="rounded-xl border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-700 dark:text-red-200">{errorText}</div> : null}
         <div className="flex flex-col-reverse justify-end gap-3 sm:flex-row">
-          <SecondaryButton label="Clear saved token" onClick={() => { storeAccessToken(''); onChangeToken(''); }} />
+          <SecondaryButton label="Clear saved token" onClick={() => { storeAccessToken(''); onChangeToken(''); setErrorText(''); }} />
           <PrimaryButton label={submitting ? 'Connecting...' : 'Unlock CLADEX'} icon={submitting ? <Loader2 size={16} className="animate-spin" /> : <Settings size={16} />} onClick={async () => {
             setSubmitting(true);
+            setErrorText('');
             try {
               await onSubmit();
+            } catch (error) {
+              setErrorText(error instanceof Error ? error.message : 'Could not unlock CLADEX with that token.');
             } finally {
               setSubmitting(false);
             }
@@ -3220,8 +3398,8 @@ function DockButton({ icon, label, active, onClick, light = false }: { icon: Rea
   return <div className="group relative"><motion.button type="button" aria-label={label} aria-current={active ? 'page' : undefined} ref={ref} onMouseMove={(event) => { if (!ref.current) return; const bounds = ref.current.getBoundingClientRect(); setPosition({ x: (event.clientX - (bounds.left + bounds.width / 2)) * 0.3, y: (event.clientY - (bounds.top + bounds.height / 2)) * 0.3 }); }} onMouseLeave={() => setPosition({ x: 0, y: 0 })} animate={{ x: position.x, y: position.y }} transition={{ type: 'spring', stiffness: 150, damping: 15, mass: 0.1 }} whileHover={{ scale: 1.08 }} whileTap={{ scale: 0.96 }} onClick={onClick} className={`rounded-xl p-3 transition-colors ${active ? 'bg-indigo-500 text-white shadow-[0_0_20px_rgba(99,102,241,0.5)]' : light ? 'text-slate-600 hover:bg-black/5 hover:text-slate-900' : 'text-gray-400 hover:bg-white/10 hover:text-white'}`}>{icon}</motion.button><div className={`pointer-events-none absolute bottom-full left-1/2 mb-3 -translate-x-1/2 whitespace-nowrap rounded-lg border px-3 py-1.5 text-xs font-bold opacity-0 transition-opacity group-hover:opacity-100 ${light ? 'border-slate-200 bg-white text-slate-800 shadow-xl' : 'border-white/10 bg-black/80 text-white'}`}>{label}</div></div>;
 }
 
-function ActionButton({ label, icon, onClick, busy = false, tone = 'default', light = false }: { label: string; icon: React.ReactNode; onClick: () => void; busy?: boolean; tone?: 'default' | 'danger'; light?: boolean }) {
-  return <button type="button" onClick={onClick} disabled={busy} className={`inline-flex items-center gap-2 rounded-2xl border px-4 py-2 text-sm font-semibold transition-colors disabled:opacity-50 ${tone === 'danger' ? 'border-red-500/25 bg-red-500/10 text-red-700 hover:bg-red-500/20 dark:text-red-200' : light ? 'border-slate-300 bg-white text-slate-800 hover:bg-slate-100' : 'border-white/10 bg-white/[0.04] text-white hover:bg-white/[0.08]'}`}>{busy ? <Loader2 size={16} className="animate-spin" /> : icon}{label}</button>;
+function ActionButton({ label, icon, onClick, busy = false, disabled = false, tone = 'default', light = false }: { label: string; icon: React.ReactNode; onClick: () => void; busy?: boolean; disabled?: boolean; tone?: 'default' | 'danger'; light?: boolean }) {
+  return <button type="button" onClick={onClick} disabled={busy || disabled} className={`inline-flex items-center gap-2 rounded-[14px] border px-4 py-2 text-sm font-semibold transition-colors disabled:opacity-50 ${tone === 'danger' ? 'border-red-500/25 bg-red-500/10 text-red-700 hover:bg-red-500/20 dark:text-red-200' : light ? 'border-slate-300 bg-white text-slate-800 hover:bg-slate-100' : 'border-slate-200/80 bg-white/70 text-slate-800 hover:bg-white dark:border-white/10 dark:bg-white/[0.04] dark:text-white dark:hover:bg-white/[0.08]'}`}>{busy ? <Loader2 size={16} className="animate-spin" /> : icon}{label}</button>;
 }
 
 function PrimaryButton({ label, icon, onClick, busy = false, disabled = false }: { label: string; icon: React.ReactNode; onClick: () => void; busy?: boolean; disabled?: boolean }) {

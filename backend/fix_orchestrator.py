@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -325,7 +326,7 @@ def _run_claude_planner(prompt: str, account_home: str | None) -> dict[str, Any]
     cmd = [
         claude_relay.claude_code_bin(),
         "-p",
-        "--tools",
+        "--allowedTools",
         "",
         "--disallowedTools",
         "Bash,Edit,MultiEdit,Write,NotebookEdit",
@@ -532,8 +533,18 @@ def _ai_plan_fix_tasks_once(
     missed = [fid for fid in findings_by_id if fid not in seen_findings]
     if missed:
         next_index = len(tasks) + 1
-        primary = findings_by_id.get(missed[0]) or {}
-        files = [_finding_path(primary.get("path"))] if _finding_path(primary.get("path")) != "." else []
+        missed_findings = [findings_by_id.get(fid) or {} for fid in missed]
+        files = []
+        for finding in missed_findings:
+            path = _finding_path(finding.get("path"))
+            if path != "." and path not in files:
+                files.append(path)
+        severity_rank = {"high": 0, "medium": 1, "low": 2}
+        severity = min(
+            (str(finding.get("severity") or "low").lower() for finding in missed_findings),
+            key=lambda item: severity_rank.get(item, 3),
+            default="low",
+        )
         tasks.append(
             {
                 "id": f"task-{next_index:04d}",
@@ -543,7 +554,7 @@ def _ai_plan_fix_tasks_once(
                 "provider": provider,
                 "status": "queued",
                 "title": f"Catch-all: address {len(missed)} planner-skipped finding(s)",
-                "severity": "low",
+                "severity": severity if severity in severity_rank else "low",
                 "category": "planner-residual",
                 "files": files,
                 "recommendation": "Apply targeted fixes for the findings the orchestrator skipped, one by one.",
@@ -670,6 +681,8 @@ def discover_validation_commands(workspace: str | Path) -> list[list[str]]:
         for name in ("lint", "test", "build"):
             if name in scripts:
                 commands.append(["cmd", "/c", "npm", "run", name] if os.name == "nt" else ["npm", "run", name])
+    if (root / "backend" / "pyproject.toml").exists() or (root / "backend" / "tests").exists():
+        commands.append([sys.executable, "-m", "pytest", "backend/tests", "--tb=short", "-q"])
     if (root / "pyproject.toml").exists() or (root / "pytest.ini").exists() or (root / "tests").exists():
         commands.append([sys.executable, "-m", "pytest", "--tb=short", "-q"])
     if (root / ".git").exists():
@@ -692,6 +705,30 @@ def _safe_phase_parallelism(tasks: list[dict[str, Any]], requested: int) -> int:
     # Fix workers share one writable workspace. Keep phases serialized until
     # CLADEX has per-task worktree isolation and a merge step.
     return 1
+
+
+def _ready_phase_tasks(tasks: list[dict[str, Any]], phase: int) -> list[dict[str, Any]]:
+    completed = {str(task.get("id")) for task in tasks if task.get("status") == "done"}
+    ready: list[dict[str, Any]] = []
+    for task in tasks:
+        if int(task.get("phase", 3) or 3) != phase or task.get("status") != "queued":
+            continue
+        dependencies = [str(item) for item in (task.get("dependsOn") or []) if str(item).strip()]
+        if all(dep in completed for dep in dependencies):
+            ready.append(task)
+    return ready
+
+
+def _blocked_phase_tasks(tasks: list[dict[str, Any]], phase: int) -> list[dict[str, Any]]:
+    completed = {str(task.get("id")) for task in tasks if task.get("status") == "done"}
+    blocked: list[dict[str, Any]] = []
+    for task in tasks:
+        if int(task.get("phase", 3) or 3) != phase or task.get("status") != "queued":
+            continue
+        dependencies = [str(item) for item in (task.get("dependsOn") or []) if str(item).strip()]
+        if any(dep not in completed for dep in dependencies):
+            blocked.append(task)
+    return blocked
 
 
 def _save_run(run: dict[str, Any]) -> None:
@@ -833,8 +870,7 @@ def launch_fix_worker(run_id: str) -> None:
         "stdout": subprocess.DEVNULL,
         "stderr": subprocess.DEVNULL,
     }
-    if os.name == "nt":
-        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+    kwargs.update(review_swarm._hidden_subprocess_kwargs())
     subprocess.Popen(command, **kwargs)
 
 
@@ -997,7 +1033,7 @@ def _git_dirty_paths(workspace: Path) -> set[str] | None:
             capture_output=True,
             check=False,
             timeout=30,
-            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            **review_swarm._hidden_subprocess_kwargs(),
         )
     except Exception:
         return None
@@ -1133,6 +1169,48 @@ def _stable_scope_check(
     return changed_files, outside_assigned
 
 
+def _restore_paths_from_source_backup(run: dict[str, Any], paths: list[str]) -> list[str]:
+    backup = run.get("sourceBackup") if isinstance(run.get("sourceBackup"), dict) else {}
+    snapshot = Path(str(backup.get("snapshot") or "")).expanduser()
+    if not snapshot.exists():
+        return []
+    workspace = Path(str(run.get("workspace"))).expanduser().resolve()
+    snapshot_root = snapshot.resolve()
+    restored: list[str] = []
+    for item in paths:
+        rel = _normalize_rel_path(item)
+        if not rel or rel == ".":
+            continue
+        target = (workspace / rel).resolve()
+        source = (snapshot_root / rel).resolve()
+        try:
+            target.relative_to(workspace)
+            source.relative_to(snapshot_root)
+        except ValueError:
+            continue
+        try:
+            if source.exists() or source.is_symlink():
+                if target.exists() or target.is_symlink():
+                    if target.is_dir() and not target.is_symlink():
+                        shutil.rmtree(target)
+                    else:
+                        target.unlink()
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if source.is_dir() and not source.is_symlink():
+                    shutil.copytree(source, target, symlinks=True)
+                else:
+                    shutil.copy2(source, target, follow_symlinks=False)
+            elif target.exists() or target.is_symlink():
+                if target.is_dir() and not target.is_symlink():
+                    shutil.rmtree(target)
+                else:
+                    target.unlink()
+            restored.append(rel)
+        except OSError:
+            continue
+    return sorted(set(restored))
+
+
 def _run_cli(
     command: list[str],
     prompt: str,
@@ -1230,11 +1308,15 @@ def run_fix_task_once(run_id: str, task_id: str) -> dict[str, Any]:
         before,
         list(task.get("files") or ["."]),
     )
+    restored_outside = _restore_paths_from_source_backup(run, outside_assigned) if outside_assigned else []
     if result.ok and outside_assigned:
         result = review_swarm.AIRunResult(
             text=result.text,
             ok=False,
-            error=f"Fix worker edited files outside assigned task scope: {', '.join(outside_assigned[:12])}",
+            error=(
+                f"Fix worker edited files outside assigned task scope: {', '.join(outside_assigned[:12])}"
+                + (f". Restored {len(restored_outside)} out-of-scope path(s) from the source backup." if restored_outside else "")
+            ),
         )
     output_path = task_output_path(run_id, task_id)
     _atomic_write_text(output_path, result.text or result.error or "")
@@ -1242,6 +1324,8 @@ def run_fix_task_once(run_id: str, task_id: str) -> dict[str, Any]:
     def finish_update(_run: dict[str, Any], current: dict[str, Any]) -> None:
         current["outputPath"] = str(output_path)
         current["changedFiles"] = sorted(changed_files)
+        if restored_outside:
+            current["restoredFiles"] = restored_outside
         current["finishedAt"] = utc_now()
         if result.ok:
             current["status"] = "done"
@@ -1272,8 +1356,7 @@ def _run_one_validation_command(
         "stdout": subprocess.PIPE,
         "stderr": subprocess.PIPE,
     }
-    if os.name == "nt":
-        popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+    popen_kwargs.update(review_swarm._hidden_subprocess_kwargs())
     try:
         process = subprocess.Popen([str(part) for part in command], **popen_kwargs)
     except Exception as exc:
@@ -1355,25 +1438,45 @@ def run_fix_run(run_id: str) -> dict[str, Any]:
         for phase in phases:
             if _cancel_requested(run_id):
                 break
-            phase_tasks = [
-                task for task in load_fix_run(run_id).get("tasks", []) if int(task.get("phase", 3) or 3) == phase and task.get("status") == "queued"
-            ]
-            max_workers = _safe_phase_parallelism(
-                phase_tasks,
-                validate_max_agents(run.get("maxAgents", DEFAULT_FIX_MAX_AGENTS)),
-            )
-            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = [executor.submit(run_fix_task_once, run_id, task["id"]) for task in phase_tasks]
-                for future in concurrent.futures.as_completed(futures):
-                    future.result()
-            run = load_fix_run(run_id)
-            if any(task.get("status") == "failed" for task in run.get("tasks", []) if int(task.get("phase", 3) or 3) == phase):
-                run["status"] = "failed"
-                run["finishedAt"] = utc_now()
-                restore_command = restore_command_for_run(run)
-                run["error"] = f"Phase {phase} failed. Restore with `{restore_command}`."
-                _save_run(run)
-                return show_fix_run(run_id)
+            while True:
+                run = load_fix_run(run_id)
+                phase_tasks = [
+                    task for task in run.get("tasks", []) if int(task.get("phase", 3) or 3) == phase
+                ]
+                queued = [task for task in phase_tasks if task.get("status") == "queued"]
+                if not queued:
+                    break
+                ready_tasks = _ready_phase_tasks(run.get("tasks", []), phase)
+                if not ready_tasks:
+                    blocked = _blocked_phase_tasks(run.get("tasks", []), phase)
+                    blocked_ids = ", ".join(str(task.get("id")) for task in blocked[:8]) or "unknown"
+                    run["status"] = "failed"
+                    run["finishedAt"] = utc_now()
+                    restore_command = restore_command_for_run(run)
+                    run["error"] = (
+                        f"Phase {phase} is blocked by incomplete task dependencies for {blocked_ids}. "
+                        f"Restore with `{restore_command}`."
+                    )
+                    _save_run(run)
+                    return show_fix_run(run_id)
+                max_workers = _safe_phase_parallelism(
+                    ready_tasks,
+                    validate_max_agents(run.get("maxAgents", DEFAULT_FIX_MAX_AGENTS)),
+                )
+                with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    futures = [executor.submit(run_fix_task_once, run_id, task["id"]) for task in ready_tasks]
+                    for future in concurrent.futures.as_completed(futures):
+                        future.result()
+                run = load_fix_run(run_id)
+                if any(task.get("status") == "failed" for task in run.get("tasks", []) if int(task.get("phase", 3) or 3) == phase):
+                    run["status"] = "failed"
+                    run["finishedAt"] = utc_now()
+                    restore_command = restore_command_for_run(run)
+                    run["error"] = f"Phase {phase} failed. Restore with `{restore_command}`."
+                    _save_run(run)
+                    return show_fix_run(run_id)
+                if _cancel_requested(run_id):
+                    break
             if _cancel_requested(run_id):
                 break
             validation_results = _run_validation_commands(run, cancel_check=lambda: _cancel_requested(run_id))

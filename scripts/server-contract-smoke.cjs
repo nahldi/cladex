@@ -1,24 +1,64 @@
 // HTTP smoke for server.cjs. Starts the Express app on an ephemeral loopback
 // port and exercises CORS, security headers, the access-token gate, and the
-// validation paths of representative privileged endpoints. Endpoints are
-// chosen so request handlers reject before any Python backend command is
-// invoked — the smoke must not require a live runtime.
+// validation paths of representative privileged endpoints. By default the
+// privileged endpoint checks reject before Python is invoked so this can run
+// before backend install. Set CLADEX_API_SMOKE_BACKEND_SUCCESS=1 after backend
+// install to also exercise a successful Node-to-Python route.
 
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
 const http = require('node:http');
+const os = require('node:os');
+const path = require('node:path');
 
 process.env.CLADEX_REMOTE_ACCESS_TOKEN = process.env.CLADEX_REMOTE_ACCESS_TOKEN
   || `smoke-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
-process.env.CLADEX_SKIP_BACKEND_BOOTSTRAP = '1';
+const RUN_BOOTSTRAP_SMOKE = process.env.CLADEX_API_SMOKE_BOOTSTRAP === '1';
+if (!RUN_BOOTSTRAP_SMOKE) {
+  process.env.CLADEX_SKIP_BACKEND_BOOTSTRAP = '1';
+} else {
+  delete process.env.CLADEX_SKIP_BACKEND_BOOTSTRAP;
+}
 process.env.API_PORT = process.env.API_PORT || '34567';
 
 const {
+  apiCommandTimeoutMs,
+  backendBootstrapTimeoutMs,
+  backendRuntimeNeedsRefresh,
+  backendRuntimeSignature,
+  bootstrapBackendRuntime,
   csvValues,
+  packageVersion,
   profileCreateAccessError,
+  readLogTail,
   startServer,
   stopServer,
 } = require('../server.cjs');
 
+const originalBootstrapTimeout = process.env.CLADEX_BACKEND_BOOTSTRAP_TIMEOUT_MS;
+process.env.CLADEX_BACKEND_BOOTSTRAP_TIMEOUT_MS = '900000';
+assert.equal(backendBootstrapTimeoutMs(), 900000);
+process.env.CLADEX_BACKEND_BOOTSTRAP_TIMEOUT_MS = 'bad';
+assert.equal(backendBootstrapTimeoutMs(), 240000);
+if (originalBootstrapTimeout === undefined) {
+  delete process.env.CLADEX_BACKEND_BOOTSTRAP_TIMEOUT_MS;
+} else {
+  process.env.CLADEX_BACKEND_BOOTSTRAP_TIMEOUT_MS = originalBootstrapTimeout;
+}
+
+const originalApiTimeout = process.env.CLADEX_API_COMMAND_TIMEOUT_MS;
+process.env.CLADEX_API_COMMAND_TIMEOUT_MS = '123456';
+assert.equal(apiCommandTimeoutMs(), 123456);
+process.env.CLADEX_API_COMMAND_TIMEOUT_MS = 'bad';
+assert.equal(apiCommandTimeoutMs(), 600000);
+if (originalApiTimeout === undefined) {
+  delete process.env.CLADEX_API_COMMAND_TIMEOUT_MS;
+} else {
+  process.env.CLADEX_API_COMMAND_TIMEOUT_MS = originalApiTimeout;
+}
+
+assert.equal(packageVersion(), JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version);
+assert.equal(backendRuntimeSignature().appVersion, packageVersion());
 assert.deepEqual(csvValues('111, 222,,333 '), ['111', '222', '333']);
 
 assert.equal(
@@ -105,10 +145,41 @@ function request(port, options) {
 }
 
 async function main() {
+  const originalLocalAppData = process.env.LOCALAPPDATA;
+  const runtimeRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cladex-runtime-manifest-'));
+  process.env.LOCALAPPDATA = runtimeRoot;
+  const managedPython = process.platform === 'win32'
+    ? path.join(runtimeRoot, 'discord-codex-relay', 'runtime', 'Scripts', 'python.exe')
+    : path.join(runtimeRoot, 'discord-codex-relay', 'runtime', 'bin', 'python');
+  fs.mkdirSync(path.dirname(managedPython), { recursive: true });
+  fs.writeFileSync(managedPython, '', 'utf8');
+  assert.equal(backendRuntimeNeedsRefresh(managedPython), true);
+  fs.writeFileSync(
+    path.join(runtimeRoot, 'discord-codex-relay', 'runtime', '.cladex-runtime-manifest.json'),
+    JSON.stringify({ signature: backendRuntimeSignature() }),
+    'utf8',
+  );
+  assert.equal(backendRuntimeNeedsRefresh(managedPython), false);
+  if (originalLocalAppData === undefined) {
+    delete process.env.LOCALAPPDATA;
+  } else {
+    process.env.LOCALAPPDATA = originalLocalAppData;
+  }
+
+  const logPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'cladex-log-tail-')), 'relay.log');
+  fs.writeFileSync(logPath, Array.from({ length: 120 }, (_, index) => `line-${index}`).join('\n'), 'utf8');
+  assert.deepEqual(await readLogTail(logPath, 3, 128), ['line-117', 'line-118', 'line-119']);
+
   const server = await startServer({ host: '127.0.0.1', port: 0, quiet: true });
   const port = server.address().port;
   assert.notEqual(port, Number(process.env.API_PORT));
   try {
+    if (RUN_BOOTSTRAP_SMOKE) {
+      const runtimePython = await bootstrapBackendRuntime();
+      assert.equal(process.env.CLADEX_SKIP_BACKEND_BOOTSTRAP, undefined);
+      assert.equal(typeof runtimePython, 'string');
+    }
+
     // Loopback request with no Origin header behaves like a desktop renderer
     // bootstrapping: it gets the runtime info and the remote access token.
     const local = await request(port, { path: '/api/runtime-info' });
@@ -144,6 +215,25 @@ async function main() {
     assert.equal(opaqueWithToken.json.remoteAccessToken, undefined);
     assert.equal(opaqueWithToken.headers['access-control-allow-origin'], 'null');
 
+    // A different localhost browser origin is allowed by CORS for local dev,
+    // but it is not the desktop capability path and must not receive or bypass
+    // the access token.
+    const loopbackOriginNoToken = await request(port, {
+      path: '/api/runtime-info',
+      headers: { Origin: 'http://127.0.0.1:3000' },
+    });
+    assert.equal(loopbackOriginNoToken.status, 401);
+    assert.equal(loopbackOriginNoToken.json.authRequired, true);
+    assert.equal(loopbackOriginNoToken.headers['access-control-allow-origin'], 'http://127.0.0.1:3000');
+
+    const loopbackOriginWithToken = await request(port, {
+      path: '/api/runtime-info',
+      headers: { Origin: 'http://127.0.0.1:3000', 'X-CLADEX-Access-Token': token },
+    });
+    assert.equal(loopbackOriginWithToken.status, 200);
+    assert.equal(loopbackOriginWithToken.json.remoteAccessProtected, true);
+    assert.equal(loopbackOriginWithToken.json.remoteAccessToken, undefined);
+
     // Untrusted non-opaque Origin is rejected by the CORS middleware.
     const evil = await request(port, {
       path: '/api/runtime-info',
@@ -166,7 +256,7 @@ async function main() {
     assert.equal(preflight.status, 204);
     assert.equal(preflight.headers['access-control-allow-origin'], 'null');
 
-    // Preflight from a trusted loopback origin succeeds and reflects the
+    // Preflight from an allowed loopback origin succeeds and reflects the
     // origin and access-token header.
     const okPreflight = await request(port, {
       method: 'OPTIONS',
@@ -255,6 +345,39 @@ async function main() {
     });
     assert.equal(badReviewAnalyze.status, 400);
     assert.match(badReviewAnalyze.json.error, /workspace is required/);
+
+    if (process.env.CLADEX_API_SMOKE_BACKEND_SUCCESS === '1') {
+      const smokeWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), 'cladex-api-smoke-'));
+      fs.writeFileSync(path.join(smokeWorkspace, 'README.md'), '# smoke\n', 'utf8');
+
+      const status = await request(port, { path: '/api/status' });
+      assert.equal(status.status, 200);
+      assert.ok(Array.isArray(status.json.running));
+      assert.ok(Array.isArray(status.json.profiles));
+
+      const reviews = await request(port, { path: '/api/reviews' });
+      assert.equal(reviews.status, 200);
+      assert.ok(Array.isArray(reviews.json));
+
+      const scout = await request(port, {
+        method: 'POST',
+        path: '/api/reviews/analyze',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ workspace: smokeWorkspace, provider: 'codex' }),
+      });
+      assert.equal(scout.status, 200);
+      assert.equal(scout.json.workspace, path.resolve(smokeWorkspace));
+      assert.ok(scout.json.recommendation);
+
+      const backup = await request(port, {
+        method: 'POST',
+        path: '/api/backups',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ workspace: smokeWorkspace, reason: 'api-smoke' }),
+      });
+      assert.equal(backup.status, 200);
+      assert.match(backup.json.id || '', /^backup-/);
+    }
 
     // Token gate denies opaque-origin access to the privileged listing route.
     const opaqueProfilesNoToken = await request(port, {

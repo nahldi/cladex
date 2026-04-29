@@ -39,6 +39,7 @@ def test_optional_skill_install_uses_per_child_timeout(tmp_path: Path, monkeypat
     monkeypatch.setattr(install_plugin, "_skill_listing", lambda: {"playwright": False})
     monkeypatch.setattr(install_plugin, "enabled_auto_skills", lambda: ["playwright"])
     monkeypatch.setattr(install_plugin, "_run_limited_subprocess", fake_run_limited)
+    monkeypatch.setenv("CLADEX_AUTO_INSTALL_OPTIONAL_SKILLS", "1")
 
     installed, failed = install_plugin.auto_install_enabled_skills()
 

@@ -72,7 +72,16 @@ def default_namespace_for_workspace(workspace: Path, *, token: str | None = None
 
 
 def state_dir_for_namespace(namespace: str) -> Path:
-    return DATA_ROOT / "state" / namespace
+    text = str(namespace or "").strip()
+    if not text or slugify(text) != text or "/" in text or "\\" in text or text in {".", ".."}:
+        raise ValueError(f"Invalid state namespace: {namespace!r}")
+    state_root = (DATA_ROOT / "state").resolve()
+    target = (state_root / text).resolve()
+    try:
+        target.relative_to(state_root)
+    except ValueError as exc:
+        raise ValueError(f"Invalid state namespace: {namespace!r}") from exc
+    return target
 
 
 def relay_codex_home() -> Path:

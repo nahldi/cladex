@@ -9,6 +9,7 @@ import threading
 import time
 
 import install_plugin
+import pytest
 import relay_common
 import relayctl
 
@@ -21,6 +22,17 @@ def test_state_dir_is_not_repo_local() -> None:
     state_dir = relay_common.state_dir_for_namespace("example")
     assert "state" in state_dir.parts
     assert Path(__file__).resolve().parents[1] not in state_dir.parents
+
+
+def test_load_registry_fails_closed_on_corrupt_json(tmp_path: Path, monkeypatch) -> None:
+    registry_path = tmp_path / "workspaces.json"
+    registry_path.write_text("{not json", encoding="utf-8")
+    monkeypatch.setattr(relayctl, "REGISTRY_PATH", registry_path)
+
+    with pytest.raises(RuntimeError, match="Profile registry is unreadable"):
+        relayctl._load_registry()
+
+    assert list(tmp_path.glob("workspaces.json.corrupt-*.bak"))
 
 
 def test_default_profile_port_allocator_avoids_registered_collisions(tmp_path: Path, monkeypatch) -> None:
@@ -332,6 +344,33 @@ def test_register_rejects_non_numeric_allowed_channel_id(tmp_path: Path, monkeyp
         raise AssertionError("cmd_register must reject non-numeric channel IDs")
 
 
+def test_register_rejects_non_numeric_allowed_bot_id(tmp_path: Path, monkeypatch) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    monkeypatch.setattr(relayctl, "_register_profile", lambda profile: None)
+    parser = relayctl.build_parser()
+    args = parser.parse_args(
+        [
+            "register",
+            "--workspace",
+            str(workspace),
+            "--discord-bot-token",
+            "token",
+            "--allowed-channel-id",
+            "1234567890",
+            "--allowed-bot-ids",
+            "not-a-bot-id",
+        ]
+    )
+
+    try:
+        relayctl.cmd_register(args)
+    except SystemExit as exc:
+        assert "numeric Discord IDs" in str(exc)
+    else:
+        raise AssertionError("cmd_register must reject non-numeric bot IDs")
+
+
 def test_register_rejects_invalid_channel_history_limit(tmp_path: Path, monkeypatch) -> None:
     workspace = tmp_path / "ws"
     workspace.mkdir()
@@ -557,6 +596,12 @@ def test_auto_skill_preferences_can_disable_and_reenable(tmp_path: Path) -> None
         install_plugin.EXTRAS_PREFS_PATH = original_path
 
 
+def test_optional_skill_auto_install_is_opt_in(monkeypatch) -> None:
+    monkeypatch.delenv("CLADEX_AUTO_INSTALL_OPTIONAL_SKILLS", raising=False)
+
+    assert install_plugin.auto_install_enabled_skills() == ([], [])
+
+
 def test_terminate_process_tree_tolerates_child_lookup_race() -> None:
     class _FakeProcess:
         def __init__(self, pid: int) -> None:
@@ -607,6 +652,21 @@ def test_profile_normalization_defaults_invalid_channel_history_limit(tmp_path: 
     )
 
     assert env["CHANNEL_HISTORY_LIMIT"] == str(relayctl.DEFAULT_CHANNEL_HISTORY_LIMIT)
+
+
+def test_profile_normalization_replaces_invalid_app_server_port(tmp_path: Path) -> None:
+    env = relayctl._normalized_profile_env(
+        {
+            "DISCORD_BOT_TOKEN": "token-value",
+            "CODEX_WORKDIR": str(tmp_path),
+            "CODEX_APP_SERVER_TRANSPORT": "websocket",
+            "CODEX_APP_SERVER_PORT": "70000",
+        }
+    )
+
+    assert env["CODEX_APP_SERVER_PORT"].isdigit()
+    assert 1 <= int(env["CODEX_APP_SERVER_PORT"]) <= 65535
+    assert env["CODEX_APP_SERVER_PORT"] != "70000"
 
 
 def test_profile_normalization_preserves_optional_overrides(tmp_path: Path) -> None:
@@ -893,7 +953,7 @@ def test_ensure_runtime_retries_after_cleaning_stale_site_packages(tmp_path: Pat
         assert all("creationflags" in kwargs for kwargs in seen_kwargs)
 
 
-def test_auto_install_enabled_skills_uses_windowless_subprocess_kwargs(tmp_path: Path) -> None:
+def test_auto_install_enabled_skills_uses_windowless_subprocess_kwargs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     original_skill_installer_script = install_plugin._skill_installer_script
     original_skill_listing = install_plugin._skill_listing
     original_enabled_auto_skills = install_plugin.enabled_auto_skills
@@ -907,6 +967,7 @@ def test_auto_install_enabled_skills_uses_windowless_subprocess_kwargs(tmp_path:
     install_plugin._skill_listing = lambda: {"playwright": False}
     install_plugin.enabled_auto_skills = lambda: ["playwright"]
     install_plugin.os.name = "nt"
+    monkeypatch.setenv("CLADEX_AUTO_INSTALL_OPTIONAL_SKILLS", "1")
 
     def _fake_run(*args, **kwargs):
         seen_kwargs.append(kwargs)
@@ -971,6 +1032,20 @@ def test_windows_candidate_shim_dirs_deduplicate() -> None:
         install_plugin._windows_python_scripts_dir = original_python
         install_plugin._windows_user_scripts_dir = original_user
         install_plugin._windows_npm_dir = original_npm
+
+
+def test_path_shims_include_claude_discord(tmp_path: Path, monkeypatch) -> None:
+    python_exe = tmp_path / "python.exe"
+    python_exe.write_text("", encoding="utf-8")
+    monkeypatch.setattr(install_plugin, "_windows_candidate_shim_dirs", lambda: [tmp_path / "Scripts"])
+    windows_shims = install_plugin._install_windows_path_shims(python_exe)
+    assert "claude-discord.cmd" in {path.name for path in windows_shims}
+    assert "-m claude_relay" in (tmp_path / "Scripts" / "claude-discord.cmd").read_text(encoding="utf-8")
+
+    monkeypatch.setattr(install_plugin.Path, "home", classmethod(lambda cls: tmp_path))
+    posix_shims = install_plugin._install_posix_path_shims(python_exe)
+    assert "claude-discord" in {path.name for path in posix_shims}
+    assert "-m claude_relay" in (tmp_path / ".local" / "bin" / "claude-discord").read_text(encoding="utf-8")
 
 
 def test_setup_subcommand_exists() -> None:
@@ -1250,6 +1325,18 @@ def test_plugin_manifest_version_matches_package_version() -> None:
     assert bundled_manifest["version"] == package_version
 
 
+def test_plugin_manifest_paths_exist() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    root_manifest = json.loads((repo_root / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8"))
+    bundle_root = repo_root / "discord_codex_relay_plugin" / "bundle"
+    bundled_manifest = json.loads((bundle_root / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8"))
+
+    for manifest_root, manifest in ((repo_root, root_manifest), (bundle_root, bundled_manifest)):
+        assert (manifest_root / manifest["skills"]).exists()
+        assert (manifest_root / manifest["interface"]["composerIcon"]).exists()
+        assert (manifest_root / manifest["interface"]["logo"]).exists()
+
+
 def test_installed_plugin_completeness_check(tmp_path: Path) -> None:
     for relative_path in install_plugin.REQUIRED_PLUGIN_FILES:
         target = tmp_path / relative_path
@@ -1276,7 +1363,7 @@ def test_cleanup_runtime_site_packages_removes_tilde_leftovers(tmp_path: Path) -
     assert set(removed) == {remove_dir, remove_file}
 
 
-def test_auto_install_enabled_skills_installs_individually_and_keeps_going(tmp_path: Path) -> None:
+def test_auto_install_enabled_skills_installs_individually_and_keeps_going(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     original_skill_installer_script = install_plugin._skill_installer_script
     original_skill_listing = install_plugin._skill_listing
     original_enabled_auto_skills = install_plugin.enabled_auto_skills
@@ -1292,6 +1379,7 @@ def test_auto_install_enabled_skills_installs_individually_and_keeps_going(tmp_p
         "pdf": True,
     }
     install_plugin.enabled_auto_skills = lambda: ["playwright", "screenshot", "missing-skill", "pdf"]
+    monkeypatch.setenv("CLADEX_AUTO_INSTALL_OPTIONAL_SKILLS", "1")
 
     def _fake_run(command, capture_output, text, check, **kwargs):
         target = command[-1].split("/")[-1]

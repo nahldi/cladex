@@ -252,6 +252,9 @@ function getRemoteAccessToken() {
       const saved = String(parsed.token || '').trim();
       if (saved) {
         remoteAccessTokenCache = saved;
+        try {
+          fsSync.chmodSync(statePath, 0o600);
+        } catch {}
         return remoteAccessTokenCache;
       }
     }
@@ -260,7 +263,8 @@ function getRemoteAccessToken() {
   remoteAccessTokenCache = generated;
   try {
     fsSync.mkdirSync(path.dirname(statePath), { recursive: true });
-    fsSync.writeFileSync(statePath, JSON.stringify({ token: generated }, null, 2) + '\n', 'utf8');
+    fsSync.writeFileSync(statePath, JSON.stringify({ token: generated }, null, 2) + '\n', { encoding: 'utf8', mode: 0o600 });
+    fsSync.chmodSync(statePath, 0o600);
   } catch {}
   return remoteAccessTokenCache;
 }
@@ -334,7 +338,7 @@ function isLoopbackRequest(req) {
     return false;
   }
   const origin = String(req.headers.origin || '').trim();
-  if (origin && !isLoopbackOrigin(origin)) {
+  if (origin && !isSameOriginRequest(req, origin)) {
     return false;
   }
   return true;
@@ -409,19 +413,114 @@ function managedRuntimePythonPath() {
   return path.join(localAppData, 'discord-codex-relay', 'runtime', 'bin', 'python');
 }
 
+function managedRuntimeRoot() {
+  const managed = managedRuntimePythonPath();
+  return managed ? path.dirname(path.dirname(managed)) : '';
+}
+
+function packageVersion() {
+  if (process.env.npm_package_version) {
+    return process.env.npm_package_version;
+  }
+  try {
+    const payload = JSON.parse(fsSync.readFileSync(path.join(__dirname, 'package.json'), 'utf8'));
+    return String(payload.version || '').trim() || '2.5.3';
+  } catch {
+    return '2.5.3';
+  }
+}
+
+function _fileSha256(filePath) {
+  try {
+    return crypto.createHash('sha256').update(fsSync.readFileSync(filePath)).digest('hex');
+  } catch {
+    return '';
+  }
+}
+
+function backendRuntimeSignature() {
+  return {
+    schema: 1,
+    appVersion: packageVersion(),
+    pyproject: _fileSha256(path.join(BACKEND_DIR, 'pyproject.toml')),
+    constraints: _fileSha256(path.join(BACKEND_DIR, 'constraints.txt')),
+    installer: _fileSha256(path.join(BACKEND_DIR, 'install_plugin.py')),
+  };
+}
+
+function backendRuntimeManifestPath() {
+  const root = managedRuntimeRoot();
+  return root ? path.join(root, '.cladex-runtime-manifest.json') : '';
+}
+
+function backendRuntimeNeedsRefresh(managedPython) {
+  if (!managedPython || !fsSync.existsSync(managedPython)) {
+    return true;
+  }
+  const manifestPath = backendRuntimeManifestPath();
+  if (!manifestPath || !fsSync.existsSync(manifestPath)) {
+    return true;
+  }
+  try {
+    const saved = JSON.parse(fsSync.readFileSync(manifestPath, 'utf8'));
+    return JSON.stringify(saved.signature || {}) !== JSON.stringify(backendRuntimeSignature());
+  } catch {
+    return true;
+  }
+}
+
+function writeBackendRuntimeManifest() {
+  const manifestPath = backendRuntimeManifestPath();
+  if (!manifestPath) {
+    return;
+  }
+  try {
+    fsSync.mkdirSync(path.dirname(manifestPath), { recursive: true });
+    fsSync.writeFileSync(
+      manifestPath,
+      JSON.stringify({ signature: backendRuntimeSignature(), updatedAt: new Date().toISOString() }, null, 2) + '\n',
+      'utf8',
+    );
+  } catch {}
+}
+
 let backendBootstrapPromise = null;
+
+function backendBootstrapTimeoutMs() {
+  const raw = String(process.env.CLADEX_BACKEND_BOOTSTRAP_TIMEOUT_MS || '').trim();
+  if (!raw) {
+    return 240000;
+  }
+  const value = Number(raw);
+  if (Number.isFinite(value) && value >= 1000) {
+    return Math.floor(value);
+  }
+  return 240000;
+}
+
+function apiCommandTimeoutMs() {
+  const raw = String(process.env.CLADEX_API_COMMAND_TIMEOUT_MS || '').trim();
+  const value = Number(raw);
+  return Number.isFinite(value) && value >= 1000 ? Math.floor(value) : 600000;
+}
+
+function apiCommandMaxBuffer() {
+  const raw = String(process.env.CLADEX_API_STDIO_MAX_BUFFER || '').trim();
+  const value = Number(raw);
+  return Number.isFinite(value) && value >= 1024 * 1024 ? Math.floor(value) : 16 * 1024 * 1024;
+}
 
 function bootstrapBackendRuntime() {
   if (backendBootstrapPromise) {
     return backendBootstrapPromise;
   }
-  backendBootstrapPromise = (async () => {
+  const promise = (async () => {
     const managed = managedRuntimePythonPath();
-    if (managed && fsSync.existsSync(managed)) {
+    if (managed && fsSync.existsSync(managed) && !backendRuntimeNeedsRefresh(managed)) {
       return managed;
     }
     if (process.env.CLADEX_SKIP_BACKEND_BOOTSTRAP === '1') {
-      return '';
+      return managed && fsSync.existsSync(managed) ? managed : '';
     }
     const candidates = process.platform === 'win32'
       ? ['py', 'python', 'python3']
@@ -432,8 +531,9 @@ function bootstrapBackendRuntime() {
         await execFileAsync(
           launcher,
           ['-c', 'import sys; sys.path.insert(0, "."); from install_plugin import _ensure_runtime; _ensure_runtime()'],
-          { cwd: BACKEND_DIR, windowsHide: true, timeout: 240000 }
+          { cwd: BACKEND_DIR, windowsHide: true, timeout: backendBootstrapTimeoutMs() }
         );
+        writeBackendRuntimeManifest();
         return managed;
       } catch (err) {
         if (err && err.code === 'ENOENT') {
@@ -447,6 +547,18 @@ function bootstrapBackendRuntime() {
     }
     return '';
   })();
+  backendBootstrapPromise = promise.then(
+    (result) => {
+      if (!result) {
+        backendBootstrapPromise = null;
+      }
+      return result;
+    },
+    (error) => {
+      backendBootstrapPromise = null;
+      throw error;
+    },
+  );
   return backendBootstrapPromise;
 }
 
@@ -458,14 +570,23 @@ async function runPython(args, cwd = BACKEND_DIR, extraEnv = {}) {
     for (const launcher of pythonwLaunchers) {
       try {
         const outputPath = path.join(os.tmpdir(), `cladex-api-${Date.now()}-${Math.random().toString(16).slice(2)}.json`);
-        await execFileAsync(launcher, ['api_runner.py', '--output', outputPath, ...args], { cwd, windowsHide: true, env: childEnv });
+        await execFileAsync(launcher, ['api_runner.py', '--output', outputPath, ...args], {
+          cwd,
+          windowsHide: true,
+          env: childEnv,
+          timeout: apiCommandTimeoutMs(),
+          maxBuffer: apiCommandMaxBuffer(),
+        });
         const raw = await fs.readFile(outputPath, 'utf-8');
         await fs.unlink(outputPath).catch(() => undefined);
         const payload = JSON.parse(raw || '{}');
+        const truncated = Boolean(payload.stdoutTruncated || payload.stderrTruncated);
         return {
-          stdout: String(payload.stdout ?? ''),
-          stderr: String(payload.stderr ?? ''),
-          code: Number(payload.code ?? 1),
+          stdout: truncated ? '' : String(payload.stdout ?? ''),
+          stderr: truncated
+            ? `Backend command output exceeded CLADEX_API_RUNNER_CAPTURE_LIMIT (${process.env.CLADEX_API_RUNNER_CAPTURE_LIMIT || 'default'} bytes).`
+            : String(payload.stderr ?? ''),
+          code: truncated ? 1 : Number(payload.code ?? 1),
         };
       } catch (err) {
         if (err && err.code === 'ENOENT') {
@@ -480,7 +601,13 @@ async function runPython(args, cwd = BACKEND_DIR, extraEnv = {}) {
 
   for (const launcher of launchers) {
     try {
-      const result = await execFileAsync(launcher, args, { cwd, windowsHide: true, env: childEnv });
+      const result = await execFileAsync(launcher, args, {
+        cwd,
+        windowsHide: true,
+        env: childEnv,
+        timeout: apiCommandTimeoutMs(),
+        maxBuffer: apiCommandMaxBuffer(),
+      });
       return { stdout: result.stdout ?? '', stderr: result.stderr ?? '', code: 0 };
     } catch (err) {
       if (err && err.code === 'ENOENT') {
@@ -541,6 +668,22 @@ function backendErrorStatus(err) {
     return 400;
   }
   return 500;
+}
+
+async function readLogTail(filePath, lineLimit = 100, byteLimit = 256 * 1024) {
+  const handle = await fs.open(filePath, 'r');
+  try {
+    const stat = await handle.stat();
+    const length = Math.min(Math.max(Number(stat.size) || 0, 0), byteLimit);
+    if (length <= 0) {
+      return [];
+    }
+    const buffer = Buffer.alloc(length);
+    await handle.read(buffer, 0, length, Math.max(0, stat.size - length));
+    return buffer.toString('utf8').split(/\r?\n/).filter(Boolean).slice(-lineLimit);
+  } finally {
+    await handle.close();
+  }
 }
 
 function sendBackendError(res, err, fallback, extra = {}) {
@@ -659,7 +802,7 @@ app.get('/api/runtime-info', async (req, res) => {
     backendDir: BACKEND_DIR,
     frontendDir: FRONTEND_DIR,
     packaged: process.env.NODE_ENV === 'production' || !!process.resourcesPath,
-    appVersion: process.env.npm_package_version || '2.5.2',
+    appVersion: packageVersion(),
     remoteAccessProtected: true,
   };
   if (isLoopbackRequest(req)) {
@@ -873,8 +1016,7 @@ app.get('/api/profiles/:id/logs', async (req, res) => {
     if (!profile?.logPath) {
       throw new Error('No log path found');
     }
-    const content = await fs.readFile(profile.logPath, 'utf-8');
-    res.json({ logs: content.split(/\r?\n/).filter(Boolean).slice(-100) });
+    res.json({ logs: await readLogTail(profile.logPath, 100) });
   } catch {
     res.status(500).json({ logs: [], error: result.stderr || result.stdout || 'Failed to read logs' });
   }
@@ -1383,8 +1525,16 @@ module.exports = {
   BACKEND_DIR,
   API_HOST,
   API_PORT,
+  apiCommandMaxBuffer,
+  apiCommandTimeoutMs,
+  bootstrapBackendRuntime,
+  backendBootstrapTimeoutMs,
+  backendRuntimeNeedsRefresh,
+  backendRuntimeSignature,
   csvValues,
+  packageVersion,
   profileCreateAccessError,
+  readLogTail,
   startServer,
   stopServer,
 };

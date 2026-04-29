@@ -1,4 +1,8 @@
 import assert from 'node:assert/strict';
+import { JSDOM } from 'jsdom';
+import React, { act } from 'react';
+import { createRoot } from 'react-dom/client';
+import { renderToString } from 'react-dom/server';
 import { createServer } from 'vite';
 
 const server = await createServer({
@@ -18,6 +22,10 @@ try {
     reviewDisplayStatus,
     reviewFindingTotal,
   } = app;
+
+  const html = renderToString(React.createElement(app.default));
+  assert.match(html, /ClaDex|CLADEX/);
+  assert.match(html, /Unified Relay Network/);
 
   const cancelledPartial = {
     status: 'cancelled',
@@ -70,6 +78,92 @@ try {
   ]);
   assert.match(message, /^Partial refresh: reviews:/);
   assert.match(message, /1 more$/);
+
+  const dom = new JSDOM('<!doctype html><html><body><div id="root"></div></body></html>', {
+    pretendToBeVisual: true,
+    url: 'http://127.0.0.1:3000/',
+  });
+  const previousWindow = globalThis.window;
+  const previousDocument = globalThis.document;
+  const previousFetch = globalThis.fetch;
+  const previousActEnvironment = globalThis.IS_REACT_ACT_ENVIRONMENT;
+  const hadNavigator = Object.prototype.hasOwnProperty.call(globalThis, 'navigator');
+  const previousNavigator = globalThis.navigator;
+  globalThis.window = dom.window;
+  globalThis.document = dom.window.document;
+  globalThis.IS_REACT_ACT_ENVIRONMENT = true;
+  Object.defineProperty(globalThis, 'navigator', {
+    value: dom.window.navigator,
+    configurable: true,
+  });
+  const requestedPaths = [];
+  globalThis.fetch = async (url) => {
+    const target = new URL(String(url), 'http://127.0.0.1:3001');
+    requestedPaths.push(target.pathname);
+    const payloadByPath = {
+      '/api/profiles': [],
+      '/api/projects': [],
+      '/api/runtime-info': {
+        apiBase: 'http://127.0.0.1:3001/api',
+        backendDir: 'backend',
+        frontendDir: 'dist',
+        packaged: false,
+        appVersion: 'test',
+        remoteAccessProtected: true,
+      },
+      '/api/reviews': [],
+      '/api/fix-runs': [],
+      '/api/backups': [],
+    };
+    if (!Object.prototype.hasOwnProperty.call(payloadByPath, target.pathname)) {
+      return new Response(JSON.stringify({ error: `unexpected API path: ${target.pathname}` }), {
+        status: 404,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+    const payload = payloadByPath[target.pathname];
+    return new Response(JSON.stringify(payload), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  };
+  const rootElement = dom.window.document.getElementById('root');
+  dom.window.HTMLCanvasElement.prototype.getContext = () => new Proxy({}, {
+    get: () => () => {},
+    set: () => true,
+  });
+  const mountedRoot = createRoot(rootElement);
+  try {
+    await act(async () => {
+      mountedRoot.render(React.createElement(app.default));
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+    assert.match(rootElement.textContent, /Unified Relay Network/);
+    assert.match(rootElement.textContent, /Review Swarm/);
+    assert.deepEqual([...new Set(requestedPaths)].sort(), [
+      '/api/backups',
+      '/api/fix-runs',
+      '/api/profiles',
+      '/api/projects',
+      '/api/reviews',
+      '/api/runtime-info',
+    ]);
+  } finally {
+    await act(async () => {
+      mountedRoot.unmount();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    dom.window.close();
+    globalThis.window = previousWindow;
+    globalThis.document = previousDocument;
+    globalThis.fetch = previousFetch;
+    globalThis.IS_REACT_ACT_ENVIRONMENT = previousActEnvironment;
+    if (hadNavigator) {
+      Object.defineProperty(globalThis, 'navigator', { value: previousNavigator, configurable: true });
+    } else {
+      delete globalThis.navigator;
+    }
+  }
 
   console.log('frontend workflow smoke passed');
 } finally {

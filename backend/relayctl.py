@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import getpass
 import importlib.metadata
 import install_plugin
@@ -317,8 +318,13 @@ def _load_registry() -> dict:
         return {"profiles": [], "projects": []}
     try:
         registry = json.loads(REGISTRY_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        return {"profiles": [], "projects": []}
+    except Exception as exc:
+        quarantine = REGISTRY_PATH.with_suffix(REGISTRY_PATH.suffix + f".corrupt-{int(time.time())}.bak")
+        try:
+            shutil.copy2(REGISTRY_PATH, quarantine)
+        except OSError:
+            quarantine = REGISTRY_PATH
+        raise RuntimeError(f"Profile registry is unreadable; quarantined copy: {quarantine}") from exc
     registry.setdefault("profiles", [])
     registry.setdefault("projects", [])
     return registry
@@ -580,6 +586,16 @@ def _default_app_server_port_for_profile(workspace: Path, *, token: str | None =
     return first
 
 
+def _safe_app_server_port(value: object, workspace: Path, *, token: str | None = None) -> int:
+    try:
+        port = int(str(value or "").strip())
+    except (TypeError, ValueError):
+        return _default_app_server_port_for_profile(workspace, token=token)
+    if port < 1 or port > 65535:
+        return _default_app_server_port_for_profile(workspace, token=token)
+    return port
+
+
 def _env_flag(value: str | None, *, default: bool = False) -> bool:
     text = (value or "").strip().lower()
     if not text:
@@ -658,7 +674,7 @@ def _normalized_profile_env(env: dict[str, str]) -> dict[str, str]:
     normalized["ALLOW_DMS"] = "true" if normalized.get("ALLOW_DMS", "false").lower() in {"1", "true", "yes", "on"} else "false"
     normalized["STATE_NAMESPACE"] = normalized.get("STATE_NAMESPACE") or default_namespace_for_workspace(workspace, token=token)
     normalized["CODEX_APP_SERVER_PORT"] = str(
-        normalized.get("CODEX_APP_SERVER_PORT") or default_port_for_workspace(workspace, token=token)
+        _safe_app_server_port(normalized.get("CODEX_APP_SERVER_PORT"), workspace, token=token)
     )
     normalized["STARTUP_DM_TEXT"] = normalized.get("STARTUP_DM_TEXT") or "Discord relay online. DM me here to chat with Codex."
     normalized["ALLOWED_USER_IDS"] = _parse_csv_ids(normalized.get("ALLOWED_USER_IDS", ""))
@@ -1861,6 +1877,7 @@ def _run_profile(profile: dict) -> int:
     (state_dir / "logs").mkdir(parents=True, exist_ok=True)
     _quarantine_stale_session_bindings(state_dir, workspace, env)
     launch_lock = None
+    process: subprocess.Popen | None = None
     try:
         try:
             launch_lock = _acquire_pid_lock(_launch_lock_path(state_dir))
@@ -1913,14 +1930,21 @@ def _run_profile(profile: dict) -> int:
             **popen_kwargs,
         )
         log_handle.close()
-        _wait_for_ready(
-            process.pid,
-            transport=env.get("CODEX_APP_SERVER_TRANSPORT", "stdio"),
-            port=int(env["CODEX_APP_SERVER_PORT"]),
-            ready_marker_path=runtime["ready_marker_path"],
-            auth_failure_marker_path=runtime["auth_failure_marker_path"],
-            log_path=log_path,
-        )
+        try:
+            _wait_for_ready(
+                process.pid,
+                transport=env.get("CODEX_APP_SERVER_TRANSPORT", "stdio"),
+                port=int(env["CODEX_APP_SERVER_PORT"]),
+                ready_marker_path=runtime["ready_marker_path"],
+                auth_failure_marker_path=runtime["auth_failure_marker_path"],
+                log_path=log_path,
+            )
+        except BaseException:
+            if process.poll() is None:
+                terminate_process_tree(process.pid)
+                with contextlib.suppress(Exception):
+                    process.wait(timeout=5)
+            raise
         return 0
     finally:
         _release_pid_lock(launch_lock)
@@ -3297,6 +3321,9 @@ def cmd_register(args: argparse.Namespace) -> int:
     args.channel_no_mention_author_ids = _ensure_numeric_ids(
         args.channel_no_mention_author_ids, "--channel-no-mention-author-id"
     )
+    args.allowed_bot_ids = ",".join(
+        _ensure_numeric_ids(str(getattr(args, "allowed_bot_ids", "") or "").split(","), "--allowed-bot-ids")
+    )
     if not args.allow_dms and not args.allowed_channel_ids:
         raise SystemExit("At least one --allowed-channel-id is required unless --allow-dms is enabled.")
     if args.allow_dms and not args.allowed_user_ids:
@@ -3331,7 +3358,7 @@ def cmd_register(args: argparse.Namespace) -> int:
         "ALLOW_DMS": "true" if args.allow_dms else "false",
         "BOT_TRIGGER_MODE": inferred_trigger_mode,
         "ALLOWED_USER_IDS": ",".join(args.allowed_user_ids),
-        "ALLOWED_BOT_IDS": _parse_csv_ids(getattr(args, "allowed_bot_ids", "") or ""),
+        "ALLOWED_BOT_IDS": args.allowed_bot_ids,
         "ALLOWED_CHANNEL_AUTHOR_IDS": ",".join(args.allowed_channel_author_ids),
         "CHANNEL_NO_MENTION_AUTHOR_IDS": ",".join(args.channel_no_mention_author_ids),
         "STARTUP_DM_USER_IDS": explicit_startup_dm_user_ids or default_startup_dm_user_ids,

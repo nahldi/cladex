@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import api_runner
 import cladex
 
 
@@ -12,6 +13,44 @@ CLAUDE_SAFE_ENV = {
     "ALLOWED_CHANNEL_IDS": "123",
     "ALLOW_DMS": "false",
 }
+
+
+def test_claude_state_dir_rejects_path_traversal_namespace(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(cladex, "CLAUDE_DATA_ROOT", tmp_path / "claude-data")
+
+    valid = cladex._claude_state_dir({"state_namespace": "forge-ce0eef1b"})
+
+    assert valid == (tmp_path / "claude-data" / "state" / "forge-ce0eef1b").resolve()
+    for namespace in ("../outside", "nested/path", "nested\\path", "", ".", ".."):
+        try:
+            cladex._claude_state_dir({"state_namespace": namespace})
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"namespace should be rejected: {namespace!r}")
+
+
+def test_api_runner_bounded_capture_marks_truncation() -> None:
+    capture = api_runner.BoundedTextCapture(10)
+
+    assert capture.write("0123456789abcdef") == 16
+
+    value = capture.getvalue()
+    assert value.startswith("0123456789")
+    assert "abcdef" not in value
+    assert "truncated by CLADEX" in value
+
+
+def test_api_runner_preserves_systemexit_message(monkeypatch) -> None:
+    def boom() -> None:
+        raise SystemExit("specific failure")
+
+    monkeypatch.setitem(api_runner.MODULES, "boom.py", SimpleNamespace(main=boom))
+
+    payload = api_runner._run_module("boom.py", [])
+
+    assert payload["code"] == 1
+    assert "specific failure" in payload["stderr"]
 
 
 def test_get_all_profiles_uses_codex_runtime_state(monkeypatch) -> None:
@@ -236,6 +275,7 @@ def test_claude_runtime_state_cleans_duplicate_namespace_workers(tmp_path: Path,
 
     monkeypatch.setattr(cladex, "CLAUDE_DATA_ROOT", data_root)
     monkeypatch.setattr(cladex, "_discovered_claude_bot_pids", lambda profile: [111, 222])
+    monkeypatch.setattr(cladex, "_pid_matches_claude_profile", lambda profile, pid: pid in live_pids)
     monkeypatch.setattr(cladex.psutil, "pid_exists", lambda pid: pid in live_pids)
 
     def fake_terminate(pid: int) -> bool:
@@ -377,6 +417,7 @@ def test_claude_running_state_uses_relay_pid(tmp_path: Path, monkeypatch) -> Non
     state_dir.mkdir(parents=True)
     (state_dir / "relay.pid").write_text("1234", encoding="utf-8")
     monkeypatch.setattr(cladex, "CLAUDE_DATA_ROOT", data_root)
+    monkeypatch.setattr(cladex, "_pid_matches_claude_profile", lambda profile, pid: pid == 1234)
     monkeypatch.setattr(cladex.psutil, "pid_exists", lambda pid: pid == 1234)
 
     state = cladex._claude_profile_runtime_state({"state_namespace": "ns-one"})
@@ -398,6 +439,7 @@ def test_claude_ready_requires_status_json_after_pid_appears(tmp_path: Path, mon
         encoding="utf-8",
     )
     monkeypatch.setattr(cladex, "CLAUDE_DATA_ROOT", data_root)
+    monkeypatch.setattr(cladex, "_pid_matches_claude_profile", lambda profile, pid: pid == 9999)
     monkeypatch.setattr(cladex.psutil, "pid_exists", lambda pid: pid == 9999)
 
     state = cladex._claude_profile_runtime_state({"state_namespace": "ns-ready"})
@@ -426,6 +468,7 @@ def test_claude_runtime_state_reads_status_json(tmp_path: Path, monkeypatch) -> 
         encoding="utf-8",
     )
     monkeypatch.setattr(cladex, "CLAUDE_DATA_ROOT", data_root)
+    monkeypatch.setattr(cladex, "_pid_matches_claude_profile", lambda profile, pid: pid == 555)
     monkeypatch.setattr(cladex.psutil, "pid_exists", lambda pid: pid == 555)
 
     state = cladex._claude_profile_runtime_state({"state_namespace": "ns-two"})
@@ -439,6 +482,31 @@ def test_claude_runtime_state_reads_status_json(tmp_path: Path, monkeypatch) -> 
     assert state["active_channel"] == "456"
     assert state["model"] == "claude-explicit"
     assert state["effort"] == "high"
+
+
+def test_claude_runtime_state_discards_stale_relay_pid(tmp_path: Path, monkeypatch) -> None:
+    data_root = tmp_path / "data"
+    state_dir = data_root / "state" / "ns-stale"
+    state_dir.mkdir(parents=True)
+    pid_file = state_dir / "relay.pid"
+    pid_file.write_text("777", encoding="utf-8")
+    (state_dir / "status.json").write_text(json.dumps({"status": "ready"}), encoding="utf-8")
+    killed: list[int] = []
+
+    monkeypatch.setattr(cladex, "CLAUDE_DATA_ROOT", data_root)
+    monkeypatch.setattr(cladex, "_pid_matches_claude_profile", lambda profile, pid: False)
+    monkeypatch.setattr(cladex, "_discovered_claude_bot_pids", lambda profile: [])
+    monkeypatch.setattr(cladex.psutil, "pid_exists", lambda pid: True)
+    monkeypatch.setattr(cladex.relayctl, "terminate_process_tree", lambda pid: killed.append(pid) or True)
+
+    state = cladex._claude_profile_runtime_state({"state_namespace": "ns-stale"})
+
+    assert state["running"] is False
+    assert state["ready"] is False
+    assert state["pid"] is None
+    assert state["pids"] == []
+    assert not pid_file.exists()
+    assert killed == []
 
 
 def test_stop_claude_profile_terminates_pid(monkeypatch) -> None:
@@ -478,6 +546,18 @@ def test_load_claude_registry_is_tolerant(tmp_path: Path, monkeypatch) -> None:
 
     assert payload["profiles"][0]["name"] == "x"
     assert payload["projects"] == []
+
+
+def test_load_json_file_quarantines_corrupt_state(tmp_path: Path) -> None:
+    import pytest
+
+    path = tmp_path / "workspaces.json"
+    path.write_text("{not json", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Invalid JSON state file"):
+        cladex._load_json_file(path, default={"profiles": [], "projects": []})
+
+    assert list(tmp_path.glob("workspaces.json.corrupt-*"))
 
 
 def test_list_json_contains_runtime_fields(monkeypatch, capsys) -> None:
@@ -785,6 +865,20 @@ def test_update_profile_rejects_non_numeric_channel_id(monkeypatch) -> None:
     assert "numeric Discord IDs" in str(excinfo.value)
 
 
+def test_update_claude_profile_rejects_unsupported_startup_notice_fields() -> None:
+    profile = {
+        "name": "claude-one",
+        "_relay_type": "claude",
+        "workspace": "C:/repo",
+        "env_file": "C:/repo/.env",
+    }
+
+    import pytest
+
+    with pytest.raises(ValueError, match="Codex profiles only"):
+        cladex.update_profile(profile, startup_dm_text="online")
+
+
 def test_update_profile_rejects_invalid_channel_history_limit(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -923,3 +1017,72 @@ def test_cmd_chat_history_returns_operator_messages(monkeypatch, capsys) -> None
     assert rc == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["messages"][0]["content"] == "Ready."
+
+
+def test_cmd_chat_reads_message_file(tmp_path: Path, monkeypatch, capsys) -> None:
+    message_file = tmp_path / "message.txt"
+    message_file.write_text("hello from a file\n", encoding="utf-8")
+    captured: dict[str, str] = {}
+    monkeypatch.setattr(
+        cladex,
+        "_filter_profiles",
+        lambda name=None, relay_type=None: [{"name": "codex-one", "_relay_type": "codex"}],
+    )
+
+    def fake_chat(profile, *, message, channel_id, sender_name, sender_id):
+        captured["message"] = message
+        return {"ok": True, "reply": "done"}
+
+    monkeypatch.setattr(cladex, "_chat_with_profile", fake_chat)
+
+    rc = cladex.cmd_chat(
+        SimpleNamespace(
+            name="codex-one",
+            type="codex",
+            message="",
+            message_file=str(message_file),
+            channel_id=None,
+            sender_name="Operator",
+            sender_id="0",
+            json=True,
+        )
+    )
+
+    assert rc == 0
+    assert captured["message"] == "hello from a file"
+    assert json.loads(capsys.readouterr().out)["reply"] == "done"
+
+
+def test_cmd_chat_missing_message_file_returns_json_error(tmp_path: Path, monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        cladex,
+        "_filter_profiles",
+        lambda name=None, relay_type=None: [{"name": "codex-one", "_relay_type": "codex"}],
+    )
+
+    rc = cladex.cmd_chat(
+        SimpleNamespace(
+            name="codex-one",
+            type="codex",
+            message="",
+            message_file=str(tmp_path / "missing.txt"),
+            channel_id=None,
+            sender_name="Operator",
+            sender_id="0",
+            json=True,
+        )
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 1
+    assert payload["ok"] is False
+    assert "Could not read message file" in payload["error"]
+
+
+def test_cmd_review_findings_missing_job_is_error(tmp_path: Path, monkeypatch, capsys) -> None:
+    monkeypatch.setattr(cladex.review_swarm, "REVIEW_DATA_ROOT", tmp_path / "reviews")
+
+    rc = cladex.cmd_review_findings(SimpleNamespace(id="review-20260429-010203-abcdef12"))
+
+    assert rc == 1
+    assert "No review job found" in capsys.readouterr().err

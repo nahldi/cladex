@@ -153,8 +153,11 @@ class ClaudeRelayBot(commands.Bot):
 
     async def _send_discord_response(self, channel_id: str, content: str, reply_to: str = "") -> None:
         """Send response to Discord channel."""
+        claimed = False
+        sent_any = False
         try:
-            if not self._backend.claim_outbound_discord_reply(channel_id, reply_to, content):
+            claimed = self._backend.claim_outbound_discord_reply(channel_id, reply_to, content)
+            if not claimed:
                 logger.info("Suppressed duplicate Claude Discord reply for channel %s source %s", channel_id, reply_to or "-")
                 return
 
@@ -180,9 +183,12 @@ class ClaudeRelayBot(commands.Bot):
                         )
                     else:
                         await channel.send(chunk, allowed_mentions=SAFE_ALLOWED_MENTIONS)
+                    sent_any = True
                     first = False
 
         except Exception as e:
+            if claimed and not sent_any:
+                self._backend.release_outbound_discord_reply(channel_id, reply_to, content)
             logger.exception(f"Failed to send Discord response: {e}")
 
     def _on_status(self, status: str) -> None:
@@ -209,6 +215,13 @@ class ClaudeRelayBot(commands.Bot):
         current_len = 0
 
         for line in lines:
+            while len(line) > max_length:
+                if current:
+                    chunks.append("\n".join(current))
+                    current = []
+                    current_len = 0
+                chunks.append(line[:max_length])
+                line = line[max_length:]
             if current_len + len(line) + 1 > max_length:
                 if current:
                     chunks.append("\n".join(current))
@@ -230,14 +243,16 @@ class ClaudeRelayBot(commands.Bot):
             return False
 
         # Block other bots unless explicitly allowed
+        author_is_allowed_bot = False
         if message.author.bot:
             bot_id = str(message.author.id)
             if bot_id not in self.config.allowed_bot_ids:
                 return False
+            author_is_allowed_bot = True
 
         user_id = str(message.author.id)
         approved_user_ids = set(self.config.allowed_user_ids) | set(self.config.operator_ids)
-        if self.config.allowed_user_ids and user_id not in approved_user_ids:
+        if approved_user_ids and not author_is_allowed_bot and user_id not in approved_user_ids:
             return False
 
         # Handle DMs separately so a guild-channel allowlist doesn't reject
@@ -264,6 +279,9 @@ class ClaudeRelayBot(commands.Bot):
 
         if self.config.trigger_mode == "prefix":
             return message.content.startswith(self.config.prefix)
+
+        if self.config.trigger_mode == "dm_only":
+            return False
 
         # Default: mention_or_dm
         return self.user.mentioned_in(message)
@@ -303,14 +321,26 @@ class ClaudeRelayBot(commands.Bot):
         logger.info(f"[RECV] {message.author}: {content[:100]}...")
         self._write_status("working", f"Handling message from {message.author.display_name}")
 
-        async with message.channel.typing():
-            await self._backend.send_discord_message(
-                channel_id=str(message.channel.id),
-                sender_id=str(message.author.id),
-                sender_name=message.author.display_name,
-                content=content,
-                message_id=str(message.id),
-            )
+        accepted = False
+        try:
+            async with message.channel.typing():
+                accepted = await self._backend.send_discord_message(
+                    channel_id=str(message.channel.id),
+                    sender_id=str(message.author.id),
+                    sender_name=message.author.display_name,
+                    content=content,
+                    message_id=str(message.id),
+                )
+                if not accepted:
+                    logger.warning("Claude inbound queue rejected Discord message %s in channel %s", message.id, message.channel.id)
+                    await message.channel.send(
+                        "CLADEX is busy and could not queue that message. Try again after the current turn finishes.",
+                        allowed_mentions=SAFE_ALLOWED_MENTIONS,
+                    )
+                    return
+        finally:
+            if not accepted:
+                self._backend.release_inbound_discord_message(str(message.channel.id), str(message.id))
 
     def _write_status(self, status: str, detail: str | None = None) -> None:
         """Write status to state file."""

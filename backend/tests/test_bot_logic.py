@@ -14,18 +14,35 @@ from types import SimpleNamespace
 
 def _load_bot_module():
     temp_root = tempfile.mkdtemp(prefix="relay-bot-test-")
-    os.environ["HOME"] = temp_root
-    os.environ["XDG_CONFIG_HOME"] = temp_root
-    os.environ["XDG_DATA_HOME"] = temp_root
-    os.environ["ENV_FILE"] = str(Path(temp_root) / "test.env")
-    os.environ["DISCORD_BOT_TOKEN"] = "test-token"
-    os.environ["CODEX_WORKDIR"] = os.getcwd()
-    os.environ["STATE_NAMESPACE"] = "test-bot-logic"
-    sys.modules.pop("bot", None)
-    sys.modules.pop("relay_common", None)
-    if "bot" in sys.modules:
-        return importlib.reload(sys.modules["bot"])
-    return importlib.import_module("bot")
+    temp_dir = Path(temp_root) / "Temp"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    env_updates = {
+        "HOME": temp_root,
+        "XDG_CONFIG_HOME": temp_root,
+        "XDG_DATA_HOME": temp_root,
+        "LOCALAPPDATA": str(Path(temp_root) / "LocalAppData"),
+        "APPDATA": str(Path(temp_root) / "AppData"),
+        "TEMP": str(temp_dir),
+        "TMP": str(temp_dir),
+        "ENV_FILE": str(Path(temp_root) / "test.env"),
+        "DISCORD_BOT_TOKEN": "test-token",
+        "CODEX_WORKDIR": os.getcwd(),
+        "STATE_NAMESPACE": "test-bot-logic",
+    }
+    previous_env = {key: os.environ.get(key) for key in env_updates}
+    try:
+        os.environ.update(env_updates)
+        sys.modules.pop("bot", None)
+        sys.modules.pop("relay_common", None)
+        if "bot" in sys.modules:
+            return importlib.reload(sys.modules["bot"])
+        return importlib.import_module("bot")
+    finally:
+        for key, value in previous_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 def _message(*, channel_id: int, author_id: int = 1, content: str = "", mentions=None, guild=True, reference=None):
@@ -418,6 +435,60 @@ def test_allowed_channel_respects_author_allowlist() -> None:
     assert bot._message_targets_bot(allowed, relay_user) is True
 
 
+def test_allowed_channel_rejects_unapproved_bot_author() -> None:
+    bot = _load_bot_module()
+    relay_user = SimpleNamespace(id=999)
+    bot.CONFIG.allowed_channel_ids = {42}
+    bot.CONFIG.allowed_channel_author_ids = set()
+    bot.CONFIG.allowed_bot_ids = {8}
+    bot.CONFIG.trigger_mode = "mention_or_dm"
+
+    blocked = _message(channel_id=42, author_id=7, content="<@999> take this", mentions=[relay_user])
+    blocked.author.bot = True
+    allowed = _message(channel_id=42, author_id=8, content="<@999> take this", mentions=[relay_user])
+    allowed.author.bot = True
+
+    assert bot._message_targets_bot(blocked, relay_user) is False
+    assert bot._message_targets_bot(allowed, relay_user) is True
+
+
+def test_reset_command_requires_observable_message() -> None:
+    bot = _load_bot_module()
+    bot.client = SimpleNamespace(user=SimpleNamespace(id=999))
+    bot.CONFIG.allowed_channel_ids = {42}
+    bot.CONFIG.allowed_channel_author_ids = {1}
+    bot.CONFIG.allowed_bot_ids = set()
+    bot.RECENT_MESSAGE_IDS.clear()
+    bot.SESSIONS.clear()
+    reset_calls: list[bool] = []
+    replies: list[str] = []
+
+    class FakeSession:
+        async def reset(self) -> None:
+            reset_calls.append(True)
+
+    async def _reply(content: str, **_kwargs: object) -> None:
+        replies.append(content)
+
+    bot.SESSIONS["channel-42"] = FakeSession()
+    blocked = _message(channel_id=42, author_id=7, content="!reset")
+    blocked.id = 1001
+    blocked.reply = _reply
+
+    allowed = _message(channel_id=42, author_id=1, content="!reset")
+    allowed.id = 1002
+    allowed.reply = _reply
+
+    async def _run() -> None:
+        await bot.on_message(blocked)
+        await bot.on_message(allowed)
+
+    asyncio.run(_run())
+
+    assert len(reset_calls) == 1
+    assert replies == ["Context cleared."]
+
+
 def test_trigger_mode_all_allows_allowed_channel_messages() -> None:
     bot = _load_bot_module()
     relay_user = SimpleNamespace(id=999)
@@ -480,6 +551,7 @@ def test_targeted_teammate_bot_message_becomes_actionable_handoff() -> None:
     relay_user = SimpleNamespace(id=999)
     bot.CONFIG.allowed_channel_ids = {42}
     bot.CONFIG.allowed_channel_author_ids = {7}
+    bot.CONFIG.allowed_bot_ids = {7}
     bot.CONFIG.channel_no_mention_author_ids = set()
     bot.CONFIG.trigger_mode = "mention_or_dm"
 
@@ -498,6 +570,7 @@ def test_targeted_teammate_bot_question_requires_reply() -> None:
     relay_user = SimpleNamespace(id=999)
     bot.CONFIG.allowed_channel_ids = {42}
     bot.CONFIG.allowed_channel_author_ids = {7}
+    bot.CONFIG.allowed_bot_ids = {7}
     bot.CONFIG.channel_no_mention_author_ids = set()
     bot.CONFIG.trigger_mode = "mention_or_dm"
 

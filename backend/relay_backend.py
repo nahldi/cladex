@@ -135,8 +135,6 @@ def build_thread_start_params(session, *, cwd: Path) -> dict[str, Any]:
         "developerInstructions": session._developer_instructions(),
         "personality": None,
         "ephemeral": False,
-        "experimentalRawEvents": False,
-        "persistExtendedHistory": True,
     }
     params.update(_thread_permission_fields(session))
     return params
@@ -145,8 +143,6 @@ def build_thread_start_params(session, *, cwd: Path) -> dict[str, Any]:
 def build_thread_resume_params(session, *, thread_id: str, cwd: Path) -> dict[str, Any]:
     params = {
         "threadId": thread_id,
-        "history": None,
-        "path": None,
         "model": session._configured_model(),
         "modelProvider": None,
         "serviceTier": None,
@@ -155,7 +151,6 @@ def build_thread_resume_params(session, *, thread_id: str, cwd: Path) -> dict[st
         "baseInstructions": None,
         "developerInstructions": session._developer_instructions(),
         "personality": None,
-        "persistExtendedHistory": True,
     }
     params.update(_thread_permission_fields(session))
     return params
@@ -190,7 +185,6 @@ def build_turn_start_params(
         "summary": None,
         "personality": None,
         "outputSchema": None,
-        "collaborationMode": None,
     }
     params.update(_turn_permission_fields(session))
     return params
@@ -359,19 +353,32 @@ class CliResumeCodexBackend(CodexBackend):
         ]
 
     def _base_command(self, *, resume_thread_id: str | None, review: bool = False) -> list[str]:
-        if review:
-            command = [self.codex_bin, "review"]
-        elif resume_thread_id:
-            command = [self.codex_bin, "exec", "resume", resume_thread_id]
-        else:
-            command = [self.codex_bin, "exec"]
+        command = [self.codex_bin]
         if self.session._configured_model():
             command.extend(["--model", self.session._configured_model()])
-        command.extend(["--cd", str(self.session._runtime_workdir()), "--json", "--skip-git-repo-check"])
+        command.extend(["--cd", str(self.session._runtime_workdir())])
         if self.session.config.codex_full_access:
             command.append("--dangerously-bypass-approvals-and-sandbox")
         else:
-            command.extend(["--sandbox", "workspace-write", "--ask-for-approval", "never"])
+            sandbox_provider = getattr(self.session, "_sandbox_mode", None)
+            approval_provider = getattr(self.session, "_approval_policy", None)
+            sandbox = sandbox_provider() if callable(sandbox_provider) else "workspace-write"
+            approval = approval_provider() if callable(approval_provider) else "never"
+            command.extend(
+                [
+                    "--sandbox",
+                    sandbox,
+                    "--ask-for-approval",
+                    approval,
+                ]
+            )
+        if review:
+            command.extend(["exec", "review"])
+        elif resume_thread_id:
+            command.extend(["exec", "resume", resume_thread_id])
+        else:
+            command.append("exec")
+        command.extend(["--json", "--skip-git-repo-check"])
         return command
 
     @staticmethod
@@ -430,21 +437,32 @@ class CliResumeCodexBackend(CodexBackend):
         # RAM until communicate() returns.
         timeout_seconds = max(_safe_int(os.environ.get("CLADEX_CODEX_FALLBACK_TIMEOUT"), 600), 60)
         max_output_bytes = max(_safe_int(os.environ.get("CLADEX_CODEX_FALLBACK_MAX_OUTPUT_BYTES"), 8 * 1024 * 1024), 256 * 1024)
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + timeout_seconds
+
+        async def _write_prompt() -> None:
+            try:
+                if process.stdin and prompt_text:
+                    process.stdin.write(prompt_text.encode("utf-8"))
+                    await process.stdin.drain()
+                if process.stdin:
+                    process.stdin.close()
+            except (BrokenPipeError, ConnectionError):
+                pass
+
         try:
-            if process.stdin and prompt_text:
-                process.stdin.write(prompt_text.encode("utf-8"))
-                await process.stdin.drain()
-            if process.stdin:
-                process.stdin.close()
-        except (BrokenPipeError, ConnectionError):
-            pass
+            await asyncio.wait_for(_write_prompt(), timeout=timeout_seconds)
+        except asyncio.TimeoutError:
+            await self._terminate_cli_process_tree(process)
+            raise BackendUnavailableError(
+                f"Degraded Codex CLI fallback timed out while sending prompt after {timeout_seconds}s."
+            )
         chunks: list[bytes] = []
         bytes_read = 0
         truncated = False
-        deadline = asyncio.get_event_loop().time() + timeout_seconds
         try:
             while True:
-                remaining = deadline - asyncio.get_event_loop().time()
+                remaining = deadline - loop.time()
                 if remaining <= 0:
                     raise asyncio.TimeoutError
                 try:

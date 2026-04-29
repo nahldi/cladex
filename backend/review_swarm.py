@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
 import json
 import os
 import re
@@ -10,6 +11,7 @@ import sys
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,12 +27,18 @@ MAX_AGENTS = 50
 MAX_TEXT_BYTES = 512 * 1024
 DEFAULT_AI_MAX_PARALLEL = 4
 DEFAULT_AGENT_OUTPUT_LIMIT = 120_000
+MAX_AI_MESSAGE_FILE_BYTES = 2 * 1024 * 1024
+MAX_JSON_EXTRACTION_CHARS = 512 * 1024
+STALE_JOB_RUN_LOCK_SECONDS = 10 * 60
+STALE_ACTIVE_REVIEW_SECONDS = 60 * 60
+HARDLINK_SCRATCH_OVERHEAD_RATIO = 0.05
 REVIEW_DATA_ROOT = Path(user_data_dir("cladex", False)) / "reviews"
 BACKUP_DATA_ROOT = Path(user_data_dir("cladex", False)) / "backups"
 REVIEW_STRATEGY = "ai-review-swarm"
 REVIEW_ID_RE = re.compile(r"^review-\d{8}-\d{6}-[a-f0-9]{8}$")
 BACKUP_ID_RE = re.compile(r"^backup-\d{8}-\d{6}-[a-f0-9]{8}$")
 TERMINAL_REVIEW_STATUSES = {"completed", "completed_with_warnings", "failed", "cancelled"}
+SCRATCH_READY_MARKER = ".cladex-scratch-ready"
 AGENT_SPECIALTIES = (
     (
         "security",
@@ -125,7 +133,11 @@ SKIP_DIRS = {
     ".mypy_cache",
     ".next",
     ".nuxt",
+    ".playwright-cli",
+    ".playwright-mcp",
     ".pytest_cache",
+    ".pytest-basetemp",
+    ".pytest-tmp",
     ".ruff_cache",
     ".turbo",
     ".venv",
@@ -134,9 +146,13 @@ SKIP_DIRS = {
     "build",
     "coverage",
     "dist",
+    "manual-mode-test",
+    "memory",
     "node_modules",
+    "output",
     "release",
     "target",
+    "tmp",
     "vendor",
     "venv",
 }
@@ -255,16 +271,14 @@ LINE_PATTERN_SKIP_FILENAMES = frozenset({
     "test_fix_orchestrator.py",
     "test_review_swarm.py",
 })
-SECRET_VALUE_RE = re.compile(
-    r"\b(api[_-]?key|auth[_-]?token|client[_-]?secret|discord[_-]?token|password|private[_-]?key|secret|token)\b\s*[:=]",
-    re.I,
-)
+SECRET_KEY_PATTERN = r"(?:api[_-]?key|auth[_-]?token|client[_-]?secret|discord[_-]?token|password|private[_-]?key|secret|token)"
 SECRET_ASSIGNMENT_RE = re.compile(
-    r"\b(api[_-]?key|auth[_-]?token|client[_-]?secret|discord[_-]?token|password|private[_-]?key|secret|token)\b\s*[:=]\s*([\"']?)[^\s,\"'}]+",
+    rf"(?P<prefix>[\"']?\b{SECRET_KEY_PATTERN}\b[\"']?\s*[:=]\s*)(?P<quote>[\"']?)(?P<value>[^\s,\"'}}]+)(?P=quote)",
     re.I,
 )
 DISCORD_TOKEN_RE = re.compile(r"\b[A-Za-z0-9_-]{23,28}\.[A-Za-z0-9_-]{6,7}\.[A-Za-z0-9_-]{27,45}\b")
 GITHUB_TOKEN_RE = re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b")
+FUNCTION_SIGNATURE_RE = re.compile(r"^\s*(async\s+)?(def|function)\s+\w+\s*\(")
 TODO_MARKER_RE = re.compile(r"\b(TODO|FIXME|HACK|XXX)\b", re.I)
 COMMENT_PREFIX_RE = re.compile(r"(?:#|//|/\*|<!--|--\s|;|\*\s)")
 
@@ -472,12 +486,159 @@ def list_reviews() -> list[dict[str, Any]]:
     return jobs
 
 
+def _active_review_for_workspace(workspace: Path, *, preflight_only: bool) -> dict[str, Any] | None:
+    """Return the newest active review for a target workspace.
+
+    Starting the same project scan twice usually means a double click, retry, or
+    timed-out HTTP request. Reusing the active job keeps reviewer lanes and
+    provider slots bounded while still allowing a new scan after the prior one
+    reaches a terminal state.
+    """
+    target = str(workspace)
+    newest: dict[str, Any] | None = None
+    for path in REVIEW_DATA_ROOT.glob("*/job.json"):
+        payload = _read_json(path, default={})
+        if not payload.get("id"):
+            continue
+        if payload.get("status") in TERMINAL_REVIEW_STATUSES:
+            continue
+        if str(payload.get("workspace") or "") != target:
+            continue
+        if bool(payload.get("preflightOnly")) != bool(preflight_only):
+            continue
+        if _active_review_is_stale(payload):
+            _mark_active_review_stale(payload)
+            continue
+        if newest is None or str(payload.get("createdAt", "")) > str(newest.get("createdAt", "")):
+            newest = payload
+    return newest
+
+
+def _parse_iso_timestamp(value: object) -> float:
+    text = str(value or "").strip()
+    if not text:
+        return 0.0
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return 0.0
+
+
+def _active_review_stale_seconds() -> int:
+    return max(60, _safe_int(os.environ.get("CLADEX_REVIEW_ACTIVE_STALE_SECONDS"), STALE_ACTIVE_REVIEW_SECONDS))
+
+
+def _review_job_has_live_worker(job: dict[str, Any]) -> bool:
+    job_id = str(job.get("id") or "")
+    if not job_id:
+        return False
+    lock_path = job_dir(job_id) / "run.lock"
+    if not lock_path.exists():
+        return False
+    try:
+        existing = lock_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        existing = ""
+    try:
+        pid = int(existing.split(":", 1)[0]) if existing else 0
+    except ValueError:
+        pid = 0
+    if pid and _pid_alive(pid):
+        return True
+    try:
+        return (time.time() - lock_path.stat().st_mtime) <= STALE_JOB_RUN_LOCK_SECONDS
+    except OSError:
+        return False
+
+
+def _active_review_is_stale(job: dict[str, Any]) -> bool:
+    if job.get("status") in TERMINAL_REVIEW_STATUSES:
+        return False
+    if _review_job_has_live_worker(job):
+        return False
+    updated_ts = _parse_iso_timestamp(job.get("updatedAt") or job.get("createdAt"))
+    return updated_ts > 0 and (time.time() - updated_ts) > _active_review_stale_seconds()
+
+
+def _mark_active_review_stale(job: dict[str, Any]) -> None:
+    job["status"] = "failed"
+    job["finishedAt"] = utc_now()
+    job["error"] = job.get("error") or "Review worker stopped without finishing; marked stale so a new scan can start."
+    for agent in job.get("agents", []):
+        if agent.get("status") in {"queued", "running", None, ""}:
+            agent["status"] = "failed"
+            agent["detail"] = agent.get("detail") or "Review worker stopped before this lane completed."
+    _update_progress(job)
+    save_job(job)
+
+
 def show_review(job_id: str) -> dict[str, Any]:
     return _public_job(load_job(job_id))
 
 
+def _persist_findings(job_id: str, findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    normalized = dedup_findings([dict(item) for item in findings])
+    normalized.sort(
+        key=lambda item: (
+            SEVERITY_ORDER.get(str(item.get("severity")), 3),
+            str(item.get("path", "")),
+            int(item.get("line", 0) or 0),
+            str(item.get("title", "")),
+        )
+    )
+    for index, finding in enumerate(normalized, start=1):
+        finding["id"] = f"F{index:04d}"
+    _write_json(findings_json_path(job_id), {"jobId": job_id, "findings": normalized})
+    return normalized
+
+
 def cancel_flag_path(job_id: str) -> Path:
     return job_dir(job_id) / "cancel.flag"
+
+
+def _workspace_start_lock_path(workspace: Path, *, preflight_only: bool) -> Path:
+    digest = hashlib.sha256(f"{workspace}|{int(bool(preflight_only))}".encode("utf-8")).hexdigest()[:24]
+    return REVIEW_DATA_ROOT / "_workspace-start-locks" / f"{digest}.lock"
+
+
+@contextmanager
+def _workspace_start_lock(workspace: Path, *, preflight_only: bool):
+    lock_path = _workspace_start_lock_path(workspace, preflight_only=preflight_only)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    while True:
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            if _global_lane_lock_stale(lock_path):
+                try:
+                    lock_path.unlink()
+                except OSError:
+                    pass
+                continue
+            time.sleep(0.1)
+            continue
+        try:
+            os.write(fd, json.dumps({"pid": os.getpid(), "workspace": str(workspace), "createdAt": utc_now()}).encode("utf-8"))
+        finally:
+            os.close(fd)
+        break
+    try:
+        yield
+    finally:
+        try:
+            lock_path.unlink()
+        except OSError:
+            pass
+
+
+def global_review_lane_dir(provider: str = "", account_home: str = "") -> Path:
+    base = REVIEW_DATA_ROOT / "_global-ai-slots"
+    if not provider and not account_home:
+        return base
+    provider_slug = re.sub(r"[^a-z0-9._-]+", "-", str(provider or "provider").strip().lower()).strip("-") or "provider"
+    account_key = str(Path(account_home).expanduser().resolve()) if account_home else "default"
+    digest = hashlib.sha256(f"{provider_slug}|{account_key}".encode("utf-8")).hexdigest()[:16]
+    return base / f"{provider_slug}-{digest}"
 
 
 def _cancel_requested(job_id: str) -> bool:
@@ -575,6 +736,21 @@ def restore_backup(backup_id: str, *, confirm: str) -> dict[str, Any]:
         raise ValueError(f"restore target is missing: {target}")
 
     pre_restore = create_source_backup(target, reason=f"pre-restore:{backup_id}")
+    try:
+        _restore_snapshot_into_target(snapshot, target)
+    except Exception:
+        rollback_snapshot = Path(str(pre_restore.get("snapshot", ""))).expanduser().resolve()
+        if rollback_snapshot.exists() and rollback_snapshot.is_dir():
+            _restore_snapshot_into_target(rollback_snapshot, target)
+        raise
+
+    restored = dict(backup)
+    restored["restoredAt"] = utc_now()
+    restored["preRestoreBackupId"] = pre_restore["id"]
+    return restored
+
+
+def _restore_snapshot_into_target(snapshot: Path, target: Path) -> None:
     snapshot_names = {child.name for child in snapshot.iterdir()}
     for child in target.iterdir():
         if _preserve_on_restore(child.name):
@@ -585,11 +761,6 @@ def restore_backup(backup_id: str, *, confirm: str) -> dict[str, Any]:
         if _preserve_on_restore(child.name):
             continue
         _copy_into(child, target / child.name, target)
-
-    restored = dict(backup)
-    restored["restoredAt"] = utc_now()
-    restored["preRestoreBackupId"] = pre_restore["id"]
-    return restored
 
 
 def start_review(
@@ -619,72 +790,66 @@ def start_review(
     if not protection_violation:
         assert_workspace_allowed(target)
 
-    job_id = f"review-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
-    artifact_dir = job_dir(job_id)
-    artifact_dir.mkdir(parents=True, exist_ok=True)
-    limit_metadata = _review_limit_metadata(
-        agent_count=agent_count,
-        preflight_only=bool(preflight_only),
-        account_home=str(account_home or "").strip(),
-    )
-    job = {
-        "id": job_id,
-        "title": str(title or "").strip() or _default_title(target),
-        "workspace": str(target),
-        "provider": provider_name,
-        "strategy": REVIEW_STRATEGY,
-        "preflightOnly": bool(preflight_only),
-        "agentCount": agent_count,
-        "accountHome": str(account_home or "").strip(),
-        "status": "queued",
-        "createdAt": utc_now(),
-        "updatedAt": utc_now(),
-        "startedAt": "",
-        "finishedAt": "",
-        "artifactDir": str(artifact_dir),
-        "progress": {"total": agent_count, "queued": agent_count, "running": 0, "done": 0, "failed": 0, "cancelled": 0, "maxParallel": limit_metadata["maxParallel"]},
-        "agents": [],
-        "error": "",
-        "scratchWorkspace": "",
-        "scratchError": "",
-        "coordinationPath": str(coordination_markdown_path(job_id)),
-        "maxParallel": limit_metadata["maxParallel"],
-        "limits": limit_metadata,
-        "limitWarnings": limit_metadata["warnings"],
-        "allowSelfReview": bool(allow_self_review),
-        "selfReview": bool(protection_violation),
-        "backupBeforeReview": bool(backup_before_review or protection_violation),
-        "sourceBackup": {},
-    }
-    for index in range(agent_count):
-        focus, focus_prompt = agent_specialty(index)
-        job["agents"].append(
-            {
-                "id": f"agent-{index + 1:02d}",
-                "provider": provider_name,
-                "focus": focus,
-                "focusPrompt": focus_prompt,
-                "status": "queued",
-                "assignedFiles": 0,
-                "findings": 0,
-                "detail": "",
-            }
+    with _workspace_start_lock(target, preflight_only=bool(preflight_only)):
+        active_job = _active_review_for_workspace(target, preflight_only=bool(preflight_only))
+        if active_job is not None:
+            public = _public_job(active_job)
+            public["returnedActiveReview"] = True
+            return public
+
+        job_id = f"review-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+        artifact_dir = job_dir(job_id)
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        limit_metadata = _review_limit_metadata(
+            agent_count=agent_count,
+            preflight_only=bool(preflight_only),
+            account_home=str(account_home or "").strip(),
         )
-    save_job(job)
-    if job["backupBeforeReview"]:
-        try:
-            backup = create_source_backup(target, reason="review-start", source_job_id=job_id)
-            job["sourceBackup"] = backup
-            save_job(job)
-        except Exception as exc:
-            if protection_violation:
-                job["status"] = "failed"
-                job["error"] = f"CLADEX self-review requires a source backup first, but backup creation failed: {exc}"
-                save_job(job)
-                raise ValueError(job["error"]) from exc
-            job["sourceBackup"] = {"error": str(exc)}
-            save_job(job)
-    _write_json(findings_json_path(job_id), {"jobId": job_id, "findings": []})
+        job = {
+            "id": job_id,
+            "title": str(title or "").strip() or _default_title(target),
+            "workspace": str(target),
+            "provider": provider_name,
+            "strategy": REVIEW_STRATEGY,
+            "preflightOnly": bool(preflight_only),
+            "agentCount": agent_count,
+            "accountHome": str(account_home or "").strip(),
+            "status": "queued",
+            "createdAt": utc_now(),
+            "updatedAt": utc_now(),
+            "startedAt": "",
+            "finishedAt": "",
+            "artifactDir": str(artifact_dir),
+            "progress": {"total": agent_count, "queued": agent_count, "running": 0, "done": 0, "failed": 0, "cancelled": 0, "maxParallel": limit_metadata["maxParallel"]},
+            "agents": [],
+            "error": "",
+            "scratchWorkspace": "",
+            "scratchError": "",
+            "coordinationPath": str(coordination_markdown_path(job_id)),
+            "maxParallel": limit_metadata["maxParallel"],
+            "limits": limit_metadata,
+            "limitWarnings": limit_metadata["warnings"],
+            "allowSelfReview": bool(allow_self_review),
+            "selfReview": bool(protection_violation),
+            "backupBeforeReview": bool(backup_before_review or protection_violation),
+            "sourceBackup": {},
+        }
+        for index in range(agent_count):
+            focus, focus_prompt = agent_specialty(index)
+            job["agents"].append(
+                {
+                    "id": f"agent-{index + 1:02d}",
+                    "provider": provider_name,
+                    "focus": focus,
+                    "focusPrompt": focus_prompt,
+                    "status": "queued",
+                    "assignedFiles": 0,
+                    "findings": 0,
+                    "detail": "",
+                }
+            )
+        save_job(job)
+        _write_json(findings_json_path(job_id), {"jobId": job_id, "findings": []})
     if launch:
         launch_review_worker(job_id)
     return show_review(job_id)
@@ -698,8 +863,7 @@ def launch_review_worker(job_id: str) -> None:
         "stdout": subprocess.DEVNULL,
         "stderr": subprocess.DEVNULL,
     }
-    if os.name == "nt":
-        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+    kwargs.update(_hidden_subprocess_kwargs())
     subprocess.Popen(command, **kwargs)
 
 
@@ -718,6 +882,8 @@ def _should_skip_dir(path: Path) -> bool:
 def _should_review_file(path: Path) -> bool:
     name = path.name.lower()
     if name.startswith(".env"):
+        return False
+    if name == SCRATCH_READY_MARKER:
         return False
     if path.suffix.lower() not in REVIEW_EXTENSIONS and name not in {"dockerfile", "makefile", "procfile"}:
         return False
@@ -1040,11 +1206,29 @@ def _finding(
     }
 
 
+def _looks_like_literal_secret_assignment(line: str) -> bool:
+    match = SECRET_ASSIGNMENT_RE.search(line)
+    if not match or FUNCTION_SIGNATURE_RE.search(line):
+        return False
+    quote = str(match.group("quote") or "")
+    value = str(match.group("value") or "").strip()
+    if quote not in {"'", '"'}:
+        return False
+    lowered = value.lower()
+    if lowered in {"", "none", "null", "true", "false", "token", "secret", "password"}:
+        return False
+    if any(marker in lowered for marker in ("example", "sample", "placeholder", "changeme", "test-token", "dummy", "fake")):
+        return False
+    if len(value) < 20:
+        return False
+    return bool(re.search(r"[A-Za-z]", value) and re.search(r"\d", value))
+
+
 def scan_file(path: Path, workspace: Path) -> list[dict[str, Any]]:
     relative = path.relative_to(workspace).as_posix()
     if path.suffix.lower() in LINE_PATTERN_SKIP_EXTENSIONS:
         return []
-    if path.name in LINE_PATTERN_SKIP_FILENAMES:
+    if path.name in LINE_PATTERN_SKIP_FILENAMES or path.name.startswith("test_"):
         return []
     try:
         lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -1054,7 +1238,7 @@ def scan_file(path: Path, workspace: Path) -> list[dict[str, Any]]:
     for index, line in enumerate(lines, start=1):
         lowered = line.lower()
         stripped = line.strip()
-        if SECRET_VALUE_RE.search(line) or DISCORD_TOKEN_RE.search(line) or GITHUB_TOKEN_RE.search(line):
+        if _looks_like_literal_secret_assignment(line) or DISCORD_TOKEN_RE.search(line) or GITHUB_TOKEN_RE.search(line):
             findings.append(
                 _finding(
                     severity="high",
@@ -1257,8 +1441,7 @@ def project_shape_findings(workspace: Path, files: list[Path]) -> list[dict[str,
 
 
 def sanitize_text(text: str, *, limit: int = 6000) -> str:
-    redacted = SECRET_ASSIGNMENT_RE.sub(lambda match: f"{match.group(1)}=[REDACTED]", text)
-    redacted = SECRET_VALUE_RE.sub(lambda match: f"{match.group(1)}=[REDACTED]", redacted)
+    redacted = SECRET_ASSIGNMENT_RE.sub(lambda match: f"{match.group('prefix')}[REDACTED]", text)
     redacted = DISCORD_TOKEN_RE.sub("[REDACTED_DISCORD_TOKEN]", redacted)
     redacted = GITHUB_TOKEN_RE.sub("[REDACTED_GITHUB_TOKEN]", redacted)
     if len(redacted) > limit:
@@ -1340,10 +1523,14 @@ def _scratch_disk_preflight(job: dict[str, Any]) -> dict[str, Any]:
             "agentCount": int(job.get("agentCount") or 0),
         }
     agent_count = max(int(job.get("agentCount") or 1), 1)
-    # 1 base scratch + N per-agent scratch copies. Source backup is created
-    # earlier (a separate copy) and is not counted here because it has
-    # already succeeded by the time we get to lane preflight.
-    estimated = workspace_bytes * (1 + agent_count)
+    backup_copies = 1 if job.get("backupBeforeReview") and not (job.get("sourceBackup") or {}).get("id") else 0
+    hardlink_agents = _agent_scratch_copy_mode() == "hardlink" and _hardlink_supported_for(REVIEW_DATA_ROOT / "_scratch-probe")
+    # 1 base scratch, N per-agent scratch clones, plus the optional source
+    # backup that is created by the worker after this preflight passes. Agent
+    # clones use hardlinks by default, so their incremental disk estimate is
+    # metadata plus files generated during read-only review commands.
+    agent_multiplier = HARDLINK_SCRATCH_OVERHEAD_RATIO if hardlink_agents else 1
+    estimated = int(workspace_bytes * (1 + backup_copies + (agent_count * agent_multiplier)))
     ceiling_env = os.environ.get("CLADEX_REVIEW_SCRATCH_MAX_BYTES")
     try:
         ceiling = int(ceiling_env) if ceiling_env else 0
@@ -1355,8 +1542,10 @@ def _scratch_disk_preflight(job: dict[str, Any]) -> dict[str, Any]:
     metadata = {
         "workspaceBytes": workspace_bytes,
         "estimatedScratchBytes": estimated,
+        "estimatedBackupBytes": workspace_bytes * backup_copies,
         "agentCount": agent_count,
         "ceilingBytes": ceiling,
+        "agentCopyMode": "hardlink" if hardlink_agents else "copy",
     }
     if estimated > ceiling:
         raise RuntimeError(
@@ -1371,10 +1560,7 @@ def _scratch_disk_preflight(job: dict[str, Any]) -> dict[str, Any]:
 def prepare_scratch_workspace(job: dict[str, Any]) -> Path:
     source = Path(job["workspace"]).expanduser().resolve()
     scratch = job_dir(job["id"]) / "scratch" / "base-workspace"
-    if scratch.exists():
-        return scratch
-    scratch.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(source, scratch, symlinks=True, ignore=_review_scratch_ignore)
+    _copytree_with_ready_marker(source, scratch, ignore=_review_scratch_ignore)
     return scratch
 
 
@@ -1384,11 +1570,63 @@ def agent_scratch_workspace_path(job: dict[str, Any], agent: dict[str, Any]) -> 
 
 def prepare_agent_scratch_workspace(job: dict[str, Any], agent: dict[str, Any], base_scratch: Path) -> Path:
     scratch = agent_scratch_workspace_path(job, agent)
-    if scratch.exists():
-        return scratch
-    scratch.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(base_scratch, scratch, symlinks=True)
+    copy_function = _copy2_or_hardlink if _agent_scratch_copy_mode() == "hardlink" else None
+    _copytree_with_ready_marker(base_scratch, scratch, copy_function=copy_function)
     return scratch
+
+
+def _agent_scratch_copy_mode() -> str:
+    mode = str(os.environ.get("CLADEX_REVIEW_AGENT_SCRATCH_MODE") or "hardlink").strip().lower()
+    return "copy" if mode == "copy" else "hardlink"
+
+
+def _hardlink_supported_for(root: Path) -> bool:
+    probe_dir = root / ".hardlink-probe"
+    source = probe_dir / "source.txt"
+    linked = probe_dir / "linked.txt"
+    try:
+        probe_dir.mkdir(parents=True, exist_ok=True)
+        source.write_text("probe", encoding="utf-8")
+        os.link(source, linked)
+        return linked.exists()
+    except OSError:
+        return False
+    finally:
+        shutil.rmtree(probe_dir, ignore_errors=True)
+
+
+def _copy2_or_hardlink(source: str, target: str) -> str:
+    try:
+        os.link(source, target)
+        return target
+    except OSError:
+        return shutil.copy2(source, target)
+
+
+def _copytree_with_ready_marker(
+    source: Path,
+    target: Path,
+    *,
+    ignore: Callable[[str, list[str]], set[str]] | None = None,
+    copy_function: Callable[[str, str], str] | None = None,
+) -> None:
+    marker = target / SCRATCH_READY_MARKER
+    if target.exists() and marker.exists():
+        return
+    if target.exists():
+        shutil.rmtree(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temp = target.with_name(f".{target.name}.tmp-{uuid.uuid4().hex[:8]}")
+    try:
+        kwargs: dict[str, Any] = {"symlinks": True, "ignore": ignore}
+        if copy_function is not None:
+            kwargs["copy_function"] = copy_function
+        shutil.copytree(source, temp, **kwargs)
+        (temp / SCRATCH_READY_MARKER).write_text(utc_now(), encoding="utf-8")
+        temp.replace(target)
+    except Exception:
+        shutil.rmtree(temp, ignore_errors=True)
+        raise
 
 
 def _coordination_agent_heading(agent: dict[str, Any]) -> str:
@@ -1506,6 +1744,63 @@ class AIRunResult:
     error: str = ""
 
 
+PROVIDER_LIMIT_PATTERNS = (
+    "usage limit",
+    "rate limit",
+    "rate-limit",
+    "quota",
+    "insufficient credits",
+    "purchase more credits",
+    "too many requests",
+)
+
+
+def _is_provider_limit_error(text: str) -> bool:
+    normalized = str(text or "").lower()
+    return any(pattern in normalized for pattern in PROVIDER_LIMIT_PATTERNS)
+
+
+def _compact_ai_error(text: str, *, max_chars: int = 900) -> str:
+    sanitized = sanitize_text(str(text or "")).strip()
+    if not sanitized:
+        return "AI reviewer failed."
+    important = [
+        line.strip()
+        for line in sanitized.splitlines()
+        if line.strip() and ("error" in line.lower() or "limit" in line.lower() or "quota" in line.lower())
+    ]
+    compact = "\n".join(dict.fromkeys(important)) if important else sanitized
+    if len(compact) > max_chars:
+        compact = compact[:max_chars].rstrip() + "\n...[truncated by CLADEX]"
+    return compact
+
+
+def _provider_limit_detail(provider: str, text: str) -> str:
+    retry = ""
+    match = re.search(r"try again at\s+([^\.\n\r]+)", str(text or ""), flags=re.I)
+    if match:
+        retry = f" Retry after {match.group(1).strip()}."
+    return (
+        f"{provider} account limit reached; remaining reviewer lanes were not launched."
+        f"{retry} Reduce lane count, wait for the provider reset, or select a separate provider account folder."
+    )
+
+
+def _read_text_with_limit(path: Path, *, max_bytes: int = MAX_AI_MESSAGE_FILE_BYTES) -> str:
+    try:
+        with path.open("rb") as handle:
+            payload = handle.read(max_bytes + 1)
+    except OSError:
+        return ""
+    truncated = len(payload) > max_bytes
+    if truncated:
+        payload = payload[:max_bytes]
+    text = payload.decode("utf-8", errors="replace")
+    if truncated:
+        text = text.rstrip() + "\n...[truncated by CLADEX]"
+    return text
+
+
 def _run_codex_ai_review(
     job: dict[str, Any],
     agent: dict[str, Any],
@@ -1522,7 +1817,7 @@ def _run_codex_ai_review(
         "--cd",
         str(scratch),
         "--sandbox",
-        "workspace-write",
+        "read-only",
         "--ask-for-approval",
         "never",
         "exec",
@@ -1535,7 +1830,7 @@ def _run_codex_ai_review(
     env = _minimal_reviewer_env(account_home={"CODEX_HOME": str(job.get("accountHome"))} if job.get("accountHome") else {})
     result = _run_cli(command, _ai_prompt(job, agent, files, scratch=scratch), env=env, cancel_check=cancel_check)
     if result.ok and output_path.exists():
-        return AIRunResult(text=output_path.read_text(encoding="utf-8", errors="replace"), ok=True)
+        return AIRunResult(text=_read_text_with_limit(output_path), ok=True)
     return result
 
 
@@ -1554,7 +1849,7 @@ def _run_claude_ai_review(
         "-p",
         "--permission-mode",
         "dontAsk",
-        "--tools",
+        "--allowedTools",
         "Read,Grep,Glob,LS",
         "--disallowedTools",
         "Bash,Edit,MultiEdit,Write,NotebookEdit",
@@ -1622,27 +1917,61 @@ def _minimal_reviewer_env(*, account_home: dict[str, str] | None = None) -> dict
     return base
 
 
+def _hidden_subprocess_kwargs() -> dict[str, Any]:
+    """Return Windows subprocess options that prevent transient console windows."""
+    if os.name != "nt":
+        return {}
+    kwargs: dict[str, Any] = {}
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    if creationflags:
+        kwargs["creationflags"] = creationflags
+    try:
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 0)
+        startupinfo.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
+        kwargs["startupinfo"] = startupinfo
+    except Exception:
+        pass
+    return kwargs
+
+
 def _terminate_process_tree(process: subprocess.Popen) -> None:
     """Best-effort termination of a Popen process and any children."""
     if process.poll() is not None:
         return
     try:
         if os.name == "nt":
-            subprocess.run(
+            result = subprocess.run(
                 ["taskkill", "/F", "/T", "/PID", str(process.pid)],
                 check=False,
                 capture_output=True,
                 timeout=10,
+                **_hidden_subprocess_kwargs(),
             )
+            try:
+                process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                process.kill()
+            if result.returncode != 0 and process.poll() is None:
+                process.kill()
         else:
             process.terminate()
             try:
-                process.wait(timeout=5)
+                process.wait(timeout=1)
             except subprocess.TimeoutExpired:
                 process.kill()
     except Exception:
         try:
             process.kill()
+        except Exception:
+            pass
+
+
+def _close_process_pipes(process: subprocess.Popen) -> None:
+    for pipe in (process.stdin, process.stdout, process.stderr):
+        try:
+            if pipe is not None:
+                pipe.close()
         except Exception:
             pass
 
@@ -1663,8 +1992,7 @@ def _run_cli(
         "env": env,
         "cwd": str(cwd) if cwd else None,
     }
-    if os.name == "nt":
-        popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+    popen_kwargs.update(_hidden_subprocess_kwargs())
     try:
         process = subprocess.Popen(command, **popen_kwargs)
     except FileNotFoundError as exc:
@@ -1689,8 +2017,9 @@ def _run_cli(
     output_lock = threading.Lock()
     stdout_chunks: list[bytes] = []
     stderr_chunks: list[bytes] = []
+    retained_bytes = {"stdout": 0, "stderr": 0}
 
-    def _reader(pipe: Any, chunks: list[bytes]) -> None:
+    def _reader(pipe: Any, chunks: list[bytes], stream_name: str) -> None:
         nonlocal last_output_at, saw_output
         try:
             fd = pipe.fileno()
@@ -1699,7 +2028,11 @@ def _run_cli(
                 if not chunk:
                     break
                 with output_lock:
-                    chunks.append(chunk)
+                    remaining = max(output_limit - retained_bytes[stream_name], 0)
+                    if remaining:
+                        kept = chunk[:remaining]
+                        chunks.append(kept)
+                        retained_bytes[stream_name] += len(kept)
                     last_output_at = time.monotonic()
                     saw_output = True
         except Exception:
@@ -1707,11 +2040,11 @@ def _run_cli(
 
     readers: list[threading.Thread] = []
     if process.stdout is not None:
-        thread = threading.Thread(target=_reader, args=(process.stdout, stdout_chunks), daemon=True)
+        thread = threading.Thread(target=_reader, args=(process.stdout, stdout_chunks, "stdout"), daemon=True)
         thread.start()
         readers.append(thread)
     if process.stderr is not None:
-        thread = threading.Thread(target=_reader, args=(process.stderr, stderr_chunks), daemon=True)
+        thread = threading.Thread(target=_reader, args=(process.stderr, stderr_chunks, "stderr"), daemon=True)
         thread.start()
         readers.append(thread)
 
@@ -1740,6 +2073,7 @@ def _run_cli(
         if cancel_check is not None and cancel_check():
             cancelled = True
             _terminate_process_tree(process)
+            _close_process_pipes(process)
             break
         with output_lock:
             idle_for = now - last_output_at
@@ -1747,21 +2081,24 @@ def _run_cli(
         if idle_for >= active_idle_timeout:
             timed_out = f"AI reviewer was idle for {int(idle_for)}s without producing output."
             _terminate_process_tree(process)
+            _close_process_pipes(process)
             break
         if now - started_at >= max_runtime:
             timed_out = f"AI reviewer exceeded the maximum runtime of {int(max_runtime)}s."
             _terminate_process_tree(process)
+            _close_process_pipes(process)
             break
         time.sleep(0.2)
 
     if cancelled or timed_out:
         try:
-            process.wait(timeout=5)
+            process.wait(timeout=1)
         except Exception:
             try:
                 process.kill()
             except Exception:
                 pass
+        _close_process_pipes(process)
 
     for thread in readers:
         thread.join(timeout=2)
@@ -1848,11 +2185,11 @@ def _extract_json_payload(text: str) -> dict[str, Any] | None:
     last = stripped.rfind("}")
     if first >= 0 and last > first:
         candidates.append(stripped[first : last + 1])
-    # Brace-balanced scan: walk every `{` in the text and try to find its matching `}`
-    # via a string-aware brace counter. This rescues cases where stdout has the
-    # planner JSON followed by stderr lines that contain stray `}` characters
-    # (which would otherwise confuse the greedy rfind candidate above).
-    candidates.extend(_balanced_json_objects(stripped))
+    # Brace-balanced scan rescues JSON mixed with surrounding logs. Keep it
+    # bounded so hostile or broken reviewer output cannot turn parsing into a
+    # CPU sink.
+    if len(stripped) <= MAX_JSON_EXTRACTION_CHARS:
+        candidates.extend(_linear_balanced_json_objects(stripped))
     for candidate in candidates:
         try:
             payload = json.loads(candidate)
@@ -1863,49 +2200,38 @@ def _extract_json_payload(text: str) -> dict[str, Any] | None:
     return None
 
 
-def _balanced_json_objects(text: str) -> list[str]:
-    """Return every brace-balanced `{...}` substring in `text`.
-
-    Aware of double-quoted strings and backslash escapes so a `}` inside a
-    string literal does not close the object early. Used as a fallback for
-    extracting JSON that is mixed with surrounding plain-text logs.
-    """
+def _linear_balanced_json_objects(text: str) -> list[str]:
+    """Return top-level brace-balanced `{...}` substrings in linear time."""
     out: list[str] = []
-    n = len(text)
-    i = 0
-    while i < n:
-        if text[i] != "{":
-            i += 1
+    start: int | None = None
+    depth = 0
+    in_string = False
+    escape = False
+    for index, ch in enumerate(text):
+        if start is None:
+            if ch == "{":
+                start = index
+                depth = 1
+                in_string = False
+                escape = False
             continue
-        depth = 0
-        in_string = False
-        escape = False
-        j = i
-        while j < n:
-            ch = text[j]
-            if in_string:
-                if escape:
-                    escape = False
-                elif ch == "\\":
-                    escape = True
-                elif ch == '"':
-                    in_string = False
-            else:
-                if ch == '"':
-                    in_string = True
-                elif ch == "{":
-                    depth += 1
-                elif ch == "}":
-                    depth -= 1
-                    if depth == 0:
-                        out.append(text[i : j + 1])
-                        break
-            j += 1
-        # Whether we closed or fell off the end, advance past this `{` so we
-        # also catch sibling objects that follow.
-        i += 1
-    # Prefer the largest objects first — the orchestrator plan is the biggest
-    # JSON document Codex emits.
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                out.append(text[start : index + 1])
+                start = None
     out.sort(key=len, reverse=True)
     return out
 
@@ -1941,7 +2267,7 @@ def parse_ai_findings(
     scratch: Path | None = None,
 ) -> list[dict[str, Any]]:
     sanitized = sanitize_text(text)
-    payload = _extract_json_payload(sanitized)
+    payload = _extract_json_payload(text)
     parsed = payload.get("findings") if isinstance(payload, dict) else None
     findings: list[dict[str, Any]] = []
     if isinstance(parsed, list):
@@ -1954,14 +2280,14 @@ def parse_ai_findings(
             confidence = str(raw.get("confidence") or "medium").strip().lower()
             if confidence not in {"high", "medium", "low"}:
                 confidence = "medium"
-            relative_path = _relativize_finding_path(str(raw.get("path") or "."), workspace=workspace, scratch=scratch)
+            relative_path = _relativize_finding_path(sanitize_text(str(raw.get("path") or "."), limit=500), workspace=workspace, scratch=scratch)
             findings.append(
                 _finding(
                     severity=severity,
-                    category=str(raw.get("category") or f"ai-{agent.get('focus') or 'review'}").strip()[:80],
+                    category=sanitize_text(str(raw.get("category") or f"ai-{agent.get('focus') or 'review'}").strip(), limit=80)[:80],
                     relative_path=relative_path,
                     line=max(_safe_int(raw.get("line"), 0), 0),
-                    title=str(raw.get("title") or "AI reviewer finding").strip()[:180],
+                    title=sanitize_text(str(raw.get("title") or "AI reviewer finding").strip(), limit=180)[:180],
                     detail=sanitize_text(str(raw.get("detail") or raw.get("evidence") or "").strip()),
                     recommendation=sanitize_text(str(raw.get("recommendation") or "Inspect this finding and apply a targeted fix.").strip()),
                     confidence=confidence,
@@ -2036,7 +2362,13 @@ def _acquire_job_run_lock(job_id: str) -> bool:
             existing_pid = int(existing.split(":", 1)[0]) if existing else 0
         except ValueError:
             existing_pid = 0
-        if existing_pid and existing_pid != os.getpid() and not _pid_alive(existing_pid):
+        stale = existing_pid and existing_pid != os.getpid() and not _pid_alive(existing_pid)
+        if not stale:
+            try:
+                stale = (time.time() - lock_path.stat().st_mtime) > STALE_JOB_RUN_LOCK_SECONDS and existing_pid <= 0
+            except OSError:
+                stale = False
+        if stale:
             try:
                 lock_path.unlink()
             except OSError:
@@ -2069,6 +2401,7 @@ def _pid_alive(pid: int) -> bool:
                 capture_output=True,
                 text=True,
                 timeout=5,
+                **_hidden_subprocess_kwargs(),
             )
         except Exception:
             return True
@@ -2082,6 +2415,72 @@ def _pid_alive(pid: int) -> bool:
     except OSError:
         return False
     return True
+
+
+def _global_lane_lock_stale(path: Path) -> bool:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        payload = {}
+    try:
+        pid = int(payload.get("pid", 0) or 0)
+    except Exception:
+        pid = 0
+    if pid and not _pid_alive(pid):
+        return True
+    try:
+        age_seconds = time.time() - path.stat().st_mtime
+    except OSError:
+        return False
+    return age_seconds > 12 * 60 * 60
+
+
+@contextmanager
+def _global_ai_lane_slot(
+    limit: int,
+    *,
+    label: str,
+    provider: str = "",
+    account_home: str = "",
+    cancel_check: Callable[[], bool] | None = None,
+):
+    slot_path: Path | None = None
+    lane_dir = global_review_lane_dir(provider, account_home)
+    lane_dir.mkdir(parents=True, exist_ok=True)
+    limit = max(1, int(limit or DEFAULT_AI_MAX_PARALLEL))
+    try:
+        while slot_path is None:
+            if cancel_check is not None and cancel_check():
+                raise RuntimeError("Cancelled by operator before AI reviewer launch.")
+            for index in range(limit):
+                candidate = lane_dir / f"slot-{index}.lock"
+                try:
+                    fd = os.open(str(candidate), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                except FileExistsError:
+                    if _global_lane_lock_stale(candidate):
+                        try:
+                            candidate.unlink()
+                        except OSError:
+                            pass
+                    continue
+                try:
+                    os.write(
+                        fd,
+                        json.dumps({"pid": os.getpid(), "label": label, "createdAt": utc_now()}).encode("utf-8"),
+                    )
+                finally:
+                    os.close(fd)
+                slot_path = candidate
+                break
+            if slot_path is None:
+                time.sleep(0.25)
+        yield
+    finally:
+        if slot_path is not None:
+            try:
+                slot_path.unlink()
+            except OSError:
+                pass
 
 
 def run_review_job(job_id: str) -> dict[str, Any]:
@@ -2124,6 +2523,22 @@ def _run_review_job_locked(job_id: str) -> dict[str, Any]:
             job["scratchEstimate"] = {"error": str(exc)}
             save_job(job)
             raise
+        if job.get("backupBeforeReview") and not (job.get("sourceBackup") or {}).get("id"):
+            if _cancel_requested(job_id):
+                raise RuntimeError("Cancelled before source backup.")
+            job["sourceBackup"] = {"status": "running", "startedAt": utc_now()}
+            save_job(job)
+            try:
+                backup = create_source_backup(workspace, reason="review-start", source_job_id=job_id)
+                job["sourceBackup"] = backup
+                save_job(job)
+            except Exception as exc:
+                if job.get("selfReview") or job.get("allowSelfReview"):
+                    raise RuntimeError(
+                        f"CLADEX self-review requires a source backup first, but backup creation failed: {exc}"
+                    ) from exc
+                job["sourceBackup"] = {"status": "failed", "error": str(exc)}
+                save_job(job)
         try:
             scratch = prepare_scratch_workspace(job)
             job["scratchWorkspace"] = str(scratch)
@@ -2149,6 +2564,8 @@ def _run_review_job_locked(job_id: str) -> dict[str, Any]:
         findings.extend(_agent_finding_prefix("project", str(job["provider"]), base_findings))
 
         cancel_check = lambda: _cancel_requested(job["id"])
+        provider_limit_reached = threading.Event()
+        provider_limit_message = {"text": ""}
 
         def process_agent(index: int, shard: list[Path]) -> None:
             agent = job["agents"][index]
@@ -2160,6 +2577,14 @@ def _run_review_job_locked(job_id: str) -> dict[str, Any]:
                     _update_progress(job)
                     save_job(job)
                 return
+            if provider_limit_reached.is_set() and not job.get("preflightOnly"):
+                with lock:
+                    agent["status"] = "failed"
+                    agent["assignedFiles"] = len(shard)
+                    agent["detail"] = provider_limit_message["text"] or _provider_limit_detail(str(job["provider"]), "")
+                    _update_progress(job)
+                    save_job(job)
+                return
             with lock:
                 agent["status"] = "running"
                 agent["assignedFiles"] = len(shard)
@@ -2168,32 +2593,61 @@ def _run_review_job_locked(job_id: str) -> dict[str, Any]:
                 save_job(job)
 
             agent_findings: list[dict[str, Any]] = []
+            agent_findings_persisted = False
             try:
                 for path in shard:
                     agent_findings.extend(scan_file(path, workspace))
                 if not job.get("preflightOnly") and not cancel_check():
-                    lane_scratch = prepare_agent_scratch_workspace(job, agent, scratch)
-                    with lock:
-                        agent["scratchWorkspace"] = str(lane_scratch)
-                        agent["detail"] = "Reviewing assigned shard in isolated scratch workspace."
-                        save_job(job)
-                    if str(job.get("provider")) == "codex":
-                        ai_result = _run_codex_ai_review(job, agent, shard, cancel_check=cancel_check)
-                    else:
-                        ai_result = _run_claude_ai_review(job, agent, shard, cancel_check=cancel_check)
+                    if provider_limit_reached.is_set():
+                        raise RuntimeError(provider_limit_message["text"] or _provider_limit_detail(str(job["provider"]), ""))
+                    slot_limit = _safe_int(job.get("maxParallel"), DEFAULT_AI_MAX_PARALLEL)
+                    with _global_ai_lane_slot(
+                        slot_limit,
+                        label=f"{job['id']}:{agent['id']}",
+                        provider=str(job.get("provider") or ""),
+                        account_home=str(job.get("accountHome") or ""),
+                        cancel_check=cancel_check,
+                    ):
+                        if provider_limit_reached.is_set():
+                            raise RuntimeError(provider_limit_message["text"] or _provider_limit_detail(str(job["provider"]), ""))
+                        lane_scratch = prepare_agent_scratch_workspace(job, agent, scratch)
+                        with lock:
+                            agent["scratchWorkspace"] = str(lane_scratch)
+                            agent["detail"] = "Reviewing assigned shard in isolated scratch workspace."
+                            save_job(job)
+                        if str(job.get("provider")) == "codex":
+                            ai_result = _run_codex_ai_review(job, agent, shard, cancel_check=cancel_check)
+                        else:
+                            ai_result = _run_claude_ai_review(job, agent, shard, cancel_check=cancel_check)
                     if not ai_result.ok:
                         if cancel_check() or "cancelled by operator" in (ai_result.error or "").lower():
                             with lock:
                                 agent["status"] = "cancelled"
                                 agent["detail"] = ai_result.error or "Cancelled mid-shard."
                                 _update_progress(job)
-                                save_job(job)
+                            save_job(job)
                             return
-                        raise RuntimeError(ai_result.error or "AI reviewer failed")
+                        ai_error = ai_result.error or "AI reviewer failed"
+                        if _is_provider_limit_error(ai_error):
+                            detail = _provider_limit_detail(str(job["provider"]), ai_error)
+                            provider_limit_message["text"] = detail
+                            provider_limit_reached.set()
+                            with lock:
+                                job["providerLimit"] = detail
+                                if detail not in job.setdefault("limitWarnings", []):
+                                    job["limitWarnings"].append(detail)
+                                limits = job.setdefault("limits", {})
+                                warnings = limits.setdefault("warnings", [])
+                                if detail not in warnings:
+                                    warnings.append(detail)
+                                save_job(job)
+                            raise RuntimeError(detail)
+                        raise RuntimeError(_compact_ai_error(ai_error))
                     agent_findings.extend(parse_ai_findings(ai_result.text, workspace=workspace, agent=agent, scratch=lane_scratch))
                 prefixed = _agent_finding_prefix(agent["id"], str(job["provider"]), agent_findings)
                 with lock:
                     findings.extend(prefixed)
+                    agent_findings_persisted = True
                     if cancel_check():
                         agent["status"] = "cancelled"
                         agent["findings"] = len(prefixed)
@@ -2206,8 +2660,20 @@ def _run_review_job_locked(job_id: str) -> dict[str, Any]:
                     save_job(job)
             except Exception as exc:
                 with lock:
-                    agent["status"] = "failed"
-                    agent["detail"] = str(exc)
+                    if agent_findings and not agent_findings_persisted:
+                        prefixed = _agent_finding_prefix(agent["id"], str(job["provider"]), agent_findings)
+                        findings.extend(prefixed)
+                        agent["findings"] = len(prefixed)
+                    if cancel_check() or "cancelled" in str(exc).lower():
+                        agent["status"] = "cancelled"
+                    else:
+                        agent["status"] = "failed"
+                    detail = str(exc)
+                    if _is_provider_limit_error(detail):
+                        provider_limit_message["text"] = detail
+                        provider_limit_reached.set()
+                        job["providerLimit"] = detail
+                    agent["detail"] = _compact_ai_error(detail)
                     _update_progress(job)
                     save_job(job)
 
@@ -2230,18 +2696,7 @@ def _run_review_job_locked(job_id: str) -> dict[str, Any]:
             for future in concurrent.futures.as_completed(futures):
                 future.result()
 
-        findings = dedup_findings(findings)
-        findings.sort(
-            key=lambda item: (
-                SEVERITY_ORDER.get(str(item.get("severity")), 3),
-                str(item.get("path", "")),
-                int(item.get("line", 0) or 0),
-                str(item.get("title", "")),
-            )
-        )
-        for index, finding in enumerate(findings, start=1):
-            finding["id"] = f"F{index:04d}"
-        _write_json(findings_json_path(job_id), {"jobId": job_id, "findings": findings})
+        findings = _persist_findings(job_id, findings)
 
         statuses = [str(item.get("status")) for item in job["agents"]]
         cancelled = sum(1 for status in statuses if status == "cancelled")
@@ -2251,10 +2706,16 @@ def _run_review_job_locked(job_id: str) -> dict[str, Any]:
             job["error"] = "Cancelled before all lanes finished."
         elif failed == len(job["agents"]):
             job["status"] = "failed"
-            job["error"] = "All reviewer lanes failed."
+            job["error"] = job.get("providerLimit") or "All reviewer lanes failed."
         elif failed:
             job["status"] = "completed_with_warnings"
-            job["error"] = f"{failed} of {len(job['agents'])} reviewer lane(s) failed; partial findings may be incomplete."
+            if job.get("providerLimit"):
+                job["error"] = (
+                    f"{failed} of {len(job['agents'])} reviewer lane(s) did not run because the provider account limit was reached; "
+                    "partial findings may be incomplete."
+                )
+            else:
+                job["error"] = f"{failed} of {len(job['agents'])} reviewer lane(s) failed; partial findings may be incomplete."
         elif _cancel_requested(job_id) and cancelled:
             job["status"] = "cancelled"
             job["error"] = "Cancelled before all lanes finished."
@@ -2271,6 +2732,7 @@ def _run_review_job_locked(job_id: str) -> dict[str, Any]:
         job["status"] = "failed"
         job["finishedAt"] = utc_now()
         job["error"] = str(exc)
+        findings = _persist_findings(job_id, findings)
         save_job(job)
         _atomic_write_text(report_markdown_path(job_id), build_report(job, findings, []))
     return show_review(job_id)
@@ -2313,6 +2775,8 @@ def build_report(job: dict[str, Any], findings: list[dict[str, Any]], files: lis
     ]
     if job.get("error"):
         lines.extend(["## Job Error", "", str(job["error"]), ""])
+    if job.get("providerLimit"):
+        lines.extend(["## Provider Account Limit", "", str(job["providerLimit"]), ""])
     if job.get("scratchError"):
         lines.extend(["## Scratch Workspace Warning", "", str(job["scratchError"]), ""])
     progress = job.get("progress", {})

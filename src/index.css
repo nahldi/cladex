@@ -22,6 +22,13 @@
     0% { transform: translateY(0) scale(1); opacity: 1; }
     100% { transform: translateY(-50px) scale(1.5); opacity: 0; }
   }
+
+  @keyframes swarm-scan-sweep {
+    0% { transform: translateX(-35%) rotate(8deg); opacity: 0; }
+    12% { opacity: 0.55; }
+    55% { opacity: 0.22; }
+    100% { transform: translateX(135%) rotate(8deg); opacity: 0; }
+  }
 }
 
 html,
@@ -37,6 +44,65 @@ body {
 
 .dark body {
   background: #050505;
+}
+
+.swarm-control-rail,
+.swarm-activity-shell,
+.swarm-run-card,
+.swarm-standby-field {
+  position: relative;
+}
+
+.swarm-control-rail::before,
+.swarm-activity-shell::before,
+.swarm-run-card::before,
+.swarm-standby-field::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  border-radius: inherit;
+}
+
+.swarm-control-rail::before,
+.swarm-activity-shell::before {
+  background:
+    linear-gradient(rgba(125, 181, 165, 0.055) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(125, 181, 165, 0.045) 1px, transparent 1px);
+  background-size: 28px 28px;
+  mask-image: linear-gradient(180deg, rgba(0, 0, 0, 0.92), transparent 88%);
+}
+
+.swarm-run-card::before {
+  background: linear-gradient(105deg, transparent 0%, rgba(125, 181, 165, 0.12) 45%, transparent 58%);
+  transform: translateX(-35%) rotate(8deg);
+  animation: swarm-scan-sweep 6.5s ease-in-out infinite;
+}
+
+.swarm-standby-field::before {
+  background:
+    radial-gradient(circle at 74% 28%, rgba(125, 181, 165, 0.16), transparent 34%),
+    linear-gradient(rgba(212, 115, 94, 0.06) 1px, transparent 1px),
+    linear-gradient(60deg, rgba(125, 181, 165, 0.045) 1px, transparent 1px);
+  background-size: auto, 38px 38px, 46px 46px;
+}
+
+.swarm-control-rail > *,
+.swarm-activity-shell > *,
+.swarm-run-card > *,
+.swarm-standby-field > * {
+  position: relative;
+}
+
+.swarm-standby-field > .swarm-hive-layer {
+  position: absolute;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .swarm-run-card::before {
+    animation: none;
+    opacity: 0.12;
+  }
 }
 
 /* Custom Scrollbar for a sleeker look */

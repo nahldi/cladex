@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 import relay_runtime
+import relay_common
 
 from relay_runtime import DurableRuntime, TaskLeaseConflictError, WorktreeManager
 
@@ -19,6 +20,15 @@ def _init_git_repo(path: Path) -> None:
     (path / "README.md").write_text("test\n", encoding="utf-8")
     subprocess.run(["git", "add", "README.md"], cwd=path, check=True, capture_output=True, text=True)
     subprocess.run(["git", "commit", "-m", "init"], cwd=path, check=True, capture_output=True, text=True)
+
+
+def test_state_namespace_rejects_path_traversal() -> None:
+    with pytest.raises(ValueError, match="Invalid state namespace"):
+        relay_common.state_dir_for_namespace("../outside")
+    with pytest.raises(ValueError, match="Invalid state namespace"):
+        relay_common.state_dir_for_namespace("nested/path")
+    with pytest.raises(ValueError, match="Invalid state namespace"):
+        relay_common.state_dir_for_namespace("Case-Alias")
 
 
 def test_runtime_binding_creates_worktree_and_memory_contract(tmp_path: Path) -> None:
@@ -36,6 +46,23 @@ def test_runtime_binding_creates_worktree_and_memory_contract(tmp_path: Path) ->
     assert (state / "durable-runtime.sqlite3").exists()
     assert "For relay implementation, runtime, packaging, or audit questions" in agents_text
     assert str(Path(__file__).resolve().parents[2]) in agents_text
+
+
+def test_worktree_manager_rebuilds_partial_existing_directory(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    state = tmp_path / "state"
+    _init_git_repo(repo)
+    manager = WorktreeManager(state / "worktrees")
+    partial = manager.root / relay_runtime.slugify("project-one") / relay_runtime.slugify("channel-one")
+    partial.mkdir(parents=True)
+    (partial / "BROKEN.txt").write_text("not a git worktree\n", encoding="utf-8")
+
+    worktree_path, branch = manager.ensure(repo, project_id="project-one", channel_id="channel-one")
+
+    assert worktree_path == partial
+    assert branch.startswith("relay/")
+    assert (worktree_path / ".git").exists()
+    assert not (worktree_path / "BROKEN.txt").exists()
 
 
 def test_runtime_persists_primary_thread_mapping(tmp_path: Path) -> None:
@@ -79,6 +106,39 @@ def test_runtime_persists_outbound_discord_reply_dedup(tmp_path: Path) -> None:
     assert resumed.claim_outbound_discord_reply("channel-88", "222", "done") is False
 
 
+def test_runtime_can_release_discord_receipts_after_failed_side_effect(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    state = tmp_path / "state"
+    _init_git_repo(repo)
+
+    runtime = DurableRuntime(state_dir=state, repo_path=repo, state_namespace="test", agent_name="codex")
+
+    assert runtime.claim_inbound_discord_message("channel-release", "in-1") is True
+    assert runtime.claim_inbound_discord_message("channel-release", "in-1") is False
+    runtime.release_inbound_discord_message("channel-release", "in-1")
+    assert runtime.claim_inbound_discord_message("channel-release", "in-1") is True
+
+    assert runtime.claim_outbound_discord_reply("channel-release", "src-1", "hello") is True
+    assert runtime.claim_outbound_discord_reply("channel-release", "src-1", "hello") is False
+    runtime.release_outbound_discord_reply("channel-release", "src-1", "hello")
+    assert runtime.claim_outbound_discord_reply("channel-release", "src-1", "hello") is True
+
+
+def test_runtime_prunes_receipts_by_channel_count(tmp_path: Path, monkeypatch) -> None:
+    repo = tmp_path / "repo"
+    state = tmp_path / "state"
+    _init_git_repo(repo)
+    monkeypatch.setenv("CLADEX_RELAY_RECEIPT_MAX_PER_CHANNEL", "100")
+
+    runtime = DurableRuntime(state_dir=state, repo_path=repo, state_namespace="test", agent_name="codex")
+
+    for index in range(105):
+        assert runtime.claim_inbound_discord_message("channel-prune", f"in-{index}") is True
+
+    assert runtime.has_inbound_discord_message("channel-prune", "in-0") is False
+    assert runtime.has_inbound_discord_message("channel-prune", "in-104") is True
+
+
 def test_runtime_rejects_overlapping_fresh_leases(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     state = tmp_path / "state"
@@ -101,6 +161,54 @@ def test_runtime_rejects_overlapping_fresh_leases(tmp_path: Path) -> None:
             target_files=["src/**"],
             validation=["pytest tests/login -q"],
         )
+
+
+def test_runtime_broad_wildcard_lease_conflicts_with_specific_file(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    state = tmp_path / "state"
+    _init_git_repo(repo)
+
+    runtime = DurableRuntime(state_dir=state, repo_path=repo, state_namespace="test", agent_name="codex")
+    runtime.claim_task(
+        channel_key="channel-wide",
+        title="edit python files",
+        owner_agent="codex-a",
+        target_files=["**/*.py"],
+        validation=["pytest -q"],
+    )
+
+    with pytest.raises(TaskLeaseConflictError):
+        runtime.claim_task(
+            channel_key="channel-specific",
+            title="edit backend file",
+            owner_agent="codex-b",
+            target_files=["backend/app.py"],
+            validation=["pytest -q"],
+        )
+
+
+def test_runtime_sibling_path_prefixes_do_not_conflict(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    state = tmp_path / "state"
+    _init_git_repo(repo)
+
+    runtime = DurableRuntime(state_dir=state, repo_path=repo, state_namespace="test", agent_name="codex")
+    first = runtime.claim_task(
+        channel_key="channel-app",
+        title="edit app",
+        owner_agent="codex-a",
+        target_files=["src/app.py", "src/app/**"],
+        validation=["pytest -q"],
+    )
+    second = runtime.claim_task(
+        channel_key="channel-apply",
+        title="edit apply",
+        owner_agent="codex-b",
+        target_files=["src/apply.py", "src/apple/**"],
+        validation=["pytest -q"],
+    )
+
+    assert first["id"] != second["id"]
 
 
 def test_runtime_logs_false_external_claims_to_drift_log(tmp_path: Path) -> None:
@@ -158,6 +266,179 @@ def test_runtime_updates_status_and_handoff_after_turn_result(tmp_path: Path) ->
     assert "task-" in tasks
 
 
+def test_runtime_turn_dedupe_is_database_enforced(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    state = tmp_path / "state"
+    _init_git_repo(repo)
+
+    runtime = DurableRuntime(state_dir=state, repo_path=repo, state_namespace="test", agent_name="codex")
+    runtime.bind_thread("channel-turn", thread_id="thread-turn", backend="codex", status="active")
+
+    first = runtime.store.record_turn(
+        thread_id="thread-turn",
+        turn_id="turn-dupe",
+        summary="one",
+        files_changed=[],
+        commands_run=[],
+        validations=[],
+        next_step="next",
+    )
+    second = runtime.store.record_turn(
+        thread_id="thread-turn",
+        turn_id="turn-dupe",
+        summary="two",
+        files_changed=[],
+        commands_run=[],
+        validations=[],
+        next_step="next",
+    )
+
+    assert first is True
+    assert second is False
+
+
+def test_runtime_duplicate_turn_recovers_missing_artifact(tmp_path: Path, monkeypatch) -> None:
+    repo = tmp_path / "repo"
+    state = tmp_path / "state"
+    _init_git_repo(repo)
+
+    runtime = DurableRuntime(state_dir=state, repo_path=repo, state_namespace="test", agent_name="codex")
+    runtime.bind_thread("channel-turn-artifact", thread_id="thread-artifact", backend="codex", status="active")
+    original_append = runtime._append_turn_artifact
+    attempts = {"count": 0}
+
+    def flaky_append(*args, **kwargs) -> None:
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise OSError("disk not ready")
+        original_append(*args, **kwargs)
+
+    monkeypatch.setattr(runtime, "_append_turn_artifact", flaky_append)
+
+    with pytest.raises(OSError):
+        runtime.record_turn_result(
+            channel_key="channel-turn-artifact",
+            thread_id="thread-artifact",
+            turn_id="turn-artifact-recover",
+            summary="first write",
+            files_changed=[],
+            commands_run=[],
+            validations=[],
+            next_step="retry",
+        )
+
+    assert runtime.record_turn_result(
+        channel_key="channel-turn-artifact",
+        thread_id="thread-artifact",
+        turn_id="turn-artifact-recover",
+        summary="first write",
+        files_changed=[],
+        commands_run=[],
+        validations=[],
+        next_step="retry",
+    ) is False
+
+    artifact = next((state / "turn-artifacts").glob("*.jsonl"))
+    assert "turn-artifact-recover" in artifact.read_text(encoding="utf-8")
+    binding = runtime.ensure_binding("channel-turn-artifact")
+    status_md = (binding.worktree_path / "memory" / "STATUS.md").read_text(encoding="utf-8")
+    handoff_md = (binding.worktree_path / "memory" / "HANDOFF.md").read_text(encoding="utf-8")
+    assert "retry" in status_md
+    assert "first write" in handoff_md
+
+
+def test_runtime_duplicate_turn_recovers_missing_side_effects_for_that_turn(tmp_path: Path, monkeypatch) -> None:
+    repo = tmp_path / "repo"
+    state = tmp_path / "state"
+    _init_git_repo(repo)
+
+    runtime = DurableRuntime(state_dir=state, repo_path=repo, state_namespace="test", agent_name="codex")
+    runtime.bind_thread("channel-turn-side-effects", thread_id="thread-side-effects", backend="codex", status="active")
+
+    assert runtime.record_turn_result(
+        channel_key="channel-turn-side-effects",
+        thread_id="thread-side-effects",
+        turn_id="turn-ok",
+        summary="first good turn",
+        files_changed=[],
+        commands_run=[],
+        validations=[],
+        next_step="next",
+    ) is True
+
+    original_side_effects = runtime._record_turn_side_effects
+    attempts = {"count": 0}
+
+    def flaky_side_effects(*args, **kwargs) -> None:
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise OSError("handoff not ready")
+        original_side_effects(*args, **kwargs)
+
+    monkeypatch.setattr(runtime, "_record_turn_side_effects", flaky_side_effects)
+
+    with pytest.raises(OSError):
+        runtime.record_turn_result(
+            channel_key="channel-turn-side-effects",
+            thread_id="thread-side-effects",
+            turn_id="turn-needs-repair",
+            summary="repair this side effect",
+            files_changed=[],
+            commands_run=[],
+            validations=[],
+            next_step="retry side effects",
+        )
+
+    assert runtime.store.turn_side_effects_synced("turn-ok") is True
+    assert runtime.store.turn_side_effects_synced("turn-needs-repair") is False
+    assert runtime.record_turn_result(
+        channel_key="channel-turn-side-effects",
+        thread_id="thread-side-effects",
+        turn_id="turn-needs-repair",
+        summary="repair this side effect",
+        files_changed=[],
+        commands_run=[],
+        validations=[],
+        next_step="retry side effects",
+    ) is False
+
+    binding = runtime.ensure_binding("channel-turn-side-effects")
+    handoff_md = (binding.worktree_path / "memory" / "HANDOFF.md").read_text(encoding="utf-8")
+    assert "repair this side effect" in handoff_md
+    assert runtime.store.turn_side_effects_synced("turn-needs-repair") is True
+
+
+def test_runtime_turn_side_effect_claim_has_single_winner(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    state = tmp_path / "state"
+    _init_git_repo(repo)
+
+    runtime = DurableRuntime(state_dir=state, repo_path=repo, state_namespace="test", agent_name="codex")
+    assert runtime.store.record_turn(
+        thread_id="thread-claim",
+        turn_id="turn-claim",
+        summary="claim once",
+        files_changed=[],
+        commands_run=[],
+        validations=[],
+        next_step="next",
+    ) is True
+
+    results: list[bool] = []
+
+    def claim() -> None:
+        results.append(runtime.store.claim_turn_side_effects("turn-claim"))
+
+    threads = [threading.Thread(target=claim) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert results.count(True) == 1
+    assert results.count(False) == 7
+
+
 def test_runtime_new_human_message_supersedes_existing_active_task(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     state = tmp_path / "state"
@@ -187,6 +468,37 @@ def test_runtime_new_human_message_supersedes_existing_active_task(tmp_path: Pat
     assert active["title"] == "Only answer yes or no."
     assert tasks["tasks"][0]["title"] == "Only answer yes or no."
     assert any(task["status"] == "released" for task in tasks["tasks"])
+
+
+def test_runtime_expired_active_task_is_not_revived(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    state = tmp_path / "state"
+    _init_git_repo(repo)
+
+    runtime = DurableRuntime(state_dir=state, repo_path=repo, state_namespace="test", agent_name="codex")
+    old = runtime.claim_task(
+        channel_key="channel-expired",
+        title="old task",
+        owner_agent="dead-agent",
+        target_files=[],
+        validation=[],
+    )
+    with runtime.store._connect() as conn:
+        conn.execute(
+            "UPDATE task_leases SET lease_expires_at = ? WHERE task_id = ?",
+            ("2000-01-01T00:00:00+00:00", old["id"]),
+        )
+
+    new = runtime.ensure_task(
+        channel_key="channel-expired",
+        title="new task",
+        owner_agent="new-agent",
+        target_files=[],
+        validation=[],
+    )
+
+    assert new["id"] != old["id"]
+    assert new["owner"] == "new-agent"
 
 
 def test_runtime_context_bundle_uses_latest_distinct_handoff_highlights(tmp_path: Path) -> None:
@@ -409,10 +721,12 @@ def test_runtime_records_compaction_and_preserves_continuity(tmp_path: Path) -> 
     assert "Compaction event recorded" in handoff_text
 
 
-def test_runtime_writes_turn_artifact_jsonl(tmp_path: Path) -> None:
+def test_runtime_writes_turn_artifact_jsonl(tmp_path: Path, monkeypatch) -> None:
     repo = tmp_path / "repo"
     state = tmp_path / "state"
     _init_git_repo(repo)
+    fsync_calls: list[int] = []
+    monkeypatch.setattr(relay_runtime.os, "fsync", lambda fd: fsync_calls.append(fd))
 
     runtime = DurableRuntime(state_dir=state, repo_path=repo, state_namespace="test", agent_name="codex")
     runtime.bind_thread("channel-6", thread_id="thread-666", backend="codex-app-server", status="active")
@@ -444,6 +758,7 @@ def test_runtime_writes_turn_artifact_jsonl(tmp_path: Path) -> None:
     assert payload["turn_id"] == "turn-6"
     assert payload["files_changed"] == ["bot.py", "relay_runtime.py"]
     assert payload["command_exit_codes"] == [0]
+    assert fsync_calls
 
 
 def test_runtime_tracks_restart_churn(tmp_path: Path) -> None:

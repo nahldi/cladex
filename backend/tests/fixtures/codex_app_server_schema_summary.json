@@ -11,15 +11,14 @@
         "cwd",
         "developerInstructions",
         "ephemeral",
-        "experimentalRawEvents",
         "model",
         "modelProvider",
         "permissionProfile",
-        "persistExtendedHistory",
         "personality",
         "sandbox",
         "serviceName",
-        "serviceTier"
+        "serviceTier",
+        "sessionStartSource"
       ],
       "required": []
     },
@@ -32,12 +31,10 @@
         "config",
         "cwd",
         "developerInstructions",
-        "history",
+        "excludeTurns",
         "model",
         "modelProvider",
-        "path",
         "permissionProfile",
-        "persistExtendedHistory",
         "personality",
         "sandbox",
         "serviceTier",
@@ -49,12 +46,15 @@
       "schema": "v2/ThreadListParams.json",
       "allowedProperties": [
         "archived",
+        "cursor",
         "cwd",
         "limit",
         "modelProviders",
         "searchTerm",
+        "sortDirection",
         "sortKey",
-        "sourceKinds"
+        "sourceKinds",
+        "useStateDbOnly"
       ],
       "required": []
     },
@@ -63,7 +63,6 @@
       "allowedProperties": [
         "approvalPolicy",
         "approvalsReviewer",
-        "collaborationMode",
         "cwd",
         "effort",
         "input",

@@ -78,6 +78,13 @@ def _safe_positive_int_env(name: str, default: int) -> int:
     return max(value, 1)
 
 
+def _env_flag_enabled(name: str, *, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
 class _BoundedBytesCapture:
     def __init__(self, max_bytes: int, *, label: str) -> None:
         self.max_bytes = max(max_bytes, 1)
@@ -379,6 +386,8 @@ def _skill_listing() -> dict[str, bool]:
 
 
 def auto_install_enabled_skills() -> tuple[list[str], list[str]]:
+    if not _env_flag_enabled("CLADEX_AUTO_INSTALL_OPTIONAL_SKILLS"):
+        return [], []
     script = _skill_installer_script("install-skill-from-github.py")
     if not script.exists():
         return [], enabled_auto_skills()
@@ -570,6 +579,7 @@ def _install_windows_path_shims(python_exe: Path) -> list[Path]:
         return []
     shims = {
         "cladex.cmd": "cladex",
+        "claude-discord.cmd": "claude_relay",
         "codex-discord.cmd": "relayctl",
         "codex-discord-install-plugin.cmd": "install_plugin",
     }
@@ -593,6 +603,7 @@ def _install_posix_path_shims(python_exe: Path) -> list[Path]:
     scripts_dir.mkdir(parents=True, exist_ok=True)
     shims = {
         "cladex": "cladex",
+        "claude-discord": "claude_relay",
         "codex-discord": "relayctl",
         "codex-discord-install-plugin": "install_plugin",
     }
@@ -663,12 +674,15 @@ def main(source: str | None = None) -> int:
             print(f"Installed PATH shim at {shim}")
     if shutil.which("codex-discord") is None:
         print("`codex-discord` must be installed on PATH for the relay command itself to run.")
+    auto_install_skills = _env_flag_enabled("CLADEX_AUTO_INSTALL_OPTIONAL_SKILLS")
     installed_skills, failed_skills = auto_install_enabled_skills()
     if installed_skills:
         print("Installed recommended optional skills: " + ", ".join(installed_skills))
     if failed_skills:
         print("Could not auto-install optional skills: " + ", ".join(failed_skills))
-    if not installed_skills and not failed_skills:
+    if not auto_install_skills:
+        print("Skipped optional skill auto-install. Set CLADEX_AUTO_INSTALL_OPTIONAL_SKILLS=1 to opt in.")
+    elif not installed_skills and not failed_skills:
         print("Recommended optional skills already present or disabled.")
     return 0
 

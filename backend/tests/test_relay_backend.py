@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import json
 import os
 from pathlib import Path
@@ -13,6 +14,7 @@ from claude_backend import (
     InboundMessage,
     PersistentClaudeProcess,
     RelayBackend,
+    _claude_subprocess_env,
 )
 
 
@@ -58,6 +60,27 @@ def test_build_persistent_command_uses_stream_json(tmp_path: Path) -> None:
     assert "-p" in cmd_with_session
     assert "--resume" in cmd_with_session
     assert "test-session" in cmd_with_session
+
+
+def test_claude_subprocess_env_filters_relay_and_codex_secrets(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "discord-secret")
+    monkeypatch.setenv("CLADEX_REMOTE_ACCESS_TOKEN", "remote-secret")
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-secret")
+    monkeypatch.setenv("CODEX_HOME", "codex-home")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "anthropic-secret")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-config"))
+    monkeypatch.setenv("PATH", os.environ.get("PATH", ""))
+
+    env = _claude_subprocess_env(tmp_path)
+
+    assert env["CLADEX_ACTIVE_WORKTREE"] == str(tmp_path)
+    assert env["CLAUDE_CODE_ENTRYPOINT"] == "cladex-relay"
+    assert env["ANTHROPIC_API_KEY"] == "anthropic-secret"
+    assert env["CLAUDE_CONFIG_DIR"] == str(tmp_path / "claude-config")
+    assert "DISCORD_BOT_TOKEN" not in env
+    assert "CLADEX_REMOTE_ACCESS_TOKEN" not in env
+    assert "OPENAI_API_KEY" not in env
+    assert "CODEX_HOME" not in env
 
 
 def test_idle_processes_are_evicted_after_ttl(tmp_path: Path, monkeypatch) -> None:
@@ -252,6 +275,41 @@ def test_run_turn_keeps_bounded_stdout_while_extracting_stream_text(tmp_path: Pa
     assert len(result.stdout.encode("utf-8")) < 72 * 1024
 
 
+def test_persistent_process_uses_large_stream_limit(tmp_path: Path, monkeypatch) -> None:
+    backend = ClaudeBackend(
+        workspace=tmp_path,
+        state_dir=tmp_path / "state",
+        on_response=lambda msg: None,
+    )
+    persistent = PersistentClaudeProcess(
+        session=backend._session_for_channel("123", tmp_path),
+        worktree=tmp_path,
+    )
+    captured: dict[str, object] = {}
+    monkeypatch.setenv("CLADEX_CLAUDE_STREAM_LIMIT_BYTES", str(256 * 1024))
+
+    class _FakeStderr:
+        async def readline(self) -> bytes:
+            return b""
+
+    class _FakeProcess:
+        stdin = object()
+        stdout = object()
+        stderr = _FakeStderr()
+        returncode = None
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        captured.update(kwargs)
+        return _FakeProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    process = asyncio.run(backend._ensure_persistent_process(persistent))
+
+    assert process is not None
+    assert captured["limit"] == 256 * 1024
+
+
 def test_process_message_retries_with_fresh_session_on_resume_failure(tmp_path: Path) -> None:
     responses: list[str] = []
     statuses: list[str] = []
@@ -353,6 +411,37 @@ def test_relay_backend_bounds_inbound_queue_and_reports_busy(tmp_path: Path, mon
                 content="local message",
             )
         )
+
+
+def test_relay_backend_local_message_gets_exception_when_worker_raises(tmp_path: Path) -> None:
+    relay = RelayBackend(
+        workspace=tmp_path,
+        state_dir=tmp_path / "state",
+        on_discord_response=lambda channel, content, reply_to: None,
+        on_status=lambda status: None,
+    )
+
+    async def raising_process_message(_msg):
+        raise RuntimeError("boom")
+
+    relay._claude.process_message = raising_process_message  # type: ignore[method-assign]
+
+    async def run_case() -> None:
+        worker = asyncio.create_task(relay._process_messages())
+        try:
+            with pytest.raises(RuntimeError, match="boom"):
+                await relay.send_local_message(
+                    channel_id="local",
+                    sender_id="operator",
+                    sender_name="operator",
+                    content="local message",
+                )
+        finally:
+            worker.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await worker
+
+    asyncio.run(run_case())
 
 
 def test_backend_start_uses_launcher_restart_reason_from_env(tmp_path: Path, monkeypatch) -> None:

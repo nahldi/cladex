@@ -10,6 +10,7 @@ import sys
 import tempfile
 import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,7 @@ import psutil
 from platformdirs import user_config_dir, user_data_dir
 
 from agent_guardrails import assert_workspace_allowed, workspace_protection_violation
+from relay_common import slugify
 import claude_relay
 import relayctl
 import review_swarm
@@ -40,13 +42,24 @@ def _load_json_file(path: Path, *, default: dict[str, Any]) -> dict[str, Any]:
         return dict(default)
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return dict(default)
+    except Exception as exc:
+        _quarantine_corrupt_json(path)
+        raise ValueError(f"Invalid JSON state file: {path}") from exc
     if not isinstance(payload, dict):
-        return dict(default)
+        _quarantine_corrupt_json(path)
+        raise ValueError(f"Invalid JSON state file: {path}")
     payload.setdefault("profiles", [])
     payload.setdefault("projects", [])
     return payload
+
+
+def _quarantine_corrupt_json(path: Path) -> None:
+    try:
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        quarantine = path.with_name(f"{path.name}.corrupt-{stamp}-{uuid.uuid4().hex[:6]}")
+        shutil.copy2(path, quarantine)
+    except Exception:
+        pass
 
 
 def _load_claude_registry() -> dict[str, Any]:
@@ -112,7 +125,15 @@ def _load_claude_env(profile: dict[str, Any]) -> dict[str, str]:
 
 def _claude_state_dir(profile: dict[str, Any]) -> Path:
     namespace = str(profile.get("state_namespace", "")).strip()
-    return CLAUDE_DATA_ROOT / "state" / namespace
+    if not namespace or slugify(namespace) != namespace.lower() or "/" in namespace or "\\" in namespace or namespace in {".", ".."}:
+        raise ValueError(f"Invalid Claude state namespace: {namespace!r}")
+    state_root = (CLAUDE_DATA_ROOT / "state").resolve()
+    target = (state_root / namespace).resolve()
+    try:
+        target.relative_to(state_root)
+    except ValueError as exc:
+        raise ValueError(f"Invalid Claude state namespace: {namespace!r}") from exc
+    return target
 
 
 def _read_claude_pid_file(path: Path) -> int | None:
@@ -149,6 +170,30 @@ def _discovered_claude_bot_pids(profile: dict[str, Any]) -> list[int]:
         if str(proc_env.get("STATE_NAMESPACE", "")).strip() == namespace:
             pids.add(int(proc.info["pid"]))
     return sorted(pids)
+
+
+def _pid_matches_claude_profile(profile: dict[str, Any], pid: int | None) -> bool:
+    if pid is None:
+        return False
+    namespace = str(profile.get("state_namespace", "")).strip()
+    if not namespace:
+        return False
+    try:
+        proc = psutil.Process(pid)
+        cmdline = " ".join(proc.cmdline()).lower()
+    except (psutil.Error, OSError):
+        return False
+    if not cmdline:
+        return False
+    bot_script = str(Path(_backend_script_path("claude_bot.py")).resolve()).lower()
+    is_claude_bot = bot_script in cmdline or " -m claude_bot " in f" {cmdline} "
+    if not is_claude_bot:
+        return False
+    try:
+        proc_env = proc.environ()
+    except (psutil.Error, OSError):
+        proc_env = {}
+    return str(proc_env.get("STATE_NAMESPACE", "")).strip() == namespace
 
 
 def _cleanup_duplicate_claude_bot_pids(pids: list[int], keep_pid: int | None) -> None:
@@ -216,6 +261,9 @@ def _claude_profile_runtime_state(profile: dict[str, Any]) -> dict[str, Any]:
     log_path = state_dir / "relay.log"
     status_file = state_dir / "status.json"
     file_pid = _read_claude_pid_file(pid_file)
+    if file_pid is not None and not _pid_matches_claude_profile(profile, file_pid):
+        pid_file.unlink(missing_ok=True)
+        file_pid = None
     discovered_pids = _discovered_claude_bot_pids(profile)
     pid: int | None = None
     running = False
@@ -945,6 +993,8 @@ def update_profile(
         )
         return
     if relay_type == "claude":
+        if any(str(value or "").strip() for value in (startup_dm_user_ids, startup_dm_text, startup_channel_text)):
+            raise ValueError("Startup notice fields are currently supported for Codex profiles only.")
         _update_claude_profile(
             profile,
             workspace=workspace,
@@ -1358,10 +1408,15 @@ def _doctor_codex_app_server_schema() -> dict[str, Any]:
             [relayctl.resolve_codex_bin(), "app-server", "generate-json-schema", "--out", str(out_dir)]
         )
         schemas = sorted(item.name for item in out_dir.glob("*.json"))
-    ok = bool(result.get("ok")) and bool(schemas)
+        compatibility_error = ""
+        if bool(result.get("ok")) and schemas:
+            compatibility_error = _codex_schema_payload_compatibility_error(out_dir)
+    ok = bool(result.get("ok")) and bool(schemas) and not compatibility_error
     detail = str(result.get("error") or result.get("output") or "").strip()
     if bool(result.get("ok")) and not schemas:
         detail = "Codex app-server schema command succeeded but wrote no JSON schema files."
+    elif compatibility_error:
+        detail = compatibility_error
     return {
         "name": "codex-app-server-schema",
         "ok": ok,
@@ -1369,6 +1424,67 @@ def _doctor_codex_app_server_schema() -> dict[str, Any]:
         "detail": detail,
         "schemas": schemas,
     }
+
+
+def _codex_schema_payload_compatibility_error(out_dir: Path) -> str:
+    import relay_backend
+
+    class DoctorSession:
+        def _configured_model(self) -> str:
+            return ""
+
+        def _approval_policy(self) -> str:
+            return "on-request"
+
+        def _sandbox_mode(self) -> str:
+            return "workspace-write"
+
+        def _developer_instructions(self) -> str:
+            return ""
+
+        def _runtime_workdir(self) -> Path:
+            return Path("C:/cladex-doctor")
+
+        def _turn_effort(self, _kind: str, _prompt_text: str = "") -> str:
+            return "high"
+
+    session = DoctorSession()
+    payloads = {
+        "ThreadStartParams": relay_backend.build_thread_start_params(session, cwd=Path("C:/cladex-doctor")),
+        "ThreadResumeParams": relay_backend.build_thread_resume_params(session, thread_id="thread-doctor", cwd=Path("C:/cladex-doctor")),
+        "ThreadListParams": relay_backend.build_thread_list_params(session),
+        "TurnStartParams": relay_backend.build_turn_start_params(session, thread_id="thread-doctor", prompt="ping", injected_context="context"),
+        "TurnSteerParams": relay_backend.build_turn_steer_params(thread_id="thread-doctor", prompt="steer", expected_turn_id="turn-doctor"),
+        "TurnInterruptParams": relay_backend.build_turn_interrupt_params(thread_id="thread-doctor", turn_id="turn-doctor"),
+    }
+    problems: list[str] = []
+    for schema_name, payload in payloads.items():
+        try:
+            schema = _load_codex_generated_schema(out_dir, schema_name)
+        except Exception as exc:
+            problems.append(str(exc))
+            continue
+        allowed = set((schema.get("properties") or {}).keys())
+        extra = sorted(set(payload) - allowed)
+        if extra:
+            problems.append(f"{schema_name} rejects CLADEX fields: {', '.join(extra)}")
+    return "; ".join(problems)
+
+
+def _load_codex_generated_schema(out_dir: Path, schema_name: str) -> dict[str, Any]:
+    schema_path = out_dir / f"{schema_name}.json"
+    if schema_path.exists():
+        return json.loads(schema_path.read_text(encoding="utf-8"))
+    for combined_name in ("codex_app_server_protocol.v2.schemas.json", "codex_app_server_protocol.schemas.json"):
+        combined_path = out_dir / combined_name
+        if not combined_path.exists():
+            continue
+        combined = json.loads(combined_path.read_text(encoding="utf-8"))
+        definitions = combined.get("definitions") or combined.get("$defs") or {}
+        schema = definitions.get(schema_name)
+        if isinstance(schema, dict):
+            return schema
+    raise RuntimeError(f"missing {schema_name} schema definition")
 
 
 def _codex_app_server_request(
@@ -1673,9 +1789,24 @@ def cmd_chat(args: argparse.Namespace) -> int:
     if not profiles:
         print("No matching profiles found.")
         return 1
+    message = str(args.message or "").strip()
+    message_file = str(getattr(args, "message_file", "") or "").strip()
+    if message_file:
+        try:
+            message = Path(message_file).read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            error_payload = {"ok": False, "error": f"Could not read message file: {exc}"}
+            if getattr(args, "json", False):
+                print(json.dumps(error_payload))
+            else:
+                print(error_payload["error"])
+            return 1
+    if not message:
+        print("message is required.")
+        return 1
     payload = _chat_with_profile(
         profiles[0],
-        message=str(args.message or "").strip(),
+        message=message,
         channel_id=args.channel_id,
         sender_name=args.sender_name or "Operator",
         sender_id=args.sender_id or "0",
@@ -1905,8 +2036,9 @@ def cmd_review_run(args: argparse.Namespace) -> int:
 def cmd_review_findings(args: argparse.Namespace) -> int:
     try:
         review_swarm.validate_review_id(args.id)
+        review_swarm.load_job(args.id)
     except Exception as exc:
-        print(f"invalid review id: {exc}", file=sys.stderr)
+        print(f"could not load review job: {exc}", file=sys.stderr)
         return 1
     findings_path = review_swarm.findings_json_path(args.id)
     if not findings_path.exists():
@@ -2282,7 +2414,8 @@ def build_parser() -> argparse.ArgumentParser:
     chat_parser = subparsers.add_parser("chat", help="Send a local operator message through a running relay.")
     chat_parser.add_argument("name")
     chat_parser.add_argument("--type", choices=("codex", "claude"), default=None)
-    chat_parser.add_argument("--message", required=True)
+    chat_parser.add_argument("--message", default="")
+    chat_parser.add_argument("--message-file", default="")
     chat_parser.add_argument("--channel-id", default=None)
     chat_parser.add_argument("--sender-name", default="Operator")
     chat_parser.add_argument("--sender-id", default="0")
