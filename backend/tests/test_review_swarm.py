@@ -13,6 +13,36 @@ import claude_relay
 import review_swarm
 
 
+def test_analyze_workspace_recommends_swarm_settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    project = tmp_path / "target"
+    project.mkdir()
+    (project / "package.json").write_text(
+        json.dumps({"scripts": {"lint": "eslint .", "test": "vitest", "build": "vite build"}}),
+        encoding="utf-8",
+    )
+    (project / "pyproject.toml").write_text("[project]\nname='target'\n", encoding="utf-8")
+    src = project / "src"
+    src.mkdir()
+    tests = project / "tests"
+    tests.mkdir()
+    for index in range(35):
+        (src / f"module_{index}.ts").write_text(f"export const value{index} = {index};\n", encoding="utf-8")
+    (src / "worker.py").write_text("print('ok')\n", encoding="utf-8")
+    (tests / "worker.test.ts").write_text("test('ok', () => {});\n", encoding="utf-8")
+    monkeypatch.setattr(review_swarm, "workspace_protection_violation", lambda *_args, **_kwargs: "")
+
+    analysis = review_swarm.analyze_workspace(project, provider="claude")
+
+    assert analysis["workspace"] == str(project.resolve())
+    assert analysis["recommendation"]["provider"] == "claude"
+    assert analysis["recommendation"]["modelStrategy"] == "claude CLI default"
+    assert analysis["recommendation"]["agents"] >= 7
+    assert analysis["hasTests"] is True
+    assert "npm run lint" in analysis["validationCommands"]
+    assert any(item["name"] == "TypeScript" for item in analysis["languages"])
+    assert any(item["path"] == "package.json" for item in analysis["markers"])
+
+
 def test_review_swarm_preflight_writes_report_and_redacts_secret_values(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     project = tmp_path / "target"
     project.mkdir()

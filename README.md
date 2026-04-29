@@ -73,8 +73,8 @@ cmd /c npm run electron:build  # Creates installer in release/
 ```
 
 Packaged launchers produced by the build:
-- `release\CLADEX Setup 2.5.1.exe`
-- `release\CLADEX 2.5.1.exe`
+- `release\CLADEX Setup 2.5.2.exe`
+- `release\CLADEX 2.5.2.exe`
 - `release\win-unpacked\CLADEX.exe`
 
 Portable/installer first run:
@@ -84,7 +84,7 @@ Portable/installer first run:
 4. In the app, choose `Add Relay`, then enter the workspace path, Discord bot token, allowed channel id or scoped DM allowlist, and optional per-relay account home (`CODEX_HOME` or `CLAUDE_CONFIG_DIR`).
 5. Start the profile and verify it reaches `Ready` before testing in Discord.
 
-Project reviews do not require a Discord relay profile. Open `Review Project`, choose a folder, select Codex or Claude, set 1-50 reviewer lanes, and start the swarm. CLADEX gives every lane a different focus and shard, queues AI lanes behind a bounded worker pool, creates a local source snapshot when enabled, runs reviewers against a scratch copy where possible, and merges results into one report plus a fix plan.
+Project reviews do not require a Discord relay profile. Open `Review Swarm`, choose a target folder, and let Project Scout inspect the project shape before launch. CLADEX recommends a reviewer count, pre-fills the scan title/provider, gives every lane a different focus and shard, queues AI lanes behind a bounded worker pool, creates a local source snapshot when enabled, runs reviewers against CLADEX-managed scratch copies instead of editing the target project, and merges results into one report plus a fix plan. Completed scans live under the History tab; the active pane only shows scans that are queued or running.
 
 ## Security
 
@@ -198,9 +198,9 @@ codex-discord stop
 - The packaged desktop app uses a loopback-only local API. It is meant to manage relays on the same machine, not expose a remote control surface.
 - If you intentionally override the loopback-only API guard, set `CLADEX_ALLOW_REMOTE_API=1`, protect the remote token, and add any extra browse roots with `CLADEX_REMOTE_FS_ROOTS`.
 - `CLADEX_REMOTE_FS_UNRESTRICTED=1` restores arbitrary host browsing and should only be used on a trusted private machine.
-- Project Review artifacts, coordination notes, fix-run reports, and source snapshots are stored under the local CLADEX data directory. Review workers do not apply fixes. **Fix Review** is a separate explicit action that creates a backup before any fix worker edits the selected project. Write-capable CLADEX self-fix requires the completed self-review job plus a separate self-fix approval.
+- Review Swarm artifacts, coordination notes, scratch workspaces, fix-run reports, and source snapshots are stored under the local CLADEX data directory. Review workers do not apply fixes and do not create working folders inside the selected project by default. **Fix Review** is a separate explicit action that creates a backup before any fix worker edits the selected project. Write-capable CLADEX self-fix requires the completed self-review job plus a separate self-fix approval.
+- The Review Swarm page is for the selected project. The session-only override that allows targeting the CLADEX app repo itself lives in Runtime settings and should stay off for normal project reviews.
 - Set `CLADEX_REVIEW_MAX_PARALLEL` if a machine/account pool can safely run more reviewer CLI processes than the default. The UI shows the effective parallel limit and queues requested lanes behind it.
-- Production roadmap and remaining release gates live in [ROADMAP.md](ROADMAP.md). Items that have shipped move to [DONE_ROADMAP.md](DONE_ROADMAP.md).
 
 ## License
 

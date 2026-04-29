@@ -5,8 +5,16 @@ release/
 coverage/
 /AGENTS.md
 /memory/
+/ROADMAP.md
+/DONE_ROADMAP.md
+/DEVELOPMENT_LOG.md
 /.claude/
 /tmp/
+.playwright-cli/
+.playwright-mcp/
+.pytest-basetemp/
+.pytest-tmp/
+manual-mode-test/
 .DS_Store
 *.log
 .env*

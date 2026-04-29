@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { AnimatePresence, motion, useMotionTemplate, useMotionValue, useSpring, useTransform } from 'motion/react';
+import { AnimatePresence, motion, useMotionTemplate, useMotionValue, useReducedMotion, useSpring, useTransform } from 'motion/react';
 import {
   Activity,
   AlertTriangle,
@@ -32,6 +32,7 @@ type RelayType = 'claude' | 'codex';
 type ReviewProvider = 'codex' | 'claude';
 type ReviewJobStatus = 'queued' | 'running' | 'completed' | 'completed_with_warnings' | 'failed' | 'cancelled';
 type FixRunStatus = 'queued' | 'running' | 'completed' | 'completed_with_warnings' | 'failed' | 'cancelled';
+type ReviewActivityTab = 'active' | 'history' | 'fixes' | 'snapshots';
 
 interface Profile {
   id: string;
@@ -112,6 +113,29 @@ interface LimitMetadata {
   maxWorkers?: number;
   warnings?: string[];
   accountHomeWarning?: string;
+}
+
+interface ReviewAnalysis {
+  workspace: string;
+  projectName: string;
+  fileCount: number;
+  workspaceBytes?: number;
+  languages?: Array<{ name: string; files: number }>;
+  markers?: Array<{ path: string; label: string }>;
+  validationCommands?: string[];
+  riskAreas?: string[];
+  hasTests?: boolean;
+  secretLikeFileCount?: number;
+  selfReview?: boolean;
+  recommendation: {
+    provider: ReviewProvider;
+    agents: number;
+    title: string;
+    modelStrategy?: string;
+    laneFocuses?: Array<{ focus: string; detail: string }>;
+    reasons?: string[];
+    limits?: LimitMetadata;
+  };
 }
 
 interface SeverityCounts {
@@ -592,6 +616,8 @@ const api = {
   fixRuns: () => fetchOptionalJson<FixRun[]>(`${API_BASE}/fix-runs`, [], { timeoutMs: API_POLL_TIMEOUT_MS }),
   fixRun: (id: string) => fetchJson<FixRun>(`${API_BASE}/fix-runs/${id}`, { timeoutMs: API_POLL_TIMEOUT_MS }),
   backups: () => fetchJson<BackupRecord[]>(`${API_BASE}/backups`, { timeoutMs: API_POLL_TIMEOUT_MS }),
+  analyzeReview: (body: { workspace: string; provider: ReviewProvider; allowSelfReview?: boolean }) =>
+    fetchJson<ReviewAnalysis>(`${API_BASE}/reviews/analyze`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }),
   startReview: (body: { workspace: string; provider: ReviewProvider; agents: number; title?: string; accountHome?: string; allowSelfReview?: boolean; backupBeforeReview?: boolean }) =>
     fetchJson<ReviewJob>(`${API_BASE}/reviews`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }),
   startFixReview: (id: string, body: { allowSelfFix?: boolean } = {}) =>
@@ -653,6 +679,7 @@ export default function App() {
   const [bootPending, setBootPending] = useState(true);
   const [remoteAuthRequired, setRemoteAuthRequired] = useState(false);
   const [remoteAccessTokenDraft, setRemoteAccessTokenDraft] = useState(() => getStoredAccessToken());
+  const [allowCladexSelfReview, setAllowCladexSelfReview] = useState(false);
   const bootFailureCount = useRef(0);
   const loadAllInFlight = useRef(false);
   const isDark = true;
@@ -859,6 +886,8 @@ export default function App() {
                 fixRuns={fixRuns}
                 backups={backups}
                 busyKey={busyKey}
+                allowCladexSelfReview={allowCladexSelfReview}
+                onAnalyze={(body) => api.analyzeReview(body)}
                 onStart={(body) => void runAction('review-start', () => api.startReview(body))}
                 onFixPlan={(job) => void runAction(`review-fix-${job.id}`, () => api.createFixPlan(job.id))}
                 onFixReview={(job, options) => void runAction(`review-fix-run-${job.id}`, () => api.startFixReview(job.id, options))}
@@ -879,7 +908,7 @@ export default function App() {
         <div className={`flex items-center justify-between gap-1 overflow-x-auto rounded-2xl border p-2 backdrop-blur-xl shadow-2xl transition-colors duration-500 sm:gap-2 ${isDark ? 'border-white/10 bg-white/5 shadow-black/50' : 'border-slate-300/70 bg-white/80 shadow-slate-300/50'}`}>
           <DockButton icon={<LayoutGrid />} label="Relays" active={view === 'relays'} onClick={() => setView('relays')} light={!isDark} />
           <DockButton icon={<FolderKanban />} label="Workgroups" active={view === 'workgroups'} onClick={() => setView('workgroups')} light={!isDark} />
-          <DockButton icon={<SearchCheck />} label="Review Project" active={view === 'review'} onClick={() => setView('review')} light={!isDark} />
+          <DockButton icon={<SearchCheck />} label="Review Swarm" active={view === 'review'} onClick={() => setView('review')} light={!isDark} />
           <DockButton icon={<MessageSquare />} label="Live Console" active={view === 'live'} onClick={() => setView('live')} light={!isDark} />
           <div className={`mx-2 h-8 w-px ${isDark ? 'bg-white/10' : 'bg-slate-300/80'}`} />
           <DockButton icon={<Plus />} label="Add Relay" onClick={() => setActiveModal('add')} light={!isDark} />
@@ -901,7 +930,15 @@ export default function App() {
         {activeModal === 'add' ? <AddProfileModal onClose={() => setActiveModal(null)} onSubmit={async (data) => { await runAction('create-profile', () => api.createProfile(data)); setActiveModal(null); }} /> : null}
         {activeModal === 'edit' && selectedProfile ? <EditProfileModal profile={selectedProfile} onClose={() => setActiveModal(null)} onSubmit={async (data) => { await runAction(`update-${selectedProfile.id}`, () => api.updateProfile(selectedProfile.id, selectedProfile.relayType, data)); setActiveModal(null); }} /> : null}
         {activeModal === 'logs' && selectedProfile ? <LogsModal profile={selectedProfile} onClose={() => setActiveModal(null)} /> : null}
-        {activeModal === 'settings' ? <SettingsModal runtimeInfo={runtimeInfo} onClose={() => setActiveModal(null)} onStopAll={() => void runAction('stop-all', api.stopAll)} /> : null}
+        {activeModal === 'settings' ? (
+          <SettingsModal
+            runtimeInfo={runtimeInfo}
+            allowCladexSelfReview={allowCladexSelfReview}
+            onChangeAllowCladexSelfReview={setAllowCladexSelfReview}
+            onClose={() => setActiveModal(null)}
+            onStopAll={() => void runAction('stop-all', api.stopAll)}
+          />
+        ) : null}
         {activeModal === 'workgroup' ? <WorkgroupModal profiles={profiles} onClose={() => setActiveModal(null)} onSubmit={async (name, members) => { await runAction(`workgroup-${name}`, () => api.createProject(name, members)); setActiveModal(null); }} /> : null}
       </AnimatePresence>
     </div>
@@ -1182,6 +1219,8 @@ function ReviewProjectView({
   fixRuns,
   backups,
   busyKey,
+  allowCladexSelfReview,
+  onAnalyze,
   onStart,
   onFixPlan,
   onFixReview,
@@ -1193,6 +1232,8 @@ function ReviewProjectView({
   fixRuns: FixRun[];
   backups: BackupRecord[];
   busyKey: string | null;
+  allowCladexSelfReview: boolean;
+  onAnalyze: (body: { workspace: string; provider: ReviewProvider; allowSelfReview?: boolean }) => Promise<ReviewAnalysis>;
   onStart: (body: { workspace: string; provider: ReviewProvider; agents: number; title?: string; accountHome?: string; allowSelfReview?: boolean; backupBeforeReview?: boolean }) => void;
   onFixPlan: (job: ReviewJob) => void;
   onFixReview: (job: ReviewJob, options?: { allowSelfFix?: boolean }) => void;
@@ -1206,23 +1247,54 @@ function ReviewProjectView({
   const [agents, setAgents] = useState(8);
   const [codexAccountHome, setCodexAccountHome] = useState('');
   const [claudeAccountHome, setClaudeAccountHome] = useState('');
-  const [allowSelfReview, setAllowSelfReview] = useState(false);
   const [backupBeforeReview, setBackupBeforeReview] = useState(true);
+  const [activityTab, setActivityTab] = useState<ReviewActivityTab>('active');
+  const [analysis, setAnalysis] = useState<ReviewAnalysis | null>(null);
+  const [analysisError, setAnalysisError] = useState('');
+  const [analyzing, setAnalyzing] = useState(false);
   const accountHome = provider === 'codex' ? codexAccountHome : claudeAccountHome;
   const setAccountHome = provider === 'codex' ? setCodexAccountHome : setClaudeAccountHome;
   const reviewBusy = busyKey === 'review-start';
   const backupBusy = busyKey === 'backup-create';
   const workspaceFilled = workspace.trim().length > 0;
-  const activeJobs = jobs.filter((job) => job.status === 'queued' || job.status === 'running').length;
+  const activeReviewJobs = jobs.filter((job) => isInFlightStatus(job.status));
+  const historicalReviewJobs = jobs.filter((job) => !isInFlightStatus(job.status));
+  const activeJobs = activeReviewJobs.length;
   const activeFixRuns = fixRuns.filter((run) => run.status === 'queued' || run.status === 'running').length;
+
+  async function analyzeTarget(nextWorkspace = workspace, selectedProvider = provider) {
+    const target = nextWorkspace.trim();
+    if (!target || analyzing) return;
+    setAnalyzing(true);
+    setAnalysisError('');
+    try {
+      const result = await onAnalyze({ workspace: target, provider: selectedProvider, allowSelfReview: allowCladexSelfReview });
+      setAnalysis(result);
+      setWorkspace(result.workspace || target);
+      setProvider(result.recommendation.provider);
+      setAgents(result.recommendation.agents);
+      const previousTitle = analysis?.recommendation.title || '';
+      setTitle((current) => (!current.trim() || current === previousTitle ? (result.recommendation.title || `${result.projectName || 'Project'} deep scan`) : current));
+    } catch (error) {
+      setAnalysis(null);
+      setAnalysisError(error instanceof Error ? error.message : 'Project Scout failed.');
+    } finally {
+      setAnalyzing(false);
+    }
+  }
+
+  function selectProvider(nextProvider: ReviewProvider) {
+    setProvider(nextProvider);
+    setAnalysis((current) => current ? { ...current, recommendation: { ...current.recommendation, provider: nextProvider } } : current);
+  }
 
   return (
     <div className="mx-auto flex w-full max-w-7xl flex-1 flex-col px-4 pb-8 pt-6 sm:px-8 sm:pt-8">
       <div className="mb-6 flex flex-col gap-4 sm:mb-8 lg:flex-row lg:items-end lg:justify-between">
         <div>
-          <div className="text-[10px] font-bold uppercase tracking-[0.24em] text-slate-500 dark:text-gray-500">Project review swarm</div>
-          <h2 className="mt-2 text-3xl font-black tracking-tight text-slate-900 dark:text-white">Send read-only reviewers through a project.</h2>
-          <p className="mt-2 max-w-3xl text-sm text-slate-600 dark:text-gray-400">Each lane gets a different focus, explores a separate shard, and merges findings into one report plus a fix plan. Reviewers do not apply source changes.</p>
+          <div className="text-[10px] font-bold uppercase tracking-[0.24em] text-slate-500 dark:text-gray-500">Review swarm</div>
+          <h2 className="mt-2 text-3xl font-black tracking-tight text-slate-900 dark:text-white">Launch targeted swarm scans.</h2>
+          <p className="mt-2 max-w-3xl text-sm text-slate-600 dark:text-gray-400">Choose the folder on the left, then send read-only Codex or Claude lanes through isolated scratch copies. Completed scans stay in History.</p>
         </div>
         <div className="flex flex-wrap gap-2">
           <MetaPill label={`${activeJobs} active review${activeJobs === 1 ? '' : 's'}`} />
@@ -1231,87 +1303,411 @@ function ReviewProjectView({
       </div>
 
       <div className="grid gap-5 xl:grid-cols-[420px_minmax(0,1fr)]">
-        <div className="rounded-[30px] border border-slate-200/80 bg-white/80 p-5 shadow-[0_18px_45px_rgba(15,23,42,0.08)] dark:border-white/10 dark:bg-white/[0.03] dark:shadow-2xl">
-          <div className="space-y-5">
-            <FormSection title="Target">
-              <BrowseField label="Project folder" value={workspace} onChange={setWorkspace} placeholder="C:\\Projects\\target-repo" />
-              <FormInput label="Review title" value={title} onChange={setTitle} placeholder="Production readiness pass" />
-            </FormSection>
-
-            <FormSection title="Review lanes">
-              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-                <TypeButton active={provider === 'codex'} label="Codex" icon={<Terminal size={18} />} onClick={() => setProvider('codex')} tone="emerald" />
-                <TypeButton active={provider === 'claude'} label="Claude Code" icon={<Bot size={18} />} onClick={() => setProvider('claude')} tone="orange" />
+        <div className="space-y-4">
+          <FormSection title="Launch target">
+            <BrowseField
+              label="Target folder"
+              value={workspace}
+              onChange={(value) => {
+                setWorkspace(value);
+                setAnalysis(null);
+                setAnalysisError('');
+              }}
+              onPicked={(value) => void analyzeTarget(value)}
+              placeholder="C:\\Projects\\target-repo"
+              buttonLabel="Choose target folder"
+            />
+            <ProjectScoutCard
+              workspaceFilled={workspaceFilled}
+              analysis={analysis}
+              errorText={analysisError}
+              busy={analyzing}
+              onAnalyze={() => void analyzeTarget()}
+            />
+            <FormInput label="Run title" value={title} onChange={setTitle} placeholder="Production readiness pass" />
+            <div className="rounded-2xl border border-emerald-400/20 bg-emerald-500/[0.06] px-4 py-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="text-[10px] font-bold uppercase tracking-[0.22em] text-emerald-700 dark:text-emerald-200">Swarm workspace</div>
+                <MetaPill label="CLADEX scratch copies" />
               </div>
-              <label className="block">
-                <div className="mb-2 flex items-center justify-between gap-3">
-                  <div className="text-[10px] font-bold uppercase tracking-[0.22em] text-slate-500 dark:text-gray-500">Reviewer count</div>
-                  <div className="font-mono text-sm text-slate-700 dark:text-gray-300">{agents}</div>
-                </div>
-                <input
-                  type="range"
-                  min={1}
-                  max={50}
-                  value={agents}
-                  onChange={(event) => setAgents(Number(event.target.value))}
-                  className="w-full accent-indigo-500"
-                />
-              </label>
-              <BrowseField
-                label={provider === 'codex' ? 'Codex account home' : 'Claude config folder'}
-                value={accountHome}
-                onChange={setAccountHome}
-                placeholder="Optional account home for this review run"
-              />
-              <ToggleRow checked={backupBeforeReview} onChange={setBackupBeforeReview} label="Save a source snapshot before review" />
-              <ToggleRow checked={allowSelfReview} onChange={setAllowSelfReview} label="Allow explicit CLADEX self-review" />
-            </FormSection>
+              <div className="mt-2 text-sm text-slate-600 dark:text-gray-400">
+                Review lanes inspect isolated copies of the target folder. The selected project is not edited during review.
+              </div>
+            </div>
+            <ToggleRow checked={backupBeforeReview} onChange={setBackupBeforeReview} label="Create backup before scan" />
+          </FormSection>
 
-            <PrimaryButton
-              label={reviewBusy ? 'Starting...' : 'Review Project'}
-              icon={reviewBusy ? <Loader2 size={16} className="animate-spin" /> : <SearchCheck size={16} />}
-              busy={reviewBusy || backupBusy || !workspaceFilled}
-              onClick={() => {
-                if (!workspaceFilled || reviewBusy || backupBusy) return;
-                onStart({ workspace, provider, agents, title, accountHome, allowSelfReview, backupBeforeReview });
-              }}
-            />
-            <SecondaryButton
-              label={backupBusy ? 'Saving snapshot...' : 'Save snapshot only'}
-              busy={backupBusy || reviewBusy || !workspaceFilled}
-              onClick={() => {
-                if (!workspaceFilled || reviewBusy || backupBusy) return;
-                onCreateBackup(workspace);
-              }}
-            />
+          <FormSection title="Swarm lanes">
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <TypeButton active={provider === 'codex'} label="Codex" icon={<Terminal size={18} />} onClick={() => selectProvider('codex')} tone="emerald" />
+              <TypeButton active={provider === 'claude'} label="Claude Code" icon={<Bot size={18} />} onClick={() => selectProvider('claude')} tone="orange" />
+            </div>
+            <label className="block">
+              <div className="mb-2 flex items-center justify-between gap-3">
+                <div className="text-[10px] font-bold uppercase tracking-[0.22em] text-slate-500 dark:text-gray-500">Reviewer count</div>
+                <div className="font-mono text-sm text-slate-700 dark:text-gray-300">{agents}</div>
+              </div>
+              <input
+                type="range"
+                min={1}
+                max={50}
+                value={agents}
+                onChange={(event) => setAgents(Number(event.target.value))}
+                className="w-full accent-emerald-500"
+              />
+            </label>
+            <details className="rounded-2xl border border-slate-200/80 bg-white/60 px-4 py-3 dark:border-white/10 dark:bg-black/20">
+              <summary className="cursor-pointer text-sm font-semibold text-slate-700 dark:text-gray-300">Advanced provider account options</summary>
+              <div className="mt-4 space-y-4">
+                <BrowseField
+                  label={provider === 'codex' ? 'Codex login/config folder' : 'Claude login/config folder'}
+                  value={accountHome}
+                  onChange={setAccountHome}
+                  placeholder={provider === 'codex' ? 'Optional CODEX_HOME for a separate Codex account' : 'Optional CLAUDE_CONFIG_DIR for a separate Claude account'}
+                  buttonLabel="Choose account folder"
+                  stacked
+                />
+              </div>
+            </details>
+          </FormSection>
+
+          <div className="rounded-[26px] border border-slate-200/80 bg-white/70 p-4 shadow-[0_18px_45px_rgba(15,23,42,0.08)] dark:border-white/10 dark:bg-white/[0.03] dark:shadow-2xl">
+            <div className="space-y-3">
+              <PrimaryButton
+                label={reviewBusy ? 'Starting...' : analysis ? 'Scan Now' : 'Start Review Swarm'}
+                icon={reviewBusy ? <Loader2 size={16} className="animate-spin" /> : <SearchCheck size={16} />}
+                busy={reviewBusy || backupBusy || !workspaceFilled}
+                onClick={() => {
+                  if (!workspaceFilled || reviewBusy || backupBusy) return;
+                  setActivityTab('active');
+                  onStart({ workspace, provider, agents, title, accountHome, allowSelfReview: allowCladexSelfReview, backupBeforeReview });
+                }}
+              />
+              <SecondaryButton
+                label={backupBusy ? 'Saving snapshot...' : 'Save snapshot only'}
+                busy={backupBusy || reviewBusy || !workspaceFilled}
+                onClick={() => {
+                  if (!workspaceFilled || reviewBusy || backupBusy) return;
+                  onCreateBackup(workspace);
+                }}
+              />
+            </div>
           </div>
         </div>
 
-        <div className="space-y-4">
-          {jobs.length === 0 ? (
-            <EmptyState title="No project reviews yet." detail="Pick a project folder, choose Codex or Claude lanes, then start a read-only review." />
-          ) : (
-            jobs.map((job) => (
-              <ReviewJobCard
-                key={job.id}
-                job={job}
-                activeFixRun={fixRuns.find((run) => (run.reviewId || run.reviewJobId) === job.id && isInFlightStatus(run.status))}
-                fixPlanBusy={busyKey === `review-fix-${job.id}`}
-                fixReviewBusy={busyKey === `review-fix-run-${job.id}`}
-                cancelBusy={busyKey === `review-cancel-${job.id}`}
-                onFixPlan={() => onFixPlan(job)}
-                onFixReview={(options) => onFixReview(job, options)}
-                onCancel={() => onCancel(job)}
-              />
-            ))
-          )}
-          <FixRunsPanel
-            runs={fixRuns}
-            busyKey={busyKey}
-            onCancel={onCancelFixRun}
-          />
-          <BackupListCard backups={backups} />
+        <SwarmActivityPanel
+          activeTab={activityTab}
+          onTabChange={setActivityTab}
+          activeJobs={activeReviewJobs}
+          historyJobs={historicalReviewJobs}
+          fixRuns={fixRuns}
+          backups={backups}
+          busyKey={busyKey}
+          onFixPlan={onFixPlan}
+          onFixReview={onFixReview}
+          onCancel={onCancel}
+          onCancelFixRun={onCancelFixRun}
+        />
+      </div>
+    </div>
+  );
+}
+
+function SwarmActivityPanel({
+  activeTab,
+  onTabChange,
+  activeJobs,
+  historyJobs,
+  fixRuns,
+  backups,
+  busyKey,
+  onFixPlan,
+  onFixReview,
+  onCancel,
+  onCancelFixRun,
+}: {
+  activeTab: ReviewActivityTab;
+  onTabChange: (tab: ReviewActivityTab) => void;
+  activeJobs: ReviewJob[];
+  historyJobs: ReviewJob[];
+  fixRuns: FixRun[];
+  backups: BackupRecord[];
+  busyKey: string | null;
+  onFixPlan: (job: ReviewJob) => void;
+  onFixReview: (job: ReviewJob, options?: { allowSelfFix?: boolean }) => void;
+  onCancel: (job: ReviewJob) => void;
+  onCancelFixRun: (run: FixRun) => void;
+}) {
+  const [historyLimit, setHistoryLimit] = useState(8);
+  const visibleHistoryJobs = historyJobs.slice(0, historyLimit);
+  const remainingHistoryJobs = Math.max(0, historyJobs.length - visibleHistoryJobs.length);
+  const tabs: Array<{ id: ReviewActivityTab; label: string; count: number; icon: React.ReactNode }> = [
+    { id: 'active', label: 'Active scans', count: activeJobs.length, icon: <Activity size={15} /> },
+    { id: 'history', label: 'History', count: historyJobs.length, icon: <FileText size={15} /> },
+    { id: 'fixes', label: 'Fix runs', count: fixRuns.length, icon: <Wrench size={15} /> },
+    { id: 'snapshots', label: 'Snapshots', count: backups.length, icon: <FolderKanban size={15} /> },
+  ];
+
+  const renderReviewJob = (job: ReviewJob) => (
+    <ReviewJobCard
+      key={job.id}
+      job={job}
+      activeFixRun={fixRuns.find((run) => (run.reviewId || run.reviewJobId) === job.id && isInFlightStatus(run.status))}
+      fixPlanBusy={busyKey === `review-fix-${job.id}`}
+      fixReviewBusy={busyKey === `review-fix-run-${job.id}`}
+      cancelBusy={busyKey === `review-cancel-${job.id}`}
+      onFixPlan={() => onFixPlan(job)}
+      onFixReview={(options) => onFixReview(job, options)}
+      onCancel={() => onCancel(job)}
+    />
+  );
+
+  return (
+    <section className="min-w-0 rounded-[30px] border border-slate-200/80 bg-white/75 p-4 shadow-[0_18px_45px_rgba(15,23,42,0.08)] dark:border-white/10 dark:bg-white/[0.03] dark:shadow-2xl sm:p-5">
+      <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+        <div>
+          <div className="text-[10px] font-bold uppercase tracking-[0.22em] text-slate-500 dark:text-gray-500">Swarm activity</div>
+          <div className="mt-1 text-lg font-bold tracking-tight text-slate-900 dark:text-white">
+            {activeJobs.length ? `${activeJobs.length} scan${activeJobs.length === 1 ? '' : 's'} in motion` : 'Standby'}
+          </div>
         </div>
+        <div className="grid grid-cols-2 gap-2 sm:flex sm:flex-wrap sm:justify-end">
+          {tabs.map((tab) => (
+            <ActivityTabButton
+              key={tab.id}
+              active={activeTab === tab.id}
+              icon={tab.icon}
+              label={tab.label}
+              count={tab.count}
+              onClick={() => onTabChange(tab.id)}
+            />
+          ))}
+        </div>
+      </div>
+
+      <div className="mt-5">
+        {activeTab === 'active' ? (
+          activeJobs.length ? (
+            <div className="space-y-4">{activeJobs.map(renderReviewJob)}</div>
+          ) : (
+            <HiveStandby historyCount={historyJobs.length} />
+          )
+        ) : null}
+
+        {activeTab === 'history' ? (
+          historyJobs.length ? (
+            <div className="space-y-4">
+              {visibleHistoryJobs.map(renderReviewJob)}
+              {remainingHistoryJobs > 0 ? (
+                <button
+                  type="button"
+                  onClick={() => setHistoryLimit((current) => current + 8)}
+                  className="w-full rounded-2xl border border-dashed border-slate-200/80 bg-white/50 px-4 py-3 text-sm font-semibold text-slate-600 transition-colors hover:bg-white dark:border-white/10 dark:bg-black/20 dark:text-gray-300 dark:hover:bg-white/[0.06]"
+                >
+                  Show {Math.min(8, remainingHistoryJobs)} more scan{Math.min(8, remainingHistoryJobs) === 1 ? '' : 's'} ({remainingHistoryJobs} remaining)
+                </button>
+              ) : null}
+            </div>
+          ) : (
+            <EmptyState title="No scan history yet." detail="Finished review swarms will be stored here after the first run." />
+          )
+        ) : null}
+
+        {activeTab === 'fixes' ? (
+          fixRuns.length ? (
+            <FixRunsPanel runs={fixRuns} busyKey={busyKey} onCancel={onCancelFixRun} />
+          ) : (
+            <EmptyState title="No fix runs yet." detail="Fix Review runs will appear here after a completed swarm scan is selected from History." />
+          )
+        ) : null}
+
+        {activeTab === 'snapshots' ? (
+          <BackupListCard backups={backups} embedded />
+        ) : null}
+      </div>
+    </section>
+  );
+}
+
+function ProjectScoutCard({
+  workspaceFilled,
+  analysis,
+  errorText,
+  busy,
+  onAnalyze,
+}: {
+  workspaceFilled: boolean;
+  analysis: ReviewAnalysis | null;
+  errorText: string;
+  busy: boolean;
+  onAnalyze: () => void;
+}) {
+  const recommendation = analysis?.recommendation;
+  const topLanguages = analysis?.languages?.slice(0, 4) || [];
+  const topMarkers = analysis?.markers?.slice(0, 4) || [];
+  const laneFocuses = recommendation?.laneFocuses?.slice(0, 6) || [];
+  return (
+    <div className="rounded-2xl border border-amber-400/20 bg-amber-500/[0.06] px-4 py-3">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <div className="text-[10px] font-bold uppercase tracking-[0.22em] text-amber-700 dark:text-amber-200">Project Scout</div>
+          <div className="mt-1 text-sm text-slate-600 dark:text-gray-400">
+            {analysis ? `${analysis.projectName} scanned` : 'Scan the project shape before launching lanes.'}
+          </div>
+        </div>
+        <button
+          type="button"
+          onClick={onAnalyze}
+          disabled={!workspaceFilled || busy}
+          className="inline-flex min-h-10 items-center justify-center gap-2 rounded-2xl border border-amber-400/25 bg-amber-500/10 px-3 py-2 text-sm font-semibold text-amber-800 transition-colors hover:bg-amber-500/15 disabled:cursor-not-allowed disabled:opacity-50 dark:text-amber-100"
+        >
+          {busy ? <Loader2 size={15} className="animate-spin" /> : <SearchCheck size={15} />}
+          {analysis ? 'Rescan' : 'Scout'}
+        </button>
+      </div>
+      {errorText ? <div className="mt-3 rounded-xl border border-red-500/20 bg-red-500/10 px-3 py-2 text-xs text-red-700 dark:text-red-200">{errorText}</div> : null}
+      {analysis && recommendation ? (
+        <div className="mt-4 space-y-3">
+          <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+            <ScoutMetric label="Files" value={String(analysis.fileCount)} />
+            <ScoutMetric label="Lanes" value={String(recommendation.agents)} />
+            <ScoutMetric label="Provider" value={recommendation.provider} />
+            <ScoutMetric label="Model" value={recommendation.modelStrategy || 'CLI default'} />
+          </div>
+          {topLanguages.length ? (
+            <div className="flex flex-wrap gap-2">
+              {topLanguages.map((item) => <MetaPill key={item.name} label={`${item.name} ${item.files}`} />)}
+            </div>
+          ) : null}
+          {topMarkers.length ? (
+            <div className="flex flex-wrap gap-2">
+              {topMarkers.map((item) => <MetaPill key={item.path} label={item.path} />)}
+            </div>
+          ) : null}
+          {recommendation.reasons?.length ? (
+            <ul className="space-y-1 text-xs leading-relaxed text-slate-600 dark:text-gray-400">
+              {recommendation.reasons.slice(0, 4).map((reason) => <li key={reason}>- {reason}</li>)}
+            </ul>
+          ) : null}
+          {laneFocuses.length ? (
+            <div className="flex flex-wrap gap-2">
+              {laneFocuses.map((lane) => <MetaPill key={lane.focus} label={lane.focus} />)}
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function ScoutMetric({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="rounded-xl border border-white/10 bg-black/[0.08] px-3 py-2 dark:bg-black/20">
+      <div className="text-[9px] font-bold uppercase tracking-[0.18em] text-slate-500 dark:text-gray-500">{label}</div>
+      <div className="mt-1 truncate font-mono text-sm text-slate-800 dark:text-gray-100">{value}</div>
+    </div>
+  );
+}
+
+function ActivityTabButton({
+  active,
+  icon,
+  label,
+  count,
+  onClick,
+}: {
+  active: boolean;
+  icon: React.ReactNode;
+  label: string;
+  count: number;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-pressed={active}
+      className={`inline-flex min-h-10 items-center justify-center gap-2 rounded-2xl border px-3 py-2 text-xs font-semibold transition-colors ${
+        active
+          ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-100 shadow-[0_0_24px_rgba(16,185,129,0.18)]'
+          : 'border-slate-200/80 bg-white/60 text-slate-600 hover:bg-white dark:border-white/10 dark:bg-black/20 dark:text-gray-400 dark:hover:bg-white/[0.06] dark:hover:text-white'
+      }`}
+    >
+      {icon}
+      <span className="truncate">{label}</span>
+      <span className={`rounded-full px-2 py-0.5 font-mono text-[10px] ${active ? 'bg-white/15 text-white' : 'bg-slate-200/70 text-slate-600 dark:bg-white/10 dark:text-gray-300'}`}>{count}</span>
+    </button>
+  );
+}
+
+const HIVE_CELLS = [
+  { left: 10, top: 12, delay: 0 },
+  { left: 25, top: 8, delay: 0.3 },
+  { left: 40, top: 12, delay: 0.6 },
+  { left: 55, top: 8, delay: 0.9 },
+  { left: 70, top: 12, delay: 1.2 },
+  { left: 18, top: 31, delay: 1.5 },
+  { left: 33, top: 35, delay: 1.8 },
+  { left: 48, top: 31, delay: 2.1 },
+  { left: 63, top: 35, delay: 2.4 },
+  { left: 78, top: 31, delay: 2.7 },
+  { left: 10, top: 54, delay: 3.0 },
+  { left: 25, top: 58, delay: 3.3 },
+  { left: 40, top: 54, delay: 3.6 },
+  { left: 55, top: 58, delay: 3.9 },
+  { left: 70, top: 54, delay: 4.2 },
+];
+
+const SWARM_DOTS = [
+  { left: 17, top: 22, delay: 0.1 },
+  { left: 37, top: 18, delay: 0.7 },
+  { left: 59, top: 20, delay: 1.4 },
+  { left: 73, top: 42, delay: 2.0 },
+  { left: 29, top: 48, delay: 2.6 },
+  { left: 47, top: 69, delay: 3.2 },
+  { left: 66, top: 66, delay: 3.8 },
+  { left: 20, top: 72, delay: 4.4 },
+];
+
+function HiveStandby({ historyCount }: { historyCount: number }) {
+  const shouldReduceMotion = useReducedMotion();
+
+  return (
+    <div className="relative min-h-[440px] overflow-hidden rounded-[28px] border border-dashed border-amber-300/35 bg-slate-50/60 p-5 dark:border-amber-300/20 dark:bg-black/20 sm:p-6">
+      <div className="relative z-10 flex min-h-[390px] flex-col justify-between">
+        <div className="max-w-sm">
+          <div className="inline-flex items-center gap-2 rounded-full border border-amber-400/30 bg-amber-500/10 px-3 py-1 text-[10px] font-bold uppercase tracking-[0.22em] text-amber-700 dark:text-amber-200">
+            <Activity size={14} />
+            Swarm standby
+          </div>
+          <h3 className="mt-4 text-2xl font-black tracking-tight text-slate-900 dark:text-white">No active scan running.</h3>
+          <p className="mt-2 text-sm leading-relaxed text-slate-600 dark:text-gray-400">Start a review from the launch controls and live lane progress will take over this pane.</p>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          <MetaPill label="read-only reviewers" />
+          <MetaPill label="scratch workspaces" />
+          <MetaPill label={`${historyCount} in history`} mono />
+        </div>
+      </div>
+      <div className="pointer-events-none absolute inset-0 opacity-95">
+        {HIVE_CELLS.map((cell, index) => (
+          <motion.div
+            key={`cell-${index}`}
+            className="absolute h-16 w-16 border border-amber-400/25 bg-amber-400/[0.04] dark:border-amber-300/20 dark:bg-amber-300/[0.04]"
+            style={{ left: `${cell.left}%`, top: `${cell.top}%`, clipPath: 'polygon(25% 6%, 75% 6%, 100% 50%, 75% 94%, 25% 94%, 0 50%)' }}
+            animate={shouldReduceMotion ? { opacity: 0.42, scale: 1 } : { opacity: [0.28, 0.58, 0.28], scale: [0.98, 1.03, 0.98] }}
+            transition={shouldReduceMotion ? undefined : { duration: 5.5, delay: cell.delay, repeat: Infinity, ease: 'easeInOut' }}
+          />
+        ))}
+        {SWARM_DOTS.map((dot, index) => (
+          <motion.span
+            key={`dot-${index}`}
+            className="absolute h-2.5 w-2.5 rounded-full bg-emerald-300/80 shadow-[0_0_16px_rgba(110,231,183,0.55)]"
+            style={{ left: `${dot.left}%`, top: `${dot.top}%` }}
+            animate={shouldReduceMotion ? { x: 0, y: 0, opacity: 0.72 } : { x: [0, 10, -5, 0], y: [0, -8, 6, 0], opacity: [0.35, 1, 0.55, 0.35] }}
+            transition={shouldReduceMotion ? undefined : { duration: 6, delay: dot.delay, repeat: Infinity, ease: 'easeInOut' }}
+          />
+        ))}
       </div>
     </div>
   );
@@ -1663,10 +2059,10 @@ function FixTaskTile({ task }: { task: FixTaskRecord }) {
   );
 }
 
-function BackupListCard({ backups }: { backups: BackupRecord[] }) {
+function BackupListCard({ backups, embedded = false }: { backups: BackupRecord[]; embedded?: boolean }) {
   const recent = backups.slice(0, 8);
   return (
-    <div className="rounded-[30px] border border-slate-200/80 bg-white/80 p-5 shadow-[0_18px_45px_rgba(15,23,42,0.08)] dark:border-white/10 dark:bg-white/[0.03] dark:shadow-2xl">
+    <div className={embedded ? 'rounded-[24px] border border-slate-200/80 bg-white/55 p-4 dark:border-white/10 dark:bg-black/20 sm:p-5' : 'rounded-[30px] border border-slate-200/80 bg-white/80 p-5 shadow-[0_18px_45px_rgba(15,23,42,0.08)] dark:border-white/10 dark:bg-white/[0.03] dark:shadow-2xl'}>
       <div className="flex items-center justify-between gap-3">
         <div>
           <div className="text-[10px] font-bold uppercase tracking-[0.22em] text-slate-500 dark:text-gray-500">Source snapshots</div>
@@ -2497,11 +2893,32 @@ function WorkgroupModal({
   );
 }
 
-function SettingsModal({ runtimeInfo, onClose, onStopAll }: { runtimeInfo: RuntimeInfo | null; onClose: () => void; onStopAll: () => void }) {
+function SettingsModal({
+  runtimeInfo,
+  allowCladexSelfReview,
+  onChangeAllowCladexSelfReview,
+  onClose,
+  onStopAll,
+}: {
+  runtimeInfo: RuntimeInfo | null;
+  allowCladexSelfReview: boolean;
+  onChangeAllowCladexSelfReview: (value: boolean) => void;
+  onClose: () => void;
+  onStopAll: () => void;
+}) {
+  const handleSelfReviewToggle = (checked: boolean) => {
+    if (!checked) {
+      onChangeAllowCladexSelfReview(false);
+      return;
+    }
+    if (window.confirm('Allow Review Swarm to target the CLADEX app repo for this app session? This is only for deliberate CLADEX development and should stay off for normal project reviews.')) {
+      onChangeAllowCladexSelfReview(true);
+    }
+  };
   return (
     <ModalShell title="CLADEX Runtime" onClose={onClose} wide>
       <div className="space-y-6">
-        <p className="text-sm leading-relaxed text-slate-600 dark:text-gray-400">This panel shows the real runtime state. Profile behavior lives with each relay, not in fake global settings.</p>
+        <p className="text-sm leading-relaxed text-slate-600 dark:text-gray-400">This panel shows the real runtime state and rare global safety overrides. Day-to-day profile behavior still lives with each relay.</p>
         <InspectorRow label="API base" value={runtimeInfo?.apiBase || 'Loading...'} mono />
         <InspectorRow label="Backend path" value={runtimeInfo?.backendDir || 'Loading...'} mono />
         {runtimeInfo?.frontendDir ? <InspectorRow label="Frontend path" value={runtimeInfo.frontendDir} mono /> : null}
@@ -2515,6 +2932,17 @@ function SettingsModal({ runtimeInfo, onClose, onStopAll }: { runtimeInfo: Runti
             <li>Claude now shares the same durable memory, worktree, status, and handoff path instead of a thin side path.</li>
             <li>Bot labels, trigger mode, model choice, and DM access are managed per relay profile.</li>
           </ul>
+        </div>
+        <div className="rounded-2xl border border-amber-400/30 bg-amber-500/[0.08] p-4 text-sm text-amber-950 dark:text-amber-100">
+          <div className="mb-3 text-[10px] font-bold uppercase tracking-[0.22em] text-amber-700 dark:text-amber-300">CLADEX development safety</div>
+          <ToggleRow
+            checked={allowCladexSelfReview}
+            onChange={handleSelfReviewToggle}
+            label="Allow Review Swarm to target the CLADEX app repo this session"
+          />
+          <div className="mt-3 text-xs leading-relaxed text-amber-800 dark:text-amber-200/80">
+            Keep this off for normal project reviews. Enable it only when intentionally reviewing CLADEX itself; write-capable self-fix still requires a separate confirmation.
+          </div>
         </div>
         <div className="rounded-2xl border border-slate-200/80 bg-white/70 p-4 text-sm text-slate-600 dark:border-white/10 dark:bg-black/30 dark:text-gray-400">
           <div className="mb-2 text-[10px] font-bold uppercase tracking-[0.22em] text-slate-500 dark:text-gray-500">First Run Checklist</div>
@@ -2623,31 +3051,35 @@ function FormInput({ label, value, onChange, placeholder, mono = false, type = '
   return <label className="block"><div className="mb-2 text-[10px] font-bold uppercase tracking-[0.22em] text-slate-500 dark:text-gray-500">{label}</div><input type={type} value={value} onChange={(event) => onChange(event.target.value)} placeholder={placeholder} className={`w-full rounded-2xl border border-slate-200 bg-white/80 px-4 py-3 text-slate-900 outline-none focus:border-indigo-500 dark:border-white/10 dark:bg-black/40 dark:text-white ${mono ? 'font-mono text-sm' : 'text-sm'}`} /></label>;
 }
 
-function BrowseField({ label, value, onChange, placeholder }: { label: string; value: string; onChange: (value: string) => void; placeholder: string }) {
+function BrowseField({ label, value, onChange, onPicked, placeholder, buttonLabel, stacked = false }: { label: string; value: string; onChange: (value: string) => void; onPicked?: (value: string) => void; placeholder: string; buttonLabel?: string; stacked?: boolean }) {
   const [browserOpen, setBrowserOpen] = useState(false);
   const desktopPickerAvailable = Boolean(window.cladexDesktop?.chooseDirectory);
   return (
     <>
     <label className="block">
       <div className="mb-2 text-[10px] font-bold uppercase tracking-[0.22em] text-slate-500 dark:text-gray-500">{label}</div>
-      <div className="flex flex-col gap-3 sm:flex-row">
+      <div className={`flex flex-col gap-3 ${stacked ? '' : 'sm:flex-row'}`}>
         <input value={value} onChange={(event) => onChange(event.target.value)} placeholder={placeholder} className="min-w-0 flex-1 rounded-2xl border border-slate-200 bg-white/80 px-4 py-3 text-sm text-slate-900 outline-none focus:border-indigo-500 dark:border-white/10 dark:bg-black/40 dark:text-white" />
         <button
           type="button"
           onClick={async () => {
             if (desktopPickerAvailable) {
-              onChange(await chooseWorkspaceFolder(value));
+              const chosen = await chooseWorkspaceFolder(value);
+              onChange(chosen);
+              if (chosen && chosen !== value) {
+                onPicked?.(chosen);
+              }
               return;
             }
             setBrowserOpen(true);
           }}
           className="rounded-2xl border border-slate-200 bg-white/80 px-4 py-3 text-sm font-semibold text-slate-700 transition-colors hover:bg-slate-100 dark:border-white/10 dark:bg-white/[0.03] dark:text-gray-200 dark:hover:bg-white/[0.08]"
         >
-          {desktopPickerAvailable ? 'Browse' : 'Browse server'}
+          {buttonLabel || (desktopPickerAvailable ? 'Browse' : 'Browse server')}
         </button>
       </div>
     </label>
-    {browserOpen ? <DirectoryBrowserModal initialPath={value} onClose={() => setBrowserOpen(false)} onPick={(nextPath) => { onChange(nextPath); setBrowserOpen(false); }} /> : null}
+    {browserOpen ? <DirectoryBrowserModal initialPath={value} onClose={() => setBrowserOpen(false)} onPick={(nextPath) => { onChange(nextPath); onPicked?.(nextPath); setBrowserOpen(false); }} /> : null}
     </>
   );
 }
@@ -2673,7 +3105,7 @@ function ToggleRow({ checked, onChange, label }: { checked: boolean; onChange: (
 
 function TypeButton({ active, label, icon, onClick, tone }: { active: boolean; label: string; icon: React.ReactNode; onClick: () => void; tone: 'orange' | 'emerald' }) {
   const activeStyles = tone === 'orange' ? 'border-orange-500/40 bg-orange-500/10 text-orange-200' : 'border-emerald-500/40 bg-emerald-500/10 text-emerald-200';
-  return <button onClick={onClick} className={`flex items-center justify-center gap-3 rounded-2xl border px-4 py-4 font-semibold transition-colors ${active ? activeStyles : 'border-white/10 bg-white/[0.03] text-gray-400 hover:bg-white/[0.06]'}`}>{icon}{label}</button>;
+  return <button type="button" onClick={onClick} className={`flex items-center justify-center gap-3 rounded-2xl border px-4 py-4 font-semibold transition-colors ${active ? activeStyles : 'border-white/10 bg-white/[0.03] text-gray-400 hover:bg-white/[0.06]'}`}>{icon}{label}</button>;
 }
 
 function RemoteAccessModal({
@@ -2785,16 +3217,17 @@ function ModalShell({ title, children, onClose, wide = false }: { title: string;
 function DockButton({ icon, label, active, onClick, light = false }: { icon: React.ReactNode; label: string; active?: boolean; onClick: () => void; light?: boolean }) {
   const ref = useRef<HTMLButtonElement>(null);
   const [position, setPosition] = useState({ x: 0, y: 0 });
-  return <div className="group relative"><motion.button ref={ref} onMouseMove={(event) => { if (!ref.current) return; const bounds = ref.current.getBoundingClientRect(); setPosition({ x: (event.clientX - (bounds.left + bounds.width / 2)) * 0.3, y: (event.clientY - (bounds.top + bounds.height / 2)) * 0.3 }); }} onMouseLeave={() => setPosition({ x: 0, y: 0 })} animate={{ x: position.x, y: position.y }} transition={{ type: 'spring', stiffness: 150, damping: 15, mass: 0.1 }} whileHover={{ scale: 1.08 }} whileTap={{ scale: 0.96 }} onClick={onClick} className={`rounded-xl p-3 transition-colors ${active ? 'bg-indigo-500 text-white shadow-[0_0_20px_rgba(99,102,241,0.5)]' : light ? 'text-slate-600 hover:bg-black/5 hover:text-slate-900' : 'text-gray-400 hover:bg-white/10 hover:text-white'}`}>{icon}</motion.button><div className={`pointer-events-none absolute bottom-full left-1/2 mb-3 -translate-x-1/2 whitespace-nowrap rounded-lg border px-3 py-1.5 text-xs font-bold opacity-0 transition-opacity group-hover:opacity-100 ${light ? 'border-slate-200 bg-white text-slate-800 shadow-xl' : 'border-white/10 bg-black/80 text-white'}`}>{label}</div></div>;
+  return <div className="group relative"><motion.button type="button" aria-label={label} aria-current={active ? 'page' : undefined} ref={ref} onMouseMove={(event) => { if (!ref.current) return; const bounds = ref.current.getBoundingClientRect(); setPosition({ x: (event.clientX - (bounds.left + bounds.width / 2)) * 0.3, y: (event.clientY - (bounds.top + bounds.height / 2)) * 0.3 }); }} onMouseLeave={() => setPosition({ x: 0, y: 0 })} animate={{ x: position.x, y: position.y }} transition={{ type: 'spring', stiffness: 150, damping: 15, mass: 0.1 }} whileHover={{ scale: 1.08 }} whileTap={{ scale: 0.96 }} onClick={onClick} className={`rounded-xl p-3 transition-colors ${active ? 'bg-indigo-500 text-white shadow-[0_0_20px_rgba(99,102,241,0.5)]' : light ? 'text-slate-600 hover:bg-black/5 hover:text-slate-900' : 'text-gray-400 hover:bg-white/10 hover:text-white'}`}>{icon}</motion.button><div className={`pointer-events-none absolute bottom-full left-1/2 mb-3 -translate-x-1/2 whitespace-nowrap rounded-lg border px-3 py-1.5 text-xs font-bold opacity-0 transition-opacity group-hover:opacity-100 ${light ? 'border-slate-200 bg-white text-slate-800 shadow-xl' : 'border-white/10 bg-black/80 text-white'}`}>{label}</div></div>;
 }
 
 function ActionButton({ label, icon, onClick, busy = false, tone = 'default', light = false }: { label: string; icon: React.ReactNode; onClick: () => void; busy?: boolean; tone?: 'default' | 'danger'; light?: boolean }) {
-  return <button onClick={onClick} disabled={busy} className={`inline-flex items-center gap-2 rounded-2xl border px-4 py-2 text-sm font-semibold transition-colors disabled:opacity-50 ${tone === 'danger' ? 'border-red-500/25 bg-red-500/10 text-red-700 hover:bg-red-500/20 dark:text-red-200' : light ? 'border-slate-300 bg-white text-slate-800 hover:bg-slate-100' : 'border-white/10 bg-white/[0.04] text-white hover:bg-white/[0.08]'}`}>{busy ? <Loader2 size={16} className="animate-spin" /> : icon}{label}</button>;
+  return <button type="button" onClick={onClick} disabled={busy} className={`inline-flex items-center gap-2 rounded-2xl border px-4 py-2 text-sm font-semibold transition-colors disabled:opacity-50 ${tone === 'danger' ? 'border-red-500/25 bg-red-500/10 text-red-700 hover:bg-red-500/20 dark:text-red-200' : light ? 'border-slate-300 bg-white text-slate-800 hover:bg-slate-100' : 'border-white/10 bg-white/[0.04] text-white hover:bg-white/[0.08]'}`}>{busy ? <Loader2 size={16} className="animate-spin" /> : icon}{label}</button>;
 }
 
 function PrimaryButton({ label, icon, onClick, busy = false, disabled = false }: { label: string; icon: React.ReactNode; onClick: () => void; busy?: boolean; disabled?: boolean }) {
   return (
     <button
+      type="button"
       onClick={onClick}
       disabled={busy || disabled}
       aria-busy={busy || undefined}
@@ -2809,6 +3242,7 @@ function PrimaryButton({ label, icon, onClick, busy = false, disabled = false }:
 function SecondaryButton({ label, onClick, busy = false }: { label: string; onClick: () => void; busy?: boolean }) {
   return (
     <button
+      type="button"
       onClick={onClick}
       disabled={busy}
       aria-busy={busy || undefined}
@@ -2820,5 +3254,5 @@ function SecondaryButton({ label, onClick, busy = false }: { label: string; onCl
 }
 
 function MiniIconButton({ label, icon, onClick, tone = 'default' }: { label: string; icon: React.ReactNode; onClick: () => void; tone?: 'default' | 'danger' }) {
-  return <button title={label} onClick={onClick} className={`inline-flex h-9 w-9 items-center justify-center rounded-full border transition-colors ${tone === 'danger' ? 'border-red-500/20 bg-red-500/10 text-red-700 hover:bg-red-500/20 dark:text-red-200' : 'border-slate-200/80 bg-white/70 text-slate-500 hover:bg-slate-200 hover:text-slate-900 dark:border-white/5 dark:bg-white/5 dark:text-gray-400 dark:hover:bg-white/10 dark:hover:text-white'}`}>{icon}</button>;
+  return <button type="button" title={label} onClick={onClick} className={`inline-flex h-9 w-9 items-center justify-center rounded-full border transition-colors ${tone === 'danger' ? 'border-red-500/20 bg-red-500/10 text-red-700 hover:bg-red-500/20 dark:text-red-200' : 'border-slate-200/80 bg-white/70 text-slate-500 hover:bg-slate-200 hover:text-slate-900 dark:border-white/5 dark:bg-white/5 dark:text-gray-400 dark:hover:bg-white/10 dark:hover:text-white'}`}>{icon}</button>;
 }

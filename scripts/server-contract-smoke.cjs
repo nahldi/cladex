@@ -246,6 +246,16 @@ async function main() {
     assert.equal(badReview.status, 400);
     assert.match(badReview.json.error, /workspace is required/);
 
+    // Review Scout: missing workspace rejected before backend run.
+    const badReviewAnalyze = await request(port, {
+      method: 'POST',
+      path: '/api/reviews/analyze',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    assert.equal(badReviewAnalyze.status, 400);
+    assert.match(badReviewAnalyze.json.error, /workspace is required/);
+
     // Token gate denies opaque-origin access to the privileged listing route.
     const opaqueProfilesNoToken = await request(port, {
       path: '/api/profiles',

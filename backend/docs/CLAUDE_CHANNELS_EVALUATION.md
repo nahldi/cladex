@@ -39,4 +39,4 @@ We would re-evaluate Channels for adoption if/when:
 
 **Do not adopt Claude Code Channels as a Claude transport for CLADEX in 2.4.0.** The current `claude -p` stream-json subprocess bridge stays as the supported Claude transport. Re-evaluate when Channels reaches stable / GA and the open questions above are resolved.
 
-This decision is documented in [memory/DECISIONS.md](../../memory/DECISIONS.md) and on the public roadmap so future agents do not redo this evaluation under the assumption it was simply "deferred".
+This decision is documented here so future maintainers do not redo this evaluation under the assumption it was simply "deferred".

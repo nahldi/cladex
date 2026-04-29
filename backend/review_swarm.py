@@ -74,6 +74,48 @@ AGENT_SPECIALTIES = (
     ),
 )
 
+LANGUAGE_BY_EXTENSION = {
+    ".c": "C/C++",
+    ".cpp": "C/C++",
+    ".cs": "C#",
+    ".css": "CSS",
+    ".go": "Go",
+    ".html": "HTML",
+    ".java": "Java",
+    ".js": "JavaScript",
+    ".jsx": "JavaScript",
+    ".kt": "Kotlin",
+    ".mjs": "JavaScript",
+    ".php": "PHP",
+    ".ps1": "PowerShell",
+    ".py": "Python",
+    ".rb": "Ruby",
+    ".rs": "Rust",
+    ".sh": "Shell",
+    ".sql": "SQL",
+    ".swift": "Swift",
+    ".ts": "TypeScript",
+    ".tsx": "TypeScript",
+}
+PROJECT_MARKER_FILES = {
+    "package.json": "Node/JavaScript package",
+    "pnpm-lock.yaml": "pnpm lockfile",
+    "yarn.lock": "Yarn lockfile",
+    "package-lock.json": "npm lockfile",
+    "pyproject.toml": "Python package",
+    "requirements.txt": "Python requirements",
+    "go.mod": "Go module",
+    "Cargo.toml": "Rust crate",
+    "pom.xml": "Maven project",
+    "build.gradle": "Gradle project",
+    "Dockerfile": "Docker build",
+    "docker-compose.yml": "Docker Compose stack",
+    "vite.config.ts": "Vite frontend",
+    "vite.config.js": "Vite frontend",
+    "next.config.js": "Next.js app",
+    "README.md": "Project README",
+}
+
 SKIP_DIRS = {
     ".git",
     ".hg",
@@ -362,6 +404,10 @@ def validate_agent_count(value: Any) -> int:
     if count < 1 or count > MAX_AGENTS:
         raise ValueError(f"agents must be between 1 and {MAX_AGENTS}")
     return count
+
+
+def _clamp(value: int, low: int, high: int) -> int:
+    return max(low, min(high, value))
 
 
 def validate_review_id(value: str) -> str:
@@ -695,6 +741,227 @@ def inventory_files(workspace: str | Path) -> list[Path]:
                 files.append(path)
     files.sort(key=lambda item: item.relative_to(root).as_posix().lower())
     return files
+
+
+def _language_counts(files: list[Path]) -> list[dict[str, Any]]:
+    counts: dict[str, int] = {}
+    for path in files:
+        language = LANGUAGE_BY_EXTENSION.get(path.suffix.lower())
+        if not language:
+            continue
+        counts[language] = counts.get(language, 0) + 1
+    return [
+        {"name": name, "files": count}
+        for name, count in sorted(counts.items(), key=lambda item: (-item[1], item[0].lower()))
+    ]
+
+
+def _project_markers(workspace: Path) -> list[dict[str, str]]:
+    markers: list[dict[str, str]] = []
+    for filename, label in PROJECT_MARKER_FILES.items():
+        if (workspace / filename).exists():
+            markers.append({"path": filename, "label": label})
+    workflows = workspace / ".github" / "workflows"
+    if workflows.exists() and workflows.is_dir():
+        markers.append({"path": ".github/workflows", "label": "GitHub Actions"})
+    return markers
+
+
+def _package_scripts(workspace: Path) -> dict[str, Any]:
+    package_json = workspace / "package.json"
+    if not package_json.exists():
+        return {}
+    try:
+        package = json.loads(package_json.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    scripts = package.get("scripts", {}) if isinstance(package, dict) else {}
+    return scripts if isinstance(scripts, dict) else {}
+
+
+def _validation_commands(workspace: Path) -> list[str]:
+    commands: list[str] = []
+    scripts = _package_scripts(workspace)
+    for script in ("lint", "test", "build"):
+        if script in scripts:
+            commands.append("npm test" if script == "test" else f"npm run {script}")
+    if any((workspace / name).exists() for name in ("pyproject.toml", "pytest.ini", "tox.ini")) or (workspace / "tests").exists():
+        commands.append("python -m pytest")
+    if (workspace / "go.mod").exists():
+        commands.append("go test ./...")
+    if (workspace / "Cargo.toml").exists():
+        commands.append("cargo test")
+    return list(dict.fromkeys(commands))[:8]
+
+
+def _secret_like_name_count(workspace: Path) -> int:
+    count = 0
+    for current, dirs, filenames in os.walk(workspace):
+        current_path = Path(current)
+        dirs[:] = [name for name in dirs if not _should_skip_dir(current_path / name)]
+        for name in filenames:
+            if (name.lower().startswith(".env") and not is_template_secret_filename(name)) or (
+                has_secret_token_segment(name) and not is_template_secret_filename(name)
+            ):
+                count += 1
+    return count
+
+
+def _has_tests(workspace: Path, files: list[Path]) -> bool:
+    return any("test" in part.lower() or "spec" in part.lower() for path in files for part in path.relative_to(workspace).parts)
+
+
+def _recommend_agent_count(
+    *,
+    file_count: int,
+    language_count: int,
+    has_tests: bool,
+    marker_count: int,
+    secret_like_count: int,
+) -> tuple[int, list[str]]:
+    if file_count <= 20:
+        agents = 4
+    elif file_count <= 75:
+        agents = 6
+    elif file_count <= 180:
+        agents = 8
+    elif file_count <= 400:
+        agents = 10
+    elif file_count <= 800:
+        agents = 12
+    else:
+        agents = 16
+    reasons = [f"{file_count} reviewable file(s) found"]
+    if language_count > 1:
+        bump = min(4, language_count - 1)
+        agents += bump
+        reasons.append(f"{language_count} language families detected")
+    if marker_count >= 4:
+        agents += 1
+        reasons.append("multiple project/build markers detected")
+    if not has_tests and file_count > 0:
+        agents += 1
+        reasons.append("no obvious tests/spec paths found")
+    if secret_like_count:
+        agents += 1
+        reasons.append("secret-like local filenames are present")
+    agents = _clamp(agents, 1, MAX_AGENTS)
+    if agents > DEFAULT_AI_MAX_PARALLEL:
+        reasons.append(f"{agents} lanes will queue behind the default {DEFAULT_AI_MAX_PARALLEL}-lane AI parallel limit")
+    return agents, reasons
+
+
+def _risk_areas(
+    *,
+    workspace: Path,
+    files: list[Path],
+    languages: list[dict[str, Any]],
+    markers: list[dict[str, str]],
+    has_tests: bool,
+    secret_like_count: int,
+) -> list[str]:
+    marker_paths = {item["path"] for item in markers}
+    language_names = {str(item.get("name")) for item in languages}
+    risks: list[str] = []
+    if secret_like_count:
+        risks.append("security")
+    if not has_tests and files:
+        risks.append("testing")
+    if {"package.json", "pyproject.toml", "requirements.txt", "go.mod", "Cargo.toml"} & marker_paths:
+        risks.append("dependencies")
+    if {"TypeScript", "JavaScript", "Python", "Go", "Rust"} & language_names:
+        risks.append("runtime")
+    if any(part in {"api", "server", "backend"} for path in files for part in path.relative_to(workspace).parts):
+        risks.append("backend")
+    if any(part in {"src", "app", "pages", "components"} for path in files for part in path.relative_to(workspace).parts) and (
+        {"TypeScript", "JavaScript", "HTML", "CSS"} & language_names
+    ):
+        risks.append("frontend")
+    if len(files) > 400:
+        risks.append("performance")
+    risks.append("release")
+    return list(dict.fromkeys(risks))
+
+
+def analyze_workspace(
+    workspace: str | Path,
+    *,
+    provider: str = "codex",
+    allow_self_review: bool = False,
+) -> dict[str, Any]:
+    provider_name = validate_provider(provider)
+    target = Path(workspace).expanduser().resolve()
+    if not target.exists() or not target.is_dir():
+        raise ValueError(f"workspace does not exist or is not a directory: {target}")
+    protection_env = {"CLADEX_ALLOW_CLADEX_WORKSPACE": "", "CLADEX_ALLOW_SELF_WORKSPACE": ""}
+    protection_violation = workspace_protection_violation(target, env=protection_env)
+    if protection_violation and not allow_self_review:
+        raise ValueError(
+            protection_violation
+            + " To scout CLADEX itself, enable the CLADEX self-review option in Runtime settings first."
+        )
+    if not protection_violation:
+        assert_workspace_allowed(target)
+
+    files = inventory_files(target)
+    languages = _language_counts(files)
+    markers = _project_markers(target)
+    validation_commands = _validation_commands(target)
+    has_tests = _has_tests(target, files)
+    secret_like_count = _secret_like_name_count(target)
+    agent_count, reasons = _recommend_agent_count(
+        file_count=len(files),
+        language_count=len(languages),
+        has_tests=has_tests,
+        marker_count=len(markers),
+        secret_like_count=secret_like_count,
+    )
+    risk_areas = _risk_areas(
+        workspace=target,
+        files=files,
+        languages=languages,
+        markers=markers,
+        has_tests=has_tests,
+        secret_like_count=secret_like_count,
+    )
+    lane_focuses = [
+        {"focus": focus, "detail": detail}
+        for focus, detail in AGENT_SPECIALTIES[: min(agent_count, len(AGENT_SPECIALTIES))]
+        if focus in risk_areas or len(risk_areas) < 3
+    ]
+    if len(lane_focuses) < min(agent_count, 6):
+        for focus, detail in AGENT_SPECIALTIES:
+            if any(item["focus"] == focus for item in lane_focuses):
+                continue
+            lane_focuses.append({"focus": focus, "detail": detail})
+            if len(lane_focuses) >= min(agent_count, 6):
+                break
+    scratch_bytes = _approximate_workspace_bytes(target)
+    limits = _review_limit_metadata(agent_count=agent_count, preflight_only=False, account_home="")
+    if not validation_commands:
+        reasons.append("no standard validation command was detected")
+    return {
+        "workspace": str(target),
+        "projectName": target.name or "Project",
+        "fileCount": len(files),
+        "workspaceBytes": scratch_bytes,
+        "languages": languages[:8],
+        "markers": markers[:12],
+        "validationCommands": validation_commands,
+        "riskAreas": risk_areas,
+        "hasTests": has_tests,
+        "secretLikeFileCount": secret_like_count,
+        "selfReview": bool(protection_violation),
+        "recommendation": {
+            "provider": provider_name,
+            "agents": agent_count,
+            "title": f"{target.name or 'Project'} deep scan",
+            "modelStrategy": f"{provider_name} CLI default",
+            "laneFocuses": lane_focuses,
+            "reasons": reasons,
+            "limits": limits,
+        },
+    }
 
 
 def is_template_secret_filename(name: str) -> bool:

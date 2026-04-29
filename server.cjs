@@ -659,7 +659,7 @@ app.get('/api/runtime-info', async (req, res) => {
     backendDir: BACKEND_DIR,
     frontendDir: FRONTEND_DIR,
     packaged: process.env.NODE_ENV === 'production' || !!process.resourcesPath,
-    appVersion: process.env.npm_package_version || '2.5.1',
+    appVersion: process.env.npm_package_version || '2.5.2',
     remoteAccessProtected: true,
   };
   if (isLoopbackRequest(req)) {
@@ -1123,6 +1123,40 @@ app.get('/api/reviews/:id/findings', async (req, res) => {
     res.json(await runJson(['cladex.py', 'review', 'findings', req.params.id]));
   } catch (err) {
     sendBackendError(res, err, 'Failed to load review findings');
+  }
+});
+
+app.post('/api/reviews/analyze', async (req, res) => {
+  const workspace = String(req.body?.workspace || '').trim();
+  const provider = String(req.body?.provider || 'codex').trim().toLowerCase();
+  const allowSelfReviewInput = parseBooleanField(req.body, 'allowSelfReview', false);
+  if (!workspace) {
+    res.status(400).json({ success: false, error: 'workspace is required' });
+    return;
+  }
+  if (provider !== 'codex' && provider !== 'claude') {
+    res.status(400).json({ success: false, error: 'provider must be codex or claude' });
+    return;
+  }
+  if (!allowSelfReviewInput.ok) {
+    res.status(400).json({ success: false, error: allowSelfReviewInput.error });
+    return;
+  }
+  const args = [
+    'cladex.py',
+    'review',
+    'analyze',
+    '--workspace',
+    path.resolve(workspace),
+    '--provider',
+    provider,
+    '--json',
+  ];
+  if (allowSelfReviewInput.value) args.push('--allow-cladex-self-review');
+  try {
+    res.json(await runJson(args));
+  } catch (err) {
+    sendBackendError(res, err, 'Failed to analyze review target', { success: false });
   }
 });
 

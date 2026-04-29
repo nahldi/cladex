@@ -1806,6 +1806,27 @@ def cmd_review_list(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_review_analyze(args: argparse.Namespace) -> int:
+    try:
+        record = review_swarm.analyze_workspace(
+            args.workspace,
+            provider=args.provider,
+            allow_self_review=getattr(args, "allow_cladex_self_review", False),
+        )
+    except Exception as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    if getattr(args, "json", False):
+        print(json.dumps(record))
+    else:
+        recommendation = record.get("recommendation", {})
+        print(
+            f"Recommended {recommendation.get('agents')} {recommendation.get('provider')} "
+            f"review lane(s) for {record.get('workspace')}."
+        )
+    return 0
+
+
 def cmd_review_start(args: argparse.Namespace) -> int:
     try:
         record = review_swarm.start_review(
@@ -2311,6 +2332,13 @@ def build_parser() -> argparse.ArgumentParser:
     review_list_parser = review_subparsers.add_parser("list", help="List project review jobs.")
     review_list_parser.add_argument("--json", action="store_true", help="Output as JSON for API")
     review_list_parser.set_defaults(func=cmd_review_list)
+
+    review_analyze_parser = review_subparsers.add_parser("analyze", help="Inspect a target project and recommend Review Swarm settings.")
+    review_analyze_parser.add_argument("--workspace", required=True)
+    review_analyze_parser.add_argument("--provider", choices=("codex", "claude"), default="codex")
+    review_analyze_parser.add_argument("--allow-cladex-self-review", action="store_true", help="Explicitly allow scouting the protected CLADEX repo.")
+    review_analyze_parser.add_argument("--json", action="store_true", help="Output as JSON for API")
+    review_analyze_parser.set_defaults(func=cmd_review_analyze)
 
     review_start_parser = review_subparsers.add_parser("start", help="Start a read-only project review job.")
     review_start_parser.add_argument("--workspace", required=True)
