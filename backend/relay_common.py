@@ -30,6 +30,7 @@ REGISTRY_PATH = CONFIG_ROOT / "workspaces.json"
 RELAY_CODEX_CONFIG_HEADER = '# Managed by discord-codex-relay.\n[windows]\nsandbox = "elevated"\n'
 DEFAULT_APP_SERVER_PORT_START = 18000
 DEFAULT_APP_SERVER_PORT_RANGE = 40000
+DEFAULT_LOG_TAIL_MAX_READ_BYTES = 1024 * 1024
 
 
 def slugify(value: str) -> str:
@@ -496,12 +497,43 @@ def terminate_process_tree(pid: int) -> bool:
     return stopped
 
 
+def _log_tail_max_read_bytes() -> int:
+    try:
+        value = int(os.environ.get("CLADEX_LOG_TAIL_MAX_BYTES") or DEFAULT_LOG_TAIL_MAX_READ_BYTES)
+    except (TypeError, ValueError):
+        value = DEFAULT_LOG_TAIL_MAX_READ_BYTES
+    return max(value, 1)
+
+
 def tail_lines(path: Path, count: int) -> str:
     if count <= 0 or not path.exists():
         return ""
-    with path.open("r", encoding="utf-8", errors="replace") as handle:
-        lines = handle.readlines()
-    return "".join(lines[-count:])
+    max_read = _log_tail_max_read_bytes()
+    chunk_size = min(64 * 1024, max_read)
+    chunks: list[bytes] = []
+    bytes_read = 0
+    newline_count = 0
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            position = handle.tell()
+            while position > 0 and bytes_read < max_read:
+                to_read = min(chunk_size, position, max_read - bytes_read)
+                position -= to_read
+                handle.seek(position)
+                chunk = handle.read(to_read)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                bytes_read += len(chunk)
+                newline_count += chunk.count(b"\n")
+                if newline_count > count:
+                    break
+    except OSError:
+        return ""
+    text = b"".join(reversed(chunks)).decode("utf-8", errors="replace").replace("\r\n", "\n")
+    lines = text.splitlines(keepends=True)
+    return "".join(lines[-count:]) if len(lines) > count else text
 
 
 def follow_file(path: Path) -> int:

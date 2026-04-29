@@ -361,6 +361,8 @@ const FILE_MODE_API_BASE = readFileModeApiBase();
 const API_BASE = typeof window !== 'undefined'
   ? (window.location.protocol !== 'file:' ? `${window.location.origin}/api` : (FILE_MODE_API_BASE || 'http://127.0.0.1:3001/api'))
   : 'http://127.0.0.1:3001/api';
+const API_REQUEST_TIMEOUT_MS = 120000;
+const API_POLL_TIMEOUT_MS = 8000;
 const CLADEX_LOGO = new URL('../assets/icon.png', import.meta.url).href;
 const FIRST_RUN_REQUIREMENTS = [
   'Python 3.10+ installed and reachable from PATH.',
@@ -392,6 +394,15 @@ class ApiRequestError extends Error {
     this.status = status;
   }
 }
+
+class ApiRequestTimeoutError extends Error {
+  constructor(message = 'CLADEX API request timed out.') {
+    super(message);
+    this.name = 'ApiRequestTimeoutError';
+  }
+}
+
+type ApiFetchInit = RequestInit & { timeoutMs?: number };
 
 function getStoredAccessToken(): string {
   try {
@@ -493,26 +504,61 @@ function fetchTargetIsTrusted(url: string): boolean {
   }
 }
 
-async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
-  const headers = new Headers(init?.headers || {});
+async function fetchJson<T>(url: string, init?: ApiFetchInit): Promise<T> {
+  const {
+    timeoutMs = API_REQUEST_TIMEOUT_MS,
+    signal: callerSignal,
+    headers: initHeaders,
+    ...fetchInit
+  } = init || {};
+  const headers = new Headers(initHeaders || {});
   const accessToken = getStoredAccessToken();
   if (accessToken && fetchTargetIsTrusted(url)) {
     headers.set('X-CLADEX-Access-Token', accessToken);
   }
-  const response = await fetch(url, { ...init, headers });
-  if (!response.ok) {
-    const payload = await response.json().catch(() => null);
-    if (response.status === 401 && payload?.authRequired) {
-      throw new RemoteAccessTokenError(payload?.error || 'CLADEX remote access token required.');
+  const controller = new AbortController();
+  let timedOut = false;
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  const abortFromCaller = () => controller.abort();
+  if (callerSignal) {
+    if (callerSignal.aborted) {
+      controller.abort();
+    } else {
+      callerSignal.addEventListener('abort', abortFromCaller, { once: true });
     }
-    throw new ApiRequestError(payload?.error || 'Request failed', response.status);
   }
-  return response.json();
+  if (timeoutMs > 0) {
+    timeoutId = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, timeoutMs);
+  }
+  try {
+    const response = await fetch(url, { ...fetchInit, headers, signal: controller.signal });
+    if (!response.ok) {
+      const payload = await response.json().catch(() => null);
+      if (response.status === 401 && payload?.authRequired) {
+        throw new RemoteAccessTokenError(payload?.error || 'CLADEX remote access token required.');
+      }
+      throw new ApiRequestError(payload?.error || 'Request failed', response.status);
+    }
+    return response.json();
+  } catch (error) {
+    if (timedOut) {
+      throw new ApiRequestTimeoutError(`CLADEX API request timed out after ${Math.round(timeoutMs / 1000)}s.`);
+    }
+    throw error;
+  } finally {
+    if (timeoutId !== undefined) {
+      clearTimeout(timeoutId);
+    }
+    callerSignal?.removeEventListener?.('abort', abortFromCaller);
+  }
 }
 
-async function fetchOptionalJson<T>(url: string, fallback: T): Promise<T> {
+async function fetchOptionalJson<T>(url: string, fallback: T, init?: ApiFetchInit): Promise<T> {
   try {
-    return await fetchJson<T>(url);
+    return await fetchJson<T>(url, init);
   } catch (error) {
     if (error instanceof ApiRequestError && error.status === 404) {
       return fallback;
@@ -522,11 +568,11 @@ async function fetchOptionalJson<T>(url: string, fallback: T): Promise<T> {
 }
 
 const api = {
-  profiles: () => fetchJson<Profile[]>(`${API_BASE}/profiles`),
-  projects: () => fetchJson<ProjectRecord[]>(`${API_BASE}/projects`),
-  runtimeInfo: () => fetchJson<RuntimeInfo>(`${API_BASE}/runtime-info`),
-  logs: (id: string, relayType: RelayType) => fetchJson<{ logs: string[] }>(`${API_BASE}/profiles/${id}/logs?type=${relayType}`),
-  chatHistory: (id: string, relayType: RelayType) => fetchJson<{ messages: ChatMessageRecord[] }>(`${API_BASE}/profiles/${id}/chat/history?type=${relayType}`),
+  profiles: () => fetchJson<Profile[]>(`${API_BASE}/profiles`, { timeoutMs: API_POLL_TIMEOUT_MS }),
+  projects: () => fetchJson<ProjectRecord[]>(`${API_BASE}/projects`, { timeoutMs: API_POLL_TIMEOUT_MS }),
+  runtimeInfo: () => fetchJson<RuntimeInfo>(`${API_BASE}/runtime-info`, { timeoutMs: API_POLL_TIMEOUT_MS }),
+  logs: (id: string, relayType: RelayType) => fetchJson<{ logs: string[] }>(`${API_BASE}/profiles/${id}/logs?type=${relayType}`, { timeoutMs: API_POLL_TIMEOUT_MS }),
+  chatHistory: (id: string, relayType: RelayType) => fetchJson<{ messages: ChatMessageRecord[] }>(`${API_BASE}/profiles/${id}/chat/history?type=${relayType}`, { timeoutMs: API_POLL_TIMEOUT_MS }),
   sendChat: (id: string, relayType: RelayType, body: { message: string; channelId?: string; senderName?: string; senderId?: string }) =>
     fetchJson<{ ok: boolean; reply: string; channelId?: string }>(`${API_BASE}/profiles/${id}/chat`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...body, type: relayType }) }),
   createProfile: (body: ProfileFormData) => fetchJson(`${API_BASE}/profiles`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }),
@@ -542,10 +588,10 @@ const api = {
   startProject: (name: string) => fetchJson(`${API_BASE}/projects/${encodeURIComponent(name)}/start`, { method: 'POST' }),
   stopProject: (name: string) => fetchJson(`${API_BASE}/projects/${encodeURIComponent(name)}/stop`, { method: 'POST' }),
   removeProject: (name: string) => fetchJson(`${API_BASE}/projects/${encodeURIComponent(name)}`, { method: 'DELETE' }),
-  reviews: () => fetchJson<ReviewJob[]>(`${API_BASE}/reviews`),
-  fixRuns: () => fetchOptionalJson<FixRun[]>(`${API_BASE}/fix-runs`, []),
-  fixRun: (id: string) => fetchJson<FixRun>(`${API_BASE}/fix-runs/${id}`),
-  backups: () => fetchJson<BackupRecord[]>(`${API_BASE}/backups`),
+  reviews: () => fetchJson<ReviewJob[]>(`${API_BASE}/reviews`, { timeoutMs: API_POLL_TIMEOUT_MS }),
+  fixRuns: () => fetchOptionalJson<FixRun[]>(`${API_BASE}/fix-runs`, [], { timeoutMs: API_POLL_TIMEOUT_MS }),
+  fixRun: (id: string) => fetchJson<FixRun>(`${API_BASE}/fix-runs/${id}`, { timeoutMs: API_POLL_TIMEOUT_MS }),
+  backups: () => fetchJson<BackupRecord[]>(`${API_BASE}/backups`, { timeoutMs: API_POLL_TIMEOUT_MS }),
   startReview: (body: { workspace: string; provider: ReviewProvider; agents: number; title?: string; accountHome?: string; allowSelfReview?: boolean; backupBeforeReview?: boolean }) =>
     fetchJson<ReviewJob>(`${API_BASE}/reviews`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }),
   startFixReview: (id: string, body: { allowSelfFix?: boolean } = {}) =>
@@ -558,6 +604,38 @@ const api = {
   reviewFindings: (id: string) => fetchJson<{ jobId: string; findings: ReviewFinding[] }>(`${API_BASE}/reviews/${id}/findings`),
   listDirectories: (currentPath = '') => fetchJson<DirectoryListResponse>(`${API_BASE}/fs/list${currentPath ? `?path=${encodeURIComponent(currentPath)}` : ''}`),
 };
+
+type RefreshFailure = { label: string; error: unknown };
+
+function refreshErrorText(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message;
+  }
+  return 'Request failed';
+}
+
+export function refreshStatusMessage(failures: RefreshFailure[], prefix = 'Partial refresh'): string {
+  if (!failures.length) {
+    return '';
+  }
+  const shown = failures.slice(0, 3).map((failure) => `${failure.label}: ${refreshErrorText(failure.error)}`);
+  const remaining = failures.length - shown.length;
+  return `${prefix}: ${shown.join('; ')}${remaining > 0 ? `; ${remaining} more` : ''}`;
+}
+
+function recordRefreshResult<T>(
+  result: PromiseSettledResult<T>,
+  label: string,
+  apply: (value: T) => void,
+  failures: RefreshFailure[],
+): boolean {
+  if (result.status === 'fulfilled') {
+    apply(result.value);
+    return true;
+  }
+  failures.push({ label, error: result.reason });
+  return false;
+}
 
 export default function App() {
   const [view, setView] = useState<ViewName>('relays');
@@ -595,7 +673,10 @@ export default function App() {
       setLoading(true);
     }
     try {
-      const [profileRows, projectRows, runtime, reviews, fixRunRows, backupRows] = await Promise.all([
+      const failures: RefreshFailure[] = [];
+      let appliedAny = false;
+      let fixRunRows: FixRun[] | null = null;
+      const [profileRows, projectRows, runtime, reviews, fixRunsResult, backupRows] = await Promise.allSettled([
         api.profiles(),
         api.projects(),
         api.runtimeInfo(),
@@ -603,19 +684,58 @@ export default function App() {
         api.fixRuns(),
         api.backups(),
       ]);
-      setProfiles(profileRows);
-      setProjects(projectRows);
-      setReviewJobs(reviews);
-      const detailedFixRuns = await Promise.all(
-        fixRunRows.map((run) => (isInFlightStatus(run.status) ? api.fixRun(run.id).catch(() => run) : Promise.resolve(run)))
-      );
-      setFixRuns(detailedFixRuns);
-      setBackups(backupRows);
-      setRuntimeInfo(runtime);
+      appliedAny = recordRefreshResult(profileRows, 'profiles', setProfiles, failures) || appliedAny;
+      appliedAny = recordRefreshResult(projectRows, 'workgroups', setProjects, failures) || appliedAny;
+      appliedAny = recordRefreshResult(runtime, 'runtime', setRuntimeInfo, failures) || appliedAny;
+      appliedAny = recordRefreshResult(reviews, 'reviews', setReviewJobs, failures) || appliedAny;
+      if (fixRunsResult.status === 'fulfilled') {
+        fixRunRows = fixRunsResult.value;
+        appliedAny = true;
+      } else {
+        failures.push({ label: 'fix runs', error: fixRunsResult.reason });
+      }
+      appliedAny = recordRefreshResult(backupRows, 'backups', setBackups, failures) || appliedAny;
+
+      if (fixRunRows !== null) {
+        const baseFixRuns = fixRunRows;
+        const detailResults = await Promise.allSettled(
+          baseFixRuns.map((run) => (isInFlightStatus(run.status) ? api.fixRun(run.id) : Promise.resolve(run)))
+        );
+        const detailedFixRuns = detailResults.map((result, index) => {
+          if (result.status === 'fulfilled') {
+            return result.value;
+          }
+          failures.push({ label: `fix run ${baseFixRuns[index]?.id || index + 1}`, error: result.reason });
+          return baseFixRuns[index];
+        });
+        setFixRuns(detailedFixRuns);
+      }
+
+      if (failures.some((failure) => failure.error instanceof RemoteAccessTokenError)) {
+        setRemoteAuthRequired(true);
+        setBootPending(false);
+        setErrorText('');
+        return;
+      }
+
+      if (!appliedAny) {
+        const message = refreshStatusMessage(failures, 'Refresh failed') || 'Failed to refresh CLADEX state.';
+        const nextFailures = bootFailureCount.current + 1;
+        bootFailureCount.current = nextFailures;
+        if (bootPending && nextFailures < 5) {
+          keepLoading = true;
+          setErrorText('');
+        } else {
+          setBootPending(false);
+          setErrorText(message);
+        }
+        return;
+      }
+
       setRemoteAuthRequired(false);
       bootFailureCount.current = 0;
       setBootPending(false);
-      setErrorText('');
+      setErrorText(refreshStatusMessage(failures));
     } catch (error) {
       if (error instanceof RemoteAccessTokenError) {
         setRemoteAuthRequired(true);
@@ -1217,6 +1337,50 @@ function statusLabel(status: string): string {
   return status.replace(/_/g, ' ');
 }
 
+type ReviewPresentationJob = Pick<ReviewJob, 'status'> & Partial<Pick<ReviewJob, 'severityCounts' | 'progress' | 'agents'>>;
+
+export function reviewFindingTotal(job: Pick<ReviewPresentationJob, 'severityCounts'>): number {
+  const counts = job.severityCounts || { high: 0, medium: 0, low: 0 };
+  return (counts.high || 0) + (counts.medium || 0) + (counts.low || 0);
+}
+
+export function isPartialCancelledReview(job: ReviewPresentationJob): boolean {
+  if (job.status !== 'cancelled') {
+    return false;
+  }
+  if (reviewFindingTotal(job) > 0) {
+    return true;
+  }
+  if ((job.progress?.done || 0) > 0) {
+    return true;
+  }
+  return Boolean(job.agents?.some((agent) => (agent.findings || 0) > 0 || agent.status === 'done'));
+}
+
+export function reviewDisplayStatus(job: ReviewPresentationJob): string {
+  return isPartialCancelledReview(job) ? 'partial/cancelled' : statusLabel(job.status);
+}
+
+export function canBrowseReviewFindings(job: ReviewPresentationJob): boolean {
+  if (job.status === 'completed' || job.status === 'completed_with_warnings' || job.status === 'failed') {
+    return true;
+  }
+  return isPartialCancelledReview(job);
+}
+
+export function canStartFixReviewForJob(job: Pick<ReviewJob, 'status'>): boolean {
+  return job.status === 'completed' || job.status === 'completed_with_warnings';
+}
+
+export function reviewAgentVisibility(agents: ReviewAgentRecord[] = [], initialLimit = 8): { visible: ReviewAgentRecord[]; overflow: ReviewAgentRecord[]; total: number } {
+  const safeLimit = Math.max(0, initialLimit);
+  return {
+    visible: agents.slice(0, safeLimit),
+    overflow: agents.slice(safeLimit),
+    total: agents.length,
+  };
+}
+
 function statusTone(status: string): string {
   if (status === 'failed') {
     return 'text-red-300 bg-red-500/10 border-red-500/25';
@@ -1561,20 +1725,33 @@ function ReviewJobCard({
   const finished = (progress.done || 0) + (progress.failed || 0) + (progress.cancelled || 0);
   const percent = Math.min(100, Math.round((finished / total) * 100));
   const inFlight = isInFlightStatus(job.status);
-  const canFixReview = job.status === 'completed' || job.status === 'completed_with_warnings';
+  const canFixReview = canStartFixReviewForJob(job);
+  const canExploreFindings = canBrowseReviewFindings(job);
+  const partialCancelled = isPartialCancelledReview(job);
   const severity = job.severityCounts || { high: 0, medium: 0, low: 0 };
-  const totalFindings = severity.high + severity.medium + severity.low;
+  const totalFindings = reviewFindingTotal(job);
+  const lanes = reviewAgentVisibility(job.agents || []);
+  const renderAgentCard = (agent: ReviewAgentRecord) => (
+    <div key={agent.id} className="rounded-2xl border border-slate-200/80 bg-white/70 px-3 py-3 dark:border-white/5 dark:bg-black/30">
+      <div className="flex items-center justify-between gap-3">
+        <div className="font-mono text-xs text-slate-700 dark:text-gray-300">{agent.id}</div>
+        <div className="text-[10px] font-bold uppercase tracking-[0.18em] text-slate-500 dark:text-gray-500">{agent.status}</div>
+      </div>
+      <div className="mt-1 text-xs text-slate-500 dark:text-gray-500">{agent.focus || 'review'} - {agent.assignedFiles} files, {agent.findings} findings</div>
+    </div>
+  );
 
   return (
     <div className="rounded-[30px] border border-slate-200/80 bg-white/80 p-5 shadow-[0_18px_45px_rgba(15,23,42,0.08)] dark:border-white/10 dark:bg-white/[0.03] dark:shadow-2xl">
       <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
         <div className="min-w-0">
           <div className="flex flex-wrap items-center gap-2">
-            <span className={`rounded-full border px-2.5 py-1 text-[10px] font-bold uppercase tracking-[0.22em] ${statusTone(job.status)}`}>{statusLabel(job.status)}</span>
+            <span className={`rounded-full border px-2.5 py-1 text-[10px] font-bold uppercase tracking-[0.22em] ${statusTone(job.status)}`}>{reviewDisplayStatus(job)}</span>
             <MetaPill label={`${job.provider} swarm`} mono />
             <MetaPill label={`${job.agentCount} lane${job.agentCount === 1 ? '' : 's'}`} mono />
             {job.selfReview ? <MetaPill label="CLADEX self-review" /> : null}
             {job.cancelRequested && inFlight ? <MetaPill label="cancel pending" /> : null}
+            {partialCancelled ? <MetaPill label="partial findings" /> : null}
           </div>
           <h3 className="mt-3 text-xl font-bold tracking-tight text-slate-900 dark:text-white">{job.title || job.id}</h3>
           <div className="mt-2 break-all font-mono text-xs text-slate-500 dark:text-gray-500">{job.workspace}</div>
@@ -1638,17 +1815,21 @@ function ReviewJobCard({
 
       {job.error ? <div className="mt-4 rounded-2xl border border-red-500/25 bg-red-500/10 px-4 py-3 text-sm text-red-100">{job.error}</div> : null}
 
-      {job.agents?.length ? (
-        <div className="mt-5 grid gap-2 md:grid-cols-2">
-          {job.agents.slice(0, 8).map((agent) => (
-            <div key={agent.id} className="rounded-2xl border border-slate-200/80 bg-white/70 px-3 py-3 dark:border-white/5 dark:bg-black/30">
-              <div className="flex items-center justify-between gap-3">
-                <div className="font-mono text-xs text-slate-700 dark:text-gray-300">{agent.id}</div>
-                <div className="text-[10px] font-bold uppercase tracking-[0.18em] text-slate-500 dark:text-gray-500">{agent.status}</div>
+      {lanes.total ? (
+        <div className="mt-5 space-y-2">
+          <div className="grid gap-2 md:grid-cols-2">
+            {lanes.visible.map(renderAgentCard)}
+          </div>
+          {lanes.overflow.length ? (
+            <details className="rounded-2xl border border-slate-200/80 bg-white/60 px-3 py-3 dark:border-white/5 dark:bg-black/20">
+              <summary className="cursor-pointer text-xs font-semibold text-indigo-700 dark:text-indigo-300">
+                Show all {lanes.total} lanes ({lanes.overflow.length} more)
+              </summary>
+              <div className="mt-3 grid gap-2 md:grid-cols-2">
+                {lanes.overflow.map(renderAgentCard)}
               </div>
-              <div className="mt-1 text-xs text-slate-500 dark:text-gray-500">{agent.focus || 'review'} - {agent.assignedFiles} files, {agent.findings} findings</div>
-            </div>
-          ))}
+            </details>
+          ) : null}
         </div>
       ) : null}
 
@@ -1659,14 +1840,14 @@ function ReviewJobCard({
         </details>
       ) : null}
 
-      {(job.status === 'completed' || job.status === 'completed_with_warnings' || job.status === 'failed') ? (
-        <FindingsExplorer jobId={job.id} totalFindings={totalFindings} />
+      {canExploreFindings ? (
+        <FindingsExplorer jobId={job.id} totalFindings={totalFindings} partial={partialCancelled} />
       ) : null}
     </div>
   );
 }
 
-function FindingsExplorer({ jobId, totalFindings }: { jobId: string; totalFindings: number }) {
+function FindingsExplorer({ jobId, totalFindings, partial = false }: { jobId: string; totalFindings: number; partial?: boolean }) {
   const [open, setOpen] = useState(false);
   const [findings, setFindings] = useState<ReviewFinding[] | null>(null);
   const [loading, setLoading] = useState(false);
@@ -1723,7 +1904,7 @@ function FindingsExplorer({ jobId, totalFindings }: { jobId: string; totalFindin
   return (
     <details className="mt-4" open={open} onToggle={(event) => setOpen((event.currentTarget as HTMLDetailsElement).open)}>
       <summary className="cursor-pointer text-sm font-semibold text-indigo-300">
-        Findings explorer{totalFindings > 0 ? ` (${totalFindings})` : ''}
+        {partial ? 'Partial findings explorer' : 'Findings explorer'}{totalFindings > 0 ? ` (${totalFindings})` : ''}
       </summary>
       <div className="mt-3 rounded-2xl border border-white/5 bg-black/40 p-4">
         {loading ? <div className="text-xs text-gray-400">Loading findings...</div> : null}

@@ -2,20 +2,21 @@
 
 ## Windows
 
-### Option 1: Use the packaged desktop app
+### Option 1: Use a packaged desktop release
 
 1. Install Python 3.10+ first.
 2. Install the AI CLI you plan to use:
    - `codex` for Codex relays
    - `claude` for Claude relays
-3. Open `release\CLADEX Setup 2.5.0.exe` and install it.
-4. Or run `release\CLADEX 2.5.0.exe` or `release\win-unpacked\CLADEX.exe` directly.
-5. In CLADEX, choose `Add Relay`, then enter:
+3. Download the packaged release asset from GitHub, or build it locally with `cmd /c npm run electron:build`.
+4. Open `release\CLADEX Setup 2.5.1.exe` and install it.
+5. Or run `release\CLADEX 2.5.1.exe` or `release\win-unpacked\CLADEX.exe` directly.
+6. In CLADEX, choose `Add Relay`, then enter:
    - a workspace folder
    - a Discord bot token
    - the allowed channel id or scoped DM user/operator allowlist
    - an optional account folder when the relay should use a separate `CODEX_HOME` or `CLAUDE_CONFIG_DIR`
-6. Start the saved relay and wait for `Ready`.
+7. Start the saved relay and wait for `Ready`.
 
 Project reviews are available without creating a Discord relay. Use the `Review Project` view to choose a target folder, Codex or Claude, and 1-50 reviewer lanes. The swarm uses your installed and authenticated CLI, queues review lanes behind a bounded worker pool, and writes one merged report plus a fix plan. A completed review can then start **Fix Review**, which creates a backup before any fix worker edits the selected project. CLADEX self-fix requires the completed self-review job plus a separate explicit self-fix confirmation.
 

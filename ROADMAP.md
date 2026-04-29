@@ -2,7 +2,7 @@
 
 CLADEX stays focused on Claude Code and OpenAI Codex relays. Shipped work is tracked in [DONE_ROADMAP.md](DONE_ROADMAP.md); release narrative lives in [DEVELOPMENT_LOG.md](DEVELOPMENT_LOG.md).
 
-As of **2.5.0**, the entire April 2026 roadmap is closed — production-blocking AND non-blocking items have either shipped or have an explicit recorded decision.
+As of **2.5.1**, the April 2026 roadmap is closed: production-blocking and follow-up verification items have either shipped or have an explicit recorded decision.
 
 - Clone-to-run setup, review swarms, Fix Review orchestration, local security, CI gates, and visible queue/concurrency limits all shipped (2.1.0 through 2.3.3).
 - Provider-native Codex account/rate-limit surfacing is wired into `cladex doctor --json` via the app-server `account/read` and `account/rateLimits/read` RPCs (2.4.0).
@@ -10,6 +10,7 @@ As of **2.5.0**, the entire April 2026 roadmap is closed — production-blocking
 - Interactive review-finding filter (severity, category) + JSON export ship in the desktop Review Project view, backed by `GET /api/reviews/:id/findings` and `cladex review findings <id>` (2.4.0).
 - Claude Code Channels was evaluated and explicitly **not adopted**. Rationale and re-evaluation criteria are documented in [backend/docs/CLAUDE_CHANNELS_EVALUATION.md](backend/docs/CLAUDE_CHANNELS_EVALUATION.md) (2.4.0).
 - Fix Review orchestration is now AI-driven: an upstream Codex/Claude planner subprocess decides how many fix workers to spawn, what type each one should be, and which findings each one owns, with a per-task `dependsOn` graph and a deterministic 1:1 fallback when the planner subprocess fails (2.5.0).
+- Post-2.5.0 verification hardening shipped in 2.5.1: review subprocess idle-timeout behavior, Fix Review scope/cancel/restore/self-fix safety, backend resource bounds, profile validation, pinned provider CLI CI, runtime-version doctor gates, explicit relay-management skill invocation, resilient review dashboard polling, partial cancelled-review findings, 50-lane visibility, and release metadata alignment.
 
 ## Current Production Contract
 
@@ -35,6 +36,7 @@ Future enhancements should be opened as new roadmap entries with their own scope
 - `cmd /c npm ci`
 - `cmd /c npm audit`
 - `cmd /c npm run lint`
+- `cmd /c npm run frontend:smoke`
 - `cmd /c npm run build`
 - `cmd /c npm run api:smoke`
 - `py -m pip install -e "backend[dev]" -c backend\constraints.txt`

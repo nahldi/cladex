@@ -1388,7 +1388,6 @@ def _run_cli(
     cwd: Path | None = None,
     cancel_check: Callable[[], bool] | None = None,
 ) -> AIRunResult:
-    timeout = _safe_int(os.environ.get("CLADEX_REVIEW_AGENT_TIMEOUT"), 1800)
     output_limit = max(_safe_int(os.environ.get("CLADEX_REVIEW_AGENT_OUTPUT_LIMIT"), DEFAULT_AGENT_OUTPUT_LIMIT), 1000)
     popen_kwargs: dict[str, Any] = {
         "stdin": subprocess.PIPE,
@@ -1406,42 +1405,105 @@ def _run_cli(
     except Exception as exc:
         return AIRunResult(text="", ok=False, error=f"AI reviewer failed to start: {exc}")
 
-    if process.stdin and prompt:
+    idle_timeout_env = os.environ.get("CLADEX_REVIEW_AGENT_IDLE_TIMEOUT")
+    idle_timeout = max(_safe_int(idle_timeout_env, 600), 1)
+    initial_idle_default = idle_timeout if idle_timeout_env is not None else max(idle_timeout, 1800)
+    initial_idle_timeout = max(
+        _safe_int(os.environ.get("CLADEX_REVIEW_AGENT_INITIAL_IDLE_TIMEOUT"), initial_idle_default),
+        1,
+    )
+    max_runtime = max(_safe_int(os.environ.get("CLADEX_REVIEW_AGENT_MAX_RUNTIME"), 10800), idle_timeout)
+    legacy_timeout = os.environ.get("CLADEX_REVIEW_AGENT_TIMEOUT")
+    if legacy_timeout:
+        max_runtime = max(_safe_int(legacy_timeout, max_runtime), idle_timeout)
+    started_at = time.monotonic()
+    last_output_at = started_at
+    saw_output = False
+    output_lock = threading.Lock()
+    stdout_chunks: list[bytes] = []
+    stderr_chunks: list[bytes] = []
+
+    def _reader(pipe: Any, chunks: list[bytes]) -> None:
+        nonlocal last_output_at, saw_output
         try:
-            process.stdin.write(prompt.encode("utf-8"))
+            fd = pipe.fileno()
+            while True:
+                chunk = os.read(fd, 4096)
+                if not chunk:
+                    break
+                with output_lock:
+                    chunks.append(chunk)
+                    last_output_at = time.monotonic()
+                    saw_output = True
+        except Exception:
+            return
+
+    readers: list[threading.Thread] = []
+    if process.stdout is not None:
+        thread = threading.Thread(target=_reader, args=(process.stdout, stdout_chunks), daemon=True)
+        thread.start()
+        readers.append(thread)
+    if process.stderr is not None:
+        thread = threading.Thread(target=_reader, args=(process.stderr, stderr_chunks), daemon=True)
+        thread.start()
+        readers.append(thread)
+
+    def _stdin_writer() -> None:
+        try:
+            if process.stdin and prompt:
+                process.stdin.write(prompt.encode("utf-8"))
         except Exception:
             pass
-    try:
-        if process.stdin:
-            process.stdin.close()
-    except Exception:
-        pass
-
-    deadline = time.monotonic() + max(timeout, 30)
-    cancelled = False
-    while True:
         try:
-            stdout, stderr = process.communicate(timeout=1.0)
+            if process.stdin:
+                process.stdin.close()
+        except Exception:
+            pass
+
+    writer_thread = threading.Thread(target=_stdin_writer, daemon=True)
+    writer_thread.start()
+
+    cancelled = False
+    timed_out = ""
+    while True:
+        returncode = process.poll()
+        if returncode is not None:
             break
-        except subprocess.TimeoutExpired:
-            if cancel_check is not None and cancel_check():
-                cancelled = True
-                _terminate_process_tree(process)
-                try:
-                    stdout, stderr = process.communicate(timeout=5)
-                except Exception:
-                    stdout, stderr = b"", b""
-                break
-            if time.monotonic() >= deadline:
-                _terminate_process_tree(process)
-                try:
-                    stdout, stderr = process.communicate(timeout=5)
-                except Exception:
-                    stdout, stderr = b"", b""
-                return AIRunResult(text="", ok=False, error="AI reviewer timed out before producing a complete result.")
+        now = time.monotonic()
+        if cancel_check is not None and cancel_check():
+            cancelled = True
+            _terminate_process_tree(process)
+            break
+        with output_lock:
+            idle_for = now - last_output_at
+            active_idle_timeout = idle_timeout if saw_output else initial_idle_timeout
+        if idle_for >= active_idle_timeout:
+            timed_out = f"AI reviewer was idle for {int(idle_for)}s without producing output."
+            _terminate_process_tree(process)
+            break
+        if now - started_at >= max_runtime:
+            timed_out = f"AI reviewer exceeded the maximum runtime of {int(max_runtime)}s."
+            _terminate_process_tree(process)
+            break
+        time.sleep(0.2)
+
+    if cancelled or timed_out:
+        try:
+            process.wait(timeout=5)
+        except Exception:
+            try:
+                process.kill()
+            except Exception:
+                pass
+
+    for thread in readers:
+        thread.join(timeout=2)
+    writer_thread.join(timeout=2)
 
     if cancelled:
         return AIRunResult(text="", ok=False, error="AI reviewer cancelled by operator.")
+    if timed_out:
+        return AIRunResult(text="", ok=False, error=timed_out)
 
     def _decode(value: bytes | str | None) -> str:
         if value is None:
@@ -1450,6 +1512,9 @@ def _run_cli(
             return value.decode("utf-8", errors="replace")
         return value
 
+    with output_lock:
+        stdout = b"".join(stdout_chunks)
+        stderr = b"".join(stderr_chunks)
     text = "\n".join(part for part in (_decode(stdout), _decode(stderr)) if part)
     if len(text) > output_limit:
         text = text[:output_limit].rstrip() + "\n...[truncated by CLADEX]"

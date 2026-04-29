@@ -1,8 +1,19 @@
 import asyncio
+import json
 import os
 from pathlib import Path
 
-from claude_backend import ClaudeBackend, ClaudeSession, CommandResult, InboundMessage, ChannelType
+import pytest
+
+from claude_backend import (
+    ChannelType,
+    ClaudeBackend,
+    ClaudeSession,
+    CommandResult,
+    InboundMessage,
+    PersistentClaudeProcess,
+    RelayBackend,
+)
 
 
 def test_session_persists_initialized_state(tmp_path: Path) -> None:
@@ -183,6 +194,64 @@ def test_run_turn_uses_persistent_stream_json(tmp_path: Path) -> None:
     assert "default" in cmd
 
 
+def test_run_turn_keeps_bounded_stdout_while_extracting_stream_text(tmp_path: Path, monkeypatch) -> None:
+    backend = ClaudeBackend(
+        workspace=tmp_path,
+        state_dir=tmp_path / "state",
+        on_response=lambda msg: None,
+    )
+    persistent = PersistentClaudeProcess(
+        session=backend._session_for_channel("123", tmp_path),
+        worktree=tmp_path,
+    )
+    monkeypatch.setenv("CLADEX_CLAUDE_TURN_MAX_OUTPUT_BYTES", str(64 * 1024))
+
+    events = [
+        json.dumps({"type": "system", "payload": "x" * 220})
+        for _ in range(400)
+    ]
+    events.extend(
+        [
+            json.dumps({"type": "content_block_delta", "delta": {"text": "hello "}}),
+            json.dumps({"type": "content_block_delta", "delta": {"text": "world"}}),
+            json.dumps({"type": "result", "session_id": "session-123"}),
+        ]
+    )
+
+    class _FakeStdin:
+        def write(self, data: bytes) -> None:
+            return None
+
+        async def drain(self) -> None:
+            return None
+
+    class _FakeStdout:
+        def __init__(self, lines: list[str]) -> None:
+            self._lines = [line.encode("utf-8") + b"\n" for line in lines]
+
+        async def readline(self) -> bytes:
+            if not self._lines:
+                return b""
+            return self._lines.pop(0)
+
+    class _FakeProcess:
+        stdin = _FakeStdin()
+        stdout = _FakeStdout(events)
+        returncode = None
+
+    async def fake_ensure_process(_persistent):
+        return _FakeProcess()
+
+    monkeypatch.setattr(backend, "_ensure_persistent_process", fake_ensure_process)
+
+    result = asyncio.run(backend._run_turn("prompt", cwd=tmp_path, persistent=persistent))
+
+    assert result.returncode == 0
+    assert result.response_text == "hello world"
+    assert "[CLADEX: earlier Claude stdout truncated" in result.stdout
+    assert len(result.stdout.encode("utf-8")) < 72 * 1024
+
+
 def test_process_message_retries_with_fresh_session_on_resume_failure(tmp_path: Path) -> None:
     responses: list[str] = []
     statuses: list[str] = []
@@ -239,6 +308,51 @@ def test_process_message_retries_with_fresh_session_on_resume_failure(tmp_path: 
     assert calls[1][1] != calls[0][1]
     assert responses == ["done"]
     assert any("stale" in status.lower() for status in statuses)
+
+
+def test_relay_backend_bounds_inbound_queue_and_reports_busy(tmp_path: Path, monkeypatch) -> None:
+    statuses: list[str] = []
+    monkeypatch.setenv("CLADEX_CLAUDE_INBOUND_QUEUE_MAX", "1")
+    relay = RelayBackend(
+        workspace=tmp_path,
+        state_dir=tmp_path / "state",
+        on_discord_response=lambda channel, content, reply_to: None,
+        on_status=statuses.append,
+    )
+
+    first = asyncio.run(
+        relay.send_discord_message(
+            channel_id="123",
+            sender_id="u1",
+            sender_name="user",
+            content="first",
+            message_id="m1",
+        )
+    )
+    second = asyncio.run(
+        relay.send_discord_message(
+            channel_id="123",
+            sender_id="u1",
+            sender_name="user",
+            content="second",
+            message_id="m2",
+        )
+    )
+
+    assert first is True
+    assert second is False
+    assert relay.queue_status == {"depth": 1, "limit": 1, "full": True}
+    assert any("queue full" in status.lower() for status in statuses)
+
+    with pytest.raises(RuntimeError, match="queue full"):
+        asyncio.run(
+            relay.send_local_message(
+                channel_id="local",
+                sender_id="operator",
+                sender_name="operator",
+                content="local message",
+            )
+        )
 
 
 def test_backend_start_uses_launcher_restart_reason_from_env(tmp_path: Path, monkeypatch) -> None:

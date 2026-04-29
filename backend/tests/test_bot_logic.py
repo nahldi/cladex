@@ -145,6 +145,37 @@ def test_load_config_disables_visible_terminal_on_stdio(tmp_path) -> None:
     assert config.open_visible_terminal is False
 
 
+def test_load_config_defaults_invalid_channel_history_limit(tmp_path) -> None:
+    bot = _load_bot_module()
+    env_path = tmp_path / "relay.env"
+    env_path.write_text(
+        "\n".join(
+            [
+                "DISCORD_BOT_TOKEN=test-token",
+                f"CODEX_WORKDIR={tmp_path}",
+                "STATE_NAMESPACE=test-invalid-history",
+                "CHANNEL_HISTORY_LIMIT=not-a-number",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    tracked_keys = ["ENV_FILE", "CHANNEL_HISTORY_LIMIT"]
+    original = {key: os.environ.get(key) for key in tracked_keys}
+    try:
+        os.environ["ENV_FILE"] = str(env_path)
+        os.environ.pop("CHANNEL_HISTORY_LIMIT", None)
+        config = bot._load_config()
+    finally:
+        for key, value in original.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    assert config.channel_history_limit == bot.DEFAULT_CHANNEL_HISTORY_LIMIT
+
+
 def test_durable_context_budget_trims_lightweight_coordination_turns() -> None:
     bot = _load_bot_module()
 
@@ -340,6 +371,37 @@ def test_reader_loop_ignores_payload_handler_errors_and_continues(tmp_path) -> N
 
     assert handled == [{"method": "good", "params": {"ok": True}}]
     assert "Protocol handler error ignored" in (tmp_path / "app-server.log").read_text(encoding="utf-8")
+
+
+def test_dm_observability_fails_closed_when_user_allowlist_empty() -> None:
+    """F0004: A profile that ends up with `ALLOW_DMS=true` but an empty
+    `ALLOWED_USER_IDS` (e.g. all configured IDs were non-numeric and got
+    silently dropped during normalization) must not let arbitrary DM senders
+    reach the relay. The runtime check has to fail closed."""
+    bot = _load_bot_module()
+    relay_user = SimpleNamespace(id=999)
+    bot.CONFIG.allow_dms = True
+    bot.CONFIG.allowed_user_ids = set()
+    bot.CONFIG.allowed_channel_ids = set()
+
+    dm_message = _message(channel_id=12345, author_id=7, content="hi", guild=False)
+
+    assert bot._message_is_observable_by_relay(dm_message, relay_user) is False
+
+
+def test_guild_observability_fails_closed_when_channel_allowlist_empty() -> None:
+    """F0004: An empty `ALLOWED_CHANNEL_IDS` must deny guild messages rather
+    than allow every channel."""
+    bot = _load_bot_module()
+    relay_user = SimpleNamespace(id=999)
+    bot.CONFIG.allow_dms = False
+    bot.CONFIG.allowed_user_ids = set()
+    bot.CONFIG.allowed_channel_ids = set()
+    bot.CONFIG.allowed_channel_author_ids = set()
+
+    guild_message = _message(channel_id=42, author_id=7, content="hi")
+
+    assert bot._message_is_observable_by_relay(guild_message, relay_user) is False
 
 
 def test_allowed_channel_respects_author_allowlist() -> None:
@@ -771,6 +833,85 @@ def test_build_channel_history_caps_default_unlimited_to_finite_default() -> Non
     assert captured["limit"] > 0
 
 
+def test_attachment_metadata_size_cap_rejects_before_download(tmp_path) -> None:
+    bot = _load_bot_module()
+    bot.ATTACHMENT_MAX_BYTES = 10
+    for item in bot.ATTACHMENTS_DIR.glob("*big.png"):
+        item.unlink()
+    save_calls: list[Path] = []
+
+    class FakeAttachment:
+        id = 123
+        url = "https://cdn.example/big.png"
+        filename = "big.png"
+        content_type = "image/png"
+        size = 11
+
+        async def save(self, target: Path) -> None:
+            save_calls.append(target)
+
+    local_path, rejection = asyncio.run(bot._save_attachment_locally(FakeAttachment(), message_id=456))
+
+    assert local_path is None
+    assert rejection == "size_exceeds_limit:11>10"
+    assert save_calls == []
+    assert list(bot.ATTACHMENTS_DIR.glob("*big.png")) == []
+
+
+def test_attachment_stream_fallback_enforces_hard_byte_limit(monkeypatch) -> None:
+    bot = _load_bot_module()
+    bot.ATTACHMENT_MAX_BYTES = 10
+    for item in bot.ATTACHMENTS_DIR.glob("*stream.png"):
+        item.unlink()
+
+    class FakeContent:
+        async def iter_chunked(self, _chunk_size: int):
+            yield b"a" * 6
+            yield b"b" * 6
+
+    class FakeResponse:
+        status = 200
+        headers = {"Content-Type": "image/png"}
+        content = FakeContent()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeSession:
+        def __init__(self, timeout):
+            self.timeout = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        def get(self, _url: str) -> FakeResponse:
+            return FakeResponse()
+
+    class FakeAttachment:
+        id = 789
+        url = "https://cdn.example/stream.png"
+        filename = "stream.png"
+        content_type = "image/png"
+        size = None
+
+        async def save(self, target: Path) -> None:
+            raise RuntimeError("force streamed fallback")
+
+    monkeypatch.setattr(bot.aiohttp, "ClientSession", FakeSession)
+
+    local_path, rejection = asyncio.run(bot._save_attachment_locally(FakeAttachment(), message_id=456))
+
+    assert local_path is None
+    assert rejection == "size_exceeds_limit:12>10"
+    assert list(bot.ATTACHMENTS_DIR.glob("*stream.png")) == []
+
+
 def test_auth_failure_text_detection() -> None:
     bot = _load_bot_module()
     assert bot._is_auth_failure_text('Auth(TokenRefreshFailed("Server returned error response: invalid_grant: Invalid refresh token"))') is True
@@ -1033,6 +1174,54 @@ def test_startup_notice_marker_suppresses_repeat_notifications() -> None:
     bot._record_startup_notice()
 
     assert bot._should_send_startup_notice() is False
+
+
+def test_startup_notices_are_best_effort_per_target(capsys) -> None:
+    bot = _load_bot_module()
+    bot.STARTUP_NOTICE_MARKER_PATH.unlink(missing_ok=True)
+    bot.CONFIG.startup_dm_user_ids = {101, 202}
+    bot.CONFIG.startup_dm_text = "relay online"
+    bot.CONFIG.startup_channel_text = "channel online"
+    bot.CONFIG.allowed_channel_ids = {303}
+    sent: list[tuple[str, int, str]] = []
+
+    class FakeUser:
+        def __init__(self, user_id: int):
+            self.user_id = user_id
+
+        async def send(self, content: str, **_kwargs):
+            sent.append(("dm", self.user_id, content))
+
+    class FakeChannel:
+        async def send(self, _content: str, **_kwargs):
+            raise RuntimeError("missing channel permission")
+
+    class FakeClient:
+        user = SimpleNamespace(id=999)
+
+        async def fetch_user(self, user_id: int):
+            if user_id == 101:
+                raise RuntimeError("missing user permission")
+            return FakeUser(user_id)
+
+        def get_channel(self, _channel_id: int):
+            return None
+
+        async def fetch_channel(self, _channel_id: int):
+            return FakeChannel()
+
+    bot.client = FakeClient()
+
+    failures = asyncio.run(bot._send_startup_notices())
+
+    assert sent == [("dm", 202, "relay online")]
+    assert [item["kind"] for item in failures] == ["dm", "channel"]
+    marker = json.loads(bot.STARTUP_NOTICE_MARKER_PATH.read_text(encoding="utf-8"))
+    assert marker["sent_dm_user_ids"] == [202]
+    assert marker["failures"] == failures
+    output = capsys.readouterr().out
+    assert "Startup DM failed for 101" in output
+    assert "Startup channel message failed for 303" in output
 
 
 def test_run_preflights_before_discord_login() -> None:

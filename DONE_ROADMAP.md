@@ -2,6 +2,16 @@
 
 Items that started life on `ROADMAP.md` and have shipped. Newest tranches first. The active work-in-progress list lives in [ROADMAP.md](ROADMAP.md); release-by-release narrative lives in [DEVELOPMENT_LOG.md](DEVELOPMENT_LOG.md).
 
+## Completed For 2.5.1
+
+Closed the post-2.5.0 verification/self-review findings and hardened the new Fix Review path for production use.
+
+- **Review/Fix Review execution safety.** Review subprocesses now use output-aware idle timeout with a generous initial silent grace, async stdin writing for large prompts, and a max-runtime ceiling. Fix Review now retries transient scope snapshots, forbids stash/reset/checkout hiding in worker prompts, exposes restore commands, supports cancel-aware validation, and keeps CLADEX self-fix behind a separate explicit flag.
+- **Backend reliability and resource bounds.** Codex attachment downloads are bounded and cleaned up on rejection; startup notices are best-effort; channel-history/workspace inputs are validated before persistence; Claude stream capture, inbound queues, installer subprocesses, Codex fallback cleanup, and log tails are bounded.
+- **Security and policy.** Existing/manual Claude profiles fail closed at runtime when allowlists are empty; CI pins required provider CLI versions; `cladex doctor` enforces declared Node/npm/Python floors; the bundled relay-management skill no longer allows implicit mutating invocation.
+- **Review dashboard.** Polling uses per-request timeouts and partial-refresh handling; cancelled reviews with partial findings can be browsed/exported; 50-lane swarms expose all lanes through an expander; `npm run frontend:smoke` covers these workflows and runs in CI.
+- **Release metadata.** Package/backend/plugin/server/docs metadata aligned to 2.5.1, `package-lock.json` regenerated, and install docs clarify packaged release assets versus locally built `release/` files.
+
 ## Completed For 2.5.0
 
 The "Fix Review orchestrator" line on the roadmap is now done. Summary in [DEVELOPMENT_LOG.md](DEVELOPMENT_LOG.md).

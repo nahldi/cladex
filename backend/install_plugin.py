@@ -2,16 +2,18 @@ from __future__ import annotations
 
 import importlib.metadata
 from importlib.resources import files
+import contextlib
 import json
 import os
 import shutil
 import subprocess
 import sys
+import threading
 import venv
 from pathlib import Path
 from urllib.parse import urlparse, unquote
 
-from relay_common import CONFIG_ROOT, DATA_ROOT, atomic_write_json, replace_directory
+from relay_common import CONFIG_ROOT, DATA_ROOT, atomic_write_json, replace_directory, terminate_process_tree
 
 
 PLUGIN_NAME = "discord-codex-relay"
@@ -55,12 +57,171 @@ REQUIRED_PLUGIN_FILES = [
     Path("skills/workspace-discord-relay/agents/openai.yaml"),
     Path("skills/workspace-discord-relay/scripts/bootstrap.py"),
 ]
+DEFAULT_INSTALL_SUBPROCESS_TIMEOUT_SECONDS = 900
+DEFAULT_OPTIONAL_SKILL_LIST_TIMEOUT_SECONDS = 60
+DEFAULT_OPTIONAL_SKILL_INSTALL_TIMEOUT_SECONDS = 300
+DEFAULT_INSTALL_SUBPROCESS_MAX_OUTPUT_BYTES = 256 * 1024
+_ORIGINAL_SUBPROCESS_RUN = subprocess.run
 
 
 def _windows_subprocess_kwargs() -> dict[str, object]:
     if os.name != "nt":
         return {}
     return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
+
+
+def _safe_positive_int_env(name: str, default: int) -> int:
+    try:
+        value = int(os.environ.get(name) or default)
+    except (TypeError, ValueError):
+        value = default
+    return max(value, 1)
+
+
+class _BoundedBytesCapture:
+    def __init__(self, max_bytes: int, *, label: str) -> None:
+        self.max_bytes = max(max_bytes, 1)
+        self.label = label
+        self._chunks: list[bytes] = []
+        self._bytes = 0
+        self._lock = threading.Lock()
+        self.truncated = False
+
+    def append(self, data: bytes) -> None:
+        if not data:
+            return
+        with self._lock:
+            remaining = self.max_bytes - self._bytes
+            if remaining > 0:
+                self._chunks.append(data[:remaining])
+                self._bytes += min(len(data), remaining)
+            if len(data) > remaining:
+                self.truncated = True
+
+    def text(self) -> str:
+        with self._lock:
+            data = b"".join(self._chunks)
+            truncated = self.truncated
+        text = data.decode("utf-8", errors="replace")
+        if truncated:
+            text = f"{text.rstrip()}\n[CLADEX: {self.label} truncated at {self.max_bytes} bytes]\n"
+        return text
+
+
+def _truncate_output_text(text: str, *, max_bytes: int, label: str) -> str:
+    encoded = text.encode("utf-8", errors="replace")
+    if len(encoded) <= max_bytes:
+        return text
+    clipped = encoded[:max_bytes].decode("utf-8", errors="replace").rstrip()
+    return f"{clipped}\n[CLADEX: {label} truncated at {max_bytes} bytes]\n"
+
+
+def _coerce_output_text(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
+def _subprocess_timeout_marker(timeout_seconds: int) -> str:
+    return f"[CLADEX: subprocess timed out after {timeout_seconds}s]\n"
+
+
+def _run_limited_subprocess(
+    command: list[str],
+    *,
+    timeout_seconds: int,
+    max_output_bytes: int,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    kwargs = _windows_subprocess_kwargs()
+
+    # Older tests monkeypatch subprocess.run directly. Preserve that seam while
+    # using the streaming Popen path in real installer execution.
+    if subprocess.run is not _ORIGINAL_SUBPROCESS_RUN:
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=timeout_seconds,
+                env=env,
+                **kwargs,
+            )
+            return subprocess.CompletedProcess(
+                getattr(result, "args", command),
+                int(getattr(result, "returncode", 0)),
+                _truncate_output_text(
+                    _coerce_output_text(getattr(result, "stdout", "")),
+                    max_bytes=max_output_bytes,
+                    label="stdout",
+                ),
+                _truncate_output_text(
+                    _coerce_output_text(getattr(result, "stderr", "")),
+                    max_bytes=max_output_bytes,
+                    label="stderr",
+                ),
+            )
+        except subprocess.TimeoutExpired as exc:
+            return subprocess.CompletedProcess(
+                command,
+                124,
+                _truncate_output_text(_coerce_output_text(exc.stdout), max_bytes=max_output_bytes, label="stdout"),
+                _truncate_output_text(_coerce_output_text(exc.stderr), max_bytes=max_output_bytes, label="stderr")
+                + _subprocess_timeout_marker(timeout_seconds),
+            )
+
+    stdout_capture = _BoundedBytesCapture(max_output_bytes, label="stdout")
+    stderr_capture = _BoundedBytesCapture(max_output_bytes, label="stderr")
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        **kwargs,
+    )
+
+    def _reader(stream, capture: _BoundedBytesCapture) -> None:
+        if stream is None:
+            return
+        try:
+            while True:
+                chunk = stream.read(64 * 1024)
+                if not chunk:
+                    return
+                capture.append(chunk)
+        finally:
+            with contextlib.suppress(Exception):
+                stream.close()
+
+    stdout_thread = threading.Thread(target=_reader, args=(process.stdout, stdout_capture), daemon=True)
+    stderr_thread = threading.Thread(target=_reader, args=(process.stderr, stderr_capture), daemon=True)
+    stdout_thread.start()
+    stderr_thread.start()
+
+    timed_out = False
+    try:
+        returncode = process.wait(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        terminate_process_tree(process.pid)
+        try:
+            returncode = process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            with contextlib.suppress(ProcessLookupError):
+                process.kill()
+            returncode = process.wait()
+
+    stdout_thread.join(timeout=2)
+    stderr_thread.join(timeout=2)
+    stdout = stdout_capture.text()
+    stderr = stderr_capture.text()
+    if timed_out:
+        returncode = 124 if returncode == 0 else returncode
+        stderr += _subprocess_timeout_marker(timeout_seconds)
+    return subprocess.CompletedProcess(command, returncode, stdout, stderr)
 
 
 def _bundle_root() -> Path:
@@ -193,12 +354,16 @@ def _skill_listing() -> dict[str, bool]:
     script = _skill_installer_script("list-skills.py")
     if not script.exists():
         return {}
-    result = subprocess.run(
+    result = _run_limited_subprocess(
         [sys.executable, str(script), "--format", "json"],
-        capture_output=True,
-        text=True,
-        check=False,
-        **_windows_subprocess_kwargs(),
+        timeout_seconds=_safe_positive_int_env(
+            "CLADEX_OPTIONAL_SKILL_LIST_TIMEOUT",
+            DEFAULT_OPTIONAL_SKILL_LIST_TIMEOUT_SECONDS,
+        ),
+        max_output_bytes=_safe_positive_int_env(
+            "CLADEX_INSTALL_SUBPROCESS_MAX_OUTPUT_BYTES",
+            DEFAULT_INSTALL_SUBPROCESS_MAX_OUTPUT_BYTES,
+        ),
     )
     if result.returncode != 0:
         return {}
@@ -235,12 +400,16 @@ def auto_install_enabled_skills() -> tuple[list[str], list[str]]:
             "--path",
             f"skills/.curated/{name}",
         ]
-        result = subprocess.run(
+        result = _run_limited_subprocess(
             command,
-            capture_output=True,
-            text=True,
-            check=False,
-            **_windows_subprocess_kwargs(),
+            timeout_seconds=_safe_positive_int_env(
+                "CLADEX_OPTIONAL_SKILL_INSTALL_TIMEOUT",
+                DEFAULT_OPTIONAL_SKILL_INSTALL_TIMEOUT_SECONDS,
+            ),
+            max_output_bytes=_safe_positive_int_env(
+                "CLADEX_INSTALL_SUBPROCESS_MAX_OUTPUT_BYTES",
+                DEFAULT_INSTALL_SUBPROCESS_MAX_OUTPUT_BYTES,
+            ),
         )
         if result.returncode == 0:
             installed.append(name)
@@ -324,13 +493,17 @@ def _ensure_runtime(source: str | None = None) -> Path:
     cleanup_runtime_site_packages()
 
     def _run_install() -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
+        return _run_limited_subprocess(
             command,
-            check=False,
-            capture_output=True,
-            text=True,
             env=env,
-            **_windows_subprocess_kwargs(),
+            timeout_seconds=_safe_positive_int_env(
+                "CLADEX_INSTALL_SUBPROCESS_TIMEOUT",
+                DEFAULT_INSTALL_SUBPROCESS_TIMEOUT_SECONDS,
+            ),
+            max_output_bytes=_safe_positive_int_env(
+                "CLADEX_INSTALL_SUBPROCESS_MAX_OUTPUT_BYTES",
+                DEFAULT_INSTALL_SUBPROCESS_MAX_OUTPUT_BYTES,
+            ),
         )
 
     result = _run_install()

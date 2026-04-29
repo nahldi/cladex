@@ -2,6 +2,82 @@
 
 This file is tracked on purpose. It gives future Claude/Codex agents a concise source of truth for what has been done, what is in progress, and what still needs care. Runtime-only memory files under `memory/` are useful locally, but GitHub users and new agents need this public handoff too.
 
+## 2.5.1 Production Hardening (2026-04-29)
+
+**Status.** Implementation complete in the working tree. This tranche closes the verified findings from self-review `review-20260428-212527-cf81fdd1` and the follow-up swarm review of the dirty 2.5.1 tree. Source backup for the original Fix Review attempt remains `backup-20260428-233430-34791a4e`.
+
+**Review source.** The 10-lane Codex self-review at `8bd8793` produced 82 raw findings, triaged to 32 real findings. The first AI Fix Review run (`fix-20260428-233430-921bd2e8`) landed phase-1 worker fixes for 10 findings and exposed two orchestrator defects: review subprocesses used a hard wall-clock timeout, and the assigned-file detector could misclassify transient workspace operations.
+
+**Fixes shipped in this tranche.**
+- Fixed phase-1 worker findings: Claude profile start idempotence, profile access invariants, safe `.env` serialization, runtime lease/worktree/memory-write races, local API origin handling, CSP/anti-framing headers, and real HTTP API smoke coverage.
+- Hardened the Fix Review orchestrator: AI planner prompt/schema ordering, finding-id salvage from planner `files`, bounded planner retries, Claude fix-worker `--allowedTools` with write-capable permission mode, duplicate-start idempotence, explicit `--allow-cladex-self-fix`, exact restore-command exposure, cancel-aware validation, and stable assigned-file rechecks.
+- Replaced review subprocess wall-clock termination with output-aware idle timeout, a generous initial silent grace, max-runtime ceiling, stdout/stderr reader threads, async stdin writing for large prompts, and focused regression tests.
+- Closed remaining backend reliability findings: bounded Codex attachment handling, best-effort startup notices, channel-history validation, workspace path validation, Claude stream capture caps, bounded Claude inbound queue/status, installer subprocess timeouts/output caps, Codex fallback process-tree cleanup, and bounded log tailing.
+- Closed CI/policy/release findings: pinned provider CLI versions in required CI, doctor runtime-version gates for Node/npm/Python, disabled implicit invocation for the mutating relay-management skill, aligned package/backend/plugin/server metadata to 2.5.1, regenerated `package-lock.json`, and clarified packaged release install paths.
+- Closed review dashboard findings: fetch timeouts, resilient `Promise.allSettled` polling, cancelled reviews with partial findings visible/exportable, full 1-50 lane visibility through an expander, and `npm run frontend:smoke` wired into CI.
+
+**Validation evidence so far.**
+- Focused review/fix suites: `backend/tests/test_review_swarm.py` -> 40 passed, 1 skipped; `backend/tests/test_fix_orchestrator.py` -> 20 passed.
+- Combined touched backend/UI gate: `backend/tests/test_bot_logic.py backend/tests/test_cladex.py backend/tests/test_claude_relay.py backend/tests/test_relayctl.py backend/tests/test_backend.py backend/tests/test_relay_backend.py backend/tests/test_resource_bounds.py backend/tests/test_fix_orchestrator.py backend/tests/test_review_swarm.py` -> 297 passed, 1 skipped, 1 warning.
+- Frontend: `npm run frontend:smoke` passed; `npm run lint` passed.
+- API smoke passed after updating `Origin: null` behavior to require the token while still allowing authenticated opaque/file-origin preflight.
+- Full gate evidence: `npm ci`, `npm audit`, `npm run lint`, `npm run frontend:smoke`, `npm run build`, `npm run api:smoke`, editable backend install (`discord-codex-relay==2.5.1`), tracked privacy audit, `cladex doctor --json`, backend full suite (`325 passed, 1 skipped, 1 warning`), `git diff --check`, and `npm run electron:build` all passed. Electron build produced `release\CLADEX Setup 2.5.1.exe`, `release\CLADEX 2.5.1.exe`, and `release\win-unpacked\CLADEX.exe`.
+
+## Historical 2.5.1-pre Handoff - Superseded (2026-04-28)
+
+This section is retained only as the handoff record from the interrupted pre-2.5.1 session. The current 2.5.1 section above is authoritative.
+
+**Status.** Working tree at HEAD `8bd8793` (CLADEX 2.5.0) with 15 modified files uncommitted. All gates green. Operator decision pending on commit / wait / investigate-detector-first.
+
+**Source review:** `review-20260428-212527-cf81fdd1`, 10-lane Codex self-review at `8bd8793`. 82 raw findings; triaged to 32 real ones (50 dropped: 42 secret-hygiene preflight noise, 5 against rule-definition files `review_swarm.py`/`fix_orchestrator.py`, 2 in `tmp/`, 1 stale egg-info). The triaged set is persisted to `findings.json` in the review artifact dir; the unfiltered original is alongside as `findings.json.original`.
+
+**Fix Review run:** `fix-20260428-233430-921bd2e8`. AI planner produced a 12-task grouped plan (6 Claude + 6 Codex, recommendedAgentCount 4). Phase 1 ran 4 tasks then aborted on a likely-false-positive scope-detector trigger. Phase 2 (8 tasks) and phase 3 (1 task) — covering the 22 still-open findings — never executed.
+
+**Findings closed by phase-1 worker tasks (10 of 32):**
+- F0003 — Claude profile lifecycle non-idempotent → task-0004 / Codex (`backend/cladex.py`, `backend/claude_bot.py`, plus tests)
+- F0004 + F0034 + F0035 + F0066 — profile invariants + .env injection → task-0001 / Claude (`backend/relayctl.py`, `backend/claude_relay.py`, `backend/cladex.py`, `backend/bot.py`, plus tests)
+- F0017 + F0018 + F0065 — lease/worktree/memory-file races → task-0002 / Claude. Marked **failed** by the scope detector (Claude's `git stash`/pop during validation tripped the pre-vs-post hash check on `backend/tests/test_claude_relay.py`); the relay_runtime.py + test_runtime.py race-safety code IS in the working tree and is correct per the worker's own report. Failure flag is metadata, not a content rollback.
+- F0042 + F0071 + F0072 — Origin:null trust + CSP + smoke depth → task-0003 / Claude (`server.cjs`, `scripts/server-contract-smoke.cjs`, `package.json`)
+
+**Findings still open (22):** F0050+F0051+F0055 (CI provider-CLI pinning + runtime version gates), F0052+F0053 (attachments / startup notices), F0054+F0079 (channelHistory + workspace path validation), F0056+F0057 (Claude stream + queue caps), F0059 (skill implicit invocation), F0062+F0063+F0064 (installer / process-tree cleanup / log tail bounds), F0073+F0074+F0078+F0080 (review dashboard refresh + cancelled partial findings + lane visibility + frontend tests), F0070+F0075+F0076+F0077 (release metadata drift), and the INSTALL.md packaged-install-path note.
+
+**Worker output in working tree (~1207 lines across 13 files), all gate-green:**
+- `backend/bot.py +11`, `backend/cladex.py +284`, `backend/claude_bot.py +9`, `backend/claude_relay.py +44`, `backend/relay_runtime.py +277`, `backend/relayctl.py +48`
+- `backend/tests/test_bot_logic.py +31`, `test_cladex.py +145`, `test_claude_relay.py +56`, `test_relayctl.py +102`, `test_runtime.py +121`
+- `server.cjs +23`, `scripts/server-contract-smoke.cjs +221`
+
+**Orchestrator hardening also in working tree (~237 lines across 2 files), separately authored this session:** Without these, the AI plan path collapses to deterministic ~50% of the time and every Claude fix task is a silent no-op.
+
+- `backend/fix_orchestrator.py +115`:
+  1. Tightened `_planner_prompt`: findings JSON + valid-id list moved to top, schema upfront, dropped the "no self-fix targeting" rule when `selfReview` is true. Codex was previously drifting toward CLADEX historical roadmap names with empty `findingIds`.
+  2. Added a salvage path inside `_ai_plan_fix_tasks_once`: when the planner emits a task with `files` but missing/null `findingIds`, infer the IDs from finding `path` ↔ task `files`. Without this rescue, one stochastic Codex drift collapses the whole plan to None.
+  3. Wrapped `_ai_plan_fix_tasks` around a new `_ai_plan_fix_tasks_once`: bounded retries (default 2 extra attempts, env: `CLADEX_FIX_PLANNER_RETRIES`).
+  4. Switched the Claude fix-worker invocation in `_run_provider_fix_task` from the silently-ignored `--tools` flag (and `--permission-mode dontAsk` which denies Edit/Write/Bash) to `--allowedTools` + `--permission-mode bypassPermissions`. Operator already opts in to write access via `--allow-cladex-self-fix` plus the mandatory backup, so bypassPermissions is the right default for fix workers.
+- `backend/tests/test_fix_orchestrator.py +122`: `test_ai_planner_salvages_tasks_without_findingids_when_files_match`, `test_ai_planner_remaps_planner_named_dependencies_to_canonical_task_ids`, `test_ai_planner_retries_when_first_attempt_returns_no_plan`, plus assertions on the Claude fix-worker command in the existing `test_claude_fix_task_sends_large_prompt_through_stdin`.
+
+**Validation evidence (with both worker output AND orchestrator hardening in tree):**
+- Backend pytest: `291 passed, 1 skipped, 1 warning in 51s` (was 272 baseline at 8bd8793; +19 new tests came from worker fixes + orchestrator hardening combined). Pytest was rerun with my orchestrator changes temporarily stashed and popped to confirm the worker output passes gates on its own.
+- TypeScript lint (`tsc --noEmit`): clean
+- Vite build: clean (412 KB / 124 KB gzip JS bundle)
+- API contract smoke (`scripts/server-contract-smoke.cjs`): passed (now exercises real HTTP routes thanks to task-0003 — the test file expanded from a contract-only check to representative HTTP route coverage)
+- Privacy audit (`relayctl.py privacy-audit --tracked-only .`): no findings
+
+**Open design call surfaced this session — wall-clock vs idle timeout.** `_run_cli` in `backend/review_swarm.py:1391` uses a 30-min wall-clock deadline that kills the subprocess regardless of progress. Operator flagged this; if a Codex/Claude task is genuinely producing output, killing it is the worst outcome. Proposed 2.5.1 fix:
+- Replace the wall-clock deadline with an idle timeout measured from the last byte of stdout/stderr. Hung process still gets killed; one that's actively reasoning/editing keeps going.
+- Env knob: `CLADEX_REVIEW_AGENT_IDLE_TIMEOUT` (default 10 min idle). Optionally retain a generous absolute ceiling (2-3 hours).
+- This also helps the scope detector handle Claude's `git stash`/pop validation pattern more gracefully.
+
+NOT yet implemented; would land alongside the commit if the operator chooses option A.
+
+**Open scope-detector concern (analysis, not yet fixed):** task-0002 fail flag came from Claude running `git stash`/`git stash pop` during validation (mentioned in its own report: "Diffed full-suite failures vs. baseline (with my changes stashed)"). The detector's pre-vs-post hash check fired on `backend/tests/test_claude_relay.py` because the stash transient overlapped the snapshot windows. Possible fixes (pick one in 2.5.1): forbid `git stash` in the worker prompt; re-run the after-snapshot if the diff includes files outside scope to absorb stash transients; whitelist test files for read-only diff semantics (weakens the detector — risky).
+
+**Source backup for rollback:** `backup-20260428-233430-34791a4e`. Restore: `cladex backup restore backup-20260428-233430-34791a4e --confirm backup-20260428-233430-34791a4e`.
+
+**Path-forward options** (operator decides):
+- **A. Commit as 2.5.1.** Stage every modified file, write a 2.5.1 commit naming every closed finding, push to origin/master. Bump version strings (package.json, backend/pyproject.toml, both `.codex-plugin/plugin.json`, server.cjs, README, INSTALL) and ship. Then re-run Fix Review against the same review id — only the 22 still-open findings remain in the triaged set, so the orchestrator should produce a smaller phase-1 + phase-2 + phase-3 plan.
+- **B. Investigate the detector false-positive first.** Stash orchestrator hardening, re-run a single-task Fix Review for F0017 alone, confirm relay_runtime.py is unchanged, restore, then commit.
+- **C. Discard everything** via the restore command above and start over.
+
 ## 2.5.0 Fix Review AI Orchestrator (2026-04-28)
 
 **Why.** The previous Fix Review path was a deterministic 1:1 mapping: every finding became its own task, all using the same provider as the upstream review. The user explicitly called this out: "the fix button should spawn an orchestrator that decides how many, what type, and where each agent goes." 2.5.0 makes that real.

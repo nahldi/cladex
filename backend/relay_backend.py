@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from relay_common import codex_cli_version, relay_codex_env, resolve_codex_bin
+from relay_common import codex_cli_version, relay_codex_env, resolve_codex_bin, terminate_process_tree
 
 
 def _safe_int(value: Any, default: int) -> int:
@@ -380,6 +380,26 @@ class CliResumeCodexBackend(CodexBackend):
             return {}
         return {"creationflags": subprocess.CREATE_NO_WINDOW}
 
+    @staticmethod
+    async def _terminate_cli_process_tree(process: asyncio.subprocess.Process) -> None:
+        if process.returncode is not None:
+            return
+        try:
+            await asyncio.to_thread(terminate_process_tree, process.pid)
+        except Exception:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                return
+        try:
+            await asyncio.wait_for(process.wait(), timeout=5.0)
+        except asyncio.TimeoutError:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                return
+            await process.wait()
+
     async def _run_cli_turn(
         self,
         *,
@@ -445,27 +465,16 @@ class CliResumeCodexBackend(CodexBackend):
                 chunks.append(chunk)
                 bytes_read += len(chunk)
         except asyncio.TimeoutError:
-            try:
-                process.kill()
-            except ProcessLookupError:
-                pass
-            await process.wait()
+            await self._terminate_cli_process_tree(process)
             raise BackendUnavailableError(
                 f"Degraded Codex CLI fallback timed out after {timeout_seconds}s."
             )
         if truncated:
-            try:
-                process.kill()
-            except ProcessLookupError:
-                pass
+            await self._terminate_cli_process_tree(process)
         try:
             await asyncio.wait_for(process.wait(), timeout=10.0)
         except asyncio.TimeoutError:
-            try:
-                process.kill()
-            except ProcessLookupError:
-                pass
-            await process.wait()
+            await self._terminate_cli_process_tree(process)
         raw_output = b"".join(chunks).decode("utf-8", errors="replace")
         if truncated:
             raw_output += "\n[CLADEX: degraded fallback output truncated at limit]"

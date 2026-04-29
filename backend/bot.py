@@ -76,6 +76,9 @@ Rules:
 
 DEFAULT_CODEX_MODEL = ""
 DEFAULT_CODEX_MODEL_LABEL = "Codex default"
+DEFAULT_CHANNEL_HISTORY_LIMIT = 20
+MAX_CHANNEL_HISTORY_LIMIT = 500
+DEFAULT_APP_SERVER_PORT = 8765
 SAFE_ALLOWED_MENTIONS = discord.AllowedMentions.none()
 MISSING_REPLY_SENTINEL = "[[missing_discord_reply]]"
 NO_REPLY_NEEDED_SENTINEL = "[[no_discord_reply_needed]]"
@@ -87,6 +90,23 @@ PROJECT_ROADMAP_FILE_NAMES = (
     "roadmap-pt1.md",
     "roadmap-pt2.md",
 )
+
+
+def _bounded_int_env(name: str, default: int, *, min_value: int, max_value: int) -> int:
+    raw = os.environ.get(name, "")
+    text = str(raw).strip()
+    if not text:
+        return default
+    try:
+        value = int(text, 10)
+    except (TypeError, ValueError):
+        print(f"Invalid {name}={raw!r}; using safe default {default}.")
+        return default
+    if value < min_value or value > max_value:
+        print(f"Invalid {name}={raw!r}; expected {min_value}-{max_value}, using safe default {default}.")
+        return default
+    return value
+
 
 def _load_soul_markdown() -> str:
     soul_path = Path(__file__).with_name("SOUL.md")
@@ -410,7 +430,12 @@ def _load_config() -> Config:
     model = (os.environ.get("RELAY_MODEL") or os.environ.get("CODEX_MODEL") or DEFAULT_CODEX_MODEL).strip()
     full_access = os.environ.get("CODEX_FULL_ACCESS", "false").strip().lower() in {"1", "true", "yes", "on"}
     read_only = os.environ.get("CODEX_READ_ONLY", "false").strip().lower() in {"1", "true", "yes", "on"}
-    app_server_port = int(os.environ.get("CODEX_APP_SERVER_PORT", "8765"))
+    app_server_port = _bounded_int_env(
+        "CODEX_APP_SERVER_PORT",
+        DEFAULT_APP_SERVER_PORT,
+        min_value=1,
+        max_value=65535,
+    )
     app_server_transport = os.environ.get("CODEX_APP_SERVER_TRANSPORT", "stdio").strip().lower() or "stdio"
     if app_server_transport not in {"stdio", "websocket"}:
         app_server_transport = "stdio"
@@ -458,7 +483,12 @@ def _load_config() -> Config:
         for value in allowed_channels_raw.split(",")
         if value.strip().isdigit()
     }
-    channel_history_limit = int(os.environ.get("CHANNEL_HISTORY_LIMIT", "20"))
+    channel_history_limit = _bounded_int_env(
+        "CHANNEL_HISTORY_LIMIT",
+        DEFAULT_CHANNEL_HISTORY_LIMIT,
+        min_value=0,
+        max_value=MAX_CHANNEL_HISTORY_LIMIT,
+    )
     open_visible_terminal = os.environ.get("OPEN_VISIBLE_TERMINAL", "false").strip().lower() not in {
         "0",
         "false",
@@ -525,6 +555,7 @@ INSTANCE_LOCK_HANDLE: object | None = None
 CONTEXT_BATCH_DELAY_SECONDS = 1.25
 ATTACHMENT_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
 ATTACHMENT_MAX_FILES = 500
+ATTACHMENT_MAX_BYTES = 8 * 1024 * 1024
 APP_SERVER_LOG_MAX_BYTES = 5 * 1024 * 1024
 APP_SERVER_LOG_KEEP_BYTES = 1024 * 1024
 STDIO_STREAM_LIMIT_BYTES = 64 * 1024 * 1024
@@ -834,7 +865,12 @@ def _should_send_startup_notice() -> bool:
     return payload.get("state_namespace") != CONFIG.state_namespace
 
 
-def _record_startup_notice() -> None:
+def _record_startup_notice(
+    *,
+    sent_dm_user_ids: list[int] | None = None,
+    sent_channel_ids: list[int] | None = None,
+    failures: list[dict[str, object]] | None = None,
+) -> None:
     atomic_write_text(
         STARTUP_NOTICE_MARKER_PATH,
         json.dumps(
@@ -842,6 +878,9 @@ def _record_startup_notice() -> None:
                 "sent_at": time.time(),
                 "state_namespace": CONFIG.state_namespace,
                 "bot_user_id": getattr(client.user, "id", None),
+                "sent_dm_user_ids": sent_dm_user_ids or [],
+                "sent_channel_ids": sent_channel_ids or [],
+                "failures": failures or [],
             }
         )
         + "\n",
@@ -1684,11 +1723,18 @@ def _message_is_observable_by_relay(message: discord.Message, bot_user: discord.
     if message.guild is None:
         if not CONFIG.allow_dms:
             return False
-        if CONFIG.allowed_user_ids and message.author.id not in CONFIG.allowed_user_ids:
+        if not CONFIG.allowed_user_ids:
+            # Fail closed: an empty DM allowlist while DMs are enabled would
+            # otherwise let any sender reach the relay. Profile registration
+            # forbids this combination, but defend in depth at runtime too.
+            return False
+        if message.author.id not in CONFIG.allowed_user_ids:
             return False
         return True
 
-    if CONFIG.allowed_channel_ids and message.channel.id not in CONFIG.allowed_channel_ids:
+    if not CONFIG.allowed_channel_ids:
+        return False
+    if message.channel.id not in CONFIG.allowed_channel_ids:
         return False
     if CONFIG.allowed_channel_author_ids and message.author.id not in CONFIG.allowed_channel_author_ids:
         return False
@@ -2289,21 +2335,82 @@ def _attachment_is_image(attachment: discord.Attachment) -> bool:
     return filename.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"))
 
 
+ALLOWED_ATTACHMENT_CONTENT_TYPE_PREFIXES = ("image/", "text/")
+ALLOWED_ATTACHMENT_CONTENT_TYPES = {
+    "application/json",
+    "application/pdf",
+    "application/xml",
+    "application/xhtml+xml",
+}
+
+
+def _normalized_content_type(value: str | None) -> str:
+    return str(value or "").split(";", 1)[0].strip().lower()
+
+
+def _attachment_content_type_allowed(content_type: str | None) -> bool:
+    normalized = _normalized_content_type(content_type)
+    if not normalized:
+        return True
+    if normalized in ALLOWED_ATTACHMENT_CONTENT_TYPES:
+        return True
+    return any(normalized.startswith(prefix) for prefix in ALLOWED_ATTACHMENT_CONTENT_TYPE_PREFIXES)
+
+
+def _attachment_size(attachment: discord.Attachment) -> int | None:
+    try:
+        size = getattr(attachment, "size", None)
+        return int(size) if size is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _delete_partial_attachment(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _attachment_rejection_reason(attachment: discord.Attachment) -> str | None:
+    content_type = _normalized_content_type(getattr(attachment, "content_type", None))
+    if content_type and not _attachment_content_type_allowed(content_type):
+        return f"unsupported_content_type:{content_type}"
+    size = _attachment_size(attachment)
+    if size is not None and size > ATTACHMENT_MAX_BYTES:
+        return f"size_exceeds_limit:{size}>{ATTACHMENT_MAX_BYTES}"
+    return None
+
+
 def _safe_attachment_filename(name: str) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", (name or "attachment").strip())
     return cleaned[:120] or "attachment"
 
 
-async def _save_attachment_locally(attachment: discord.Attachment, *, message_id: int) -> Path | None:
+async def _save_attachment_locally(attachment: discord.Attachment, *, message_id: int) -> tuple[Path | None, str | None]:
+    rejection = _attachment_rejection_reason(attachment)
+    if rejection is not None:
+        return None, rejection
     attachment_id = getattr(attachment, "id", None) or f"idx-{abs(hash(attachment.url))}"
     filename = _safe_attachment_filename(attachment.filename)
     target = ATTACHMENTS_DIR / f"{message_id}_{attachment_id}_{filename}"
     if target.exists() and target.stat().st_size > 0:
-        return target
+        existing_size = target.stat().st_size
+        if existing_size <= ATTACHMENT_MAX_BYTES:
+            return target, None
+        _delete_partial_attachment(target)
+        return None, f"size_exceeds_limit:{existing_size}>{ATTACHMENT_MAX_BYTES}"
     try:
-        await attachment.save(target)
+        if _attachment_size(attachment) is not None:
+            await attachment.save(target)
+        else:
+            raise RuntimeError("Attachment metadata did not include a size; using streamed fallback.")
         if target.exists() and target.stat().st_size > 0:
-            return target
+            saved_size = target.stat().st_size
+            if saved_size <= ATTACHMENT_MAX_BYTES:
+                return target, None
+            _delete_partial_attachment(target)
+            return None, f"size_exceeds_limit:{saved_size}>{ATTACHMENT_MAX_BYTES}"
     except Exception:
         pass
     try:
@@ -2311,12 +2418,35 @@ async def _save_attachment_locally(attachment: discord.Attachment, *, message_id
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(attachment.url) as response:
                 if response.status != 200:
-                    return None
-                data = await response.read()
-        target.write_bytes(data)
-        return target if target.exists() and target.stat().st_size > 0 else None
+                    _delete_partial_attachment(target)
+                    return None, None
+                response_type = _normalized_content_type(response.headers.get("Content-Type"))
+                if response_type and not _attachment_content_type_allowed(response_type):
+                    _delete_partial_attachment(target)
+                    return None, f"unsupported_content_type:{response_type}"
+                content_length = response.headers.get("Content-Length")
+                if content_length and content_length.isdigit() and int(content_length) > ATTACHMENT_MAX_BYTES:
+                    _delete_partial_attachment(target)
+                    return None, f"size_exceeds_limit:{content_length}>{ATTACHMENT_MAX_BYTES}"
+                total = 0
+                limit_rejection: str | None = None
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with target.open("wb") as handle:
+                    async for chunk in response.content.iter_chunked(64 * 1024):
+                        if not chunk:
+                            continue
+                        total += len(chunk)
+                        if total > ATTACHMENT_MAX_BYTES:
+                            limit_rejection = f"size_exceeds_limit:{total}>{ATTACHMENT_MAX_BYTES}"
+                            break
+                        handle.write(chunk)
+                if limit_rejection is not None:
+                    _delete_partial_attachment(target)
+                    return None, limit_rejection
+        return (target, None) if target.exists() and target.stat().st_size > 0 else (None, None)
     except Exception:
-        return None
+        _delete_partial_attachment(target)
+        return None, None
 
 
 async def _make_turn_input(
@@ -2331,7 +2461,7 @@ async def _make_turn_input(
 
     attachment_lines: list[str] = []
     for attachment in source_message.attachments:
-        local_path = await _save_attachment_locally(attachment, message_id=source_message.id)
+        local_path, rejection = await _save_attachment_locally(attachment, message_id=source_message.id)
         details = [attachment.filename or "attachment"]
         if attachment.content_type:
             details.append(attachment.content_type)
@@ -2342,6 +2472,8 @@ async def _make_turn_input(
         line = "- " + " | ".join(details)
         if local_path is not None:
             line += f" | local_path={local_path}"
+        elif rejection is not None:
+            line += f" | not_downloaded={rejection}"
         else:
             line += f" | url={attachment.url}"
         attachment_lines.append(line)
@@ -5143,6 +5275,44 @@ async def _startup_preflight() -> None:
     print(f"{RUNTIME_NAME} startup healthcheck: ok")
 
 
+async def _send_startup_notices() -> list[dict[str, object]]:
+    failures: list[dict[str, object]] = []
+    sent_dm_user_ids: list[int] = []
+    sent_channel_ids: list[int] = []
+
+    startup_dm_targets = set(CONFIG.startup_dm_user_ids)
+    if CONFIG.allow_dms and not startup_dm_targets and len(CONFIG.allowed_user_ids) == 1:
+        startup_dm_targets.update(CONFIG.allowed_user_ids)
+
+    for user_id in sorted(startup_dm_targets):
+        try:
+            user = await client.fetch_user(user_id)
+            await user.send(CONFIG.startup_dm_text, allowed_mentions=SAFE_ALLOWED_MENTIONS)
+            sent_dm_user_ids.append(user_id)
+            print(f"Startup DM sent to {user_id}")
+        except Exception as exc:
+            failures.append({"kind": "dm", "id": user_id, "error": str(exc)})
+            print(f"Startup DM failed for {user_id}: {exc}")
+
+    first_channel_id = next(iter(sorted(CONFIG.allowed_channel_ids)), None)
+    if first_channel_id is not None and CONFIG.startup_channel_text:
+        try:
+            channel = client.get_channel(first_channel_id) or await client.fetch_channel(first_channel_id)
+            await channel.send(CONFIG.startup_channel_text, allowed_mentions=SAFE_ALLOWED_MENTIONS)
+            sent_channel_ids.append(first_channel_id)
+            print(f"Startup channel message sent to {first_channel_id}")
+        except Exception as exc:
+            failures.append({"kind": "channel", "id": first_channel_id, "error": str(exc)})
+            print(f"Startup channel message failed for {first_channel_id}: {exc}")
+
+    _record_startup_notice(
+        sent_dm_user_ids=sent_dm_user_ids,
+        sent_channel_ids=sent_channel_ids,
+        failures=failures,
+    )
+    return failures
+
+
 @client.event
 async def on_ready() -> None:
     global STARTUP_COMPLETED, SLASH_SYNC_COMPLETED, OPERATOR_BRIDGE_TASK
@@ -5165,23 +5335,7 @@ async def on_ready() -> None:
 
     try:
         if _should_send_startup_notice():
-            startup_dm_targets = set(CONFIG.startup_dm_user_ids)
-            if CONFIG.allow_dms and not startup_dm_targets and len(CONFIG.allowed_user_ids) == 1:
-                startup_dm_targets.update(CONFIG.allowed_user_ids)
-
-            for user_id in sorted(startup_dm_targets):
-                user = await client.fetch_user(user_id)
-                if user_id in CONFIG.startup_dm_user_ids:
-                    await user.send(CONFIG.startup_dm_text, allowed_mentions=SAFE_ALLOWED_MENTIONS)
-                    print(f"Startup DM sent to {user_id}")
-
-            first_channel_id = next(iter(sorted(CONFIG.allowed_channel_ids)), None)
-            for channel_id in sorted(CONFIG.allowed_channel_ids):
-                channel = client.get_channel(channel_id) or await client.fetch_channel(channel_id)
-                if channel_id == first_channel_id and CONFIG.startup_channel_text:
-                    await channel.send(CONFIG.startup_channel_text, allowed_mentions=SAFE_ALLOWED_MENTIONS)
-                    print(f"Startup channel message sent to {channel_id}")
-            _record_startup_notice()
+            await _send_startup_notices()
         else:
             print("Startup notifications suppressed; a prior successful launch already announced readiness.")
     except Exception as exc:

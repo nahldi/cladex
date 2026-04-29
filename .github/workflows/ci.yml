@@ -21,6 +21,7 @@ jobs:
       - run: npm ci
       - run: npm audit
       - run: npm run lint
+      - run: npm run frontend:smoke
       - run: npm run build
       - run: npm run api:smoke
 
@@ -58,7 +59,7 @@ jobs:
           python-version: '3.12'
 
       - run: npm ci
-      - run: cmd /c npm install -g @openai/codex @anthropic-ai/claude-code
+      - run: cmd /c npm install -g @openai/codex@0.125.0 @anthropic-ai/claude-code@2.1.117
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -e "backend[dev]" -c backend/constraints.txt
       - run: python backend/cladex.py doctor --json

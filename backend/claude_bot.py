@@ -71,7 +71,7 @@ class BotConfig:
             allowed_user_ids=_parse_ids(os.environ.get("ALLOWED_USER_IDS", "")),
             allowed_channel_ids=_parse_ids(os.environ.get("ALLOWED_CHANNEL_IDS", "")),
             allowed_bot_ids=_parse_ids(os.environ.get("ALLOWED_BOT_IDS", "")),
-            allow_dms=os.environ.get("ALLOW_DMS", "true").lower() in ("1", "true", "yes"),
+            allow_dms=os.environ.get("ALLOW_DMS", "false").lower() in ("1", "true", "yes"),
             trigger_mode=os.environ.get("BOT_TRIGGER_MODE", "mention_or_dm"),
             prefix=os.environ.get("BOT_PREFIX", "!"),
             bot_name=os.environ.get("RELAY_BOT_NAME", "Claude"),
@@ -235,23 +235,28 @@ class ClaudeRelayBot(commands.Bot):
             if bot_id not in self.config.allowed_bot_ids:
                 return False
 
-        # Check user allowlist (if set)
-        if self.config.allowed_user_ids:
-            user_id = str(message.author.id)
-            if user_id not in self.config.allowed_user_ids and user_id not in self.config.operator_ids:
-                return False
+        user_id = str(message.author.id)
+        approved_user_ids = set(self.config.allowed_user_ids) | set(self.config.operator_ids)
+        if self.config.allowed_user_ids and user_id not in approved_user_ids:
+            return False
 
         # Handle DMs separately so a guild-channel allowlist doesn't reject
         # DM channel ids (which are private channel ids, not in the guild
         # allowlist by definition). Also requires --allow-dms; the user
         # allowlist above gates *which* DM senders are accepted.
         if isinstance(message.channel, discord.DMChannel):
-            return bool(self.config.allow_dms)
-
-        # Check channel allowlist (if set) for non-DM messages.
-        if self.config.allowed_channel_ids:
-            if str(message.channel.id) not in self.config.allowed_channel_ids:
+            if not self.config.allow_dms:
                 return False
+            if not approved_user_ids:
+                return False
+            return user_id in approved_user_ids
+
+        # Fail closed for guild messages. Registration/update paths forbid an
+        # empty allowlist, but old/manual profiles can still reach runtime.
+        if not self.config.allowed_channel_ids:
+            return False
+        if str(message.channel.id) not in self.config.allowed_channel_ids:
+            return False
 
         # Check trigger mode
         if self.config.trigger_mode in ("always", "all"):
@@ -455,12 +460,17 @@ async def run_bot(config: BotConfig) -> None:
 
     # Write PID file
     pid_file = bot.state_dir / "relay.pid"
-    pid_file.write_text(str(os.getpid()))
+    current_pid = str(os.getpid())
+    pid_file.write_text(current_pid, encoding="utf-8")
 
     try:
         await bot.start(config.token)
     finally:
-        pid_file.unlink(missing_ok=True)
+        try:
+            if pid_file.read_text(encoding="utf-8").strip() == current_pid:
+                pid_file.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def main() -> int:

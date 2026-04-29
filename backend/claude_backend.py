@@ -34,6 +34,8 @@ from relay_runtime import DurableRuntime, RELAY_PROJECT_ROOT, _extract_blocker, 
 
 logger = logging.getLogger(__name__)
 TASK_HEARTBEAT_INTERVAL_SECONDS = 60
+DEFAULT_CLAUDE_TURN_MAX_OUTPUT_BYTES = 1024 * 1024
+DEFAULT_CLAUDE_INBOUND_QUEUE_MAX = 32
 
 DEFAULT_CLAUDE_MODEL = ""
 DEFAULT_CLAUDE_PERMISSION_MODE = "default"
@@ -114,6 +116,7 @@ class CommandResult:
     stdout: str
     stderr: str
     used_resume: bool
+    response_text: str | None = None
 
 
 def _windows_hidden_subprocess_kwargs() -> dict[str, object]:
@@ -121,6 +124,83 @@ def _windows_hidden_subprocess_kwargs() -> dict[str, object]:
     if os.name != "nt":
         return {}
     return {"creationflags": subprocess.CREATE_NO_WINDOW}
+
+
+def _safe_int_env(name: str, default: int, *, minimum: int = 1) -> int:
+    try:
+        value = int(os.environ.get(name) or default)
+    except (TypeError, ValueError):
+        value = default
+    return max(value, minimum)
+
+
+def _truncate_text_to_bytes(text: str, max_bytes: int, *, label: str) -> str:
+    encoded = text.encode("utf-8", errors="replace")
+    if len(encoded) <= max_bytes:
+        return text
+    clipped = encoded[:max_bytes].decode("utf-8", errors="replace").rstrip()
+    return f"{clipped}\n[CLADEX: {label} truncated at {max_bytes} bytes]"
+
+
+class _BoundedTextHead:
+    def __init__(self, max_bytes: int, *, label: str) -> None:
+        self.max_bytes = max(max_bytes, 1)
+        self.label = label
+        self._parts: list[str] = []
+        self._bytes = 0
+        self.truncated = False
+
+    def append(self, text: str) -> None:
+        if not text or self.truncated:
+            return
+        encoded = text.encode("utf-8", errors="replace")
+        remaining = self.max_bytes - self._bytes
+        if len(encoded) <= remaining:
+            self._parts.append(text)
+            self._bytes += len(encoded)
+            return
+        if remaining > 0:
+            self._parts.append(encoded[:remaining].decode("utf-8", errors="replace"))
+            self._bytes = self.max_bytes
+        self.truncated = True
+
+    def text(self) -> str:
+        value = "".join(self._parts)
+        if self.truncated:
+            value = f"{value.rstrip()}\n[CLADEX: {self.label} truncated at {self.max_bytes} bytes]"
+        return value
+
+
+class _BoundedTextTail:
+    def __init__(self, max_bytes: int, *, label: str) -> None:
+        self.max_bytes = max(max_bytes, 1)
+        self.label = label
+        self._chunks: deque[str] = deque()
+        self._bytes = 0
+        self.truncated = False
+
+    def append(self, text: str) -> None:
+        if not text:
+            return
+        encoded = text.encode("utf-8", errors="replace")
+        if len(encoded) >= self.max_bytes:
+            self._chunks.clear()
+            self._chunks.append(encoded[-self.max_bytes :].decode("utf-8", errors="replace"))
+            self._bytes = self.max_bytes
+            self.truncated = True
+            return
+        self._chunks.append(text)
+        self._bytes += len(encoded)
+        while self._bytes > self.max_bytes and self._chunks:
+            removed = self._chunks.popleft()
+            self._bytes -= len(removed.encode("utf-8", errors="replace"))
+            self.truncated = True
+
+    def text(self) -> str:
+        value = "".join(self._chunks)
+        if self.truncated:
+            value = f"[CLADEX: earlier {self.label} truncated at {self.max_bytes} bytes]\n{value}"
+        return value
 
 
 @dataclass
@@ -362,7 +442,7 @@ class ClaudeBackend:
 
             after_changes = self._git_status(binding.worktree_path)
             changed_files = sorted(set(after_changes) | set(before_changes))
-            content = self._extract_response_text(result.stdout) if result.returncode == 0 else ""
+            content = self._response_text(result) if result.returncode == 0 else ""
 
             if self._should_retry_empty_response(result, content=content, before_changes=before_changes, after_changes=after_changes):
                 logger.warning(
@@ -381,7 +461,7 @@ class ClaudeBackend:
                 result = await self._run_turn(prompt, cwd=binding.worktree_path, persistent=persistent)
                 after_changes = self._git_status(binding.worktree_path)
                 changed_files = sorted(set(after_changes) | set(before_changes))
-                content = self._extract_response_text(result.stdout) if result.returncode == 0 else ""
+                content = self._response_text(result) if result.returncode == 0 else ""
 
             if result.returncode != 0:
                 failure_message = self._failure_text(result)
@@ -781,7 +861,14 @@ class ClaudeBackend:
                 if not line:
                     return
                 try:
-                    tail.append(line.decode("utf-8", errors="replace").rstrip())
+                    text = line.decode("utf-8", errors="replace").rstrip()
+                    tail.append(
+                        _truncate_text_to_bytes(
+                            text,
+                            _safe_int_env("CLADEX_CLAUDE_STDERR_LINE_MAX_BYTES", 8192),
+                            label="Claude stderr line",
+                        )
+                    )
                 except Exception:
                     continue
         except (asyncio.CancelledError, BrokenPipeError):
@@ -866,9 +953,20 @@ class ClaudeBackend:
                 process.stdin.write(message_line.encode("utf-8"))
                 await process.stdin.drain()
 
-                # Read responses until we get a result or error
-                stdout_lines: list[str] = []
-                stderr_parts: list[str] = []
+                # Read responses until we get a result or error. Keep raw
+                # stdout/stderr diagnostics bounded while extracting the
+                # response text incrementally from stream-json events.
+                max_capture_bytes = _safe_int_env(
+                    "CLADEX_CLAUDE_TURN_MAX_OUTPUT_BYTES",
+                    DEFAULT_CLAUDE_TURN_MAX_OUTPUT_BYTES,
+                    minimum=64 * 1024,
+                )
+                stdout_tail = _BoundedTextTail(max_capture_bytes, label="Claude stdout")
+                non_json_tail = _BoundedTextTail(max_capture_bytes, label="Claude non-JSON stdout")
+                delta_text = _BoundedTextHead(max_capture_bytes, label="Claude response")
+                result_text: str = ""
+                assistant_text: str = ""
+                error_text: str = ""
                 returncode = 0
                 final_session_id: str | None = None
 
@@ -909,12 +1007,41 @@ class ClaudeBackend:
                         if not line:
                             continue
 
-                        stdout_lines.append(line)
+                        stdout_tail.append(line + "\n")
 
                         # Parse the JSON event
                         try:
                             event = json.loads(line)
                             event_type = event.get("type", "")
+
+                            if event_type == "content_block_delta":
+                                delta = self._extract_text_from_event(event)
+                                if delta:
+                                    delta_text.append(delta)
+                            elif event_type == "result":
+                                text = self._extract_text_from_event(event)
+                                if text:
+                                    result_text = _truncate_text_to_bytes(
+                                        text,
+                                        max_capture_bytes,
+                                        label="Claude result text",
+                                    )
+                            elif event_type == "assistant":
+                                text = self._extract_text_from_event(event)
+                                if text:
+                                    assistant_text = _truncate_text_to_bytes(
+                                        text,
+                                        max_capture_bytes,
+                                        label="Claude assistant text",
+                                    )
+                            elif event_type == "error":
+                                text = self._extract_text_from_event(event)
+                                if text:
+                                    error_text = _truncate_text_to_bytes(
+                                        text,
+                                        max_capture_bytes,
+                                        label="Claude error text",
+                                    )
 
                             # Check for result (turn complete)
                             if event_type == "result":
@@ -930,28 +1057,31 @@ class ClaudeBackend:
 
                         except json.JSONDecodeError:
                             # Non-JSON output goes to stderr
-                            stderr_parts.append(line)
+                            non_json_tail.append(line + "\n")
 
                 except asyncio.TimeoutError:
                     stderr_tail = "\n".join(persistent.stderr_tail)
                     timeout_message = "Claude turn timed out after 10 minutes"
                     if stderr_tail:
                         timeout_message = f"{timeout_message}\n{stderr_tail}"
+                    response_text = (delta_text.text() or result_text or assistant_text or error_text).strip()
                     await self._terminate_process(persistent)
                     return CommandResult(
                         args=cmd_display,
                         returncode=1,
-                        stdout="\n".join(stdout_lines),
+                        stdout=stdout_tail.text(),
                         stderr=timeout_message,
                         used_resume=used_resume,
+                        response_text=response_text or None,
                     )
 
                 # Update session if we got a new ID
                 if final_session_id and final_session_id != persistent.session.session_id:
                     persistent.session.adopt(final_session_id, initialized=returncode == 0)
 
-                stdout = "\n".join(stdout_lines)
-                stderr = "\n".join(stderr_parts)
+                stdout = stdout_tail.text()
+                stderr = non_json_tail.text()
+                response_text = (delta_text.text() or result_text or assistant_text or error_text).strip()
 
                 return CommandResult(
                     args=cmd_display,
@@ -959,6 +1089,7 @@ class ClaudeBackend:
                     stdout=stdout,
                     stderr=stderr,
                     used_resume=used_resume,
+                    response_text=response_text or None,
                 )
 
             except Exception as exc:
@@ -989,6 +1120,11 @@ class ClaudeBackend:
             except json.JSONDecodeError:
                 continue
         return None
+
+    def _response_text(self, result: CommandResult) -> str:
+        if result.response_text is not None:
+            return result.response_text.strip()
+        return self._extract_response_text(result.stdout)
 
     def _extract_response_text(self, stdout: str) -> str:
         delta_parts: list[str] = []
@@ -1326,7 +1462,11 @@ class RelayBackend:
             on_status=self._on_status,
         )
 
-        self._message_queue: asyncio.Queue[InboundMessage] = asyncio.Queue()
+        self._message_queue_limit = _safe_int_env(
+            "CLADEX_CLAUDE_INBOUND_QUEUE_MAX",
+            DEFAULT_CLAUDE_INBOUND_QUEUE_MAX,
+        )
+        self._message_queue: asyncio.Queue[InboundMessage] = asyncio.Queue(maxsize=self._message_queue_limit)
         self._worker_task: asyncio.Task | None = None
         self._pending_local: dict[str, asyncio.Future[str]] = {}
 
@@ -1349,6 +1489,22 @@ class RelayBackend:
     @property
     def configured_model(self) -> str:
         return self._claude.configured_model
+
+    @property
+    def queue_depth(self) -> int:
+        return self._message_queue.qsize()
+
+    @property
+    def queue_limit(self) -> int:
+        return self._message_queue_limit
+
+    @property
+    def queue_status(self) -> dict[str, int | bool]:
+        return {
+            "depth": self.queue_depth,
+            "limit": self.queue_limit,
+            "full": self._message_queue.full(),
+        }
 
     def _route_response(self, msg: OutboundMessage) -> None:
         if msg.channel_type == ChannelType.DISCORD:
@@ -1391,6 +1547,16 @@ class RelayBackend:
                 pass
         await self._claude.stop()
 
+    def _enqueue_message(self, msg: InboundMessage) -> bool:
+        try:
+            self._message_queue.put_nowait(msg)
+            return True
+        except asyncio.QueueFull:
+            self._on_status(
+                f"ERROR: Claude inbound queue full ({self.queue_depth}/{self.queue_limit}); dropping incoming message."
+            )
+            return False
+
     async def send_discord_message(
         self,
         channel_id: str,
@@ -1398,8 +1564,8 @@ class RelayBackend:
         sender_name: str,
         content: str,
         message_id: str = "",
-    ) -> None:
-        await self._message_queue.put(
+    ) -> bool:
+        return self._enqueue_message(
             InboundMessage(
                 channel_type=ChannelType.DISCORD,
                 channel_id=channel_id,
@@ -1422,7 +1588,7 @@ class RelayBackend:
         loop = asyncio.get_running_loop()
         future: asyncio.Future[str] = loop.create_future()
         self._pending_local[request_id] = future
-        await self._message_queue.put(
+        queued = self._enqueue_message(
             InboundMessage(
                 channel_type=ChannelType.GUI,
                 channel_id=channel_id,
@@ -1432,6 +1598,9 @@ class RelayBackend:
                 message_id=request_id,
             )
         )
+        if not queued:
+            self._pending_local.pop(request_id, None)
+            raise RuntimeError(f"Claude inbound queue full ({self.queue_depth}/{self.queue_limit}).")
         try:
             return await asyncio.wait_for(future, timeout=600)
         finally:
@@ -1439,16 +1608,26 @@ class RelayBackend:
 
     async def _process_messages(self) -> None:
         while True:
+            msg: InboundMessage | None = None
             try:
                 msg = await self._message_queue.get()
+                self._on_status(
+                    f"Claude working on queued message (queue depth {self.queue_depth}/{self.queue_limit})."
+                )
                 ok = await self._claude.process_message(msg)
                 if msg.channel_type == ChannelType.GUI:
                     future = self._pending_local.get(msg.message_id)
                     if future and not future.done() and not ok:
                         future.set_exception(RuntimeError("Claude local operator turn failed."))
-                self._message_queue.task_done()
             except asyncio.CancelledError:
                 break
             except Exception as exc:
                 logger.exception("Error processing message")
                 self._on_status(f"ERROR: {exc}")
+            finally:
+                if msg is not None:
+                    self._message_queue.task_done()
+                    if self.queue_depth:
+                        self._on_status(
+                            f"Claude queue depth {self.queue_depth}/{self.queue_limit}."
+                        )

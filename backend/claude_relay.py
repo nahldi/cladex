@@ -19,6 +19,7 @@ import asyncio
 import getpass
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -83,11 +84,29 @@ def _load_env_file(path: Path) -> dict[str, str]:
     return env
 
 
+_ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _sanitize_env_value(key: str, value: str) -> str:
+    text = "" if value is None else str(value)
+    if "\x00" in text or "\r" in text or "\n" in text:
+        raise ValueError(
+            f"Profile env value for {key!r} contains forbidden control characters; "
+            "newline/carriage-return injection could create new settings on reload."
+        )
+    return text
+
+
 def _write_env_file(path: Path, env: dict[str, str]) -> None:
     """Write .env file with ordered keys."""
-    ordered_keys = [key for key in ENV_KEY_ORDER if key in env]
-    ordered_keys.extend(sorted(key for key in env if key not in ordered_keys))
-    lines = [f"{key}={env[key]}" for key in ordered_keys]
+    safe_env: dict[str, str] = {}
+    for key, value in env.items():
+        if not _ENV_KEY_RE.match(str(key)):
+            raise ValueError(f"Refusing to persist profile env key with unsupported characters: {key!r}")
+        safe_env[str(key)] = _sanitize_env_value(str(key), value)
+    ordered_keys = [key for key in ENV_KEY_ORDER if key in safe_env]
+    ordered_keys.extend(sorted(key for key in safe_env if key not in ordered_keys))
+    lines = [f"{key}={safe_env[key]}" for key in ordered_keys]
     atomic_write_text(path, "\n".join(lines) + "\n")
     try:
         path.chmod(0o600)
@@ -127,6 +146,22 @@ def _require_workspace_allowed(workspace: Path, env: dict[str, str] | None = Non
         raise SystemExit(str(exc)) from exc
 
 
+def _env_flag_enabled(value: str | None) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _require_profile_access_invariant(env: dict[str, str]) -> None:
+    allow_dms = _env_flag_enabled(env.get("ALLOW_DMS"))
+    channel_ids = _parse_csv_ids(env.get("ALLOWED_CHANNEL_IDS", ""))
+    user_ids = _parse_csv_ids(env.get("ALLOWED_USER_IDS", ""))
+    operator_ids = _parse_csv_ids(env.get("OPERATOR_IDS", ""))
+    approved = _parse_csv_ids(",".join(part for part in (user_ids, operator_ids) if part))
+    if allow_dms and not approved:
+        raise SystemExit("ALLOW_DMS=true requires at least one approved numeric user or operator id.")
+    if not channel_ids and not approved:
+        raise SystemExit("Claude profiles require at least one numeric allowed channel id or approved numeric sender id.")
+
+
 def _profile_from_env(env: dict[str, str]) -> dict:
     """Create profile dict from env."""
     workspace = Path(env["CLAUDE_WORKDIR"]).resolve()
@@ -153,6 +188,7 @@ def _profile_from_env(env: dict[str, str]) -> dict:
     normalized["ALLOWED_CHANNEL_IDS"] = _parse_csv_ids(normalized.get("ALLOWED_CHANNEL_IDS", ""))
     normalized["CLAUDE_MODEL"] = (normalized.get("CLAUDE_MODEL", "") or "").strip()
     normalized["CLAUDE_PERMISSION_MODE"] = (normalized.get("CLAUDE_PERMISSION_MODE", "default") or "default").strip()
+    _require_profile_access_invariant(normalized)
 
     PROFILES_DIR.mkdir(parents=True, exist_ok=True)
     _write_env_file(profile_env_path, normalized)
@@ -334,6 +370,25 @@ def cmd_register(args: argparse.Namespace) -> int:
         )
         return 2
     args.discord_bot_token = discord_bot_token
+
+    def _reject_non_numeric_csv(value: str | None, flag_name: str) -> None:
+        if not value:
+            return
+        for raw in str(value).split(","):
+            text = raw.strip()
+            if text and not text.isdigit():
+                print(
+                    f"[ERR] {flag_name} expects numeric Discord IDs; received {text!r}. "
+                    "Non-numeric IDs are silently dropped during normalization, which "
+                    "can leave the profile with an empty allowlist.",
+                    file=sys.stderr,
+                )
+                raise SystemExit(2)
+
+    _reject_non_numeric_csv(args.allowed_channel_id, "--allowed-channel-id")
+    _reject_non_numeric_csv(args.allowed_user_ids, "--allowed-user-ids")
+    _reject_non_numeric_csv(args.operator_ids, "--operator-ids")
+    _reject_non_numeric_csv(getattr(args, "allowed_bot_ids", None), "--allowed-bot-ids")
 
     allowed_channel_ids = _parse_csv_ids(args.allowed_channel_id or "")
     allowed_user_ids = _parse_csv_ids(args.allowed_user_ids or args.operator_ids or "")
@@ -524,6 +579,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         return 1
 
     env = _load_env_file(env_file)
+    _require_profile_access_invariant(env)
     _require_workspace_allowed(workspace, env)
 
     # Create state directory

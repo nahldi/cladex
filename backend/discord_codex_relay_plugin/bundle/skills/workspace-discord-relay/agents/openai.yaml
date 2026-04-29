@@ -5,4 +5,4 @@ interface:
   default_prompt: "Use $workspace-discord-relay to install, run, update, repair, or extend the Discord Codex relay for this workspace."
 
 policy:
-  allow_implicit_invocation: true
+  allow_implicit_invocation: false

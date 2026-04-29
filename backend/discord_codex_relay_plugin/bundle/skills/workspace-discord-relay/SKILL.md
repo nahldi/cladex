@@ -1,11 +1,11 @@
 ---
 name: workspace-discord-relay
-description: Install, register, run, inspect, repair, or reset the local Discord Codex relay from the current workspace with `codex-discord`. Use this when Codex should set up or manage a Discord transport for the current workspace, check relay health, or recover a broken relay session.
+description: Explicitly invoked management surface for installing, registering, running, inspecting, repairing, or resetting the local Discord Codex relay from the current workspace with `codex-discord`. Use only when the user directly asks to manage the relay.
 ---
 
 # Workspace Discord Relay
 
-Use this when Codex should run or manage the Discord relay from the current workspace.
+Use this only when the user explicitly asks Codex to run or manage the Discord relay from the current workspace. Do not invoke this skill because of workspace instructions alone; install, register, update, restart, reset, and skill-install commands mutate local relay state.
 
 Common commands:
 

@@ -10,6 +10,7 @@ import pytest
 from relay_backend import (
     AppServerCodexBackend,
     AppServerProtocolError,
+    BackendUnavailableError,
     CliResumeCodexBackend,
     build_thread_list_params,
     build_thread_resume_params,
@@ -225,3 +226,68 @@ def test_cli_resume_backend_builds_real_exec_commands(monkeypatch: pytest.Monkey
     assert review[:2] == ["codex.exe", "review"]
     assert "--json" in fresh
     assert "--dangerously-bypass-approvals-and-sandbox" in fresh
+
+
+def test_cli_resume_backend_terminates_process_tree_when_output_truncates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = SimpleNamespace(
+        config=SimpleNamespace(codex_full_access=False, state_dir=tmp_path / "state"),
+        _configured_model=lambda: "",
+        _runtime_workdir=lambda: tmp_path,
+    )
+    backend = CliResumeCodexBackend(session, state_store=SimpleNamespace(list_threads_for_project=lambda project_id: []))
+    backend.codex_bin = "codex"
+    monkeypatch.setenv("CLADEX_CODEX_FALLBACK_MAX_OUTPUT_BYTES", str(256 * 1024))
+    monkeypatch.setattr("relay_backend.relay_codex_env", lambda workspace, env: env)
+
+    class _FakeStdin:
+        def write(self, data: bytes) -> None:
+            return None
+
+        async def drain(self) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    class _FakeStdout:
+        def __init__(self) -> None:
+            self._sent = False
+
+        async def read(self, size: int) -> bytes:
+            if self._sent:
+                return b""
+            self._sent = True
+            return b"x" * (300 * 1024)
+
+    class _FakeProcess:
+        pid = 4321
+        stdin = _FakeStdin()
+        stdout = _FakeStdout()
+        returncode = None
+        killed = False
+
+        def kill(self) -> None:
+            self.killed = True
+            self.returncode = -9
+
+        async def wait(self) -> int:
+            self.returncode = -15 if self.returncode is None else self.returncode
+            return self.returncode
+
+    process = _FakeProcess()
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        return process
+
+    terminated: list[int] = []
+    monkeypatch.setattr("relay_backend.asyncio.create_subprocess_exec", fake_create_subprocess_exec)
+    monkeypatch.setattr("relay_backend.terminate_process_tree", lambda pid: terminated.append(pid) or True)
+
+    with pytest.raises(BackendUnavailableError):
+        asyncio.run(backend._run_cli_turn(prompt_text="prompt"))
+
+    assert terminated == [4321]
+    assert process.killed is False

@@ -7,6 +7,13 @@ from types import SimpleNamespace
 import cladex
 
 
+CLAUDE_SAFE_ENV = {
+    "DISCORD_BOT_TOKEN": "test",
+    "ALLOWED_CHANNEL_IDS": "123",
+    "ALLOW_DMS": "false",
+}
+
+
 def test_get_all_profiles_uses_codex_runtime_state(monkeypatch) -> None:
     codex_profile = {
         "name": "codex-one",
@@ -55,7 +62,7 @@ def test_start_claude_profile_uses_existing_runtime(tmp_path: Path, monkeypatch)
 
     monkeypatch.setattr(cladex.relayctl.install_plugin, "runtime_python_path", lambda: runtime_python)
     monkeypatch.setattr(cladex, "_claude_state_dir", lambda profile: state_dir)
-    monkeypatch.setattr(cladex, "_load_claude_env", lambda profile: {"DISCORD_BOT_TOKEN": "test"})
+    monkeypatch.setattr(cladex, "_load_claude_env", lambda profile: dict(CLAUDE_SAFE_ENV))
     monkeypatch.setattr(cladex.relayctl, "_background_python_windowless_executable", lambda: "pythonw.exe")
     monkeypatch.setattr(
         cladex.subprocess,
@@ -99,7 +106,7 @@ def test_start_claude_profile_bootstraps_missing_runtime(tmp_path: Path, monkeyp
     monkeypatch.setattr(cladex.relayctl.install_plugin, "_install_source", lambda: "local")
     monkeypatch.setattr(cladex.relayctl.install_plugin, "_ensure_runtime", fake_ensure_runtime)
     monkeypatch.setattr(cladex, "_claude_state_dir", lambda profile: state_dir)
-    monkeypatch.setattr(cladex, "_load_claude_env", lambda profile: {"DISCORD_BOT_TOKEN": "test"})
+    monkeypatch.setattr(cladex, "_load_claude_env", lambda profile: dict(CLAUDE_SAFE_ENV))
     monkeypatch.setattr(cladex.relayctl, "_background_python_windowless_executable", lambda: "pythonw.exe")
     monkeypatch.setattr(
         cladex.subprocess,
@@ -120,6 +127,133 @@ def test_start_claude_profile_bootstraps_missing_runtime(tmp_path: Path, monkeyp
     # Should have called _ensure_runtime since runtime was missing
     assert ensure_runtime_calls == ["local"]
     assert launches == [["pythonw.exe", cladex._backend_script_path("claude_bot.py")]]
+
+
+def test_start_claude_profile_returns_when_already_running(tmp_path: Path, monkeypatch) -> None:
+    env_file = tmp_path / "forge.env"
+    env_file.write_text("DISCORD_BOT_TOKEN=test\n", encoding="utf-8")
+    workspace = tmp_path / "forge"
+    workspace.mkdir()
+    state_dir = tmp_path / "state"
+    launches: list[list[str]] = []
+    runtime_checks: list[str] = []
+    runtime_bootstraps: list[bool] = []
+
+    monkeypatch.setattr(cladex, "_claude_state_dir", lambda profile: state_dir)
+    monkeypatch.setattr(cladex, "_load_claude_env", lambda profile: dict(CLAUDE_SAFE_ENV))
+    monkeypatch.setattr(
+        cladex,
+        "_claude_profile_runtime_state",
+        lambda profile: runtime_checks.append(profile["name"]) or {"running": True, "ready": True},
+    )
+    monkeypatch.setattr(cladex, "_ensure_claude_background_runtime", lambda: runtime_bootstraps.append(True))
+    monkeypatch.setattr(
+        cladex.subprocess,
+        "Popen",
+        lambda command, **kwargs: launches.append(command) or SimpleNamespace(pid=321),
+    )
+
+    profile = {
+        "name": "forge-ce0eef1b-09de",
+        "_relay_type": "claude",
+        "workspace": str(workspace),
+        "env_file": str(env_file),
+        "state_namespace": "forge-ce0eef1b",
+    }
+
+    cladex.start_profile(profile)
+
+    assert runtime_checks == ["forge-ce0eef1b-09de"]
+    assert launches == []
+    assert runtime_bootstraps == []
+
+
+def test_start_claude_profile_rejects_existing_empty_allowlists(tmp_path: Path, monkeypatch) -> None:
+    import pytest
+
+    env_file = tmp_path / "forge.env"
+    env_file.write_text("DISCORD_BOT_TOKEN=test\n", encoding="utf-8")
+    workspace = tmp_path / "forge"
+    workspace.mkdir()
+
+    monkeypatch.setattr(cladex, "_load_claude_env", lambda profile: {"DISCORD_BOT_TOKEN": "test"})
+
+    profile = {
+        "name": "forge-ce0eef1b-09de",
+        "_relay_type": "claude",
+        "workspace": str(workspace),
+        "env_file": str(env_file),
+        "state_namespace": "forge-ce0eef1b",
+    }
+
+    with pytest.raises(ValueError, match="Claude profiles require"):
+        cladex.start_profile(profile)
+
+
+def test_start_claude_profile_rejects_non_directory_workspace(tmp_path: Path, monkeypatch) -> None:
+    import pytest
+
+    env_file = tmp_path / "forge.env"
+    env_file.write_text("DISCORD_BOT_TOKEN=test\nALLOWED_CHANNEL_IDS=1234567890\n", encoding="utf-8")
+    workspace_file = tmp_path / "forge.txt"
+    workspace_file.write_text("not a directory", encoding="utf-8")
+    launches: list[list[str]] = []
+
+    monkeypatch.setattr(
+        cladex,
+        "_load_claude_env",
+        lambda profile: {"DISCORD_BOT_TOKEN": "test", "ALLOWED_CHANNEL_IDS": "1234567890"},
+    )
+    monkeypatch.setattr(
+        cladex.subprocess,
+        "Popen",
+        lambda command, **kwargs: launches.append(command) or SimpleNamespace(pid=321),
+    )
+
+    profile = {
+        "name": "forge-ce0eef1b-09de",
+        "_relay_type": "claude",
+        "workspace": str(workspace_file),
+        "env_file": str(env_file),
+        "state_namespace": "forge-ce0eef1b",
+    }
+
+    with pytest.raises(ValueError) as excinfo:
+        cladex.start_profile(profile)
+
+    assert "workspace does not exist or is not a directory" in str(excinfo.value)
+    assert launches == []
+
+
+def test_claude_runtime_state_cleans_duplicate_namespace_workers(tmp_path: Path, monkeypatch) -> None:
+    data_root = tmp_path / "data"
+    state_dir = data_root / "state" / "ns-dup"
+    state_dir.mkdir(parents=True)
+    (state_dir / "relay.pid").write_text("222", encoding="utf-8")
+    (state_dir / "status.json").write_text(json.dumps({"status": "ready"}), encoding="utf-8")
+    live_pids = {111, 222}
+    killed: list[int] = []
+
+    monkeypatch.setattr(cladex, "CLAUDE_DATA_ROOT", data_root)
+    monkeypatch.setattr(cladex, "_discovered_claude_bot_pids", lambda profile: [111, 222])
+    monkeypatch.setattr(cladex.psutil, "pid_exists", lambda pid: pid in live_pids)
+
+    def fake_terminate(pid: int) -> bool:
+        killed.append(pid)
+        live_pids.discard(pid)
+        return True
+
+    monkeypatch.setattr(cladex.relayctl, "terminate_process_tree", fake_terminate)
+    monkeypatch.setattr(cladex.relayctl, "_wait_for_process_exit", lambda pid, timeout_seconds=5.0: None)
+
+    state = cladex._claude_profile_runtime_state({"state_namespace": "ns-dup"})
+
+    assert killed == [111]
+    assert state["running"] is True
+    assert state["ready"] is True
+    assert state["pid"] == 222
+    assert state["pids"] == [222]
+    assert (state_dir / "relay.pid").read_text(encoding="utf-8") == "222"
 
 
 
@@ -180,6 +314,27 @@ def test_doctor_codex_account_parses_app_server_responses(monkeypatch) -> None:
     assert result["account"]["planType"] == "Plus"
     assert result["rateLimits"]["primary"]["limit"] == 100
     assert "plan=Plus" in result["detail"]
+
+
+def test_doctor_required_version_fails_below_declared_floor(monkeypatch) -> None:
+    monkeypatch.setattr(
+        cladex,
+        "_doctor_command",
+        lambda command: {"ok": True, "output": "v20.11.0\n"},
+    )
+
+    result = cladex._doctor_required_version("node", ["node", "--version"], minimum="22.12.0")
+
+    assert result["ok"] is False
+    assert result["requiredVersion"] == ">=22.12.0"
+    assert "below required" in result["detail"]
+
+
+def test_doctor_python_version_uses_declared_floor() -> None:
+    result = cladex._doctor_runtime_version("python", "3.9.18", "python.exe", minimum="3.10")
+
+    assert result["ok"] is False
+    assert result["requiredVersion"] == ">=3.10"
 
 
 def test_update_claude_profile_persists_via_local_save(tmp_path: Path, monkeypatch) -> None:
@@ -297,6 +452,23 @@ def test_stop_claude_profile_terminates_pid(monkeypatch) -> None:
     assert killed == [4321]
 
 
+def test_stop_claude_profile_terminates_duplicate_pids(tmp_path: Path, monkeypatch) -> None:
+    killed: list[int] = []
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    (state_dir / "relay.pid").write_text("222", encoding="utf-8")
+    monkeypatch.setattr(cladex, "_claude_state_dir", lambda profile: state_dir)
+    monkeypatch.setattr(cladex, "_claude_profile_runtime_state", lambda profile: {"pid": 222, "pids": [111, 222]})
+    monkeypatch.setattr(cladex.relayctl, "terminate_process_tree", lambda pid: killed.append(pid) or True)
+    monkeypatch.setattr(cladex.relayctl, "_wait_for_process_exit", lambda pid, timeout_seconds=5.0: None)
+
+    profile = {"name": "claude-one", "_relay_type": "claude", "workspace": "C:/claude", "state_namespace": "ns"}
+    cladex.stop_profile(profile)
+
+    assert killed == [111, 222]
+    assert not (state_dir / "relay.pid").exists()
+
+
 def test_load_claude_registry_is_tolerant(tmp_path: Path, monkeypatch) -> None:
     path = tmp_path / "workspaces.json"
     path.write_text(json.dumps({"profiles": [{"name": "x"}]}), encoding="utf-8")
@@ -401,6 +573,28 @@ def test_cmd_doctor_json_reports_profile_port_collisions(monkeypatch, capsys) ->
         cladex,
         "_doctor_version",
         lambda name, command: {"name": name, "ok": True, "version": "test", "detail": ""},
+    )
+    monkeypatch.setattr(
+        cladex,
+        "_doctor_required_version",
+        lambda name, command, minimum: {
+            "name": name,
+            "ok": True,
+            "version": "test",
+            "requiredVersion": f">={minimum}",
+            "detail": "",
+        },
+    )
+    monkeypatch.setattr(
+        cladex,
+        "_doctor_runtime_version",
+        lambda name, version, detail, minimum: {
+            "name": name,
+            "ok": True,
+            "version": version,
+            "requiredVersion": f">={minimum}",
+            "detail": detail,
+        },
     )
     monkeypatch.setattr(
         cladex,
@@ -556,6 +750,119 @@ def test_cmd_update_passes_fields_to_update_profile(monkeypatch, capsys) -> None
     assert updated[0][1]["bot_name"] == "Tyson"
     assert updated[0][1]["allow_dms"] is True
     assert "Updated codex-one [codex]." in capsys.readouterr().out
+
+
+def test_update_profile_rejects_non_numeric_user_ids(monkeypatch) -> None:
+    """F0004: PATCH /api/profiles forwards the raw allowed-user CSV; the
+    update path must reject non-numeric IDs rather than silently dropping
+    them via _parse_csv_ids and leaving an empty allowlist."""
+    profile = {
+        "name": "codex-one",
+        "_relay_type": "codex",
+        "workspace": "C:/repo",
+        "env_file": "C:/repo/.env",
+    }
+
+    import pytest
+
+    with pytest.raises(ValueError) as excinfo:
+        cladex.update_profile(profile, allowed_user_ids="not-a-discord-id")
+    assert "numeric Discord IDs" in str(excinfo.value)
+
+
+def test_update_profile_rejects_non_numeric_channel_id(monkeypatch) -> None:
+    profile = {
+        "name": "claude-one",
+        "_relay_type": "claude",
+        "workspace": "C:/repo",
+        "env_file": "C:/repo/.env",
+    }
+
+    import pytest
+
+    with pytest.raises(ValueError) as excinfo:
+        cladex.update_profile(profile, allowed_channel_id="general")
+    assert "numeric Discord IDs" in str(excinfo.value)
+
+
+def test_update_profile_rejects_invalid_channel_history_limit(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    env_file = tmp_path / "codex.env"
+    env_file.write_text(
+        "\n".join(
+            [
+                "DISCORD_BOT_TOKEN=token-value",
+                f"CODEX_WORKDIR={workspace}",
+                "ALLOWED_CHANNEL_IDS=1234567890",
+                "STATE_NAMESPACE=test-history-limit",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    profile = {"name": "codex-one", "_relay_type": "codex", "workspace": str(workspace), "env_file": str(env_file)}
+
+    import pytest
+
+    with pytest.raises(ValueError) as excinfo:
+        cladex.update_profile(profile, channel_history_limit="many")
+    assert "channelHistoryLimit" in str(excinfo.value)
+
+
+def test_update_profile_rejects_missing_workspace_before_persist(tmp_path: Path, monkeypatch) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    missing_workspace = tmp_path / "missing"
+    env_file = tmp_path / "codex.env"
+    env_file.write_text(
+        "\n".join(
+            [
+                "DISCORD_BOT_TOKEN=token-value",
+                f"CODEX_WORKDIR={workspace}",
+                "ALLOWED_CHANNEL_IDS=1234567890",
+                "STATE_NAMESPACE=test-missing-workspace",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    profile = {"name": "codex-one", "_relay_type": "codex", "workspace": str(workspace), "env_file": str(env_file)}
+    persisted: list[dict] = []
+    monkeypatch.setattr(cladex.relayctl, "_replace_profile_registration", lambda previous, new: persisted.append(new))
+
+    import pytest
+
+    with pytest.raises(ValueError) as excinfo:
+        cladex.update_profile(profile, workspace=str(missing_workspace))
+
+    assert "workspace does not exist or is not a directory" in str(excinfo.value)
+    assert persisted == []
+
+
+def test_cmd_update_returns_error_for_invalid_id(monkeypatch, capsys) -> None:
+    """F0004: Invalid Discord IDs in cmd_update should surface as a clear
+    JSON error (status 2) rather than a stack trace, so the API can map them
+    to a 4xx response."""
+    profile = {"name": "codex-one", "_relay_type": "codex", "workspace": "C:/repo", "env_file": "C:/repo/.env"}
+    monkeypatch.setattr(cladex, "_filter_profiles", lambda name=None, relay_type=None: [profile])
+
+    rc = cladex.cmd_update(
+        SimpleNamespace(
+            name="codex-one",
+            type="codex",
+            allow_dms=True,
+            deny_dms=False,
+            allowed_user_ids="not-a-discord-id",
+            allowed_channel_id=None,
+            json=True,
+        )
+    )
+
+    assert rc == 2
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["success"] is False
+    assert "numeric Discord IDs" in payload["error"]
 
 
 def test_project_list_json(monkeypatch, capsys) -> None:

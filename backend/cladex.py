@@ -115,6 +115,50 @@ def _claude_state_dir(profile: dict[str, Any]) -> Path:
     return CLAUDE_DATA_ROOT / "state" / namespace
 
 
+def _read_claude_pid_file(path: Path) -> int | None:
+    if not path.exists():
+        return None
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return int(text) if text.isdigit() else None
+
+
+def _discovered_claude_bot_pids(profile: dict[str, Any]) -> list[int]:
+    namespace = str(profile.get("state_namespace", "")).strip()
+    if not namespace:
+        return []
+    bot_script = str(Path(_backend_script_path("claude_bot.py")).resolve()).lower()
+    pids: set[int] = set()
+    for proc in psutil.process_iter(["pid", "cmdline"]):
+        try:
+            cmdline_items = proc.info.get("cmdline") or []
+            cmdline = " ".join(cmdline_items).lower()
+        except (psutil.Error, OSError):
+            continue
+        if not cmdline:
+            continue
+        is_claude_bot = bot_script in cmdline or " -m claude_bot " in f" {cmdline} "
+        if not is_claude_bot:
+            continue
+        try:
+            proc_env = proc.environ()
+        except (psutil.Error, OSError):
+            proc_env = {}
+        if str(proc_env.get("STATE_NAMESPACE", "")).strip() == namespace:
+            pids.add(int(proc.info["pid"]))
+    return sorted(pids)
+
+
+def _cleanup_duplicate_claude_bot_pids(pids: list[int], keep_pid: int | None) -> None:
+    for pid in sorted(set(pids)):
+        if pid == keep_pid:
+            continue
+        relayctl.terminate_process_tree(pid)
+        relayctl._wait_for_process_exit(pid, timeout_seconds=5.0)
+
+
 def _workspace_label(workspace: str) -> str:
     text = str(workspace or "").strip()
     if not text:
@@ -171,6 +215,8 @@ def _claude_profile_runtime_state(profile: dict[str, Any]) -> dict[str, Any]:
     pid_file = state_dir / "relay.pid"
     log_path = state_dir / "relay.log"
     status_file = state_dir / "status.json"
+    file_pid = _read_claude_pid_file(pid_file)
+    discovered_pids = _discovered_claude_bot_pids(profile)
     pid: int | None = None
     running = False
     ready = False
@@ -181,12 +227,22 @@ def _claude_profile_runtime_state(profile: dict[str, Any]) -> dict[str, Any]:
     active_channel = ""
     model = ""
     effort = ""
-    if pid_file.exists():
-        try:
-            pid = int(pid_file.read_text(encoding="utf-8").strip())
-        except Exception:
-            pid = None
+    if discovered_pids:
+        if file_pid in discovered_pids and psutil.pid_exists(file_pid):
+            pid = file_pid
+        else:
+            pid = max(discovered_pids)
+        _cleanup_duplicate_claude_bot_pids(discovered_pids, pid)
+        discovered_pids = [item for item in discovered_pids if item == pid or psutil.pid_exists(item)]
         running = pid is not None and psutil.pid_exists(pid)
+        if running and file_pid != pid:
+            pid_file.parent.mkdir(parents=True, exist_ok=True)
+            pid_file.write_text(str(pid), encoding="utf-8")
+    else:
+        pid = file_pid
+        running = pid is not None and psutil.pid_exists(pid)
+        if pid_file.exists() and not running:
+            pid_file.unlink(missing_ok=True)
     if status_file.exists():
         try:
             status_payload = json.loads(status_file.read_text(encoding="utf-8"))
@@ -215,6 +271,7 @@ def _claude_profile_runtime_state(profile: dict[str, Any]) -> dict[str, Any]:
         "running": running,
         "ready": ready,
         "pid": pid,
+        "pids": sorted(set(discovered_pids + ([pid] if pid else []))),
         "log_path": log_path,
         "state_dir": state_dir,
         "state": state,
@@ -361,7 +418,6 @@ def start_profile(profile: dict[str, Any], *, start_reason: str = "operator-star
         return
     if relay_type != "claude":
         raise RuntimeError(f"Unknown relay type: {relay_type}")
-    _ensure_claude_background_runtime()
 
     # Load env from env_file
     env_file = profile.get("env_file", "")
@@ -369,49 +425,68 @@ def start_profile(profile: dict[str, Any], *, start_reason: str = "operator-star
         raise RuntimeError(f"Config file not found: {env_file}")
 
     env = _load_claude_env(profile)
-    workspace = str(profile.get("workspace", "") or Path.cwd())
-    assert_workspace_allowed(Path(workspace), env=env)
+    workspace_path = _resolve_existing_workspace(str(profile.get("workspace", "") or Path.cwd()))
+    workspace = str(workspace_path)
+    _require_profile_access_invariant("claude", env)
+    assert_workspace_allowed(workspace_path, env=env)
     state_namespace = str(profile.get("state_namespace", "")).strip()
 
     # Create state directory
     state_dir = _claude_state_dir(profile)
     state_dir.mkdir(parents=True, exist_ok=True)
 
-    # Set up environment for bot
-    run_env = os.environ.copy()
-    run_env.update(env)
-    run_env["CLAUDE_WORKDIR"] = workspace
-    run_env["STATE_NAMESPACE"] = state_namespace
-    run_env["CLADEX_START_REASON"] = start_reason
+    launch_lock = None
+    try:
+        try:
+            launch_lock = relayctl._acquire_pid_lock(relayctl._launch_lock_path(state_dir))
+        except OSError:
+            return
 
-    # Log file
-    log_file = state_dir / "relay.log"
-    log_handle = log_file.open("a")
+        runtime = _claude_profile_runtime_state(profile)
+        if runtime["running"]:
+            return
 
-    # Launch bot.py in background
-    popen_kwargs: dict[str, Any] = {
-        "cwd": workspace,
-        "env": run_env,
-        "stdout": log_handle,
-        "stderr": subprocess.STDOUT,
-        "stdin": subprocess.DEVNULL,
-        "close_fds": True,
-    }
-    if os.name == "nt":
-        popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
-    else:
-        popen_kwargs["start_new_session"] = True
+        _ensure_claude_background_runtime()
 
-    bot_script = _backend_script_path("claude_bot.py")
-    process = subprocess.Popen(
-        [relayctl._background_python_windowless_executable(), bot_script],
-        **popen_kwargs,
-    )
-    log_handle.close()
+        # Set up environment for bot
+        run_env = os.environ.copy()
+        run_env.update(env)
+        run_env["CLAUDE_WORKDIR"] = workspace
+        run_env["STATE_NAMESPACE"] = state_namespace
+        run_env["CLADEX_START_REASON"] = start_reason
 
-    # Write PID file
-    pid_file = state_dir / "relay.pid"
-    pid_file.write_text(str(process.pid))
+        # Log file
+        log_file = state_dir / "relay.log"
+        log_handle = log_file.open("a")
+
+        # Launch bot.py in background
+        popen_kwargs: dict[str, Any] = {
+            "cwd": workspace,
+            "env": run_env,
+            "stdout": log_handle,
+            "stderr": subprocess.STDOUT,
+            "stdin": subprocess.DEVNULL,
+            "close_fds": True,
+        }
+        if os.name == "nt":
+            popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            popen_kwargs["start_new_session"] = True
+
+        bot_script = _backend_script_path("claude_bot.py")
+        try:
+            process = subprocess.Popen(
+                [relayctl._background_python_windowless_executable(), bot_script],
+                **popen_kwargs,
+            )
+        finally:
+            log_handle.close()
+
+        # Write PID file
+        pid_file = state_dir / "relay.pid"
+        pid_file.write_text(str(process.pid))
+    finally:
+        relayctl._release_pid_lock(launch_lock)
 
 
 def stop_profile(profile: dict[str, Any]) -> None:
@@ -422,11 +497,16 @@ def stop_profile(profile: dict[str, Any]) -> None:
     if relay_type != "claude":
         raise RuntimeError(f"Unknown relay type: {relay_type}")
 
-    # Terminate process using PID file
+    # Terminate every worker discovered for this state namespace, including
+    # relays orphaned by an overwritten relay.pid.
     runtime = _claude_profile_runtime_state(profile)
+    candidate_pids = set(runtime.get("pids", []))
     pid = runtime.get("pid")
     if pid:
+        candidate_pids.add(pid)
+    for pid in sorted(candidate_pids):
         relayctl.terminate_process_tree(pid)
+        relayctl._wait_for_process_exit(pid, timeout_seconds=5.0)
 
     # Clean up PID file
     pid_file = _claude_state_dir(profile) / "relay.pid"
@@ -597,6 +677,73 @@ def _update_profile_registry(registry: dict[str, Any], *, name: str, changes: di
             return
 
 
+def _numeric_csv_ids(value: str | None) -> list[str]:
+    return [part.strip() for part in str(value or "").split(",") if part.strip().isdigit()]
+
+
+def _merge_numeric_csv_ids(*values: str | None) -> str:
+    seen: set[str] = set()
+    merged: list[str] = []
+    for value in values:
+        for item in _numeric_csv_ids(value):
+            if item in seen:
+                continue
+            seen.add(item)
+            merged.append(item)
+    return ",".join(merged)
+
+
+def _env_flag_enabled(value: str | None) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _resolve_existing_workspace(workspace: str | Path) -> Path:
+    try:
+        resolved = Path(workspace).expanduser().resolve()
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(f"workspace does not exist or is not a directory: {workspace}") from exc
+    if not resolved.exists() or not resolved.is_dir():
+        raise ValueError(f"workspace does not exist or is not a directory: {resolved}")
+    return resolved
+
+
+def _ensure_csv_numeric_ids(value: str | None, field_name: str) -> None:
+    """Reject CSV ID strings whose entries are not all-digit Discord IDs.
+
+    `_parse_csv_ids` silently drops non-numeric entries, which can clear an
+    allowlist a caller meant to set. Failing loudly here keeps PATCH/update
+    callers honest before the value reaches the env writer.
+    """
+    if value is None:
+        return
+    for raw in str(value).split(","):
+        text = raw.strip()
+        if text and not text.isdigit():
+            raise ValueError(
+                f"{field_name} must be a comma-separated list of numeric Discord IDs; "
+                f"received {text!r}."
+            )
+
+
+def _require_profile_access_invariant(relay_type: str, env: dict[str, str]) -> None:
+    allow_dms = _env_flag_enabled(env.get("ALLOW_DMS"))
+    channel_ids = _numeric_csv_ids(env.get("ALLOWED_CHANNEL_IDS"))
+    approved_sender_ids = _numeric_csv_ids(env.get("ALLOWED_USER_IDS"))
+    if relay_type == "claude":
+        approved_sender_ids = _numeric_csv_ids(
+            _merge_numeric_csv_ids(env.get("ALLOWED_USER_IDS"), env.get("OPERATOR_IDS"))
+        )
+    if allow_dms and not approved_sender_ids:
+        raise ValueError("ALLOW_DMS=true requires at least one approved numeric user or operator id.")
+    if relay_type == "codex" and not channel_ids and not (allow_dms and approved_sender_ids):
+        raise ValueError(
+            "Codex profiles require at least one numeric allowed channel id unless DMs are enabled "
+            "for an approved numeric user."
+        )
+    if relay_type == "claude" and not channel_ids and not approved_sender_ids:
+        raise ValueError("Claude profiles require at least one numeric allowed channel id or approved numeric sender id.")
+
+
 def _update_codex_profile(
     profile: dict[str, Any],
     *,
@@ -607,6 +754,7 @@ def _update_codex_profile(
     codex_home: str | None = None,
     trigger_mode: str | None = None,
     allow_dms: bool | None = None,
+    operator_ids: str | None = None,
     allowed_user_ids: str | None = None,
     allowed_bot_ids: str | None = None,
     allowed_channel_id: str | None = None,
@@ -617,10 +765,17 @@ def _update_codex_profile(
     startup_dm_text: str | None = None,
     startup_channel_text: str | None = None,
 ) -> None:
+    _ensure_csv_numeric_ids(allowed_user_ids, "allowed_user_ids")
+    _ensure_csv_numeric_ids(operator_ids, "operator_ids")
+    _ensure_csv_numeric_ids(allowed_bot_ids, "allowed_bot_ids")
+    _ensure_csv_numeric_ids(allowed_channel_id, "allowed_channel_id")
+    _ensure_csv_numeric_ids(allowed_channel_author_ids, "allowed_channel_author_ids")
+    _ensure_csv_numeric_ids(channel_no_mention_author_ids, "channel_no_mention_author_ids")
+    _ensure_csv_numeric_ids(startup_dm_user_ids, "startup_dm_user_ids")
     env_path = Path(str(profile.get("env_file", "")).strip())
     env = relayctl._normalized_profile_env(relayctl._load_env_file(env_path))
     if workspace is not None and workspace.strip():
-        env["CODEX_WORKDIR"] = str(Path(workspace.strip()).expanduser().resolve())
+        env["CODEX_WORKDIR"] = str(_resolve_existing_workspace(workspace.strip()))
     if discord_bot_token is not None and discord_bot_token.strip():
         env["DISCORD_BOT_TOKEN"] = discord_bot_token.strip()
     if bot_name is not None:
@@ -637,6 +792,8 @@ def _update_codex_profile(
         env["ALLOW_DMS"] = "true" if allow_dms else "false"
     if allowed_user_ids is not None:
         env["ALLOWED_USER_IDS"] = relayctl._parse_csv_ids(allowed_user_ids)
+    if operator_ids is not None:
+        env["ALLOWED_USER_IDS"] = _merge_numeric_csv_ids(env.get("ALLOWED_USER_IDS", ""), operator_ids)
     if allowed_bot_ids is not None:
         env["ALLOWED_BOT_IDS"] = relayctl._parse_csv_ids(allowed_bot_ids)
     if allowed_channel_id is not None:
@@ -648,7 +805,7 @@ def _update_codex_profile(
     if channel_no_mention_author_ids is not None:
         env["CHANNEL_NO_MENTION_AUTHOR_IDS"] = relayctl._parse_csv_ids(channel_no_mention_author_ids)
     if channel_history_limit is not None:
-        env["CHANNEL_HISTORY_LIMIT"] = str(channel_history_limit).strip() or env.get("CHANNEL_HISTORY_LIMIT", "20")
+        env["CHANNEL_HISTORY_LIMIT"] = str(relayctl.parse_channel_history_limit(channel_history_limit))
     if startup_dm_user_ids is not None:
         env["STARTUP_DM_USER_IDS"] = relayctl._parse_csv_ids(startup_dm_user_ids)
     if startup_dm_text is not None:
@@ -656,7 +813,10 @@ def _update_codex_profile(
     if startup_channel_text is not None:
         env["STARTUP_CHANNEL_TEXT"] = startup_channel_text.strip()
     env = relayctl._normalized_profile_env(env)
-    assert_workspace_allowed(Path(env["CODEX_WORKDIR"]), env=env)
+    _require_profile_access_invariant("codex", env)
+    workspace_path = _resolve_existing_workspace(env["CODEX_WORKDIR"])
+    env["CODEX_WORKDIR"] = str(workspace_path)
+    assert_workspace_allowed(workspace_path, env=env)
     new_profile = relayctl._profile_from_env(env)
     relayctl._replace_profile_registration(profile, new_profile)
 
@@ -677,10 +837,14 @@ def _update_claude_profile(
     operator_ids: str | None = None,
     channel_history_limit: str | None = None,
 ) -> None:
+    _ensure_csv_numeric_ids(allowed_user_ids, "allowed_user_ids")
+    _ensure_csv_numeric_ids(operator_ids, "operator_ids")
+    _ensure_csv_numeric_ids(allowed_bot_ids, "allowed_bot_ids")
+    _ensure_csv_numeric_ids(allowed_channel_id, "allowed_channel_id")
     env_path = Path(str(profile.get("env_file", "")).strip())
     env = claude_relay._load_env_file(env_path)
     if workspace is not None and workspace.strip():
-        env["CLAUDE_WORKDIR"] = str(Path(workspace.strip()).expanduser().resolve())
+        env["CLAUDE_WORKDIR"] = str(_resolve_existing_workspace(workspace.strip()))
     if discord_bot_token is not None and discord_bot_token.strip():
         env["DISCORD_BOT_TOKEN"] = discord_bot_token.strip()
     if bot_name is not None:
@@ -702,15 +866,20 @@ def _update_claude_profile(
     if allowed_channel_id is not None:
         env["ALLOWED_CHANNEL_IDS"] = claude_relay._parse_csv_ids(allowed_channel_id)
     if channel_history_limit is not None:
-        env["CHANNEL_HISTORY_LIMIT"] = str(channel_history_limit).strip() or env.get("CHANNEL_HISTORY_LIMIT", "20")
+        env["CHANNEL_HISTORY_LIMIT"] = str(relayctl.parse_channel_history_limit(channel_history_limit))
     env["ALLOW_DMS"] = "true" if env.get("ALLOW_DMS", "false").lower() in {"1", "true", "yes"} else "false"
     env["BOT_TRIGGER_MODE"] = env.get("BOT_TRIGGER_MODE", "mention_or_dm") or "mention_or_dm"
     env["OPERATOR_IDS"] = claude_relay._parse_csv_ids(env.get("OPERATOR_IDS", ""))
     env["ALLOWED_USER_IDS"] = claude_relay._parse_csv_ids(env.get("ALLOWED_USER_IDS", ""))
     env["ALLOWED_BOT_IDS"] = claude_relay._parse_csv_ids(env.get("ALLOWED_BOT_IDS", ""))
     env["ALLOWED_CHANNEL_IDS"] = claude_relay._parse_csv_ids(env.get("ALLOWED_CHANNEL_IDS", ""))
+    if env["ALLOW_DMS"] == "true" and not env["ALLOWED_USER_IDS"] and env["OPERATOR_IDS"]:
+        env["ALLOWED_USER_IDS"] = env["OPERATOR_IDS"]
     env["CLAUDE_MODEL"] = (env.get("CLAUDE_MODEL", "") or "").strip()
-    assert_workspace_allowed(Path(env["CLAUDE_WORKDIR"]), env=env)
+    _require_profile_access_invariant("claude", env)
+    workspace_path = _resolve_existing_workspace(env["CLAUDE_WORKDIR"])
+    env["CLAUDE_WORKDIR"] = str(workspace_path)
+    assert_workspace_allowed(workspace_path, env=env)
     new_profile = claude_relay._profile_from_env(env)
     registry = _load_claude_registry()
     previous_name = str(profile.get("name", "")).strip()
@@ -763,6 +932,7 @@ def update_profile(
             codex_home=codex_home,
             trigger_mode=trigger_mode,
             allow_dms=allow_dms,
+            operator_ids=operator_ids,
             allowed_user_ids=allowed_user_ids,
             allowed_bot_ids=allowed_bot_ids,
             allowed_channel_id=allowed_channel_id,
@@ -980,27 +1150,35 @@ def cmd_update(args: argparse.Namespace) -> int:
             if fallback:
                 discord_bot_token = fallback
                 os.environ.pop("CLADEX_REGISTER_DISCORD_BOT_TOKEN", None)
-    update_profile(
-        profiles[0],
-        workspace=getattr(args, "workspace", None),
-        discord_bot_token=discord_bot_token,
-        bot_name=getattr(args, "bot_name", None),
-        model=getattr(args, "model", None),
-        codex_home=getattr(args, "codex_home", None),
-        claude_config_dir=getattr(args, "claude_config_dir", None),
-        trigger_mode=getattr(args, "trigger_mode", None),
-        allow_dms=allow_dms,
-        operator_ids=getattr(args, "operator_ids", None),
-        allowed_user_ids=getattr(args, "allowed_user_ids", None),
-        allowed_bot_ids=getattr(args, "allowed_bot_ids", None),
-        allowed_channel_id=getattr(args, "allowed_channel_id", None),
-        allowed_channel_author_ids=getattr(args, "allowed_channel_author_ids", None),
-        channel_no_mention_author_ids=getattr(args, "channel_no_mention_author_ids", None),
-        channel_history_limit=getattr(args, "channel_history_limit", None),
-        startup_dm_user_ids=getattr(args, "startup_dm_user_ids", None),
-        startup_dm_text=getattr(args, "startup_dm_text", None),
-        startup_channel_text=getattr(args, "startup_channel_text", None),
-    )
+    try:
+        update_profile(
+            profiles[0],
+            workspace=getattr(args, "workspace", None),
+            discord_bot_token=discord_bot_token,
+            bot_name=getattr(args, "bot_name", None),
+            model=getattr(args, "model", None),
+            codex_home=getattr(args, "codex_home", None),
+            claude_config_dir=getattr(args, "claude_config_dir", None),
+            trigger_mode=getattr(args, "trigger_mode", None),
+            allow_dms=allow_dms,
+            operator_ids=getattr(args, "operator_ids", None),
+            allowed_user_ids=getattr(args, "allowed_user_ids", None),
+            allowed_bot_ids=getattr(args, "allowed_bot_ids", None),
+            allowed_channel_id=getattr(args, "allowed_channel_id", None),
+            allowed_channel_author_ids=getattr(args, "allowed_channel_author_ids", None),
+            channel_no_mention_author_ids=getattr(args, "channel_no_mention_author_ids", None),
+            channel_history_limit=getattr(args, "channel_history_limit", None),
+            startup_dm_user_ids=getattr(args, "startup_dm_user_ids", None),
+            startup_dm_text=getattr(args, "startup_dm_text", None),
+            startup_channel_text=getattr(args, "startup_channel_text", None),
+        )
+    except ValueError as exc:
+        message = str(exc)
+        if getattr(args, "json", False):
+            print(json.dumps({"success": False, "error": message}))
+        else:
+            print(message, file=sys.stderr)
+        return 2
     refreshed = _filter_profiles(name=args.name, relay_type=args.type)
     record = _profile_json_record(refreshed[0]) if refreshed else {}
     if getattr(args, "json", False):
@@ -1096,12 +1274,81 @@ def _doctor_command(command: list[str], *, cwd: Path | None = None) -> dict[str,
 def _doctor_version(name: str, command: list[str]) -> dict[str, Any]:
     result = _doctor_command(command)
     output = str(result.get("output", "")).splitlines()
+    version = output[0] if output else ""
     return {
         "name": name,
         "ok": bool(result.get("ok")),
-        "version": output[0] if output else "",
+        "version": version,
         "detail": result.get("error") or result.get("output", ""),
     }
+
+
+def _parse_version_tuple(value: str) -> tuple[int, ...] | None:
+    match = re.search(r"(\d+)(?:\.(\d+))?(?:\.(\d+))?", value or "")
+    if not match:
+        return None
+    return tuple(int(part) for part in match.groups(default="0"))
+
+
+def _version_below(actual: tuple[int, ...], minimum: tuple[int, ...]) -> bool:
+    width = max(len(actual), len(minimum), 3)
+    padded_actual = actual + (0,) * (width - len(actual))
+    padded_minimum = minimum + (0,) * (width - len(minimum))
+    return padded_actual < padded_minimum
+
+
+def _declared_engine_minimum(engine: str) -> str:
+    try:
+        package_json = json.loads((Path(__file__).resolve().parents[1] / "package.json").read_text(encoding="utf-8"))
+    except Exception:
+        return ""
+    value = str((package_json.get("engines") or {}).get(engine) or "")
+    match = re.search(r">=\s*([0-9]+(?:\.[0-9]+){0,2})", value)
+    return match.group(1) if match else ""
+
+
+def _declared_python_minimum() -> str:
+    try:
+        text = (Path(__file__).resolve().parent / "pyproject.toml").read_text(encoding="utf-8")
+    except Exception:
+        return "3.10"
+    match = re.search(r"requires-python\s*=\s*[\"']>=\s*([0-9]+(?:\.[0-9]+){0,2})", text)
+    return match.group(1) if match else "3.10"
+
+
+def _doctor_runtime_version(name: str, version: str, detail: str, *, minimum: str) -> dict[str, Any]:
+    ok = True
+    actual_tuple = _parse_version_tuple(version)
+    minimum_tuple = _parse_version_tuple(minimum)
+    if minimum_tuple is not None:
+        if actual_tuple is None:
+            ok = False
+            detail = f"Could not parse {name} version `{version}`; required >= {minimum}."
+        elif _version_below(actual_tuple, minimum_tuple):
+            ok = False
+            detail = f"{name} {version} is below required >= {minimum}."
+    return {
+        "name": name,
+        "ok": ok,
+        "version": version,
+        "requiredVersion": f">={minimum}" if minimum else "",
+        "detail": detail,
+    }
+
+
+def _doctor_required_version(name: str, command: list[str], *, minimum: str) -> dict[str, Any]:
+    result = _doctor_command(command)
+    output = str(result.get("output", "")).splitlines()
+    version = output[0] if output else ""
+    if not bool(result.get("ok")):
+        return {
+            "name": name,
+            "ok": False,
+            "version": version,
+            "requiredVersion": f">={minimum}" if minimum else "",
+            "detail": result.get("error") or result.get("output", ""),
+        }
+    return _doctor_runtime_version(name, version, str(result.get("output") or ""), minimum=minimum)
 
 
 def _doctor_codex_app_server_schema() -> dict[str, Any]:
@@ -1350,14 +1597,18 @@ def _doctor_profiles() -> dict[str, Any]:
 
 def cmd_doctor(args: argparse.Namespace) -> int:
     checks = [
-        _doctor_version("node", ["node", "--version"]),
-        _doctor_version("npm", ["cmd", "/c", "npm", "--version"] if os.name == "nt" else ["npm", "--version"]),
-        {
-            "name": "python",
-            "ok": True,
-            "version": sys.version.split()[0],
-            "detail": sys.executable,
-        },
+        _doctor_required_version("node", ["node", "--version"], minimum=_declared_engine_minimum("node")),
+        _doctor_required_version(
+            "npm",
+            ["cmd", "/c", "npm", "--version"] if os.name == "nt" else ["npm", "--version"],
+            minimum=_declared_engine_minimum("npm"),
+        ),
+        _doctor_runtime_version(
+            "python",
+            sys.version.split()[0],
+            sys.executable,
+            minimum=_declared_python_minimum(),
+        ),
         _doctor_version("codex", [relayctl.resolve_codex_bin(), "--version"]),
         _doctor_version("claude", [claude_relay.claude_code_bin(), "--version"]),
         _doctor_codex_app_server_schema(),
@@ -1383,6 +1634,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             "npm ci",
             "npm audit",
             "npm run lint",
+            "npm run frontend:smoke",
             "npm run build",
             "npm run api:smoke",
             "python -m pip install -e \"backend[dev]\" -c backend/constraints.txt",

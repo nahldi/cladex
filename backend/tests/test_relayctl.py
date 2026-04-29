@@ -276,6 +276,158 @@ def test_register_rejects_allow_dms_without_user_allowlist(tmp_path: Path, monke
         raise AssertionError("cmd_register must reject --allow-dms without an allowlist")
 
 
+def test_register_rejects_non_numeric_allowed_user_id(tmp_path: Path, monkeypatch) -> None:
+    """F0004: --allowed-user-id with a non-numeric value would be silently
+    dropped by `_parse_csv_ids`, leaving --allow-dms paired with an empty
+    allowlist. cmd_register must reject the value before persistence."""
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    monkeypatch.setattr(relayctl, "_register_profile", lambda profile: None)
+    parser = relayctl.build_parser()
+    args = parser.parse_args(
+        [
+            "register",
+            "--workspace",
+            str(workspace),
+            "--discord-bot-token",
+            "token",
+            "--allow-dms",
+            "--allowed-user-id",
+            "not-a-discord-id",
+        ]
+    )
+
+    try:
+        relayctl.cmd_register(args)
+    except SystemExit as exc:
+        assert "numeric Discord IDs" in str(exc)
+    else:
+        raise AssertionError("cmd_register must reject non-numeric Discord IDs")
+
+
+def test_register_rejects_non_numeric_allowed_channel_id(tmp_path: Path, monkeypatch) -> None:
+    """F0004: A non-numeric --allowed-channel-id must not satisfy the raw
+    presence check and then collapse to an empty ALLOWED_CHANNEL_IDS."""
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    monkeypatch.setattr(relayctl, "_register_profile", lambda profile: None)
+    parser = relayctl.build_parser()
+    args = parser.parse_args(
+        [
+            "register",
+            "--workspace",
+            str(workspace),
+            "--discord-bot-token",
+            "token",
+            "--allowed-channel-id",
+            "general",
+        ]
+    )
+
+    try:
+        relayctl.cmd_register(args)
+    except SystemExit as exc:
+        assert "numeric Discord IDs" in str(exc)
+    else:
+        raise AssertionError("cmd_register must reject non-numeric channel IDs")
+
+
+def test_register_rejects_invalid_channel_history_limit(tmp_path: Path, monkeypatch) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    monkeypatch.setattr(relayctl, "_register_profile", lambda profile: None)
+    parser = relayctl.build_parser()
+    args = parser.parse_args(
+        [
+            "register",
+            "--workspace",
+            str(workspace),
+            "--discord-bot-token",
+            "token",
+            "--allowed-channel-id",
+            "1234567890",
+            "--channel-history-limit",
+            "-1",
+        ]
+    )
+
+    try:
+        relayctl.cmd_register(args)
+    except SystemExit as exc:
+        assert "channelHistoryLimit" in str(exc)
+    else:
+        raise AssertionError("cmd_register must reject invalid channel history limits")
+
+
+def test_register_rejects_missing_workspace(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(relayctl, "_register_profile", lambda profile: None)
+    parser = relayctl.build_parser()
+    args = parser.parse_args(
+        [
+            "register",
+            "--workspace",
+            str(tmp_path / "missing"),
+            "--discord-bot-token",
+            "token",
+            "--allowed-channel-id",
+            "1234567890",
+        ]
+    )
+
+    try:
+        relayctl.cmd_register(args)
+    except SystemExit as exc:
+        assert "workspace does not exist or is not a directory" in str(exc)
+    else:
+        raise AssertionError("cmd_register must reject missing workspaces")
+
+
+def test_write_env_file_rejects_newline_in_value(tmp_path: Path) -> None:
+    """F0004: The .env writer must refuse CR/LF in values so a startup-text or
+    bot-name field cannot inject ALLOW_DMS=true on the next profile load."""
+    env_path = tmp_path / "profile.env"
+    try:
+        relayctl._write_env_file(
+            env_path,
+            {
+                "DISCORD_BOT_TOKEN": "token",
+                "STARTUP_DM_TEXT": "Hello\nALLOW_DMS=true",
+                "CODEX_WORKDIR": str(tmp_path),
+            },
+        )
+    except ValueError as exc:
+        assert "STARTUP_DM_TEXT" in str(exc)
+    else:
+        raise AssertionError("_write_env_file must reject newline injection")
+    assert not env_path.exists(), "no env file should be persisted on rejection"
+
+
+def test_write_env_file_rejects_carriage_return_in_value(tmp_path: Path) -> None:
+    env_path = tmp_path / "profile.env"
+    try:
+        relayctl._write_env_file(
+            env_path,
+            {
+                "DISCORD_BOT_TOKEN": "token\rALLOW_DMS=true",
+                "CODEX_WORKDIR": str(tmp_path),
+            },
+        )
+    except ValueError as exc:
+        assert "DISCORD_BOT_TOKEN" in str(exc)
+    else:
+        raise AssertionError("_write_env_file must reject carriage-return injection")
+
+
+def test_write_env_file_rejects_invalid_key(tmp_path: Path) -> None:
+    env_path = tmp_path / "profile.env"
+    try:
+        relayctl._write_env_file(env_path, {"BAD KEY=INJECTED": "value"})
+    except ValueError as exc:
+        assert "BAD KEY=INJECTED" in str(exc)
+    else:
+        raise AssertionError("_write_env_file must reject malformed keys")
+
+
 def test_relay_codex_env_strips_inherited_secrets(tmp_path: Path, monkeypatch) -> None:
     """F0015: Codex CLI subprocesses must not inherit relay secrets such as
     Discord bot tokens, the CLADEX remote token, cloud creds, or anything
@@ -442,6 +594,19 @@ def test_profile_normalization_uses_publish_defaults(tmp_path: Path) -> None:
     assert env["CODEX_READ_ONLY"] == "false"
     assert env["OPEN_VISIBLE_TERMINAL"] == "false"
     assert env["RELAY_ATTACH_CHANNEL_ID"] == "1234567890"
+
+
+def test_profile_normalization_defaults_invalid_channel_history_limit(tmp_path: Path) -> None:
+    env = relayctl._normalized_profile_env(
+        {
+            "DISCORD_BOT_TOKEN": "token-value",
+            "CODEX_WORKDIR": str(tmp_path),
+            "ALLOWED_CHANNEL_IDS": "1234567890",
+            "CHANNEL_HISTORY_LIMIT": "not-a-number",
+        }
+    )
+
+    assert env["CHANNEL_HISTORY_LIMIT"] == str(relayctl.DEFAULT_CHANNEL_HISTORY_LIMIT)
 
 
 def test_profile_normalization_preserves_optional_overrides(tmp_path: Path) -> None:
@@ -1431,6 +1596,34 @@ def test_run_profile_waits_for_existing_launch_when_lock_is_held(tmp_path: Path)
 
     assert result == 0
     assert called == ["relay"]
+
+
+def test_run_profile_rejects_non_directory_workspace(tmp_path: Path) -> None:
+    workspace_file = tmp_path / "workspace.txt"
+    workspace_file.write_text("not a directory", encoding="utf-8")
+    env_file = tmp_path / "profile.env"
+    env_file.write_text(
+        "\n".join(
+            [
+                "DISCORD_BOT_TOKEN=token-value",
+                f"CODEX_WORKDIR={workspace_file}",
+                "STATE_NAMESPACE=test-bad-workspace",
+                "CODEX_APP_SERVER_TRANSPORT=stdio",
+                "CODEX_APP_SERVER_PORT=9999",
+                "ALLOWED_CHANNEL_IDS=1234567890",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    profile = {"name": "relay", "workspace": str(workspace_file), "env_file": str(env_file)}
+
+    try:
+        relayctl._run_profile(profile)
+    except ValueError as exc:
+        assert "workspace does not exist or is not a directory" in str(exc)
+    else:
+        raise AssertionError("_run_profile must reject non-directory workspaces")
 
 
 def test_register_infers_mention_or_dm_for_channel_profiles(tmp_path: Path) -> None:

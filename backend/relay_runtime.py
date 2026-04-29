@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -14,7 +15,71 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl  # type: ignore[import]
+
 from relay_common import atomic_write_json, atomic_write_text, slugify, workspace_root
+
+
+_FILE_LOCK_REGISTRY_GUARD = threading.Lock()
+_FILE_LOCK_REGISTRY: dict[str, threading.Lock] = {}
+
+
+def _path_lock_key(path: Path) -> str:
+    try:
+        return str(path.resolve(strict=False))
+    except OSError:
+        return os.path.abspath(str(path))
+
+
+def _thread_lock_for(path: Path) -> threading.Lock:
+    key = _path_lock_key(path)
+    with _FILE_LOCK_REGISTRY_GUARD:
+        lock = _FILE_LOCK_REGISTRY.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _FILE_LOCK_REGISTRY[key] = lock
+        return lock
+
+
+@contextlib.contextmanager
+def _serialize_path(path: Path):
+    """Serialize read-modify-write of ``path`` across threads and processes."""
+    thread_lock = _thread_lock_for(path)
+    thread_lock.acquire()
+    handle = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = path.parent / f".{path.name}.lock"
+        handle = open(lock_path, "a+b")
+        if os.name == "nt":
+            while True:
+                try:
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+                    break
+                except OSError:
+                    time.sleep(0.05)
+        else:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        if handle is not None:
+            try:
+                if os.name == "nt":
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                handle.close()
+            except OSError:
+                pass
+        thread_lock.release()
 
 
 MEMORY_DIR_NAME = "memory"
@@ -107,29 +172,36 @@ def _ensure_sectioned_markdown(path: Path, title: str, sections: dict[str, str])
 
 
 def _write_status_file(path: Path, fields: dict[str, str | None]) -> None:
-    current = _parse_sections(_read_text(path))
-    for key, value in fields.items():
-        if value is not None:
-            current[key] = value.strip()
-    _ensure_sectioned_markdown(path, "STATUS", {heading: current.get(heading, "") for heading in STATUS_SECTIONS})
+    with _serialize_path(path):
+        current = _parse_sections(_read_text(path))
+        for key, value in fields.items():
+            if value is not None:
+                current[key] = value.strip()
+        _ensure_sectioned_markdown(path, "STATUS", {heading: current.get(heading, "") for heading in STATUS_SECTIONS})
 
 
 def _append_markdown_entry(path: Path, title: str, body: str, *, prepend: bool = False) -> None:
-    existing = _read_text(path).strip()
-    header = f"# {title}\n"
-    if existing.startswith(header):
-        existing_body = existing[len(header) :].lstrip("\n")
-    else:
-        existing_body = existing
-    entry = body.strip() + "\n"
-    if prepend:
-        payload = header + "\n" + entry + ("\n" + existing_body if existing_body else "")
-    else:
-        payload = header + "\n" + ((existing_body + "\n\n") if existing_body else "") + entry
-    atomic_write_text(path, payload.rstrip() + "\n")
+    with _serialize_path(path):
+        existing = _read_text(path).strip()
+        header = f"# {title}\n"
+        if existing.startswith(header):
+            existing_body = existing[len(header) :].lstrip("\n")
+        else:
+            existing_body = existing
+        entry = body.strip() + "\n"
+        if prepend:
+            payload = header + "\n" + entry + ("\n" + existing_body if existing_body else "")
+        else:
+            payload = header + "\n" + ((existing_body + "\n\n") if existing_body else "") + entry
+        atomic_write_text(path, payload.rstrip() + "\n")
 
 
 def _prune_markdown_history(path: Path, title: str, *, keep_entries: int, max_chars: int | None = None) -> None:
+    with _serialize_path(path):
+        _prune_markdown_history_locked(path, title, keep_entries=keep_entries, max_chars=max_chars)
+
+
+def _prune_markdown_history_locked(path: Path, title: str, *, keep_entries: int, max_chars: int | None = None) -> None:
     existing = _read_text(path).strip()
     header = f"# {title}"
     if not existing:
@@ -957,37 +1029,58 @@ class RuntimeStore:
         started_at = _now_iso_from_ts(now)
         heartbeat_at = started_at
         targets = _normalize_paths(target_files)
-        conflicts = self.find_conflicts(project_id=project_id, owner_agent=owner_agent, target_files=targets, now_ts=now) if targets else []
-        if conflicts:
-            raise TaskLeaseConflictError(conflicts)
-        with self._lock, self._connect() as conn:
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO task_leases(task_id, channel_id, owner_agent, title, target_files_glob, status, validation_plan_json, started_at, heartbeat_at, lease_expires_at)
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    task_id,
-                    channel_id,
-                    owner_agent,
-                    title,
-                    json.dumps(targets),
-                    "claimed",
-                    json.dumps(validation),
-                    started_at,
-                    heartbeat_at,
-                    expires_at,
-                ),
-            )
-            conn.execute("DELETE FROM file_ownership WHERE task_id = ?", (task_id,))
-            for item in targets:
-                conn.execute(
-                    """
-                    INSERT INTO file_ownership(id, project_id, path_glob, owner_agent, task_id, lease_expires_at)
-                    VALUES(?, ?, ?, ?, ?, ?)
-                    """,
-                    (str(uuid.uuid4()), project_id, item, owner_agent, task_id, expires_at),
-                )
+        with self._lock:
+            conn = self._connect()
+            conn.isolation_level = None
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                if targets:
+                    conflicts = self._find_conflicts_in_conn(
+                        conn,
+                        project_id=project_id,
+                        owner_agent=owner_agent,
+                        target_files=targets,
+                        now_ts=now,
+                    )
+                    if conflicts:
+                        conn.execute("ROLLBACK")
+                        raise TaskLeaseConflictError(conflicts)
+                try:
+                    conn.execute(
+                        """
+                        INSERT OR REPLACE INTO task_leases(task_id, channel_id, owner_agent, title, target_files_glob, status, validation_plan_json, started_at, heartbeat_at, lease_expires_at)
+                        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            task_id,
+                            channel_id,
+                            owner_agent,
+                            title,
+                            json.dumps(targets),
+                            "claimed",
+                            json.dumps(validation),
+                            started_at,
+                            heartbeat_at,
+                            expires_at,
+                        ),
+                    )
+                    conn.execute("DELETE FROM file_ownership WHERE task_id = ?", (task_id,))
+                    for item in targets:
+                        conn.execute(
+                            """
+                            INSERT INTO file_ownership(id, project_id, path_glob, owner_agent, task_id, lease_expires_at)
+                            VALUES(?, ?, ?, ?, ?, ?)
+                            """,
+                            (str(uuid.uuid4()), project_id, item, owner_agent, task_id, expires_at),
+                        )
+                    conn.execute("COMMIT")
+                except TaskLeaseConflictError:
+                    raise
+                except Exception:
+                    conn.execute("ROLLBACK")
+                    raise
+            finally:
+                conn.close()
 
         return task_id
 
@@ -1038,16 +1131,33 @@ class RuntimeStore:
         return [dict(row) for row in rows]
 
     def find_conflicts(self, *, project_id: str, owner_agent: str, target_files: list[str], now_ts: float | None = None) -> list[LeaseConflict]:
-        now_text = _now_iso_from_ts(now_ts or time.time())
         with self._connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT file_ownership.task_id, file_ownership.owner_agent, file_ownership.path_glob
-                FROM file_ownership
-                WHERE project_id = ? AND owner_agent != ? AND lease_expires_at >= ?
-                """,
-                (project_id, owner_agent, now_text),
-            ).fetchall()
+            return self._find_conflicts_in_conn(
+                conn,
+                project_id=project_id,
+                owner_agent=owner_agent,
+                target_files=target_files,
+                now_ts=now_ts,
+            )
+
+    def _find_conflicts_in_conn(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        project_id: str,
+        owner_agent: str,
+        target_files: list[str],
+        now_ts: float | None = None,
+    ) -> list[LeaseConflict]:
+        now_text = _now_iso_from_ts(now_ts or time.time())
+        rows = conn.execute(
+            """
+            SELECT file_ownership.task_id, file_ownership.owner_agent, file_ownership.path_glob
+            FROM file_ownership
+            WHERE project_id = ? AND owner_agent != ? AND lease_expires_at >= ?
+            """,
+            (project_id, owner_agent, now_text),
+        ).fetchall()
         conflicts: list[LeaseConflict] = []
         for row in rows:
             for target in target_files:
@@ -1083,35 +1193,38 @@ class WorktreeManager:
         worktree_root.mkdir(parents=True, exist_ok=True)
         worktree_path = worktree_root / slugify(channel_id)
         branch_name = f"relay/{slugify(project_id)}-{slugify(channel_id)}"
-        if worktree_path.exists():
-            return worktree_path, _repo_branch(worktree_path)
-        try:
-            branch_exists = subprocess.run(
-                ["git", "-C", str(repo_root), "branch", "--list", branch_name],
-                check=True,
-                capture_output=True,
-                text=True,
-                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
-            ).stdout.strip()
-            if branch_exists:
-                subprocess.run(
-                    ["git", "-C", str(repo_root), "worktree", "add", str(worktree_path), branch_name],
+        with _serialize_path(worktree_path):
+            if worktree_path.exists():
+                return worktree_path, _repo_branch(worktree_path)
+            try:
+                branch_exists = subprocess.run(
+                    ["git", "-C", str(repo_root), "branch", "--list", branch_name],
                     check=True,
                     capture_output=True,
                     text=True,
                     creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
-                )
-            else:
-                subprocess.run(
-                    ["git", "-C", str(repo_root), "worktree", "add", "-b", branch_name, str(worktree_path), "HEAD"],
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
-                )
-            return worktree_path, _repo_branch(worktree_path)
-        except Exception:
-            return repo_root, _repo_branch(repo_root)
+                ).stdout.strip()
+                if branch_exists:
+                    subprocess.run(
+                        ["git", "-C", str(repo_root), "worktree", "add", str(worktree_path), branch_name],
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+                    )
+                else:
+                    subprocess.run(
+                        ["git", "-C", str(repo_root), "worktree", "add", "-b", branch_name, str(worktree_path), "HEAD"],
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+                    )
+                return worktree_path, _repo_branch(worktree_path)
+            except Exception:
+                if worktree_path.exists():
+                    return worktree_path, _repo_branch(worktree_path)
+                raise
 
 
 class VerificationEngine:

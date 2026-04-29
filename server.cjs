@@ -13,13 +13,21 @@ const API_HOST = process.env.API_HOST || '127.0.0.1';
 const API_PORT = Number(process.env.API_PORT || 3001);
 let serverInstance = null;
 let remoteAccessTokenCache = null;
+const MAX_CHANNEL_HISTORY_LIMIT = 500;
 
 app.disable('x-powered-by');
 app.use(express.json({ limit: '1mb' }));
 
 function isLoopbackOrigin(origin) {
-  if (!origin || origin === 'null') {
+  if (!origin) {
     return true;
+  }
+  // "null" is the serialized form of an opaque origin (sandboxed iframe,
+  // data: URI, certain file:// contexts). It cannot be distinguished from a
+  // hostile cross-origin embedder, so refuse to treat it as local — the
+  // /api access-token gate below still lets an authenticated caller through.
+  if (origin === 'null') {
+    return false;
   }
   try {
     const parsed = new URL(origin);
@@ -89,6 +97,38 @@ function parseBooleanField(body, key, defaultValue) {
   return { ok: false, error: `${key} must be a boolean` };
 }
 
+function parseChannelHistoryLimitField(body) {
+  if (!hasOwn(body, 'channelHistoryLimit')) {
+    return { ok: true, value: '' };
+  }
+  const raw = body.channelHistoryLimit;
+  const text = raw === null || raw === undefined ? '' : String(raw).trim();
+  if (!text) {
+    return { ok: true, value: '' };
+  }
+  if (!/^\d+$/.test(text)) {
+    return { ok: false, error: `channelHistoryLimit must be an integer between 0 and ${MAX_CHANNEL_HISTORY_LIMIT}` };
+  }
+  const value = Number(text);
+  if (value > MAX_CHANNEL_HISTORY_LIMIT) {
+    return { ok: false, error: `channelHistoryLimit must be an integer between 0 and ${MAX_CHANNEL_HISTORY_LIMIT}` };
+  }
+  return { ok: true, value: String(value) };
+}
+
+function workspacePathError(workspace) {
+  const absoluteWorkspace = path.resolve(String(workspace || '').trim());
+  try {
+    const stat = fsSync.statSync(absoluteWorkspace);
+    if (!stat.isDirectory()) {
+      return `workspace does not exist or is not a directory: ${absoluteWorkspace}`;
+    }
+  } catch {
+    return `workspace does not exist or is not a directory: ${absoluteWorkspace}`;
+  }
+  return '';
+}
+
 function csvValues(value) {
   return String(value || '')
     .split(',')
@@ -132,23 +172,31 @@ function rejectInvalidFixRunId(res, extra = {}) {
 
 app.use((req, res, next) => {
   const origin = String(req.headers.origin || '').trim();
-  const allowed = isLoopbackOrigin(origin) || isSameOriginRequest(req, origin);
+  const isOpaqueOrigin = origin === 'null';
+  const allowed = !isOpaqueOrigin && (isLoopbackOrigin(origin) || isSameOriginRequest(req, origin));
+  const corsAllowed = allowed || isOpaqueOrigin;
   res.header('Vary', 'Origin');
   res.header('X-Content-Type-Options', 'nosniff');
-  if (origin && allowed) {
-    res.header('Access-Control-Allow-Origin', origin === 'null' ? 'null' : origin);
+  res.header('X-Frame-Options', 'DENY');
+  res.header('Content-Security-Policy', "frame-ancestors 'none'");
+  if (origin && corsAllowed) {
+    res.header('Access-Control-Allow-Origin', origin);
     res.header('Access-Control-Allow-Headers', 'Content-Type, X-CLADEX-Access-Token');
     res.header('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
   }
   if (req.method === 'OPTIONS') {
-    if (origin && !allowed) {
+    // Opaque/file-like browser origins are allowed to preflight, but the
+    // follow-up /api request is still forced through X-CLADEX-Access-Token.
+    if (origin && !corsAllowed) {
       res.status(403).end();
       return;
     }
     res.status(204).end();
     return;
   }
-  if (origin && !allowed) {
+  // Non-opaque untrusted origins are rejected outright. Opaque origins fall
+  // through to the /api access-token gate, which requires a valid token.
+  if (origin && !allowed && !isOpaqueOrigin) {
     res.status(403).json({ error: 'Origin not allowed' });
     return;
   }
@@ -611,7 +659,7 @@ app.get('/api/runtime-info', async (req, res) => {
     backendDir: BACKEND_DIR,
     frontendDir: FRONTEND_DIR,
     packaged: process.env.NODE_ENV === 'production' || !!process.resourcesPath,
-    appVersion: process.env.npm_package_version || '2.5.0',
+    appVersion: process.env.npm_package_version || '2.5.1',
     remoteAccessProtected: true,
   };
   if (isLoopbackRequest(req)) {
@@ -742,6 +790,21 @@ app.patch('/api/profiles/:id', async (req, res) => {
     res.status(400).json({ success: false, error: 'type must be claude or codex' });
     return;
   }
+  const channelHistoryLimitInput = parseChannelHistoryLimitField(req.body);
+  if (!channelHistoryLimitInput.ok) {
+    res.status(400).json({ success: false, error: channelHistoryLimitInput.error });
+    return;
+  }
+  if (Object.prototype.hasOwnProperty.call(req.body, 'workspace')) {
+    const workspace = String(req.body?.workspace || '').trim();
+    if (workspace) {
+      const error = workspacePathError(workspace);
+      if (error) {
+        res.status(400).json({ success: false, error });
+        return;
+      }
+    }
+  }
   const args = ['cladex.py', 'update-profile', id, '--type', relayType, '--json'];
   const updateEnv = {};
   if (Object.prototype.hasOwnProperty.call(req.body, 'workspace')) args.push('--workspace', String(req.body?.workspace || '').trim());
@@ -765,7 +828,7 @@ app.patch('/api/profiles/:id', async (req, res) => {
   if (Object.prototype.hasOwnProperty.call(req.body, 'channelId')) args.push('--allowed-channel-id', String(req.body?.channelId || '').trim());
   if (Object.prototype.hasOwnProperty.call(req.body, 'allowedChannelAuthorIds')) args.push('--allowed-channel-author-ids', String(req.body?.allowedChannelAuthorIds || '').trim());
   if (Object.prototype.hasOwnProperty.call(req.body, 'channelNoMentionAuthorIds')) args.push('--channel-no-mention-author-ids', String(req.body?.channelNoMentionAuthorIds || '').trim());
-  if (Object.prototype.hasOwnProperty.call(req.body, 'channelHistoryLimit')) args.push('--channel-history-limit', String(req.body?.channelHistoryLimit || '').trim());
+  if (channelHistoryLimitInput.value) args.push('--channel-history-limit', channelHistoryLimitInput.value);
   if (Object.prototype.hasOwnProperty.call(req.body, 'startupDmUserIds')) args.push('--startup-dm-user-ids', String(req.body?.startupDmUserIds || '').trim());
   if (Object.prototype.hasOwnProperty.call(req.body, 'startupDmText')) args.push('--startup-dm-text', String(req.body?.startupDmText || '').trim());
   if (Object.prototype.hasOwnProperty.call(req.body, 'startupChannelText')) args.push('--startup-channel-text', String(req.body?.startupChannelText || '').trim());
@@ -881,7 +944,8 @@ app.post('/api/profiles', async (req, res) => {
   const allowedBotIds = String(req.body?.allowedBotIds || '').trim();
   const allowedChannelAuthorIds = String(req.body?.allowedChannelAuthorIds || '').trim();
   const channelNoMentionAuthorIds = String(req.body?.channelNoMentionAuthorIds || '').trim();
-  const channelHistoryLimit = String(req.body?.channelHistoryLimit || '').trim();
+  const channelHistoryLimitInput = parseChannelHistoryLimitField(req.body);
+  const channelHistoryLimit = channelHistoryLimitInput.value || '';
   const startupDmUserIds = String(req.body?.startupDmUserIds || '').trim();
   const startupDmText = String(req.body?.startupDmText || '').trim();
   const startupChannelText = String(req.body?.startupChannelText || '').trim();
@@ -890,10 +954,19 @@ app.post('/api/profiles', async (req, res) => {
     res.status(400).json({ success: false, error: allowDmsInput.error });
     return;
   }
+  if (!channelHistoryLimitInput.ok) {
+    res.status(400).json({ success: false, error: channelHistoryLimitInput.error });
+    return;
+  }
   const allowDms = allowDmsInput.value;
 
   if (!name || !workspace || !discordToken) {
     res.status(400).json({ success: false, error: 'name, workspace, and discordToken are required' });
+    return;
+  }
+  const workspaceError = workspacePathError(workspace);
+  if (workspaceError) {
+    res.status(400).json({ success: false, error: workspaceError });
     return;
   }
   if (relayType !== 'claude' && relayType !== 'codex') {
@@ -1228,7 +1301,7 @@ if (fsSync.existsSync(FRONTEND_DIR)) {
 
 function startServer(options = {}) {
   const host = options.host || API_HOST;
-  const port = Number(options.port || API_PORT);
+  const port = Number(options.port === undefined ? API_PORT : options.port);
   const quiet = Boolean(options.quiet);
   const allowRemoteApi = process.env.CLADEX_ALLOW_REMOTE_API === '1';
 

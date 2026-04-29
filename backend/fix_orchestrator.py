@@ -268,33 +268,56 @@ def _project_inventory(workspace: Path, *, max_files: int = 200) -> dict[str, An
 
 
 def _planner_prompt(review_job: dict[str, Any], findings: list[dict[str, Any]], inventory: dict[str, Any]) -> str:
+    valid_ids = [str(item.get("id") or "").strip() for item in findings if isinstance(item, dict)]
+    valid_ids = [fid for fid in valid_ids if fid]
     findings_blob = json.dumps(findings, ensure_ascii=False)[:80000]
-    inventory_blob = json.dumps(inventory, ensure_ascii=False)[:8000]
+    inventory_blob = json.dumps(inventory, ensure_ascii=False)[:4000]
+    schema_blob = json.dumps(FIX_PLAN_SCHEMA, ensure_ascii=False)
+    self_fix = bool(review_job.get("selfReview") or review_job.get("allowSelfReview"))
+    self_fix_rule = (
+        "- Self-fix run: CLADEX is BOTH the target project and the runtime, so "
+        "tasks may edit CLADEX source files to close the listed findings.\n"
+        if self_fix
+        else "- Tasks must NOT include CLADEX self-fix targeting (we cannot edit the\n"
+        "  CLADEX runtime repo from a normal project run).\n"
+    )
     return (
-        "You are CLADEX's Fix Review orchestrator. A read-only project review just\n"
-        "finished. Decide the smallest, safest set of fix tasks that close the\n"
-        "findings without breaking the project. For each task pick the AI worker\n"
-        "(Codex or Claude) that is the best fit, the reasoning effort, the files\n"
-        "the worker is allowed to touch, and which earlier task ids it depends on.\n"
+        "Plan a Fix Review for a project that has just finished a structured\n"
+        "review pass. The output goes to a deterministic CLADEX runtime that\n"
+        "will reject any task whose findingIds do not match the input list.\n"
+        "Do NOT invent your own task topics, do NOT reference past CLADEX\n"
+        "roadmap phases, do NOT skip the JSON schema. Group/route the listed\n"
+        "findings only.\n"
+        "\n"
+        f"=== VALID findingIds ({len(valid_ids)} total) ===\n"
+        f"{json.dumps(valid_ids)}\n"
+        "Every task you emit MUST have a non-empty `findingIds` array drawn\n"
+        "ONLY from this exact list. Tasks without findingIds will be discarded.\n"
+        "\n"
+        f"=== JSON Schema (this is the ONLY valid output shape) ===\n"
+        f"{schema_blob}\n"
+        "\n"
+        f"=== Findings (full JSON, {len(findings)} items) ===\n"
+        f"{findings_blob}\n"
         "\n"
         "Hard rules:\n"
         "- One task can group several findings if they share files or root cause.\n"
-        "- Every task must reference at least one findingId from the input.\n"
-        "- Tasks must NOT include CLADEX self-fix targeting (we cannot edit the\n"
-        "  CLADEX runtime repo from a normal project run).\n"
         "- Phase 1 = blocking risks, phase 2 = stabilize/validate, phase 3 = polish.\n"
-        "- recommendedAgentCount is the maximum number of concurrent fix workers\n"
-        "  you think is safe given the dependency graph (1-10).\n"
+        "- recommendedAgentCount is the safe number of concurrent fix workers\n"
+        "  given the dependency graph (1-10).\n"
+        "- Pick `provider` per task: codex for surgical edits + shell-driven\n"
+        "  validation, claude for cross-file refactors and documentation.\n"
+        f"{self_fix_rule}"
         "\n"
-        f"{_PROVIDER_GUIDE}\n"
+        f"=== Provider strengths ===\n{_PROVIDER_GUIDE}\n"
         "\n"
+        f"=== Project context (advisory) ===\n"
         f"Review provider: {review_job.get('provider')}\n"
         f"Workspace: {review_job.get('workspace')}\n"
-        f"Project inventory: {inventory_blob}\n"
-        f"Findings JSON ({len(findings)} items): {findings_blob}\n"
+        f"Inventory: {inventory_blob}\n"
         "\n"
-        "Return ONLY a JSON object that matches this schema (no prose, no markdown):\n"
-        f"{json.dumps(FIX_PLAN_SCHEMA)}\n"
+        "Return ONLY a JSON object matching the schema above. No prose, no\n"
+        "markdown fences, no commentary outside the JSON.\n"
     )
 
 
@@ -361,9 +384,35 @@ def _ai_plan_fix_tasks(
     *,
     inventory: dict[str, Any],
 ) -> tuple[list[dict[str, Any]], dict[str, Any]] | None:
-    """Run a single AI planning call. Returns (tasks, plan_metadata) on success."""
+    """Run the AI planner with bounded retries on no-plan/empty-output.
+
+    The Codex CLI is stochastic — given the exact same prompt it sometimes
+    drifts toward hallucinated tasks with no findingIds, sometimes returns a
+    well-formed plan. We retry up to `CLADEX_FIX_PLANNER_RETRIES` (default 2
+    additional attempts) before letting the deterministic fallback take over.
+    """
     if not findings:
         return None
+    try:
+        max_retries = int(os.environ.get("CLADEX_FIX_PLANNER_RETRIES", "2"))
+    except ValueError:
+        max_retries = 2
+    max_retries = max(0, min(max_retries, 5))
+    last_result: tuple[list[dict[str, Any]], dict[str, Any]] | None = None
+    for attempt in range(max_retries + 1):
+        last_result = _ai_plan_fix_tasks_once(review_job, findings, inventory=inventory)
+        if last_result is not None:
+            return last_result
+    return last_result
+
+
+def _ai_plan_fix_tasks_once(
+    review_job: dict[str, Any],
+    findings: list[dict[str, Any]],
+    *,
+    inventory: dict[str, Any],
+) -> tuple[list[dict[str, Any]], dict[str, Any]] | None:
+    """Single AI planner attempt — extracted so the public wrapper can retry."""
     provider = review_swarm.validate_provider(str(review_job.get("provider") or "codex"))
     account_home = str(review_job.get("accountHome") or "").strip() or None
     prompt = _planner_prompt(review_job, findings, inventory)
@@ -375,6 +424,16 @@ def _ai_plan_fix_tasks(
         return None
     raw_tasks = plan.get("tasks") if isinstance(plan.get("tasks"), list) else []
     findings_by_id = {str(item.get("id") or ""): item for item in findings if isinstance(item, dict)}
+    # Build a path → finding-id index so we can salvage planner tasks that
+    # forgot the `findingIds` field but did pin specific files. Without this
+    # rescue path, a single hallucinated/empty `findingIds` from the planner
+    # collapses the whole plan to None and the deterministic 1:1 fallback
+    # takes over — which loses the planner's grouping/provider intelligence.
+    findings_by_path: dict[str, list[str]] = {}
+    for fid, finding in findings_by_id.items():
+        path_norm = _finding_path(finding.get("path"))
+        if path_norm and path_norm != ".":
+            findings_by_path.setdefault(path_norm, []).append(fid)
     tasks: list[dict[str, Any]] = []
     seen_findings: set[str] = set()
     # Remap the planner's task IDs → CLADEX-canonical `task-NNNN`. The planner
@@ -387,6 +446,17 @@ def _ai_plan_fix_tasks(
             continue
         finding_ids = [str(fid) for fid in (raw.get("findingIds") or []) if str(fid).strip()]
         finding_ids = [fid for fid in finding_ids if fid in findings_by_id]
+        # Lenient salvage: if the planner emitted a task with files but no
+        # findingIds, map files back onto findings whose path matches. Only
+        # rescues findings the orchestrator hasn't already claimed elsewhere
+        # so we don't double-assign work.
+        if not finding_ids:
+            files_raw = raw.get("files") or []
+            for raw_file in files_raw:
+                path_norm = _finding_path(raw_file)
+                for candidate in findings_by_path.get(path_norm, []):
+                    if candidate not in seen_findings and candidate not in finding_ids:
+                        finding_ids.append(candidate)
         if not finding_ids:
             continue
         worker = str(raw.get("provider") or provider).strip().lower()
@@ -898,6 +968,7 @@ def _task_prompt(run: dict[str, Any], task: dict[str, Any]) -> str:
         "You are a CLADEX Fix Review worker.\n"
         "Apply one targeted fix only. The change must trace directly to the finding below.\n"
         "Do not edit files outside the assigned files unless the assignment is `.`. Do not edit CLADEX unless this workspace is CLADEX and the operator explicitly selected a CLADEX self-fix run.\n"
+        "Do not use `git stash`, `git reset`, or checkout commands to hide unrelated local changes; validate against the workspace as given.\n"
         "Keep the patch minimal, preserve existing style, and stop if the task requires secrets or external credentials.\n\n"
         f"Workspace: {run.get('workspace')}\n"
         f"Run: {run.get('id')}\n"
@@ -1037,6 +1108,31 @@ def _changed_outside_assigned(changed_files: set[str], assigned_files: list[Any]
     return outside
 
 
+def _stable_scope_check(
+    workspace: Path,
+    before: dict[str, Any],
+    assigned_files: list[Any],
+    *,
+    attempts: int = 3,
+    delay_seconds: float = 0.25,
+) -> tuple[set[str], list[str]]:
+    """Return changed files and outside-scope paths after transient state settles."""
+    attempts = max(1, attempts)
+    changed_files: set[str] = set()
+    outside_assigned: list[str] = []
+    for attempt in range(attempts):
+        after = _workspace_change_snapshot(workspace)
+        next_changed = _workspace_touched_files(before, after)
+        next_outside = _changed_outside_assigned(next_changed, assigned_files)
+        changed_files = next_changed
+        outside_assigned = next_outside
+        if not outside_assigned:
+            break
+        if attempt + 1 < attempts:
+            time.sleep(delay_seconds)
+    return changed_files, outside_assigned
+
+
 def _run_cli(
     command: list[str],
     prompt: str,
@@ -1053,12 +1149,19 @@ def _run_provider_fix_task(run: dict[str, Any], task: dict[str, Any]) -> review_
     provider = str(task.get("provider") or run.get("provider") or "codex")
     account_home = str(run.get("accountHome") or "").strip()
     if provider == "claude":
+        # `--allowedTools` is the canonical Claude Code flag (the deprecated
+        # `--tools` was being silently ignored, which combined with
+        # `--permission-mode dontAsk` denied every write tool and turned
+        # every Claude fix task into a no-op).
+        # `bypassPermissions` is required so Edit/Write/Bash run without
+        # prompting; the operator already opted in to write access via the
+        # `--allow-cladex-self-fix`-gated Fix Review backup.
         command = [
             claude_relay.claude_code_bin(),
             "-p",
             "--permission-mode",
-            "dontAsk",
-            "--tools",
+            "bypassPermissions",
+            "--allowedTools",
             "Read,Grep,Glob,LS,Edit,MultiEdit,Write,Bash",
             "--no-session-persistence",
             "--output-format",
@@ -1122,9 +1225,11 @@ def run_fix_task_once(run_id: str, task_id: str) -> dict[str, Any]:
     workspace = Path(str(run.get("workspace"))).expanduser().resolve()
     before = _workspace_change_snapshot(workspace)
     result = _run_provider_fix_task(run, task)
-    after = _workspace_change_snapshot(workspace)
-    changed_files = _workspace_touched_files(before, after)
-    outside_assigned = _changed_outside_assigned(changed_files, list(task.get("files") or ["."]))
+    changed_files, outside_assigned = _stable_scope_check(
+        workspace,
+        before,
+        list(task.get("files") or ["."]),
+    )
     if result.ok and outside_assigned:
         result = review_swarm.AIRunResult(
             text=result.text,

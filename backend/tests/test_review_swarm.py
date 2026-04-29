@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import sys
 import threading
 import time
 from pathlib import Path
@@ -812,3 +814,96 @@ def test_extract_json_payload_prefers_largest_balanced_object() -> None:
     payload = review_swarm._extract_json_payload(text)
     assert isinstance(payload, dict)
     assert payload.get("summary") == "main"
+
+
+def test_run_cli_uses_idle_timeout_not_short_wall_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CLADEX_REVIEW_AGENT_IDLE_TIMEOUT", "1")
+    monkeypatch.setenv("CLADEX_REVIEW_AGENT_MAX_RUNTIME", "5")
+    result = review_swarm._run_cli(
+        [
+            sys.executable,
+            "-c",
+            "import time\nfor i in range(4):\n print(f'tick-{i}', flush=True)\n time.sleep(0.35)\n",
+        ],
+        "",
+        env=os.environ.copy(),
+    )
+    assert result.ok is True
+    assert "tick-3" in result.text
+
+
+def test_run_cli_idle_timeout_kills_silent_process(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CLADEX_REVIEW_AGENT_IDLE_TIMEOUT", "1")
+    monkeypatch.setenv("CLADEX_REVIEW_AGENT_MAX_RUNTIME", "10")
+    started = time.monotonic()
+    result = review_swarm._run_cli(
+        [sys.executable, "-c", "import time; time.sleep(5)"],
+        "",
+        env=os.environ.copy(),
+    )
+    assert time.monotonic() - started < 4
+    assert result.ok is False
+    assert "idle" in result.error.lower()
+
+
+def test_run_cli_allows_silent_start_until_initial_idle_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CLADEX_REVIEW_AGENT_IDLE_TIMEOUT", "1")
+    monkeypatch.setenv("CLADEX_REVIEW_AGENT_INITIAL_IDLE_TIMEOUT", "3")
+    monkeypatch.setenv("CLADEX_REVIEW_AGENT_MAX_RUNTIME", "5")
+    result = review_swarm._run_cli(
+        [sys.executable, "-c", "import time; time.sleep(1.4); print('done', flush=True)"],
+        "",
+        env=os.environ.copy(),
+    )
+    assert result.ok is True
+    assert "done" in result.text
+
+
+def test_run_cli_stderr_output_resets_idle_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CLADEX_REVIEW_AGENT_IDLE_TIMEOUT", "1")
+    monkeypatch.setenv("CLADEX_REVIEW_AGENT_MAX_RUNTIME", "5")
+    result = review_swarm._run_cli(
+        [
+            sys.executable,
+            "-c",
+            "import sys, time\nfor i in range(4):\n sys.stderr.write(f'err-{i}\\n')\n sys.stderr.flush()\n time.sleep(0.35)\n",
+        ],
+        "",
+        env=os.environ.copy(),
+    )
+    assert result.ok is True
+    assert "err-3" in result.text
+
+
+def test_run_cli_max_runtime_kills_chatty_process(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CLADEX_REVIEW_AGENT_IDLE_TIMEOUT", "1")
+    monkeypatch.setenv("CLADEX_REVIEW_AGENT_MAX_RUNTIME", "2")
+    started = time.monotonic()
+    result = review_swarm._run_cli(
+        [
+            sys.executable,
+            "-c",
+            "import time\nfor i in range(100):\n print(f'tick-{i}', flush=True)\n time.sleep(0.2)\n",
+        ],
+        "",
+        env=os.environ.copy(),
+    )
+    assert time.monotonic() - started < 5
+    assert result.ok is False
+    assert "maximum runtime" in result.error.lower()
+
+
+def test_run_cli_large_stdin_prompt_does_not_block_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CLADEX_REVIEW_AGENT_IDLE_TIMEOUT", "1")
+    monkeypatch.setenv("CLADEX_REVIEW_AGENT_INITIAL_IDLE_TIMEOUT", "1")
+    monkeypatch.setenv("CLADEX_REVIEW_AGENT_MAX_RUNTIME", "10")
+    prompt = "x" * 5_000_000
+    started = time.monotonic()
+    result = review_swarm._run_cli(
+        [sys.executable, "-c", "import time; time.sleep(5)"],
+        prompt,
+        env=os.environ.copy(),
+    )
+    assert time.monotonic() - started < 4
+    assert result.ok is False
+    assert "idle" in result.error.lower()

@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import subprocess
 import json
+import threading
 from pathlib import Path
 
 import pytest
 import relay_runtime
 
-from relay_runtime import DurableRuntime, TaskLeaseConflictError
+from relay_runtime import DurableRuntime, TaskLeaseConflictError, WorktreeManager
 
 
 def _init_git_repo(path: Path) -> None:
@@ -541,3 +542,121 @@ def test_verify_test_claim_rejects_non_allowlisted_argv(tmp_path: Path, monkeypa
         status, _ = runtime.verifier._verify_test_claim(binding, not_allowed)
         assert status == "unresolved"
     assert called == []
+
+
+def test_runtime_claim_task_serializes_overlapping_concurrent_claims(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    state = tmp_path / "state"
+    _init_git_repo(repo)
+
+    runtime = DurableRuntime(state_dir=state, repo_path=repo, state_namespace="conflict", agent_name="codex")
+    project_id = runtime.project_id
+
+    barrier = threading.Barrier(8)
+    successes: list[str] = []
+    conflicts: list[str] = []
+    lock = threading.Lock()
+
+    def worker(idx: int) -> None:
+        barrier.wait()
+        try:
+            task_id = runtime.store.claim_task(
+                channel_id=f"channel-{idx}",
+                project_id=project_id,
+                owner_agent=f"codex-{idx}",
+                title=f"task-{idx}",
+                target_files=["src/auth/**"],
+                validation=[],
+            )
+            with lock:
+                successes.append(task_id)
+        except TaskLeaseConflictError:
+            with lock:
+                conflicts.append(str(idx))
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(successes) == 1
+    assert len(conflicts) == 7
+    rows = runtime.store._connect().execute(
+        "SELECT DISTINCT owner_agent FROM file_ownership WHERE project_id = ?",
+        (project_id,),
+    ).fetchall()
+    assert len(rows) == 1
+
+
+def test_runtime_worktree_ensure_serializes_concurrent_callers(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    state = tmp_path / "state"
+    _init_git_repo(repo)
+
+    manager = WorktreeManager(state / "worktrees")
+    barrier = threading.Barrier(4)
+    paths: list[Path] = []
+    errors: list[BaseException] = []
+    lock = threading.Lock()
+
+    def worker() -> None:
+        barrier.wait()
+        try:
+            wt, _branch = manager.ensure(repo, project_id="proj-x", channel_id="chan-x")
+            with lock:
+                paths.append(wt)
+        except BaseException as exc:  # noqa: BLE001 - capture for assertions
+            with lock:
+                errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert errors == []
+    resolved = {str(p.resolve()) for p in paths}
+    assert len(resolved) == 1
+    assert str(repo.resolve()) not in resolved
+
+
+def test_runtime_handoff_appends_survive_concurrent_writers(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    state = tmp_path / "state"
+    _init_git_repo(repo)
+
+    runtime = DurableRuntime(state_dir=state, repo_path=repo, state_namespace="stress", agent_name="codex")
+    binding = runtime.ensure_binding("channel-stress")
+    handoff_path = binding.worktree_path / "memory" / "HANDOFF.md"
+
+    errors: list[BaseException] = []
+    lock = threading.Lock()
+    barrier = threading.Barrier(20)
+
+    def worker(idx: int) -> None:
+        barrier.wait()
+        try:
+            runtime.write_handoff(
+                binding,
+                task_id=f"task-{idx}",
+                changed_files=[],
+                commands_run=[],
+                result=f"result-{idx}",
+                blocker="",
+                next_step=f"continue-{idx}",
+            )
+        except BaseException as exc:  # noqa: BLE001
+            with lock:
+                errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(20)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert errors == []
+    handoff_text = handoff_path.read_text(encoding="utf-8")
+    assert handoff_text.count("## ") == 20

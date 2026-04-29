@@ -130,6 +130,41 @@ def test_fix_task_success_is_rejected_when_worker_edits_outside_assigned_files(t
     assert task["changedFiles"] == ["other.py"]
 
 
+def test_fix_task_success_allows_transient_outside_scope_snapshot(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    review = _review_with_findings(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        fix_orchestrator,
+        "_run_provider_fix_task",
+        lambda _run, _task: review_swarm.AIRunResult(text="changed app.py", ok=True),
+    )
+    snapshots = [
+        {
+            "kind": "git",
+            "paths": {"app.py", "outside.py"},
+            "hashes": {"app.py": "old-app", "outside.py": "old-outside"},
+        },
+        {
+            "kind": "git",
+            "paths": {"app.py", "outside.py"},
+            "hashes": {"app.py": "new-app", "outside.py": "transient-outside"},
+        },
+        {
+            "kind": "git",
+            "paths": {"app.py", "outside.py"},
+            "hashes": {"app.py": "new-app", "outside.py": "old-outside"},
+        },
+    ]
+    monkeypatch.setattr(fix_orchestrator, "_workspace_change_snapshot", lambda _workspace: snapshots.pop(0))
+    monkeypatch.setattr(fix_orchestrator.time, "sleep", lambda _seconds: None)
+
+    run = fix_orchestrator.start_fix_run(review["id"], launch=False)
+    result = fix_orchestrator.run_fix_task_once(run["id"], run["tasks"][0]["id"])
+
+    task = result["tasks"][0]
+    assert task["status"] == "done"
+    assert task["changedFiles"] == ["app.py"]
+
+
 def test_ai_planner_groups_findings_and_picks_provider(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """The orchestrator AI step must take findings + project shape and return
     a structured plan: per-task provider choice, agent-count recommendation,
@@ -232,6 +267,50 @@ def test_ai_planner_falls_back_to_deterministic_when_provider_returns_nothing(
     assert tasks[0]["provider"] == "codex"
 
 
+def test_ai_planner_retries_when_first_attempt_returns_no_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The Codex CLI is stochastic — given the same prompt it sometimes
+    drifts to hallucinated tasks with no findingIds (which the orchestrator
+    discards), sometimes returns a clean plan. The retry loop should give
+    the planner up to N more chances before letting the deterministic
+    fallback take over.
+    """
+    monkeypatch.delenv("CLADEX_FIX_PLANNER_DISABLE", raising=False)
+    monkeypatch.setenv("CLADEX_FIX_PLANNER_RETRIES", "2")
+    project = tmp_path / "target"
+    project.mkdir()
+    findings = [
+        {"id": "F0001", "severity": "high", "path": "src/app.py", "title": "boom", "recommendation": "fix"},
+    ]
+    valid_plan = {
+        "summary": "fix it",
+        "recommendedAgentCount": 1,
+        "tasks": [
+            {"title": "fix app", "provider": "codex", "findingIds": ["F0001"], "files": ["src/app.py"], "phase": 1},
+        ],
+    }
+    call_count = {"n": 0}
+
+    def fake_codex_planner(prompt: str, home):
+        call_count["n"] += 1
+        if call_count["n"] < 2:
+            # First attempt: planner drifted; orchestrator can't salvage.
+            return {"summary": "drifted", "tasks": [{"title": "wrong", "findingIds": []}]}
+        return valid_plan
+
+    monkeypatch.setattr(fix_orchestrator, "_run_codex_planner", fake_codex_planner)
+
+    review_job = {"id": "review-x", "workspace": str(project), "provider": "codex"}
+    tasks, metadata = fix_orchestrator._build_tasks(
+        review_job, findings, workspace=project, use_ai_planner=True
+    )
+    assert call_count["n"] == 2  # one drift + one success
+    assert metadata["source"] == "ai"
+    assert len(tasks) == 1
+    assert tasks[0]["findingIds"] == ["F0001"]
+
+
 def test_ai_planner_adds_residual_task_for_skipped_findings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """If the AI planner silently drops some findings, the orchestrator must
     add a catch-all task so nothing reaches production unfixed."""
@@ -259,6 +338,64 @@ def test_ai_planner_adds_residual_task_for_skipped_findings(tmp_path: Path, monk
     assert any(t.get("category") == "planner-residual" for t in tasks)
     residual = next(t for t in tasks if t.get("category") == "planner-residual")
     assert "F0003" in residual["findingIds"]
+
+
+def test_ai_planner_salvages_tasks_without_findingids_when_files_match(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex sometimes emits tasks with the right `files` but a missing or
+    null `findingIds` field (it drifts toward its own task naming). Without
+    a salvage path the strict id-match filter drops every such task and
+    `_ai_plan_fix_tasks` returns None — collapsing the run to the
+    deterministic 1:1 fallback, which is exactly what the orchestrator is
+    supposed to replace.
+
+    The orchestrator must rescue these tasks by mapping the listed `files`
+    back onto findings whose `path` matches.
+    """
+    monkeypatch.delenv("CLADEX_FIX_PLANNER_DISABLE", raising=False)
+    project = tmp_path / "target"
+    project.mkdir()
+    findings = [
+        {"id": "F0001", "severity": "high", "path": "src/auth.ts", "title": "auth", "recommendation": "fix"},
+        {"id": "F0002", "severity": "low", "path": "README.md", "title": "docs", "recommendation": "doc"},
+    ]
+    plan_payload = {
+        "summary": "Two tasks but planner forgot findingIds",
+        "recommendedAgentCount": 2,
+        "tasks": [
+            {
+                "id": "harden-auth",
+                "title": "Harden auth",
+                "provider": "codex",
+                "findingIds": None,  # planner drifted, omitted finding ids
+                "files": ["src/auth.ts"],
+                "phase": 1,
+            },
+            {
+                "id": "polish-readme",
+                "title": "Polish README",
+                "provider": "claude",
+                # Missing findingIds key entirely
+                "files": ["README.md"],
+                "phase": 3,
+            },
+        ],
+    }
+    monkeypatch.setattr(fix_orchestrator, "_run_codex_planner", lambda prompt, home: plan_payload)
+
+    review_job = {"id": "review-x", "workspace": str(project), "provider": "codex"}
+    tasks, metadata = fix_orchestrator._build_tasks(
+        review_job, findings, workspace=project, use_ai_planner=True
+    )
+    # Salvage path must keep us on the AI plan, not collapse to deterministic.
+    assert metadata["source"] == "ai", f"expected ai plan after salvage; got {metadata}"
+    assert len(tasks) == 2
+    auth_task = next(t for t in tasks if "src/auth.ts" in (t.get("files") or []))
+    docs_task = next(t for t in tasks if "README.md" in (t.get("files") or []))
+    assert auth_task["findingIds"] == ["F0001"]
+    assert docs_task["findingIds"] == ["F0002"]
+    assert docs_task["provider"] == "claude"
 
 
 def test_ai_planner_remaps_planner_named_dependencies_to_canonical_task_ids(
@@ -371,6 +508,87 @@ def test_claude_fix_task_sends_large_prompt_through_stdin(tmp_path: Path, monkey
     assert command[-1] == "Read the fix task from stdin, apply the targeted change, and summarize the result."
     assert "long evidence" in prompt
     assert captured["cwd"] == Path(run["workspace"])
+    # The Claude fix worker MUST use the canonical `--allowedTools` flag and a
+    # permission mode that actually lets Edit/Write/Bash run. The deprecated
+    # `--tools` flag is silently ignored, and `--permission-mode dontAsk`
+    # blocks every write tool, which made every Claude fix task a no-op
+    # (the worker would report "I cannot apply this fix" and exit clean).
+    assert "--allowedTools" in command, (
+        "Claude fix worker must pass --allowedTools (the deprecated --tools is silently dropped)."
+    )
+    assert "--tools" not in command, (
+        "Claude fix worker must NOT use --tools — that flag is ignored by Claude Code 2.1+."
+    )
+    pmode_idx = command.index("--permission-mode")
+    assert command[pmode_idx + 1] in {"acceptEdits", "bypassPermissions"}, (
+        "Claude fix worker permission mode must allow Edit/Write/Bash; "
+        "`dontAsk` denies every write tool because they normally need a prompt."
+    )
+    allowed_idx = command.index("--allowedTools")
+    allowed_value = command[allowed_idx + 1]
+    for required_tool in ("Edit", "Write", "Bash"):
+        assert required_tool in allowed_value, f"Claude fix worker must allow {required_tool} to make patches."
+
+
+def test_stable_scope_check_ignores_transient_outside_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    before = {
+        "kind": "git",
+        "paths": {"assigned.py", "outside.py"},
+        "hashes": {"assigned.py": "old-assigned", "outside.py": "old-outside"},
+    }
+    snapshots = [
+        {
+            "kind": "git",
+            "paths": {"assigned.py", "outside.py"},
+            "hashes": {"assigned.py": "new-assigned", "outside.py": "transient-outside"},
+        },
+        {
+            "kind": "git",
+            "paths": {"assigned.py", "outside.py"},
+            "hashes": {"assigned.py": "new-assigned", "outside.py": "old-outside"},
+        },
+    ]
+    monkeypatch.setattr(fix_orchestrator, "_workspace_change_snapshot", lambda _workspace: snapshots.pop(0))
+    monkeypatch.setattr(fix_orchestrator.time, "sleep", lambda _seconds: None)
+
+    changed, outside = fix_orchestrator._stable_scope_check(
+        tmp_path,
+        before,
+        ["assigned.py"],
+        attempts=2,
+    )
+
+    assert changed == {"assigned.py"}
+    assert outside == []
+
+
+def test_stable_scope_check_keeps_real_outside_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    before = {
+        "kind": "git",
+        "paths": {"assigned.py", "outside.py"},
+        "hashes": {"assigned.py": "old-assigned", "outside.py": "old-outside"},
+    }
+    after = {
+        "kind": "git",
+        "paths": {"assigned.py", "outside.py"},
+        "hashes": {"assigned.py": "new-assigned", "outside.py": "new-outside"},
+    }
+    monkeypatch.setattr(fix_orchestrator, "_workspace_change_snapshot", lambda _workspace: after)
+    monkeypatch.setattr(fix_orchestrator.time, "sleep", lambda _seconds: None)
+
+    changed, outside = fix_orchestrator._stable_scope_check(
+        tmp_path,
+        before,
+        ["assigned.py"],
+        attempts=2,
+    )
+
+    assert changed == {"assigned.py", "outside.py"}
+    assert outside == ["outside.py"]
 
 
 def test_fix_run_failed_validation_stops_with_restore_hint(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

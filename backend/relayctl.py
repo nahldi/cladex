@@ -94,6 +94,8 @@ PACKAGE_NAME = "discord-codex-relay"
 GUI_CHILD_ENV = "CODEX_DISCORD_GUI_CHILD"
 DEFAULT_CODEX_MODEL = ""
 DEFAULT_CODEX_MODEL_LABEL = "Codex default"
+DEFAULT_CHANNEL_HISTORY_LIMIT = 20
+MAX_CHANNEL_HISTORY_LIMIT = 500
 SUPERVISOR_FAILURE_WINDOW_SECONDS = 10 * 60
 SUPERVISOR_BACKOFF_INITIAL_SECONDS = 2.0
 SUPERVISOR_BACKOFF_MAX_SECONDS = 5 * 60
@@ -281,10 +283,28 @@ def _load_env_file(path: Path) -> dict[str, str]:
     return env
 
 
+_ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _sanitize_env_value(key: str, value: str) -> str:
+    text = "" if value is None else str(value)
+    if "\x00" in text or "\r" in text or "\n" in text:
+        raise ValueError(
+            f"Profile env value for {key!r} contains forbidden control characters; "
+            "newline/carriage-return injection could create new settings on reload."
+        )
+    return text
+
+
 def _write_env_file(path: Path, env: dict[str, str]) -> None:
-    ordered_keys = [key for key in ENV_KEY_ORDER if key in env]
-    ordered_keys.extend(sorted(key for key in env if key not in ordered_keys))
-    lines = [f"{key}={env[key]}" for key in ordered_keys]
+    safe_env: dict[str, str] = {}
+    for key, value in env.items():
+        if not _ENV_KEY_RE.match(str(key)):
+            raise ValueError(f"Refusing to persist profile env key with unsupported characters: {key!r}")
+        safe_env[str(key)] = _sanitize_env_value(str(key), value)
+    ordered_keys = [key for key in ENV_KEY_ORDER if key in safe_env]
+    ordered_keys.extend(sorted(key for key in safe_env if key not in ordered_keys))
+    lines = [f"{key}={safe_env[key]}" for key in ordered_keys]
     atomic_write_text(path, "\n".join(lines) + "\n")
     try:
         path.chmod(0o600)
@@ -567,8 +587,48 @@ def _env_flag(value: str | None, *, default: bool = False) -> bool:
     return text in {"1", "true", "yes", "on"}
 
 
+def parse_channel_history_limit(value: object, *, field_name: str = "channelHistoryLimit") -> int:
+    text = str(value if value is not None else "").strip()
+    if not text:
+        return DEFAULT_CHANNEL_HISTORY_LIMIT
+    if not re.fullmatch(r"\d+", text):
+        raise ValueError(
+            f"{field_name} must be an integer between 0 and {MAX_CHANNEL_HISTORY_LIMIT}; received {text!r}."
+        )
+    limit = int(text, 10)
+    if limit > MAX_CHANNEL_HISTORY_LIMIT:
+        raise ValueError(
+            f"{field_name} must be an integer between 0 and {MAX_CHANNEL_HISTORY_LIMIT}; received {text!r}."
+        )
+    return limit
+
+
+def _safe_channel_history_limit(value: object) -> int:
+    try:
+        return parse_channel_history_limit(value, field_name="CHANNEL_HISTORY_LIMIT")
+    except ValueError:
+        return DEFAULT_CHANNEL_HISTORY_LIMIT
+
+
+def _resolve_existing_workspace(workspace: str | Path) -> Path:
+    try:
+        resolved = Path(workspace).expanduser().resolve()
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(f"workspace does not exist or is not a directory: {workspace}") from exc
+    if not resolved.exists() or not resolved.is_dir():
+        raise ValueError(f"workspace does not exist or is not a directory: {resolved}")
+    return resolved
+
+
+def _require_existing_workspace(workspace: str | Path) -> Path:
+    try:
+        return _resolve_existing_workspace(workspace)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+
+
 def _normalized_profile_env(env: dict[str, str]) -> dict[str, str]:
-    workspace = Path(env["CODEX_WORKDIR"]).resolve()
+    workspace = Path(env["CODEX_WORKDIR"]).expanduser().resolve()
     normalized = {
         key: value
         for key, value in dict(env).items()
@@ -593,7 +653,7 @@ def _normalized_profile_env(env: dict[str, str]) -> dict[str, str]:
     normalized["OPEN_VISIBLE_TERMINAL"] = "true" if normalized.get("OPEN_VISIBLE_TERMINAL", "false").lower() in {"1", "true", "yes", "on"} else "false"
     if normalized["CODEX_APP_SERVER_TRANSPORT"] != "websocket":
         normalized["OPEN_VISIBLE_TERMINAL"] = "false"
-    normalized["CHANNEL_HISTORY_LIMIT"] = str(normalized.get("CHANNEL_HISTORY_LIMIT", "20") or "20")
+    normalized["CHANNEL_HISTORY_LIMIT"] = str(_safe_channel_history_limit(normalized.get("CHANNEL_HISTORY_LIMIT", "")))
     normalized["BOT_TRIGGER_MODE"] = normalized.get("BOT_TRIGGER_MODE", "mention_or_dm") or "mention_or_dm"
     normalized["ALLOW_DMS"] = "true" if normalized.get("ALLOW_DMS", "false").lower() in {"1", "true", "yes", "on"} else "false"
     normalized["STATE_NAMESPACE"] = normalized.get("STATE_NAMESPACE") or default_namespace_for_workspace(workspace, token=token)
@@ -632,6 +692,8 @@ def _normalized_profile_env(env: dict[str, str]) -> dict[str, str]:
 
 def _profile_from_env(env: dict[str, str]) -> dict:
     normalized = _normalized_profile_env(env)
+    workspace_path = _resolve_existing_workspace(normalized["CODEX_WORKDIR"])
+    normalized["CODEX_WORKDIR"] = str(workspace_path)
     workspace = normalized["CODEX_WORKDIR"]
     namespace = normalized["STATE_NAMESPACE"]
     fingerprint = token_fingerprint(normalized["DISCORD_BOT_TOKEN"])
@@ -1696,6 +1758,7 @@ def _launch_bot_worker(
     log_path: Path | None = None,
     start_reason: str = "process-startup",
 ) -> subprocess.Popen:
+    workspace = _resolve_existing_workspace(workspace)
     env_data = _load_env_file(env_file)
     env_data.setdefault("CODEX_WORKDIR", str(workspace))
     env = _normalized_profile_env(env_data)
@@ -1735,11 +1798,13 @@ def _launch_bot_worker(
 
 def _run_profile_foreground(profile: dict) -> int:
     env = _normalized_profile_env(_load_env_file(Path(profile["env_file"])))
-    _require_workspace_allowed(Path(profile["workspace"]), env)
+    workspace = _resolve_existing_workspace(env["CODEX_WORKDIR"])
+    env["CODEX_WORKDIR"] = str(workspace)
+    _require_workspace_allowed(workspace, env)
     state_dir = state_dir_for_namespace(env["STATE_NAMESPACE"])
     state_dir.mkdir(parents=True, exist_ok=True)
     (state_dir / "logs").mkdir(parents=True, exist_ok=True)
-    _quarantine_stale_session_bindings(state_dir, Path(profile["workspace"]), env)
+    _quarantine_stale_session_bindings(state_dir, workspace, env)
     launch_lock = None
     try:
         try:
@@ -1751,7 +1816,7 @@ def _run_profile_foreground(profile: dict) -> int:
         if runtime["running"]:
             return 0
 
-        logged_in, login_status = _codex_login_status(Path(profile["workspace"]), env)
+        logged_in, login_status = _codex_login_status(workspace, env)
         if not logged_in:
             raise SystemExit(
                 "Native Codex CLI is not logged in for this terminal environment.\n"
@@ -1765,12 +1830,12 @@ def _run_profile_foreground(profile: dict) -> int:
 
         child_base_env = os.environ.copy()
         child_base_env.update(env)
-        child_env = relay_codex_env(Path(profile["workspace"]), child_base_env)
+        child_env = relay_codex_env(workspace, child_base_env)
         child_env["ENV_FILE"] = profile["env_file"]
         child_env["PYTHONUNBUFFERED"] = "1"
         child_env["CLADEX_START_REASON"] = os.environ.get("CLADEX_START_REASON", "operator-start").strip() or "operator-start"
         print(f"Running relay for `{profile['name']}` in the current terminal.")
-        print(f"workspace: {profile['workspace']}")
+        print(f"workspace: {workspace}")
         print(f"log: {runtime['log_path']}")
         return subprocess.run(
             [
@@ -1778,7 +1843,7 @@ def _run_profile_foreground(profile: dict) -> int:
                 "-u",
                 str(Path(__file__).resolve().with_name("bot.py")),
             ],
-            cwd=profile["workspace"],
+            cwd=str(workspace),
             env=child_env,
             check=False,
         ).returncode
@@ -1788,11 +1853,13 @@ def _run_profile_foreground(profile: dict) -> int:
 
 def _run_profile(profile: dict) -> int:
     env = _normalized_profile_env(_load_env_file(Path(profile["env_file"])))
-    _require_workspace_allowed(Path(profile["workspace"]), env)
+    workspace = _resolve_existing_workspace(env["CODEX_WORKDIR"])
+    env["CODEX_WORKDIR"] = str(workspace)
+    _require_workspace_allowed(workspace, env)
     state_dir = state_dir_for_namespace(env["STATE_NAMESPACE"])
     state_dir.mkdir(parents=True, exist_ok=True)
     (state_dir / "logs").mkdir(parents=True, exist_ok=True)
-    _quarantine_stale_session_bindings(state_dir, Path(profile["workspace"]), env)
+    _quarantine_stale_session_bindings(state_dir, workspace, env)
     launch_lock = None
     try:
         try:
@@ -1806,11 +1873,11 @@ def _run_profile(profile: dict) -> int:
 
         launch_base_env = os.environ.copy()
         launch_base_env.update(env)
-        launch_env = relay_codex_env(Path(profile["workspace"]), launch_base_env)
+        launch_env = relay_codex_env(workspace, launch_base_env)
         launch_env["ENV_FILE"] = profile["env_file"]
         launch_env["PYTHONUNBUFFERED"] = "1"
         launch_env["CLADEX_START_REASON"] = os.environ.get("CLADEX_START_REASON", "operator-start").strip() or "operator-start"
-        logged_in, login_status = _codex_login_status(Path(profile["workspace"]), env)
+        logged_in, login_status = _codex_login_status(workspace, env)
         if not logged_in:
             raise SystemExit(
                 "Native Codex CLI is not logged in for this terminal environment.\n"
@@ -1824,7 +1891,7 @@ def _run_profile(profile: dict) -> int:
         runtime["ready_marker_path"].unlink(missing_ok=True)
         log_handle = log_path.open("ab")
         popen_kwargs = {
-            "cwd": profile["workspace"],
+            "cwd": str(workspace),
             "env": launch_env,
             "stdout": log_handle,
             "stderr": subprocess.STDOUT,
@@ -2881,7 +2948,16 @@ def cmd_gui(_args: argparse.Namespace) -> int:
         buttons.grid(row=2, column=0, sticky="e", pady=(16, 0))
 
         def _save() -> None:
-            workspace = Path(vars_map["workspace"].get().strip() or Path.cwd()).resolve()
+            try:
+                workspace = _resolve_existing_workspace(vars_map["workspace"].get().strip() or Path.cwd())
+            except ValueError as exc:
+                messagebox.showerror("Relay Manager", str(exc))
+                return
+            try:
+                channel_history_limit = parse_channel_history_limit(vars_map["history_limit"].get())
+            except ValueError as exc:
+                messagebox.showerror("Relay Manager", str(exc))
+                return
             token = vars_map["token"].get().strip()
             if not token:
                 messagebox.showerror("Relay Manager", "Discord bot token is required.")
@@ -2909,7 +2985,7 @@ def cmd_gui(_args: argparse.Namespace) -> int:
                 "STARTUP_DM_USER_IDS": _parse_csv_ids(vars_map["users"].get()),
                 "STARTUP_DM_TEXT": existing_env.get("STARTUP_DM_TEXT", "Discord relay online. DM me here to chat with Codex."),
                 "ALLOWED_CHANNEL_IDS": channels,
-                "CHANNEL_HISTORY_LIMIT": vars_map["history_limit"].get().strip() or "20",
+                "CHANNEL_HISTORY_LIMIT": str(channel_history_limit),
                 "OPEN_VISIBLE_TERMINAL": "true" if vars_map["open_terminal"].get() else "false",
                 "RELAY_ATTACH_CHANNEL_ID": channels.split(",")[0] if channels else "",
             }
@@ -3181,7 +3257,7 @@ def cmd_gui(_args: argparse.Namespace) -> int:
 
 
 def cmd_register(args: argparse.Namespace) -> int:
-    workspace = Path(args.workspace or Path.cwd()).resolve()
+    workspace = _require_existing_workspace(args.workspace or Path.cwd())
     allow_cladex_workspace = bool(getattr(args, "allow_cladex_workspace", False))
     if not allow_cladex_workspace:
         _require_workspace_allowed(workspace)
@@ -3197,6 +3273,30 @@ def cmd_register(args: argparse.Namespace) -> int:
             "CLADEX_REGISTER_DISCORD_BOT_TOKEN in the environment."
         )
     args.discord_bot_token = discord_bot_token
+
+    def _ensure_numeric_ids(values: list[str], flag_name: str) -> list[str]:
+        cleaned: list[str] = []
+        for raw in values or []:
+            text = str(raw).strip()
+            if not text:
+                continue
+            if not text.isdigit():
+                raise SystemExit(
+                    f"{flag_name} expects numeric Discord IDs; received {text!r}. "
+                    "Non-numeric IDs are silently dropped during normalization, which "
+                    "can leave the profile with an empty allowlist."
+                )
+            cleaned.append(text)
+        return cleaned
+
+    args.allowed_channel_ids = _ensure_numeric_ids(args.allowed_channel_ids, "--allowed-channel-id")
+    args.allowed_user_ids = _ensure_numeric_ids(args.allowed_user_ids, "--allowed-user-id")
+    args.allowed_channel_author_ids = _ensure_numeric_ids(
+        args.allowed_channel_author_ids, "--allowed-channel-author-id"
+    )
+    args.channel_no_mention_author_ids = _ensure_numeric_ids(
+        args.channel_no_mention_author_ids, "--channel-no-mention-author-id"
+    )
     if not args.allow_dms and not args.allowed_channel_ids:
         raise SystemExit("At least one --allowed-channel-id is required unless --allow-dms is enabled.")
     if args.allow_dms and not args.allowed_user_ids:
@@ -3204,6 +3304,10 @@ def cmd_register(args: argparse.Namespace) -> int:
             "--allow-dms requires at least one --allowed-user-id so direct messages are scoped to a known operator. "
             "Add an allowlist or drop --allow-dms."
         )
+    try:
+        channel_history_limit = parse_channel_history_limit(args.channel_history_limit)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     inferred_trigger_mode = args.trigger_mode or "mention_or_dm"
     explicit_startup_dm_user_ids = _parse_many_csv_ids(
         [
@@ -3234,7 +3338,7 @@ def cmd_register(args: argparse.Namespace) -> int:
         "STARTUP_DM_TEXT": args.startup_dm_text,
         "STARTUP_CHANNEL_TEXT": getattr(args, "startup_channel_text", "") or "",
         "ALLOWED_CHANNEL_IDS": ",".join(args.allowed_channel_ids),
-        "CHANNEL_HISTORY_LIMIT": str(args.channel_history_limit),
+        "CHANNEL_HISTORY_LIMIT": str(channel_history_limit),
         "OPEN_VISIBLE_TERMINAL": "true" if args.open_visible_terminal else "false",
         "RELAY_ATTACH_CHANNEL_ID": args.attach_channel_id or (args.allowed_channel_ids[0] if args.allowed_channel_ids else ""),
     }
@@ -3581,7 +3685,7 @@ def cmd_discord_smoke(args: argparse.Namespace) -> int:
 def cmd_serve(args: argparse.Namespace) -> int:
     env_file = Path(args.env_file).resolve()
     env = _normalized_profile_env(_load_env_file(env_file))
-    workspace = Path(env["CODEX_WORKDIR"]).resolve()
+    workspace = _resolve_existing_workspace(env["CODEX_WORKDIR"])
     state_dir = state_dir_for_namespace(env["STATE_NAMESPACE"])
     state_dir.mkdir(parents=True, exist_ok=True)
     pid_path = _supervisor_pid_path(state_dir)
@@ -3944,7 +4048,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Allow this profile to use the CLADEX runtime repository as its workspace; only use for deliberate CLADEX development.",
     )
     register_parser.add_argument("--trigger-mode", choices=["all", "mention_or_dm", "dm_only"], default=None, help="How channel messages trigger the relay; defaults to `mention_or_dm` when a channel is configured")
-    register_parser.add_argument("--channel-history-limit", type=int, default=20, help="Relevant messages included in a fresh channel bootstrap digest; use 0 for an unlimited backfill scan")
+    register_parser.add_argument("--channel-history-limit", default=str(DEFAULT_CHANNEL_HISTORY_LIMIT), help="Relevant messages included in a fresh channel bootstrap digest; use 0 for an unlimited backfill scan")
     register_parser.add_argument("--startup-dm-user-id", dest="startup_dm_user_ids", action="append", default=[], metavar="USER_ID", help="User ID to receive the startup DM; repeat as needed")
     register_parser.add_argument("--startup-dm-user-ids", dest="startup_dm_user_ids_csv", default="", help="Comma-separated startup DM recipient user IDs")
     register_parser.add_argument("--startup-dm-text", default="Discord relay online. DM me here to chat with Codex.", help="Optional startup DM text")

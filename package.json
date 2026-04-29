@@ -1,7 +1,7 @@
 {
   "name": "cladex",
   "private": true,
-  "version": "2.5.0",
+  "version": "2.5.1",
   "author": "CLADEX Contributors",
   "description": "Unified desktop and CLI manager for Codex and Claude Discord relays.",
   "type": "module",
@@ -20,6 +20,7 @@
     "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
     "lint": "tsc --noEmit",
     "api:smoke": "node scripts/server-contract-smoke.cjs",
+    "frontend:smoke": "node src/App.workflow.test.mjs",
     "electron": "npm run build && electron .",
     "electron:dev": "concurrently \"npm run server\" \"npm run dev\" \"wait-on http://127.0.0.1:3000 && electron .\"",
     "electron:build": "npm run build && electron-builder --publish never",
