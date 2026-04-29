@@ -1,21 +1,18 @@
 """Stdlib-only bootstrap entry point for the CLADEX backend runtime.
 
 `server.cjs` invokes this on a clean packaged-user machine before the
-managed venv exists. Importing `install_plugin._ensure_runtime` directly
-also pulls in `relay_common`, which requires `psutil` / `platformdirs` —
-neither is on a fresh machine yet, so the import fails before pip can run.
+managed venv exists. Other backend modules pull in third-party packages
+(psutil, platformdirs) at import time, which crashes on a fresh machine
+before pip can install them. Even after creating a venv, the same
+problem repeats inside the venv until pip has actually run.
 
-This script does the minimum needed to land the runtime venv:
-  1. Resolve the same RUNTIME_ROOT / CONFIG_ROOT layout `relay_common`
-     would compute (platformdirs.user_data_dir / user_config_dir for
-     "discord-codex-relay"), using only the standard library.
-  2. Create the venv if missing.
-  3. Hand off to the venv's Python: `python -m install_plugin --bootstrap`.
-     Once we are inside the venv, importing `relay_common` is safe because
-     the package will be installed in the next step.
+This script does the entire first-stage install with the standard
+library only: create the venv, then call pip install via subprocess.
+Subsequent runs are idempotent: the venv and package are already in
+place, so pip becomes a no-op.
 
-Operators can override the runtime root with CLADEX_RUNTIME_DATA_ROOT and
-the install source with CLADEX_INSTALL_SOURCE.
+Operators can override the runtime root with CLADEX_RUNTIME_DATA_ROOT
+and the install source with CLADEX_INSTALL_SOURCE.
 """
 
 from __future__ import annotations
@@ -27,6 +24,7 @@ import venv
 from pathlib import Path
 
 PACKAGE_NAME = "discord-codex-relay"
+DEFAULT_TIMEOUT_SECONDS = 900
 
 
 def _stdlib_user_data_dir(app: str) -> Path:
@@ -63,18 +61,75 @@ def _ensure_venv(root: Path) -> Path:
     return python
 
 
-def _delegate_to_install_plugin(python: Path) -> int:
-    """Re-enter `install_plugin._ensure_runtime` from inside the runtime venv,
-    where `relay_common` and its native deps are about to be available.
-    The first run installs the package; later runs are idempotent."""
-    backend_dir = Path(__file__).resolve().parent
+def _backend_dir() -> Path:
+    return Path(__file__).resolve().parent
+
+
+def _resolve_install_source() -> str:
+    """Resolve the pip install target without importing install_plugin.
+
+    Mirrors install_plugin._install_source but stdlib-only:
+      - If CLADEX_INSTALL_SOURCE is set, use it as-is.
+      - If pyproject.toml lives next to this script (packaged bundle or
+        dev tree), install from that local path.
+      - Otherwise fall back to the published package on PyPI by name.
+    """
+    override = os.environ.get("CLADEX_INSTALL_SOURCE")
+    if override:
+        return override
+    backend = _backend_dir()
+    if (backend / "pyproject.toml").exists():
+        return str(backend)
+    return PACKAGE_NAME
+
+
+def _resolve_constraints_path(install_target: str) -> Path | None:
+    """Find a constraints.txt next to the install target or the backend dir."""
+    candidates: list[Path] = []
+    target = Path(install_target)
+    if target.exists() and target.is_dir():
+        candidates.append(target / "constraints.txt")
+    candidates.append(_backend_dir() / "constraints.txt")
+    for path in candidates:
+        try:
+            resolved = path.resolve()
+        except OSError:
+            continue
+        if resolved.exists():
+            return resolved
+    return None
+
+
+def _pip_install(python: Path) -> int:
+    install_target = _resolve_install_source()
+    constraints = _resolve_constraints_path(install_target)
     cmd = [
         str(python),
-        "-c",
-        "import sys; sys.path.insert(0, '.'); "
-        "from install_plugin import _ensure_runtime; _ensure_runtime()",
+        "-m",
+        "pip",
+        "install",
+        "--upgrade",
     ]
-    proc = subprocess.run(cmd, cwd=str(backend_dir), check=False)
+    target_path = Path(install_target)
+    if (
+        target_path.exists()
+        or install_target.startswith((".", "/", "\\"))
+        or install_target.endswith((".whl", ".zip", ".tar.gz"))
+    ):
+        cmd.append("--force-reinstall")
+    if constraints is not None:
+        cmd.extend(["-c", str(constraints)])
+    cmd.append(install_target)
+    env = os.environ.copy()
+    env["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
+    timeout_raw = os.environ.get("CLADEX_INSTALL_SUBPROCESS_TIMEOUT") or os.environ.get(
+        "CLADEX_BOOTSTRAP_TIMEOUT_SECONDS"
+    )
+    try:
+        timeout = max(int(str(timeout_raw or DEFAULT_TIMEOUT_SECONDS).strip()), 1)
+    except ValueError:
+        timeout = DEFAULT_TIMEOUT_SECONDS
+    proc = subprocess.run(cmd, env=env, timeout=timeout, check=False)
     return proc.returncode
 
 
@@ -82,8 +137,7 @@ def main() -> int:
     runtime_root = _runtime_root()
     runtime_root.parent.mkdir(parents=True, exist_ok=True)
     python = _ensure_venv(runtime_root)
-    rc = _delegate_to_install_plugin(python)
-    return rc
+    return _pip_install(python)
 
 
 if __name__ == "__main__":

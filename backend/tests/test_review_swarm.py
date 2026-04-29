@@ -1791,5 +1791,163 @@ def test_bootstrap_runtime_module_imports_with_stdlib_only() -> None:
     import sys
 
     src = Path(module.__file__).read_text(encoding="utf-8")
-    assert "import relay_common" not in src
-    assert "from relay_common" not in src
+    # Strip docstring-/comment-style mentions; only flag actual import or
+    # subprocess-arg uses. The 2.5.6 regression was a code path that did
+    # `from install_plugin import _ensure_runtime` from inside the venv
+    # before deps were pip-installed.
+    code_lines = [
+        line for line in src.splitlines()
+        if not line.lstrip().startswith("#") and '"""' not in line
+    ]
+    code_only = "\n".join(code_lines)
+    for forbidden in (
+        "from install_plugin import",
+        "import install_plugin",
+        "install_plugin import _ensure_runtime",
+        "_delegate_to_install_plugin",
+    ):
+        assert forbidden not in code_only, (
+            f"bootstrap_runtime must not reference install_plugin from code: {forbidden!r}"
+        )
+    # Confirm the bootstrap actually pip-installs by itself.
+    assert callable(getattr(module, "_pip_install"))
+    assert callable(getattr(module, "_resolve_install_source"))
+
+
+def test_bootstrap_runtime_resolves_local_install_source(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The bootstrap install source must come from the bundled `pyproject.toml`
+    when the script ships next to one (packaged bundle / dev tree). On a
+    truly clean machine without the bundle, fall back to the package name on
+    PyPI. CLADEX_INSTALL_SOURCE always wins."""
+    import bootstrap_runtime
+
+    monkeypatch.delenv("CLADEX_INSTALL_SOURCE", raising=False)
+    # Backend dir actually has pyproject.toml; bootstrap should use it.
+    src = bootstrap_runtime._resolve_install_source()
+    assert Path(src).name == "backend" or "backend" in src.replace("\\", "/").split("/"), src
+
+    # Operator override beats both auto-detect paths.
+    monkeypatch.setenv("CLADEX_INSTALL_SOURCE", "discord-codex-relay==9.9.9")
+    assert bootstrap_runtime._resolve_install_source() == "discord-codex-relay==9.9.9"
+
+
+def test_minimal_reviewer_env_isolates_home_keys_when_isolated_home_set(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """When `isolated_home` is supplied, every HOME-like key must point at
+    the per-job isolated dir, not at the host's real home. This prevents a
+    prompt-injected repo from asking the reviewer to Read/Grep host secret
+    paths like %LOCALAPPDATA%/cladex/remote-access-token.json or
+    ~/.codex/auth.json via the read-only filesystem tools."""
+    monkeypatch.setenv("HOME", "/host/home")
+    monkeypatch.setenv("USERPROFILE", "C:\\host\\Users\\op")
+    monkeypatch.setenv("APPDATA", "C:\\host\\Users\\op\\AppData\\Roaming")
+    monkeypatch.setenv("LOCALAPPDATA", "C:\\host\\Users\\op\\AppData\\Local")
+    monkeypatch.setenv("XDG_CONFIG_HOME", "/host/home/.config")
+    isolated = tmp_path / "iso-home"
+    env = review_swarm._minimal_reviewer_env(
+        account_home={"CODEX_HOME": str(tmp_path / "codex")},
+        isolated_home=isolated,
+    )
+    iso = str(isolated)
+    for key in ("HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "XDG_CONFIG_HOME"):
+        assert env.get(key) == iso, f"{key} must point at isolated home, got {env.get(key)!r}"
+    # CODEX_HOME (the explicit account home) is preserved untouched so the
+    # provider CLI can still authenticate.
+    assert env["CODEX_HOME"] == str(tmp_path / "codex")
+    # Host secret paths must not be reachable through env.
+    assert "/host" not in repr(env.get("HOME"))
+    assert isolated.exists() and isolated.is_dir()
+
+
+def test_minimal_reviewer_env_falls_back_to_host_home_when_no_isolation(monkeypatch: pytest.MonkeyPatch) -> None:
+    """For internal trusted callers (like preflight scans on the operator's
+    own machine, with no untrusted prompt) we still allow the host home
+    passthrough. Confirm the fallback works so we don't accidentally break
+    callers we haven't migrated yet."""
+    monkeypatch.setenv("HOME", "/host/home")
+    monkeypatch.setenv("USERPROFILE", "C:\\host\\Users\\op")
+    env = review_swarm._minimal_reviewer_env()
+    assert env.get("HOME") == "/host/home"
+
+
+def test_synthesizer_prompt_includes_lane_detail_for_cross_lane_correlation(tmp_path: Path) -> None:
+    """The synthesizer must see each lane's `detail` and `recommendation`
+    text — not just title/path/line — because cross-lane findings come
+    from comparing assumptions and root causes the lanes wrote in those
+    fields. F0035 from the 2.5.6 audit demonstrated the prior loss:
+    the synthesizer was told to find contradictions but the prompt
+    stripped the very text that exposes them."""
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    job = {"id": "review-20260101-000000-deadbeef", "provider": "codex", "workspace": str(workspace)}
+    lane_findings = [
+        {
+            "agentId": "agent-01",
+            "severity": "high",
+            "category": "auth",
+            "path": "auth.py",
+            "line": 5,
+            "title": "Auth check assumes startup order X",
+            "detail": "auth.py:5 short-circuits when role context is non-empty, ASSUMING startup loaded roles before auth ran.",
+            "recommendation": "Block auth until roles are loaded explicitly.",
+        },
+        {
+            "agentId": "agent-02",
+            "severity": "medium",
+            "category": "runtime",
+            "path": "lifecycle.py",
+            "line": 22,
+            "title": "Lifecycle reverses startup order",
+            "detail": "lifecycle.py:22 starts the auth subsystem BEFORE roles are loaded under the websocket boot path.",
+            "recommendation": "Move role-loading to before auth subsystem start.",
+        },
+    ]
+    prompt = review_swarm._synthesizer_prompt(job, lane_findings)
+    # Must contain the assumption text (lane A) AND the contradiction (lane B)
+    # so the synthesizer can actually correlate them.
+    assert "ASSUMING startup loaded roles before auth ran" in prompt
+    assert "starts the auth subsystem BEFORE roles are loaded" in prompt
+    # And keep the recommendations so the synthesizer can spot half-fixes.
+    assert "Block auth until roles are loaded explicitly" in prompt
+
+
+def test_load_review_findings_strict_rejects_missing_artifact(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fix Review must fail clearly when findings.json is missing rather
+    than silently starting from `[]`. The non-strict loader still returns
+    `[]` for tolerant callers (planners), but Fix Review entry points use
+    the strict loader so a corrupted artifact never produces an empty fix
+    run that backs up the workspace for nothing."""
+    import fix_orchestrator
+
+    monkeypatch.setattr(review_swarm, "REVIEW_DATA_ROOT", tmp_path / "reviews")
+    review_id = "review-20260101-000000-deadbeef"
+    with pytest.raises(FileNotFoundError, match="findings artifact"):
+        fix_orchestrator._load_review_findings_strict(review_id)
+
+
+def test_load_review_findings_strict_rejects_corrupt_json(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Corrupt findings.json must surface a ValueError so Fix Review fails
+    closed before creating a backup or starting fix workers."""
+    import fix_orchestrator
+
+    monkeypatch.setattr(review_swarm, "REVIEW_DATA_ROOT", tmp_path / "reviews")
+    review_id = "review-20260101-000000-deadbeef"
+    findings_path = review_swarm.findings_json_path(review_id)
+    findings_path.parent.mkdir(parents=True, exist_ok=True)
+    findings_path.write_text("{not valid json", encoding="utf-8")
+    with pytest.raises(ValueError, match="corrupt"):
+        fix_orchestrator._load_review_findings_strict(review_id)
+
+
+def test_load_review_findings_strict_rejects_empty_findings_list(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An empty `findings` list is also a hard fail for Fix Review — there
+    is nothing to fix, so creating a backup and launching workers would just
+    waste disk and an unhelpful empty fix-run artifact."""
+    import fix_orchestrator
+
+    monkeypatch.setattr(review_swarm, "REVIEW_DATA_ROOT", tmp_path / "reviews")
+    review_id = "review-20260101-000000-deadbeef"
+    findings_path = review_swarm.findings_json_path(review_id)
+    findings_path.parent.mkdir(parents=True, exist_ok=True)
+    findings_path.write_text(json.dumps({"findings": []}), encoding="utf-8")
+    with pytest.raises(ValueError, match="no findings"):
+        fix_orchestrator._load_review_findings_strict(review_id)

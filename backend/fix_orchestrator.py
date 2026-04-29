@@ -265,6 +265,47 @@ def _load_review_findings(review_id: str) -> list[dict[str, Any]]:
     return findings if isinstance(findings, list) else []
 
 
+def _load_review_findings_strict(review_id: str) -> list[dict[str, Any]]:
+    """Strict findings loader for Fix Review entry points.
+
+    `_load_review_findings` returns `[]` on missing or corrupt findings.json
+    because some callers (the fix planner, plan formatters) tolerate an empty
+    set. But Fix Review writes new files into the user's workspace based on
+    the findings list — starting a fix run from `[]` because the artifact got
+    truncated, deleted, or corrupted is dangerous and silent. This loader
+    raises a clear error so the caller can fail closed before creating a
+    backup or launching write workers.
+    """
+    path = review_swarm.findings_json_path(review_id)
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Fix Review needs the review findings artifact, but {path} is missing. "
+            "Re-run the review job or restore findings.json before starting a fix run."
+        )
+    try:
+        raw = path.read_text(encoding="utf-8")
+        payload = json.loads(raw) if raw.strip() else {}
+    except (json.JSONDecodeError, OSError) as exc:
+        raise ValueError(
+            f"Fix Review cannot start: review findings file is corrupt ({path}): {exc}"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise ValueError(
+            f"Fix Review cannot start: review findings file is malformed ({path})."
+        )
+    findings = payload.get("findings", [])
+    if not isinstance(findings, list):
+        raise ValueError(
+            f"Fix Review cannot start: review findings file's `findings` field is not a list ({path})."
+        )
+    if not findings:
+        raise ValueError(
+            "Fix Review cannot start: review has no findings to fix. "
+            "Confirm the review completed successfully before starting a fix run."
+        )
+    return findings
+
+
 FIX_PLAN_SCHEMA: dict[str, Any] = {
     "type": "object",
     "required": ["summary", "recommendedAgentCount", "tasks"],
@@ -1024,7 +1065,12 @@ def start_fix_run(
                 )
             if not allow_self_fix:
                 raise ValueError("CLADEX self-fix requires explicit --allow-cladex-self-fix approval.")
-        findings = _load_review_findings(review_id)
+        # Use the strict loader here: a fix run that proceeds from an empty
+        # findings list because findings.json was truncated/missing creates a
+        # backup but never writes anything useful, leaving an unhelpful empty
+        # fix-run artifact and a confusing user experience. Fail before we
+        # touch the workspace.
+        findings = _load_review_findings_strict(review_id)
         max_agent_count = validate_max_agents(max_agents)
         run_id = f"fix-{time.strftime('%Y%m%d-%H%M%S', time.gmtime())}-{uuid.uuid4().hex[:8]}"
         run_dir(run_id).mkdir(parents=True, exist_ok=True)

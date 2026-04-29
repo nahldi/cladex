@@ -459,9 +459,9 @@ function packageVersion() {
   }
   try {
     const payload = JSON.parse(fsSync.readFileSync(path.join(__dirname, 'package.json'), 'utf8'));
-    return String(payload.version || '').trim() || '2.5.6';
+    return String(payload.version || '').trim() || '2.5.7';
   } catch {
-    return '2.5.6';
+    return '2.5.7';
   }
 }
 

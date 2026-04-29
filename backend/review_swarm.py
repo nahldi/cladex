@@ -2011,7 +2011,11 @@ def _run_codex_ai_review(
         str(output_path),
         "-",
     ]
-    env = _minimal_reviewer_env(account_home={"CODEX_HOME": str(job.get("accountHome"))} if job.get("accountHome") else {})
+    isolated = _reviewer_isolated_home(scratch)
+    env = _minimal_reviewer_env(
+        account_home={"CODEX_HOME": str(job.get("accountHome"))} if job.get("accountHome") else {},
+        isolated_home=isolated,
+    )
     result = _run_cli(command, _ai_prompt(job, agent, files, scratch=scratch), env=env, cancel_check=cancel_check)
     if result.ok and output_path.exists():
         return AIRunResult(text=_read_text_with_limit(output_path), ok=True)
@@ -2045,7 +2049,8 @@ def _run_claude_ai_review(
     extra_env: dict[str, str] = {}
     if job.get("accountHome"):
         extra_env["CLAUDE_CONFIG_DIR"] = str(job["accountHome"])
-    env = _minimal_reviewer_env(account_home=extra_env)
+    isolated = _reviewer_isolated_home(scratch)
+    env = _minimal_reviewer_env(account_home=extra_env, isolated_home=isolated)
     return _run_cli(
         command,
         _ai_prompt(job, agent, files, scratch=scratch),
@@ -2069,9 +2074,14 @@ def _synthesizer_prompt(job: dict[str, Any], lane_findings: list[dict[str, Any]]
     """
     workspace = Path(job["workspace"])
     coordination_path = coordination_markdown_path(job["id"])
-    # Compact the lane findings — the synthesizer doesn't need full detail,
-    # just enough to spot correlations. Keep severity, category, path, line,
-    # and a short title; drop detail/recommendation to keep the prompt small.
+    # Compact the lane findings, but keep enough evidence for cross-lane
+    # correlation. The synthesizer's whole point is finding contradictions
+    # and assumption gaps between lanes — sending only severity/category/
+    # path/line/title was insufficient because most cross-lane issues
+    # depend on what each lane actually wrote in detail/recommendation
+    # (e.g. lane A says "X is safe under assumption Y" — lane B's
+    # `detail` is what reveals Y is false). Cap individual fields and the
+    # whole payload so a long lane report never blows the prompt.
     compact: list[dict[str, Any]] = []
     for finding in lane_findings:
         compact.append(
@@ -2081,10 +2091,12 @@ def _synthesizer_prompt(job: dict[str, Any], lane_findings: list[dict[str, Any]]
                 "category": str(finding.get("category") or ""),
                 "path": str(finding.get("path") or ""),
                 "line": finding.get("line"),
-                "title": str(finding.get("title") or "")[:140],
+                "title": str(finding.get("title") or "")[:200],
+                "detail": str(finding.get("detail") or "")[:1200],
+                "recommendation": str(finding.get("recommendation") or "")[:600],
             }
         )
-    findings_json = json.dumps(compact, ensure_ascii=False)[:60000]
+    findings_json = json.dumps(compact, ensure_ascii=False)[:120000]
     return (
         "You are the CLADEX review-swarm synthesizer.\n"
         "The specialist lanes have already finished. Your job is to find what they could not — issues that require evidence from multiple lanes to spot, contradictions between lane reports, drift between code and the docs/specs, and architectural risks no single lane was scoped to see.\n"
@@ -2146,7 +2158,7 @@ def _run_synthesizer_pass(
         extra: dict[str, str] = {}
         if job.get("accountHome"):
             extra["CLAUDE_CONFIG_DIR"] = str(job["accountHome"])
-        env = _minimal_reviewer_env(account_home=extra)
+        env = _minimal_reviewer_env(account_home=extra, isolated_home=_reviewer_isolated_home(scratch))
         result = _run_cli(command, prompt, env=env, cwd=scratch, cancel_check=cancel_check)
     else:
         import relayctl
@@ -2168,7 +2180,8 @@ def _run_synthesizer_pass(
             "-",
         ]
         env = _minimal_reviewer_env(
-            account_home={"CODEX_HOME": str(job.get("accountHome"))} if job.get("accountHome") else {}
+            account_home={"CODEX_HOME": str(job.get("accountHome"))} if job.get("accountHome") else {},
+            isolated_home=_reviewer_isolated_home(scratch),
         )
         result = _run_cli(command, prompt, env=env, cancel_check=cancel_check)
         if result.ok and output_path.exists():
@@ -2183,7 +2196,23 @@ def _run_synthesizer_pass(
     return _agent_finding_prefix("synthesizer", str(job.get("provider") or ""), parsed)
 
 
-_REVIEWER_ENV_PASSTHROUGH = (
+def _reviewer_isolated_home(scratch: Path) -> Path:
+    """Return a per-lane empty directory used as HOME/USERPROFILE for the
+    reviewer subprocess. Created lazily; safe to call repeatedly."""
+    base = Path(str(scratch)) / ".cladex-reviewer-home"
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
+
+# Process env passthrough is split in two: HOST_PASSTHROUGH covers
+# truly-machine-level entries the CLI binaries need to start, and
+# HOME_LIKE_KEYS covers anything that resolves to the user's profile
+# directory or shadows it. Reviewer subprocesses run with an isolated
+# per-job home directory in place of the host home keys, so a prompt-
+# injected repo cannot ask the reviewer to Read/Grep a host-side
+# secrets path like %LOCALAPPDATA%/cladex/remote-access-token.json,
+# ~/.aws/credentials, or ~/.codex/auth.json.
+_REVIEWER_HOST_PASSTHROUGH = (
     "PATH",
     "PATHEXT",
     "SystemRoot",
@@ -2191,10 +2220,6 @@ _REVIEWER_ENV_PASSTHROUGH = (
     "TEMP",
     "TMP",
     "TMPDIR",
-    "USERPROFILE",
-    "HOME",
-    "LOCALAPPDATA",
-    "APPDATA",
     "ProgramFiles",
     "ProgramFiles(x86)",
     "ProgramData",
@@ -2206,21 +2231,59 @@ _REVIEWER_ENV_PASSTHROUGH = (
     "WINDIR",
     "COMSPEC",
 )
+_REVIEWER_HOME_LIKE_KEYS = (
+    "HOME",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_STATE_HOME",
+)
+# Backwards-compat alias for older imports/tests; equivalent to host + home-like.
+_REVIEWER_ENV_PASSTHROUGH = _REVIEWER_HOST_PASSTHROUGH + _REVIEWER_HOME_LIKE_KEYS
 
 
-def _minimal_reviewer_env(*, account_home: dict[str, str] | None = None) -> dict[str, str]:
+def _minimal_reviewer_env(
+    *,
+    account_home: dict[str, str] | None = None,
+    isolated_home: Path | None = None,
+) -> dict[str, str]:
     """Build a minimal reviewer subprocess environment.
 
     Strips inherited credentials (Discord tokens, API keys, AWS creds, etc.) by
     default and only carries through entries needed to actually run the CLI on
     the host. Account-home overrides for the chosen provider are passed
     explicitly via `account_home`.
+
+    When `isolated_home` is provided, every HOME-like env key
+    (HOME/USERPROFILE/APPDATA/LOCALAPPDATA/XDG_*) is rewritten to point at it
+    so a prompt-injected repository cannot ask the reviewer's read-only
+    filesystem tools to read host-side secret stores like
+    `%LOCALAPPDATA%/cladex/remote-access-token.json`, `~/.codex/auth.json`,
+    `~/.aws/credentials`, or `~/.ssh/`. The provider's actual credential home
+    is still reachable via the explicit `account_home` overrides.
     """
     base: dict[str, str] = {}
-    for key in _REVIEWER_ENV_PASSTHROUGH:
+    for key in _REVIEWER_HOST_PASSTHROUGH:
         value = os.environ.get(key)
         if value is not None:
             base[key] = value
+    if isolated_home is not None:
+        isolated_home.mkdir(parents=True, exist_ok=True)
+        isolated_value = str(isolated_home)
+        for key in _REVIEWER_HOME_LIKE_KEYS:
+            base[key] = isolated_value
+    else:
+        # Fall back to passing through host home-like values when no isolation
+        # root was supplied. Callers that handle untrusted input (review/fix
+        # lanes) MUST supply `isolated_home`; this branch is only safe for
+        # internal trusted callers.
+        for key in _REVIEWER_HOME_LIKE_KEYS:
+            value = os.environ.get(key)
+            if value is not None:
+                base[key] = value
     base["CLADEX_REVIEW_LANE"] = "1"
     if account_home:
         for key, value in account_home.items():
