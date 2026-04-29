@@ -112,6 +112,27 @@ PRIVACY_IGNORED_DIR_NAMES = {
     ".mypy_cache",
 }
 PRIVACY_ALLOWED_DOTENV_FILES = {".env.example"}
+PRIVACY_GENERIC_ACCOUNT_MARKERS = {
+    "actions",
+    "admin",
+    "administrator",
+    "appveyor",
+    "build",
+    "builder",
+    "buildkite-agent",
+    "circleci",
+    "codespace",
+    "gitpod",
+    "github",
+    "jenkins",
+    "root",
+    "runner",
+    "runneradmin",
+    "ubuntu",
+    "user",
+    "users",
+    "vsts",
+}
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)
 WINDOWS_USER_PATH_RE = re.compile(r"(?i)\b([A-Z]:\\Users\\)([^\\]+)")
@@ -1196,12 +1217,33 @@ def _privacy_personal_markers() -> list[str]:
     for marker in markers:
         if len(marker) < 3:
             continue
+        if _privacy_is_generic_account_marker(marker):
+            continue
         lowered = marker.lower()
         if lowered in seen:
             continue
         seen.add(lowered)
         unique.append(marker)
     return unique
+
+
+def _privacy_is_generic_account_marker(marker: str) -> bool:
+    normalized = marker.strip().lower().replace("\\", "/").rstrip("/")
+    if not normalized:
+        return True
+    tail = normalized.rsplit("/", 1)[-1]
+    return normalized in PRIVACY_GENERIC_ACCOUNT_MARKERS or tail in PRIVACY_GENERIC_ACCOUNT_MARKERS
+
+
+def _privacy_marker_in_text(marker: str, text: str) -> bool:
+    marker = marker.strip()
+    if not marker:
+        return False
+    lowered_text = text.lower()
+    lowered_marker = marker.lower()
+    if any(separator in marker for separator in ("\\", "/", ":")):
+        return lowered_marker in lowered_text
+    return bool(re.search(rf"(?<![A-Za-z0-9_-]){re.escape(lowered_marker)}(?![A-Za-z0-9_-])", lowered_text))
 
 
 def _privacy_sensitive_env_keys(path: Path) -> list[str]:
@@ -1245,7 +1287,7 @@ def _privacy_audit(root: Path) -> list[str]:
             except OSError:
                 continue
             for marker in markers:
-                if marker and marker.lower() in text.lower():
+                if _privacy_marker_in_text(marker, text):
                     findings.append(f"personal marker found in {relative_text}: {marker}")
                     break
             if re.search(r"/mnt/c/users/[a-z0-9._ -]{2,}/", text, flags=re.IGNORECASE) or re.search(r"c:\\users\\[a-z0-9._ -]{2,}\\", text, flags=re.IGNORECASE):
@@ -1303,7 +1345,7 @@ def _privacy_audit_tracked(root: Path) -> list[str]:
             continue
         lowered_text = text.lower()
         for marker in markers:
-            if marker and marker.lower() in lowered_text:
+            if _privacy_marker_in_text(marker, lowered_text):
                 findings.append(f"personal marker found in tracked file {relative_text}: {marker}")
                 break
         if re.search(r"/mnt/c/users/[a-z0-9._ -]{2,}/", text, flags=re.IGNORECASE) or re.search(r"c:\\users\\[a-z0-9._ -]{2,}\\", text, flags=re.IGNORECASE):

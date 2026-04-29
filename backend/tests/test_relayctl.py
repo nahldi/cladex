@@ -1426,6 +1426,18 @@ def test_privacy_audit_allows_generic_user_path_patterns() -> None:
     assert all(item != "user-specific path literal found in relayctl.py" for item in findings)
 
 
+def test_privacy_markers_ignore_ci_runner_accounts() -> None:
+    assert relayctl._privacy_is_generic_account_marker("runner")
+    assert relayctl._privacy_is_generic_account_marker("/home/runner")
+    assert relayctl._privacy_is_generic_account_marker(r"C:\Users\runneradmin")
+    assert not relayctl._privacy_is_generic_account_marker("private-user-name")
+
+
+def test_privacy_marker_match_ignores_identifier_substrings() -> None:
+    assert not relayctl._privacy_marker_in_text("runner", "runner_task = api_runner.run")
+    assert relayctl._privacy_marker_in_text("private-user-name", "C:/Users/private-user-name/Desktop/project")
+
+
 def test_ensure_codex_project_trusted_handles_windows_paths(tmp_path: Path) -> None:
     project_path = _windows_project_path("OneDrive", "Desktop", "projects", "teamspace")
     config_path = tmp_path / "config.toml"

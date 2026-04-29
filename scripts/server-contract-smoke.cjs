@@ -144,6 +144,22 @@ function request(port, options) {
   });
 }
 
+function comparableFilesystemPath(value) {
+  let resolved = path.resolve(String(value || ''));
+  try {
+    resolved = fs.realpathSync.native(resolved);
+  } catch {
+    try {
+      resolved = fs.realpathSync(resolved);
+    } catch {}
+  }
+  return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+}
+
+function assertSameFilesystemPath(actual, expected) {
+  assert.equal(comparableFilesystemPath(actual), comparableFilesystemPath(expected));
+}
+
 async function main() {
   const originalLocalAppData = process.env.LOCALAPPDATA;
   const runtimeRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cladex-runtime-manifest-'));
@@ -366,7 +382,7 @@ async function main() {
         body: JSON.stringify({ workspace: smokeWorkspace, provider: 'codex' }),
       });
       assert.equal(scout.status, 200);
-      assert.equal(scout.json.workspace, path.resolve(smokeWorkspace));
+      assertSameFilesystemPath(scout.json.workspace, smokeWorkspace);
       assert.ok(scout.json.recommendation);
 
       const backup = await request(port, {
