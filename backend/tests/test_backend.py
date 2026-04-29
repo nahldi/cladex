@@ -189,6 +189,17 @@ def test_app_server_backend_interrupt_uses_active_turn_when_available() -> None:
     assert ("turn/interrupt", {"threadId": "thread-1", "turnId": "turn-1"}) in session.calls
 
 
+def test_app_server_backend_interrupt_requires_active_turn() -> None:
+    session = _FakeSession()
+    session.active_turn = None
+    backend = AppServerCodexBackend(session)
+
+    with pytest.raises(BackendUnavailableError, match="no active turn id"):
+        asyncio.run(backend.interrupt_turn("thread-1"))
+
+    assert session.calls == []
+
+
 def test_app_server_backend_steer_uses_active_turn_precondition() -> None:
     session = _FakeSession()
     session.active_turn = SimpleNamespace(turn_id="turn-1")
@@ -204,6 +215,17 @@ def test_app_server_backend_steer_uses_active_turn_precondition() -> None:
             "expectedTurnId": "turn-1",
         },
     ) in session.calls
+
+
+def test_app_server_backend_steer_requires_active_turn() -> None:
+    session = _FakeSession()
+    session.active_turn = None
+    backend = AppServerCodexBackend(session)
+
+    with pytest.raises(BackendUnavailableError, match="no active turn id"):
+        asyncio.run(backend.steer_turn("thread-1", "fold this in"))
+
+    assert session.calls == []
 
 
 def test_app_server_backend_raises_clear_protocol_error(monkeypatch: pytest.MonkeyPatch) -> None:

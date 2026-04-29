@@ -29,6 +29,10 @@ DEFAULT_AI_MAX_PARALLEL = 4
 DEFAULT_AGENT_OUTPUT_LIMIT = 120_000
 MAX_AI_MESSAGE_FILE_BYTES = 2 * 1024 * 1024
 MAX_JSON_EXTRACTION_CHARS = 512 * 1024
+DEFAULT_INVENTORY_ENTRY_BUDGET = 50_000
+DEFAULT_INVENTORY_FILE_BUDGET = 10_000
+DEFAULT_MAX_FINDINGS_PER_REVIEW = 500
+DEFAULT_MAX_DETERMINISTIC_FINDINGS_PER_LANE = 200
 STALE_JOB_RUN_LOCK_SECONDS = 10 * 60
 STALE_ACTIVE_REVIEW_SECONDS = 60 * 60
 HARDLINK_SCRATCH_OVERHEAD_RATIO = 0.05
@@ -278,9 +282,24 @@ SECRET_ASSIGNMENT_RE = re.compile(
 )
 DISCORD_TOKEN_RE = re.compile(r"\b[A-Za-z0-9_-]{23,28}\.[A-Za-z0-9_-]{6,7}\.[A-Za-z0-9_-]{27,45}\b")
 GITHUB_TOKEN_RE = re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b")
+OPENAI_TOKEN_RE = re.compile(r"\bsk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{20,}\b")
+ANTHROPIC_TOKEN_RE = re.compile(r"\bsk-ant-[A-Za-z0-9_-]{20,}\b")
 FUNCTION_SIGNATURE_RE = re.compile(r"^\s*(async\s+)?(def|function)\s+\w+\s*\(")
 TODO_MARKER_RE = re.compile(r"\b(TODO|FIXME|HACK|XXX)\b", re.I)
 COMMENT_PREFIX_RE = re.compile(r"(?:#|//|/\*|<!--|--\s|;|\*\s)")
+
+
+class CorruptReviewStateError(ValueError):
+    """Raised when a persisted review state file exists but is not usable JSON."""
+
+
+@dataclass
+class WorkspaceInventory:
+    files: list[Path]
+    visitedEntries: int
+    truncated: bool
+    secretLikeFileCount: int
+    workspaceBytes: int
 
 
 def utc_now() -> str:
@@ -352,14 +371,20 @@ def _write_json(path: Path, payload: dict[str, Any] | list[Any]) -> None:
     _atomic_write_text(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
 
-def _read_json(path: Path, default: dict[str, Any]) -> dict[str, Any]:
+def _read_json(path: Path, default: dict[str, Any], *, strict: bool = False) -> dict[str, Any]:
     if not path.exists():
         return dict(default)
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
+    except Exception as exc:
+        if strict:
+            raise CorruptReviewStateError(f"corrupt JSON in {path}: {exc}") from exc
         return dict(default)
-    return payload if isinstance(payload, dict) else dict(default)
+    if not isinstance(payload, dict):
+        if strict:
+            raise CorruptReviewStateError(f"expected JSON object in {path}")
+        return dict(default)
+    return payload
 
 
 def _safe_remove_path(path: Path, root: Path) -> None:
@@ -460,11 +485,19 @@ def _public_job(job: dict[str, Any]) -> dict[str, Any]:
     findings_payload = _read_json(findings_json_path(job["id"]), default={"findings": []})
     findings = findings_payload.get("findings") if isinstance(findings_payload, dict) else None
     public["severityCounts"] = _severity_counts(findings if isinstance(findings, list) else [])
+    try:
+        if cancel_flag_path(str(job["id"])).exists():
+            public["cancelRequested"] = True
+    except (OSError, ValueError):
+        pass
     return public
 
 
 def load_job(job_id: str) -> dict[str, Any]:
-    payload = _read_json(job_json_path(job_id), default={})
+    try:
+        payload = _read_json(job_json_path(job_id), default={}, strict=True)
+    except CorruptReviewStateError as exc:
+        raise CorruptReviewStateError(f"Corrupt review job state for `{job_id}`: {exc}") from exc
     if not payload:
         raise FileNotFoundError(f"No review job found for `{job_id}`.")
     return payload
@@ -479,7 +512,32 @@ def list_reviews() -> list[dict[str, Any]]:
     REVIEW_DATA_ROOT.mkdir(parents=True, exist_ok=True)
     jobs: list[dict[str, Any]] = []
     for path in REVIEW_DATA_ROOT.glob("*/job.json"):
-        payload = _read_json(path, default={})
+        try:
+            payload = _read_json(path, default={}, strict=True)
+        except CorruptReviewStateError as exc:
+            job_id = path.parent.name
+            if REVIEW_ID_RE.fullmatch(job_id):
+                jobs.append(
+                    _public_job(
+                        {
+                            "id": job_id,
+                            "title": "Corrupt review state",
+                            "workspace": "",
+                            "provider": "",
+                            "strategy": REVIEW_STRATEGY,
+                            "agentCount": 0,
+                            "status": "failed",
+                            "createdAt": "",
+                            "updatedAt": "",
+                            "finishedAt": "",
+                            "artifactDir": str(path.parent),
+                            "progress": {"total": 0, "queued": 0, "running": 0, "done": 0, "failed": 0, "cancelled": 0},
+                            "agents": [],
+                            "error": str(exc),
+                        }
+                    )
+                )
+            continue
         if payload.get("id"):
             jobs.append(_public_job(payload))
     jobs.sort(key=lambda item: str(item.get("createdAt", "")), reverse=True)
@@ -576,6 +634,18 @@ def show_review(job_id: str) -> dict[str, Any]:
     return _public_job(load_job(job_id))
 
 
+def _max_findings_per_review() -> int:
+    return max(1, _safe_int(os.environ.get("CLADEX_REVIEW_MAX_FINDINGS"), DEFAULT_MAX_FINDINGS_PER_REVIEW))
+
+
+def _max_deterministic_findings_per_lane() -> int:
+    configured = _safe_int(
+        os.environ.get("CLADEX_REVIEW_MAX_DETERMINISTIC_FINDINGS_PER_LANE"),
+        DEFAULT_MAX_DETERMINISTIC_FINDINGS_PER_LANE,
+    )
+    return max(1, min(configured, _max_findings_per_review()))
+
+
 def _persist_findings(job_id: str, findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
     normalized = dedup_findings([dict(item) for item in findings])
     normalized.sort(
@@ -586,9 +656,16 @@ def _persist_findings(job_id: str, findings: list[dict[str, Any]]) -> list[dict[
             str(item.get("title", "")),
         )
     )
+    max_findings = _max_findings_per_review()
+    truncated = len(normalized) > max_findings
+    if truncated:
+        normalized = normalized[:max_findings]
     for index, finding in enumerate(normalized, start=1):
         finding["id"] = f"F{index:04d}"
-    _write_json(findings_json_path(job_id), {"jobId": job_id, "findings": normalized})
+    _write_json(
+        findings_json_path(job_id),
+        {"jobId": job_id, "findings": normalized, "truncated": truncated, "maxFindings": max_findings},
+    )
     return normalized
 
 
@@ -652,11 +729,19 @@ def cancel_review(job_id: str) -> dict[str, Any]:
     job = load_job(job_id)
     if job.get("status") in TERMINAL_REVIEW_STATUSES:
         return show_review(job_id)
+
     flag = cancel_flag_path(job_id)
     flag.parent.mkdir(parents=True, exist_ok=True)
     flag.write_text(utc_now(), encoding="utf-8")
-    job["cancelRequested"] = True
-    if job.get("status") == "queued":
+
+    # For a live worker, the flag file is the durable cancellation contract.
+    # Avoid writing a full job snapshot from this request path because it can
+    # race with worker progress saves and roll lane state backwards.
+    job = load_job(job_id)
+    if job.get("status") in TERMINAL_REVIEW_STATUSES:
+        return show_review(job_id)
+    if job.get("status") == "queued" and not _review_job_has_live_worker(job):
+        job["cancelRequested"] = True
         job["status"] = "cancelled"
         job["finishedAt"] = utc_now()
         job["error"] = job.get("error") or "Cancelled before execution."
@@ -665,7 +750,8 @@ def cancel_review(job_id: str) -> dict[str, Any]:
                 agent["status"] = "cancelled"
                 agent["detail"] = agent.get("detail") or "Cancelled before launch."
         _update_progress(job)
-    save_job(job)
+        save_job(job)
+        return show_review(job_id)
     return show_review(job_id)
 
 
@@ -876,11 +962,21 @@ def _is_binary(path: Path) -> bool:
 
 
 def _should_skip_dir(path: Path) -> bool:
+    try:
+        if path.is_symlink():
+            return True
+    except OSError:
+        return True
     return path.name in SKIP_DIRS
 
 
 def _should_review_file(path: Path) -> bool:
     name = path.name.lower()
+    try:
+        if path.is_symlink():
+            return False
+    except OSError:
+        return False
     if name.startswith(".env"):
         return False
     if name == SCRATCH_READY_MARKER:
@@ -895,18 +991,78 @@ def _should_review_file(path: Path) -> bool:
     return not _is_binary(path)
 
 
-def inventory_files(workspace: str | Path) -> list[Path]:
+def _inventory_entry_budget() -> int:
+    return max(1, _safe_int(os.environ.get("CLADEX_REVIEW_INVENTORY_ENTRY_BUDGET"), DEFAULT_INVENTORY_ENTRY_BUDGET))
+
+
+def _inventory_file_budget() -> int:
+    return max(1, _safe_int(os.environ.get("CLADEX_REVIEW_INVENTORY_FILE_BUDGET"), DEFAULT_INVENTORY_FILE_BUDGET))
+
+
+def collect_workspace_inventory(workspace: str | Path) -> WorkspaceInventory:
     root = Path(workspace).expanduser().resolve()
     files: list[Path] = []
+    visited = 0
+    workspace_bytes = 0
+    secret_like_count = 0
+    truncated = False
+    entry_budget = _inventory_entry_budget()
+    file_budget = _inventory_file_budget()
+
     for current, dirs, filenames in os.walk(root):
         current_path = Path(current)
-        dirs[:] = sorted([name for name in dirs if not _should_skip_dir(current_path / name)], key=str.lower)
+        kept_dirs: list[str] = []
+        for dirname in sorted(dirs, key=str.lower):
+            visited += 1
+            if visited > entry_budget:
+                truncated = True
+                break
+            if not _should_skip_dir(current_path / dirname):
+                kept_dirs.append(dirname)
+        dirs[:] = kept_dirs if not truncated else []
+        if truncated:
+            break
         for filename in sorted(filenames, key=str.lower):
+            visited += 1
+            if visited > entry_budget:
+                truncated = True
+                dirs[:] = []
+                break
             path = current_path / filename
+            try:
+                if path.is_symlink():
+                    continue
+            except OSError:
+                continue
+            if (filename.lower().startswith(".env") and not is_template_secret_filename(filename)) or (
+                has_secret_token_segment(filename) and not is_template_secret_filename(filename)
+            ):
+                secret_like_count += 1
+            try:
+                if path.is_file():
+                    workspace_bytes += path.stat().st_size
+            except OSError:
+                pass
             if _should_review_file(path):
-                files.append(path)
+                if len(files) < file_budget:
+                    files.append(path)
+                else:
+                    truncated = True
+        if truncated:
+            break
+
     files.sort(key=lambda item: item.relative_to(root).as_posix().lower())
-    return files
+    return WorkspaceInventory(
+        files=files,
+        visitedEntries=visited,
+        truncated=truncated,
+        secretLikeFileCount=secret_like_count,
+        workspaceBytes=workspace_bytes,
+    )
+
+
+def inventory_files(workspace: str | Path) -> list[Path]:
+    return collect_workspace_inventory(workspace).files
 
 
 def _language_counts(files: list[Path]) -> list[dict[str, Any]]:
@@ -961,16 +1117,7 @@ def _validation_commands(workspace: Path) -> list[str]:
 
 
 def _secret_like_name_count(workspace: Path) -> int:
-    count = 0
-    for current, dirs, filenames in os.walk(workspace):
-        current_path = Path(current)
-        dirs[:] = [name for name in dirs if not _should_skip_dir(current_path / name)]
-        for name in filenames:
-            if (name.lower().startswith(".env") and not is_template_secret_filename(name)) or (
-                has_secret_token_segment(name) and not is_template_secret_filename(name)
-            ):
-                count += 1
-    return count
+    return collect_workspace_inventory(workspace).secretLikeFileCount
 
 
 def _has_tests(workspace: Path, files: list[Path]) -> bool:
@@ -1069,12 +1216,13 @@ def analyze_workspace(
     if not protection_violation:
         assert_workspace_allowed(target)
 
-    files = inventory_files(target)
+    inventory = collect_workspace_inventory(target)
+    files = inventory.files
     languages = _language_counts(files)
     markers = _project_markers(target)
     validation_commands = _validation_commands(target)
     has_tests = _has_tests(target, files)
-    secret_like_count = _secret_like_name_count(target)
+    secret_like_count = inventory.secretLikeFileCount
     agent_count, reasons = _recommend_agent_count(
         file_count=len(files),
         language_count=len(languages),
@@ -1102,14 +1250,20 @@ def analyze_workspace(
             lane_focuses.append({"focus": focus, "detail": detail})
             if len(lane_focuses) >= min(agent_count, 6):
                 break
-    scratch_bytes = _approximate_workspace_bytes(target)
+    scratch_bytes = inventory.workspaceBytes
     limits = _review_limit_metadata(agent_count=agent_count, preflight_only=False, account_home="")
     if not validation_commands:
         reasons.append("no standard validation command was detected")
+    if inventory.truncated:
+        reasons.append(
+            f"inventory stopped after {inventory.visitedEntries} entry scan budget; review may not include every file"
+        )
     return {
         "workspace": str(target),
         "projectName": target.name or "Project",
         "fileCount": len(files),
+        "inventoryTruncated": inventory.truncated,
+        "inventoryVisitedEntries": inventory.visitedEntries,
         "workspaceBytes": scratch_bytes,
         "languages": languages[:8],
         "markers": markers[:12],
@@ -1159,15 +1313,24 @@ def has_secret_token_segment(name: str) -> bool:
 
 def secret_name_findings(workspace: Path) -> list[dict[str, Any]]:
     findings: list[dict[str, Any]] = []
+    max_findings = _max_findings_per_review()
     for current, dirs, filenames in os.walk(workspace):
         current_path = Path(current)
         dirs[:] = [name for name in dirs if not _should_skip_dir(current_path / name)]
         for filename in filenames:
+            if len(findings) >= max_findings:
+                dirs[:] = []
+                break
+            path = current_path / filename
+            try:
+                if path.is_symlink():
+                    continue
+            except OSError:
+                continue
             if not has_secret_token_segment(filename):
                 continue
             if is_template_secret_filename(filename):
                 continue
-            path = current_path / filename
             findings.append(
                 {
                     "severity": "high",
@@ -1180,6 +1343,8 @@ def secret_name_findings(workspace: Path) -> list[dict[str, Any]]:
                     "confidence": "medium",
                 }
             )
+        if len(findings) >= max_findings:
+            break
     return findings
 
 
@@ -1238,7 +1403,13 @@ def scan_file(path: Path, workspace: Path) -> list[dict[str, Any]]:
     for index, line in enumerate(lines, start=1):
         lowered = line.lower()
         stripped = line.strip()
-        if _looks_like_literal_secret_assignment(line) or DISCORD_TOKEN_RE.search(line) or GITHUB_TOKEN_RE.search(line):
+        if (
+            _looks_like_literal_secret_assignment(line)
+            or DISCORD_TOKEN_RE.search(line)
+            or GITHUB_TOKEN_RE.search(line)
+            or OPENAI_TOKEN_RE.search(line)
+            or ANTHROPIC_TOKEN_RE.search(line)
+        ):
             findings.append(
                 _finding(
                     severity="high",
@@ -1444,6 +1615,8 @@ def sanitize_text(text: str, *, limit: int = 6000) -> str:
     redacted = SECRET_ASSIGNMENT_RE.sub(lambda match: f"{match.group('prefix')}[REDACTED]", text)
     redacted = DISCORD_TOKEN_RE.sub("[REDACTED_DISCORD_TOKEN]", redacted)
     redacted = GITHUB_TOKEN_RE.sub("[REDACTED_GITHUB_TOKEN]", redacted)
+    redacted = ANTHROPIC_TOKEN_RE.sub("[REDACTED_ANTHROPIC_TOKEN]", redacted)
+    redacted = OPENAI_TOKEN_RE.sub("[REDACTED_OPENAI_TOKEN]", redacted)
     if len(redacted) > limit:
         return redacted[: limit - 18].rstrip() + "\n...[truncated]"
     return redacted
@@ -2119,12 +2292,17 @@ def _run_cli(
     with output_lock:
         stdout = b"".join(stdout_chunks)
         stderr = b"".join(stderr_chunks)
-    text = "\n".join(part for part in (_decode(stdout), _decode(stderr)) if part)
+    stdout_text = _decode(stdout)
+    stderr_text = _decode(stderr)
+    text = "\n".join(part for part in (stdout_text, stderr_text) if part)
     if len(text) > output_limit:
         text = text[:output_limit].rstrip() + "\n...[truncated by CLADEX]"
     returncode = process.returncode if process.returncode is not None else 1
     if returncode != 0:
-        error = text.strip() or f"AI reviewer exited with code {returncode}."
+        error_text = "\n".join(part for part in (stderr_text, stdout_text) if part)
+        if len(error_text) > output_limit:
+            error_text = error_text[:output_limit].rstrip() + "\n...[truncated by CLADEX]"
+        error = error_text.strip() or f"AI reviewer exited with code {returncode}."
         return AIRunResult(text=text, ok=False, error=error)
     return AIRunResult(text=text, ok=True)
 
@@ -2560,10 +2738,12 @@ def _run_review_job_locked(job_id: str) -> dict[str, Any]:
         _atomic_write_text(coordination_markdown_path(job_id), build_coordination_markdown(job, files, shards))
         save_job(job)
 
-        base_findings = secret_name_findings(workspace) + project_shape_findings(workspace, files)
+        base_findings = (secret_name_findings(workspace) + project_shape_findings(workspace, files))[:_max_findings_per_review()]
         findings.extend(_agent_finding_prefix("project", str(job["provider"]), base_findings))
+        _persist_findings(job_id, findings)
 
         cancel_check = lambda: _cancel_requested(job["id"])
+        deterministic_lane_limit = _max_deterministic_findings_per_lane()
         provider_limit_reached = threading.Event()
         provider_limit_message = {"text": ""}
 
@@ -2596,7 +2776,12 @@ def _run_review_job_locked(job_id: str) -> dict[str, Any]:
             agent_findings_persisted = False
             try:
                 for path in shard:
-                    agent_findings.extend(scan_file(path, workspace))
+                    if len(agent_findings) >= deterministic_lane_limit:
+                        break
+                    file_findings = scan_file(path, workspace)
+                    if file_findings:
+                        remaining = deterministic_lane_limit - len(agent_findings)
+                        agent_findings.extend(file_findings[:remaining])
                 if not job.get("preflightOnly") and not cancel_check():
                     if provider_limit_reached.is_set():
                         raise RuntimeError(provider_limit_message["text"] or _provider_limit_detail(str(job["provider"]), ""))
@@ -2648,6 +2833,7 @@ def _run_review_job_locked(job_id: str) -> dict[str, Any]:
                 with lock:
                     findings.extend(prefixed)
                     agent_findings_persisted = True
+                    _persist_findings(job_id, findings)
                     if cancel_check():
                         agent["status"] = "cancelled"
                         agent["findings"] = len(prefixed)
@@ -2664,6 +2850,7 @@ def _run_review_job_locked(job_id: str) -> dict[str, Any]:
                         prefixed = _agent_finding_prefix(agent["id"], str(job["provider"]), agent_findings)
                         findings.extend(prefixed)
                         agent["findings"] = len(prefixed)
+                        _persist_findings(job_id, findings)
                     if cancel_check() or "cancelled" in str(exc).lower():
                         agent["status"] = "cancelled"
                     else:

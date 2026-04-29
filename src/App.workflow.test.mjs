@@ -54,7 +54,8 @@ try {
   assert.equal(reviewDisplayStatus(cancelledEmpty), 'cancelled');
   assert.equal(canBrowseReviewFindings(cancelledEmpty), false);
 
-  assert.equal(canStartFixReviewForJob({ status: 'completed_with_warnings' }), true);
+  assert.equal(canStartFixReviewForJob({ status: 'completed_with_warnings', severityCounts: { high: 1, medium: 0, low: 0 } }), true);
+  assert.equal(canStartFixReviewForJob({ status: 'completed_with_warnings', severityCounts: { high: 0, medium: 0, low: 0 } }), false);
   assert.equal(canBrowseReviewFindings({ status: 'failed' }), true);
 
   const lanes = Array.from({ length: 50 }, (_, index) => ({

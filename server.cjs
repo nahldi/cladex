@@ -6,11 +6,28 @@ const path = require('path');
 const fsSync = require('fs');
 const os = require('os');
 const crypto = require('crypto');
+require('dotenv').config({ path: path.join(__dirname, '.env'), quiet: true });
 
 const execFileAsync = promisify(execFile);
 const app = express();
+function parseApiPort(value, defaultPort = 3001, options = {}) {
+  const raw = value === undefined || value === null ? '' : String(value).trim();
+  if (!raw) {
+    return defaultPort;
+  }
+  if (!/^\d+$/.test(raw)) {
+    throw new Error(`${options.name || 'API_PORT'} must be an integer port between ${options.allowZero ? 0 : 1} and 65535`);
+  }
+  const port = Number(raw);
+  const minimum = options.allowZero ? 0 : 1;
+  if (!Number.isSafeInteger(port) || port < minimum || port > 65535) {
+    throw new Error(`${options.name || 'API_PORT'} must be an integer port between ${minimum} and 65535`);
+  }
+  return port;
+}
+
 const API_HOST = process.env.API_HOST || '127.0.0.1';
-const API_PORT = Number(process.env.API_PORT || 3001);
+const API_PORT = parseApiPort(process.env.API_PORT, 3001);
 let serverInstance = null;
 let remoteAccessTokenCache = null;
 const MAX_CHANNEL_HISTORY_LIMIT = 500;
@@ -152,6 +169,10 @@ function profileCreateAccessError({ relayType, channelId, allowDms, operatorIds,
     return 'channelId or an approved user/operator id is required for Claude';
   }
   return '';
+}
+
+function repeatedAllowedChannelArgs(channelId) {
+  return csvValues(channelId).flatMap((id) => ['--allowed-channel-id', id]);
 }
 
 function isValidReviewId(value) {
@@ -355,10 +376,11 @@ function hasValidRemoteAccessToken(req) {
 
 function resolvePythonLaunchers() {
   const launchers = [];
+  const managedPython = managedRuntimePythonPath();
   const localAppData = process.env.LOCALAPPDATA || '';
   const directCandidates = [
     process.env.CLADEX_PYTHON || '',
-    localAppData ? path.join(localAppData, 'discord-codex-relay', 'runtime', 'Scripts', 'python.exe') : '',
+    managedPython,
     localAppData ? path.join(localAppData, 'Programs', 'Python', 'Python313', 'python.exe') : '',
     localAppData ? path.join(localAppData, 'Programs', 'Python', 'Python312', 'python.exe') : '',
     localAppData ? path.join(localAppData, 'Programs', 'Python', 'Python311', 'python.exe') : '',
@@ -384,10 +406,11 @@ function resolvePythonLaunchers() {
 
 function resolvePythonwLaunchers() {
   const launchers = [];
+  const runtimeRoot = managedRuntimeRoot();
   const localAppData = process.env.LOCALAPPDATA || '';
   const directCandidates = [
     process.env.CLADEX_PYTHONW || '',
-    localAppData ? path.join(localAppData, 'discord-codex-relay', 'runtime', 'Scripts', 'pythonw.exe') : '',
+    runtimeRoot ? path.join(runtimeRoot, 'Scripts', 'pythonw.exe') : '',
     localAppData ? path.join(localAppData, 'Programs', 'Python', 'Python313', 'pythonw.exe') : '',
     localAppData ? path.join(localAppData, 'Programs', 'Python', 'Python312', 'pythonw.exe') : '',
     localAppData ? path.join(localAppData, 'Programs', 'Python', 'Python311', 'pythonw.exe') : '',
@@ -402,15 +425,27 @@ function resolvePythonwLaunchers() {
   return launchers;
 }
 
-function managedRuntimePythonPath() {
-  const localAppData = process.env.LOCALAPPDATA || '';
-  if (!localAppData) {
-    return '';
+function managedRuntimeDataRoot() {
+  if (process.env.CLADEX_RUNTIME_DATA_ROOT) {
+    return path.resolve(process.env.CLADEX_RUNTIME_DATA_ROOT);
   }
   if (process.platform === 'win32') {
-    return path.join(localAppData, 'discord-codex-relay', 'runtime', 'Scripts', 'python.exe');
+    const localAppData = process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local');
+    return path.join(localAppData, 'discord-codex-relay');
   }
-  return path.join(localAppData, 'discord-codex-relay', 'runtime', 'bin', 'python');
+  if (process.platform === 'darwin') {
+    return path.join(os.homedir(), 'Library', 'Application Support', 'discord-codex-relay');
+  }
+  const xdgDataHome = process.env.XDG_DATA_HOME || path.join(os.homedir(), '.local', 'share');
+  return path.join(xdgDataHome, 'discord-codex-relay');
+}
+
+function managedRuntimePythonPath() {
+  const dataRoot = managedRuntimeDataRoot();
+  if (process.platform === 'win32') {
+    return path.join(dataRoot, 'runtime', 'Scripts', 'python.exe');
+  }
+  return path.join(dataRoot, 'runtime', 'bin', 'python');
 }
 
 function managedRuntimeRoot() {
@@ -424,9 +459,9 @@ function packageVersion() {
   }
   try {
     const payload = JSON.parse(fsSync.readFileSync(path.join(__dirname, 'package.json'), 'utf8'));
-    return String(payload.version || '').trim() || '2.5.3';
+    return String(payload.version || '').trim() || '2.5.4';
   } catch {
-    return '2.5.3';
+    return '2.5.4';
   }
 }
 
@@ -562,46 +597,79 @@ function bootstrapBackendRuntime() {
   return backendBootstrapPromise;
 }
 
-async function runPython(args, cwd = BACKEND_DIR, extraEnv = {}) {
+async function readApiRunnerResult(outputPath) {
+  let raw = '';
+  try {
+    raw = await fs.readFile(outputPath, 'utf-8');
+  } catch (err) {
+    throw new Error(`api_runner did not write an output file: ${err?.message || err}`);
+  }
+  let payload;
+  try {
+    payload = JSON.parse(raw || '{}');
+  } catch (err) {
+    throw new Error(`api_runner output was not valid JSON: ${err?.message || err}`);
+  }
+  const truncated = Boolean(payload.stdoutTruncated || payload.stderrTruncated);
+  return {
+    stdout: truncated ? '' : String(payload.stdout ?? ''),
+    stderr: truncated
+      ? `Backend command output exceeded CLADEX_API_RUNNER_CAPTURE_LIMIT (${process.env.CLADEX_API_RUNNER_CAPTURE_LIMIT || 'default'} bytes).`
+      : String(payload.stderr ?? ''),
+    code: truncated ? 1 : Number(payload.code ?? 1),
+  };
+}
+
+function apiRunnerErrorResult(err, outputError = null) {
+  const stderr = outputError
+    ? outputError.message
+    : (err?.stderr ?? err?.message ?? String(err));
+  return {
+    stdout: err?.stdout ?? '',
+    stderr: String(stderr || 'CLADEX backend command failed'),
+    code: typeof err?.code === 'number' ? err.code : 1,
+  };
+}
+
+async function runPython(args, cwd = BACKEND_DIR, extraEnv = {}, options = {}) {
   await bootstrapBackendRuntime();
   const childEnv = { ...process.env, ...extraEnv };
-  if (process.platform === 'win32') {
-    const pythonwLaunchers = resolvePythonwLaunchers();
+  const platform = options.platform || process.platform;
+  const execAsync = options.execFileAsync || execFileAsync;
+  if (platform === 'win32') {
+    const pythonwLaunchers = options.pythonwLaunchers || resolvePythonwLaunchers();
     for (const launcher of pythonwLaunchers) {
+      const outputPath = path.join(os.tmpdir(), `cladex-api-${Date.now()}-${Math.random().toString(16).slice(2)}.json`);
       try {
-        const outputPath = path.join(os.tmpdir(), `cladex-api-${Date.now()}-${Math.random().toString(16).slice(2)}.json`);
-        await execFileAsync(launcher, ['api_runner.py', '--output', outputPath, ...args], {
+        await execAsync(launcher, ['api_runner.py', '--output', outputPath, ...args], {
           cwd,
           windowsHide: true,
           env: childEnv,
           timeout: apiCommandTimeoutMs(),
           maxBuffer: apiCommandMaxBuffer(),
         });
-        const raw = await fs.readFile(outputPath, 'utf-8');
-        await fs.unlink(outputPath).catch(() => undefined);
-        const payload = JSON.parse(raw || '{}');
-        const truncated = Boolean(payload.stdoutTruncated || payload.stderrTruncated);
-        return {
-          stdout: truncated ? '' : String(payload.stdout ?? ''),
-          stderr: truncated
-            ? `Backend command output exceeded CLADEX_API_RUNNER_CAPTURE_LIMIT (${process.env.CLADEX_API_RUNNER_CAPTURE_LIMIT || 'default'} bytes).`
-            : String(payload.stderr ?? ''),
-          code: truncated ? 1 : Number(payload.code ?? 1),
-        };
+        return await readApiRunnerResult(outputPath);
       } catch (err) {
         if (err && err.code === 'ENOENT') {
           continue;
         }
+        try {
+          return await readApiRunnerResult(outputPath);
+        } catch (outputError) {
+          return apiRunnerErrorResult(err, outputError);
+        }
+      } finally {
+        await fs.unlink(outputPath).catch(() => undefined);
       }
     }
   }
 
-  const launchers = resolvePythonLaunchers();
+  const launchers = options.pythonLaunchers || resolvePythonLaunchers();
   let lastError = '';
 
   for (const launcher of launchers) {
     try {
-      const result = await execFileAsync(launcher, args, {
+      const result = await execAsync(launcher, args, {
         cwd,
         windowsHide: true,
         env: childEnv,
@@ -1139,7 +1207,7 @@ app.post('/api/profiles', async (req, res) => {
       name,
       '--trigger-mode',
       triggerMode,
-      ...(channelId ? ['--allowed-channel-id', channelId] : []),
+      ...repeatedAllowedChannelArgs(channelId),
       ...(allowDms ? ['--allow-dms'] : []),
       ...(model ? ['--model', model] : []),
       ...(codexHome ? ['--codex-home', codexHome] : []),
@@ -1477,7 +1545,7 @@ if (fsSync.existsSync(FRONTEND_DIR)) {
 
 function startServer(options = {}) {
   const host = options.host || API_HOST;
-  const port = Number(options.port === undefined ? API_PORT : options.port);
+  const port = parseApiPort(options.port === undefined ? API_PORT : options.port, API_PORT, { name: 'API port', allowZero: true });
   const quiet = Boolean(options.quiet);
   const allowRemoteApi = process.env.CLADEX_ALLOW_REMOTE_API === '1';
 
@@ -1532,9 +1600,14 @@ module.exports = {
   backendRuntimeNeedsRefresh,
   backendRuntimeSignature,
   csvValues,
+  managedRuntimeDataRoot,
+  managedRuntimePythonPath,
+  parseApiPort,
   packageVersion,
   profileCreateAccessError,
   readLogTail,
+  repeatedAllowedChannelArgs,
+  runPython,
   startServer,
   stopServer,
 };

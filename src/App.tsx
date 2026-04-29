@@ -695,6 +695,7 @@ export default function App() {
   const [remoteAuthRequired, setRemoteAuthRequired] = useState(false);
   const [remoteAccessTokenDraft, setRemoteAccessTokenDraft] = useState(() => getStoredAccessToken());
   const [allowCladexSelfReview, setAllowCladexSelfReview] = useState(false);
+  const lastActionErrorRef = useRef('');
   const bootFailureCount = useRef(0);
   const loadAllInFlight = useRef(false);
   const isDark = true;
@@ -827,9 +828,12 @@ export default function App() {
       await action();
       await loadAll(true);
       setErrorText('');
+      lastActionErrorRef.current = '';
       return true;
     } catch (error) {
-      setErrorText(error instanceof Error ? error.message : 'Action failed.');
+      const message = error instanceof Error ? error.message : 'Action failed.';
+      lastActionErrorRef.current = message;
+      setErrorText(message);
       return false;
     } finally {
       setBusyKey(null);
@@ -949,8 +953,8 @@ export default function App() {
             }}
           />
         ) : null}
-        {activeModal === 'add' ? <AddProfileModal onClose={() => setActiveModal(null)} onSubmit={async (data) => { if (await runAction('create-profile', () => api.createProfile(data))) setActiveModal(null); }} /> : null}
-        {activeModal === 'edit' && selectedProfile ? <EditProfileModal profile={selectedProfile} onClose={() => setActiveModal(null)} onSubmit={async (data) => { if (await runAction(`update-${selectedProfile.id}`, () => api.updateProfile(selectedProfile.id, selectedProfile.relayType, data))) setActiveModal(null); }} /> : null}
+        {activeModal === 'add' ? <AddProfileModal onClose={() => setActiveModal(null)} onSubmit={async (data) => { if (await runAction('create-profile', () => api.createProfile(data))) { setActiveModal(null); return; } throw new Error(lastActionErrorRef.current || 'Failed to save relay.'); }} /> : null}
+        {activeModal === 'edit' && selectedProfile ? <EditProfileModal profile={selectedProfile} onClose={() => setActiveModal(null)} onSubmit={async (data) => { if (await runAction(`update-${selectedProfile.id}`, () => api.updateProfile(selectedProfile.id, selectedProfile.relayType, data))) { setActiveModal(null); return; } throw new Error(lastActionErrorRef.current || 'Failed to save relay.'); }} /> : null}
         {activeModal === 'logs' && selectedProfile ? <LogsModal profile={selectedProfile} onClose={() => setActiveModal(null)} /> : null}
         {activeModal === 'settings' ? (
           <SettingsModal
@@ -961,7 +965,7 @@ export default function App() {
             onStopAll={() => void runAction('stop-all', api.stopAll)}
           />
         ) : null}
-        {activeModal === 'workgroup' ? <WorkgroupModal profiles={profiles} onClose={() => setActiveModal(null)} onSubmit={async (name, members) => { if (await runAction(`workgroup-${name}`, () => api.createProject(name, members))) setActiveModal(null); }} /> : null}
+        {activeModal === 'workgroup' ? <WorkgroupModal profiles={profiles} onClose={() => setActiveModal(null)} onSubmit={async (name, members) => { if (await runAction(`workgroup-${name}`, () => api.createProject(name, members))) { setActiveModal(null); return; } throw new Error(lastActionErrorRef.current || 'Failed to save workgroup.'); }} /> : null}
       </AnimatePresence>
     </div>
   );
@@ -1274,6 +1278,8 @@ function ReviewProjectView({
   const [analysis, setAnalysis] = useState<ReviewAnalysis | null>(null);
   const [analysisError, setAnalysisError] = useState('');
   const [analyzing, setAnalyzing] = useState(false);
+  const analysisRequestRef = useRef(0);
+  const analysisInputRef = useRef({ workspace, provider, allowSelfReview: allowCladexSelfReview });
   const accountHome = provider === 'codex' ? codexAccountHome : claudeAccountHome;
   const setAccountHome = provider === 'codex' ? setCodexAccountHome : setClaudeAccountHome;
   const reviewBusy = busyKey === 'review-start';
@@ -1284,13 +1290,29 @@ function ReviewProjectView({
   const activeJobs = activeReviewJobs.length;
   const activeFixRuns = fixRuns.filter((run) => run.status === 'queued' || run.status === 'running').length;
 
+  useEffect(() => {
+    analysisInputRef.current = { workspace, provider, allowSelfReview: allowCladexSelfReview };
+  }, [workspace, provider, allowCladexSelfReview]);
+
   async function analyzeTarget(nextWorkspace = workspace, selectedProvider = provider) {
     const target = nextWorkspace.trim();
     if (!target || analyzing) return;
+    const requestId = analysisRequestRef.current + 1;
+    analysisRequestRef.current = requestId;
+    const allowSelfReview = allowCladexSelfReview;
     setAnalyzing(true);
     setAnalysisError('');
     try {
-      const result = await onAnalyze({ workspace: target, provider: selectedProvider, allowSelfReview: allowCladexSelfReview });
+      const result = await onAnalyze({ workspace: target, provider: selectedProvider, allowSelfReview });
+      const latest = analysisInputRef.current;
+      if (
+        requestId !== analysisRequestRef.current ||
+        latest.workspace.trim() !== target ||
+        latest.provider !== selectedProvider ||
+        latest.allowSelfReview !== allowSelfReview
+      ) {
+        return;
+      }
       setAnalysis(result);
       setWorkspace(result.workspace || target);
       setProvider(result.recommendation.provider);
@@ -1298,14 +1320,21 @@ function ReviewProjectView({
       const previousTitle = analysis?.recommendation.title || '';
       setTitle((current) => (!current.trim() || current === previousTitle ? (result.recommendation.title || `${result.projectName || 'Project'} deep scan`) : current));
     } catch (error) {
+      if (requestId !== analysisRequestRef.current) {
+        return;
+      }
       setAnalysis(null);
       setAnalysisError(error instanceof Error ? error.message : 'Project Scout failed.');
     } finally {
-      setAnalyzing(false);
+      if (requestId === analysisRequestRef.current) {
+        setAnalyzing(false);
+      }
     }
   }
 
   function selectProvider(nextProvider: ReviewProvider) {
+    analysisRequestRef.current += 1;
+    analysisInputRef.current = { ...analysisInputRef.current, provider: nextProvider };
     setProvider(nextProvider);
     setAnalysis((current) => current ? { ...current, recommendation: { ...current.recommendation, provider: nextProvider } } : current);
   }
@@ -1347,9 +1376,9 @@ function ReviewProjectView({
                   {analysis ? <MetaPill label={`${analysis.fileCount} files`} mono /> : null}
                   <button
                     type="button"
-                    disabled={reviewBusy || backupBusy || !workspaceFilled}
+                    disabled={reviewBusy || backupBusy || analyzing || !workspaceFilled}
                     onClick={() => {
-                      if (!workspaceFilled || reviewBusy || backupBusy) return;
+                      if (!workspaceFilled || reviewBusy || backupBusy || analyzing) return;
                       setActivityTab('active');
                       onStart({ workspace, provider, agents, title, accountHome, allowSelfReview: allowCladexSelfReview, backupBeforeReview });
                     }}
@@ -1364,6 +1393,8 @@ function ReviewProjectView({
                 label="Folder path"
                 value={workspace}
                 onChange={(value) => {
+                  analysisRequestRef.current += 1;
+                  analysisInputRef.current = { ...analysisInputRef.current, workspace: value };
                   setWorkspace(value);
                   setAnalysis(null);
                   setAnalysisError('');
@@ -1443,10 +1474,10 @@ function ReviewProjectView({
             <div className="sticky bottom-4 z-20 -mx-1 space-y-3 rounded-[18px] border border-slate-200/80 bg-white/88 p-3 shadow-[0_18px_45px_rgba(15,23,42,0.14)] backdrop-blur-xl dark:border-white/10 dark:bg-[#070908]/92 dark:shadow-[0_18px_55px_rgba(0,0,0,0.45)]">
               <button
                 type="button"
-                disabled={reviewBusy || backupBusy || !workspaceFilled}
+                disabled={reviewBusy || backupBusy || analyzing || !workspaceFilled}
                 aria-busy={reviewBusy || undefined}
                 onClick={() => {
-                  if (!workspaceFilled || reviewBusy || backupBusy) return;
+                  if (!workspaceFilled || reviewBusy || backupBusy || analyzing) return;
                   setActivityTab('active');
                   onStart({ workspace, provider, agents, title, accountHome, allowSelfReview: allowCladexSelfReview, backupBeforeReview });
                 }}
@@ -1457,9 +1488,9 @@ function ReviewProjectView({
               </button>
               <SecondaryButton
                 label={backupBusy ? 'Saving snapshot...' : 'Save snapshot only'}
-                busy={backupBusy || reviewBusy || !workspaceFilled}
+                busy={backupBusy || reviewBusy || analyzing || !workspaceFilled}
                 onClick={() => {
-                  if (!workspaceFilled || reviewBusy || backupBusy) return;
+                  if (!workspaceFilled || reviewBusy || backupBusy || analyzing) return;
                   onCreateBackup(workspace);
                 }}
               />
@@ -1847,8 +1878,8 @@ export function canBrowseReviewFindings(job: ReviewPresentationJob): boolean {
   return isPartialCancelledReview(job);
 }
 
-export function canStartFixReviewForJob(job: Pick<ReviewJob, 'status'>): boolean {
-  return job.status === 'completed' || job.status === 'completed_with_warnings';
+export function canStartFixReviewForJob(job: Pick<ReviewJob, 'status' | 'severityCounts'>): boolean {
+  return (job.status === 'completed' || job.status === 'completed_with_warnings') && reviewFindingTotal(job) > 0;
 }
 
 export function reviewAgentVisibility(agents: ReviewAgentRecord[] = [], initialLimit = 8): { visible: ReviewAgentRecord[]; overflow: ReviewAgentRecord[]; total: number } {
@@ -1892,6 +1923,15 @@ function warningList(record: LimitAwareRecord): string[] {
     ...(record.limits?.warnings || []),
     ...(record.limits?.accountHomeWarning ? [record.limits.accountHomeWarning] : []),
   ].filter((item, index, items) => item.trim().length > 0 && items.indexOf(item) === index);
+}
+
+function mergePendingChatMessages(fetched: ChatMessageRecord[], current: ChatMessageRecord[]): ChatMessageRecord[] {
+  const fetchedIds = new Set(fetched.map((message) => message.id));
+  const pending = current.filter((message) => (
+    (message.id.startsWith('local-') || message.id.startsWith('assistant-') || message.id.startsWith('error-')) &&
+    !fetchedIds.has(message.id)
+  ));
+  return pending.length ? [...fetched, ...pending] : fetched;
 }
 
 function maxParallelFor(record: LimitAwareRecord): number | null {
@@ -2212,11 +2252,11 @@ function ReviewJobCard({
   const finished = (progress.done || 0) + (progress.failed || 0) + (progress.cancelled || 0);
   const percent = Math.min(100, Math.round((finished / total) * 100));
   const inFlight = isInFlightStatus(job.status);
-  const canFixReview = canStartFixReviewForJob(job);
   const canExploreFindings = canBrowseReviewFindings(job);
   const partialCancelled = isPartialCancelledReview(job);
   const severity = job.severityCounts || { high: 0, medium: 0, low: 0 };
   const totalFindings = reviewFindingTotal(job);
+  const canFixReview = canStartFixReviewForJob(job);
   const lanes = reviewAgentVisibility(job.agents || []);
   const renderAgentCard = (agent: ReviewAgentRecord) => {
     const showDetail = agent.detail && ['failed', 'cancelled'].includes(agent.status);
@@ -2310,6 +2350,7 @@ function ReviewJobCard({
                 }}
               />
             ) : null}
+            {!inFlight && totalFindings === 0 ? <MetaPill label="no fixes needed" /> : null}
             {inFlight ? (
               <ActionButton
                 label={cancelBusy ? 'Cancelling...' : 'Cancel'}
@@ -2554,6 +2595,7 @@ function LiveFeed({
   const [historyError, setHistoryError] = useState('');
   const [sending, setSending] = useState(false);
   const [draft, setDraft] = useState('');
+  const sendingRef = useRef(false);
   const workspaceProfiles = profiles.filter((profile) => profile.workspace === activeWorkspace);
   const activeProfile = workspaceProfiles.find((profile) => profileKey(profile) === selectedProfileId) || workspaceProfiles[0] || null;
   const activeProfileCanChat = Boolean(activeProfile?.running && activeProfile?.ready);
@@ -2575,6 +2617,10 @@ function LiveFeed({
   }, [activeProfile, onSelectProfile, selectedProfileId]);
 
   useEffect(() => {
+    sendingRef.current = sending;
+  }, [sending]);
+
+  useEffect(() => {
     let cancelled = false;
     const loadHistory = async () => {
       if (!activeProfile) {
@@ -2585,7 +2631,8 @@ function LiveFeed({
       try {
         const payload = await api.chatHistory(activeProfile.id, activeProfile.relayType);
         if (!cancelled) {
-          setMessages(payload.messages || []);
+          const nextMessages = payload.messages || [];
+          setMessages((current) => (sendingRef.current ? mergePendingChatMessages(nextMessages, current) : nextMessages));
           setHistoryError('');
         }
       } catch (error) {
@@ -2804,6 +2851,7 @@ function AddProfileModal({ onClose, onSubmit }: { onClose: () => void; onSubmit:
   const [startupDmText, setStartupDmText] = useState('Discord relay online. DM me here to chat with Codex.');
   const [startupChannelText, setStartupChannelText] = useState('');
   const [saving, setSaving] = useState(false);
+  const [submitError, setSubmitError] = useState('');
 
   const codex = type === 'Codex';
   const accessError = profileCreateAccessError(type, channelId, allowDms, operatorIds, allowedUserIds);
@@ -2866,12 +2914,18 @@ function AddProfileModal({ onClose, onSubmit }: { onClose: () => void; onSubmit:
             {accessError}
           </div>
         ) : null}
+        {submitError ? (
+          <div className="rounded-2xl border border-red-500/25 bg-red-500/10 px-4 py-3 text-sm font-medium text-red-800 dark:text-red-100">
+            {submitError}
+          </div>
+        ) : null}
 
         <div className="flex flex-col-reverse justify-end gap-3 pt-2 sm:flex-row">
           <SecondaryButton label="Cancel" onClick={onClose} />
           <PrimaryButton label={saving ? 'Saving...' : 'Save relay'} icon={saving ? <Loader2 size={16} className="animate-spin" /> : <Plus size={16} />} onClick={async () => {
             if (!canSave) return;
             setSaving(true);
+            setSubmitError('');
             try {
               await onSubmit({
                 name,
@@ -2894,6 +2948,8 @@ function AddProfileModal({ onClose, onSubmit }: { onClose: () => void; onSubmit:
                 startupDmText,
                 startupChannelText,
               });
+            } catch (error) {
+              setSubmitError(error instanceof Error ? error.message : 'Failed to save relay.');
             } finally {
               setSaving(false);
             }
@@ -2924,6 +2980,7 @@ function EditProfileModal({ profile, onClose, onSubmit }: { profile: Profile; on
   const [startupDmText, setStartupDmText] = useState(profile.startupDmText || '');
   const [startupChannelText, setStartupChannelText] = useState(profile.startupChannelText || '');
   const [saving, setSaving] = useState(false);
+  const [submitError, setSubmitError] = useState('');
 
   const codex = profile.type === 'Codex';
 
@@ -2974,11 +3031,17 @@ function EditProfileModal({ profile, onClose, onSubmit }: { profile: Profile; on
             <FormInput label="Startup channel text" value={startupChannelText} onChange={setStartupChannelText} placeholder="Optional message posted in the main channel on startup" />
           </FormSection>
         ) : null}
+        {submitError ? (
+          <div className="rounded-2xl border border-red-500/25 bg-red-500/10 px-4 py-3 text-sm font-medium text-red-800 dark:text-red-100">
+            {submitError}
+          </div>
+        ) : null}
 
         <div className="flex flex-col-reverse justify-end gap-3 pt-2 sm:flex-row">
           <SecondaryButton label="Cancel" onClick={onClose} />
           <PrimaryButton label={saving ? 'Saving...' : 'Save changes'} icon={saving ? <Loader2 size={16} className="animate-spin" /> : <Pencil size={16} />} onClick={async () => {
             setSaving(true);
+            setSubmitError('');
             try {
               await onSubmit({
                 type: profile.type,
@@ -3001,6 +3064,8 @@ function EditProfileModal({ profile, onClose, onSubmit }: { profile: Profile; on
                 startupDmText,
                 startupChannelText,
               });
+            } catch (error) {
+              setSubmitError(error instanceof Error ? error.message : 'Failed to save relay.');
             } finally {
               setSaving(false);
             }
@@ -3023,6 +3088,11 @@ function WorkgroupModal({
   const [name, setName] = useState('');
   const [selectedIds, setSelectedIds] = useState<Record<string, boolean>>({});
   const [saving, setSaving] = useState(false);
+  const [submitError, setSubmitError] = useState('');
+  const selectedMembers = profiles.filter((profile) => selectedIds[profileKey(profile)]).map((profile) => ({ id: profile.id, relayType: profile.relayType }));
+  const nameFilled = name.trim().length > 0;
+  const canSave = nameFilled && selectedMembers.length > 0;
+  const validationMessage = !nameFilled ? 'Name the workgroup before saving.' : selectedMembers.length === 0 ? 'Select at least one relay.' : '';
 
   return (
     <ModalShell title="Create Workgroup" onClose={onClose} wide>
@@ -3042,18 +3112,28 @@ function WorkgroupModal({
             ))}
           </div>
         </div>
+        {submitError || validationMessage ? (
+          <div className={`rounded-2xl border px-4 py-3 text-sm font-medium ${submitError ? 'border-red-500/25 bg-red-500/10 text-red-800 dark:text-red-100' : 'border-amber-500/25 bg-amber-500/10 text-amber-800 dark:text-amber-100'}`}>
+            {submitError || validationMessage}
+          </div>
+        ) : null}
         <div className="flex flex-col-reverse justify-end gap-3 pt-2 sm:flex-row">
           <SecondaryButton label="Cancel" onClick={onClose} />
           <PrimaryButton label={saving ? 'Saving...' : 'Save workgroup'} icon={saving ? <Loader2 size={16} className="animate-spin" /> : <FolderKanban size={16} />} onClick={async () => {
-            const members = profiles.filter((profile) => selectedIds[profileKey(profile)]).map((profile) => ({ id: profile.id, relayType: profile.relayType }));
-            if (!name || !members.length) return;
+            if (!canSave) {
+              setSubmitError('');
+              return;
+            }
             setSaving(true);
+            setSubmitError('');
             try {
-              await onSubmit(name, members);
+              await onSubmit(name.trim(), selectedMembers);
+            } catch (error) {
+              setSubmitError(error instanceof Error ? error.message : 'Failed to save workgroup.');
             } finally {
               setSaving(false);
             }
-          }} />
+          }} busy={saving} disabled={!canSave} />
         </div>
       </div>
     </ModalShell>

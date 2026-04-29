@@ -275,6 +275,7 @@ def _claude_profile_runtime_state(profile: dict[str, Any]) -> dict[str, Any]:
     active_channel = ""
     model = ""
     effort = ""
+    raw_status = ""
     if discovered_pids:
         if file_pid in discovered_pids and psutil.pid_exists(file_pid):
             pid = file_pid
@@ -323,6 +324,7 @@ def _claude_profile_runtime_state(profile: dict[str, Any]) -> dict[str, Any]:
         "log_path": log_path,
         "state_dir": state_dir,
         "state": state,
+        "raw_status": raw_status,
         "status_message": status_message,
         "session_id": session_id,
         "active_worktree": active_worktree,
@@ -453,6 +455,37 @@ def _ensure_claude_background_runtime() -> None:
         relayctl.install_plugin._ensure_runtime(source=source)
 
 
+def _claude_start_ready_timeout_seconds() -> float:
+    raw = os.environ.get("CLADEX_CLAUDE_START_READY_TIMEOUT_SECONDS", "20")
+    try:
+        value = float(str(raw).strip())
+    except (TypeError, ValueError):
+        value = 20.0
+    return max(value, 0.0)
+
+
+def _wait_for_claude_worker_startup(profile: dict[str, Any], *, pid: int, timeout_seconds: float | None = None) -> None:
+    timeout = _claude_start_ready_timeout_seconds() if timeout_seconds is None else max(float(timeout_seconds), 0.0)
+    if timeout <= 0:
+        return
+    deadline = time.monotonic() + timeout
+    last_status = ""
+    while time.monotonic() < deadline:
+        runtime = _claude_profile_runtime_state(profile)
+        last_status = str(runtime.get("status_message") or runtime.get("raw_status") or "").strip()
+        raw_status = str(runtime.get("raw_status", "")).strip().lower()
+        if runtime.get("ready"):
+            return
+        if raw_status in {"error", "stopped"}:
+            detail = last_status or raw_status
+            raise RuntimeError(f"Claude relay failed during startup: {detail}")
+        if not runtime.get("running") and not psutil.pid_exists(pid):
+            raise RuntimeError("Claude relay process exited before reporting ready.")
+        time.sleep(0.25)
+    detail = f" Last status: {last_status}" if last_status else ""
+    raise RuntimeError(f"Claude relay did not report ready within {timeout:.1f}s.{detail}")
+
+
 def start_profile(profile: dict[str, Any], *, start_reason: str = "operator-start") -> None:
     relay_type = str(profile.get("_relay_type", "")).strip().lower()
     if relay_type == "codex":
@@ -492,6 +525,11 @@ def start_profile(profile: dict[str, Any], *, start_reason: str = "operator-star
 
         runtime = _claude_profile_runtime_state(profile)
         if runtime["running"]:
+            if not runtime.get("ready"):
+                existing_pid = runtime.get("pid")
+                if not isinstance(existing_pid, int):
+                    raise RuntimeError("Claude relay is running but no worker PID is available for readiness checks.")
+                _wait_for_claude_worker_startup(profile, pid=existing_pid)
             return
 
         _ensure_claude_background_runtime()
@@ -533,6 +571,7 @@ def start_profile(profile: dict[str, Any], *, start_reason: str = "operator-star
         # Write PID file
         pid_file = state_dir / "relay.pid"
         pid_file.write_text(str(process.pid))
+        _wait_for_claude_worker_startup(profile, pid=process.pid)
     finally:
         relayctl._release_pid_lock(launch_lock)
 
@@ -812,7 +851,7 @@ def _update_codex_profile(
     startup_dm_user_ids: str | None = None,
     startup_dm_text: str | None = None,
     startup_channel_text: str | None = None,
-) -> None:
+) -> dict[str, Any]:
     _ensure_csv_numeric_ids(allowed_user_ids, "allowed_user_ids")
     _ensure_csv_numeric_ids(operator_ids, "operator_ids")
     _ensure_csv_numeric_ids(allowed_bot_ids, "allowed_bot_ids")
@@ -867,6 +906,7 @@ def _update_codex_profile(
     assert_workspace_allowed(workspace_path, env=env)
     new_profile = relayctl._profile_from_env(env)
     relayctl._replace_profile_registration(profile, new_profile)
+    return new_profile
 
 
 def _update_claude_profile(
@@ -884,7 +924,7 @@ def _update_claude_profile(
     allowed_channel_id: str | None = None,
     operator_ids: str | None = None,
     channel_history_limit: str | None = None,
-) -> None:
+) -> dict[str, Any]:
     _ensure_csv_numeric_ids(allowed_user_ids, "allowed_user_ids")
     _ensure_csv_numeric_ids(operator_ids, "operator_ids")
     _ensure_csv_numeric_ids(allowed_bot_ids, "allowed_bot_ids")
@@ -945,6 +985,7 @@ def _update_claude_profile(
     new_env_path = Path(str(new_profile.get("env_file", "")).strip()) if new_profile.get("env_file") else None
     if previous_env_path and previous_env_path != new_env_path:
         previous_env_path.unlink(missing_ok=True)
+    return new_profile
 
 
 def update_profile(
@@ -968,10 +1009,10 @@ def update_profile(
     startup_dm_user_ids: str | None = None,
     startup_dm_text: str | None = None,
     startup_channel_text: str | None = None,
-) -> None:
+) -> dict[str, Any]:
     relay_type = str(profile.get("_relay_type", "")).strip().lower()
     if relay_type == "codex":
-        _update_codex_profile(
+        return _update_codex_profile(
             profile,
             workspace=workspace,
             discord_bot_token=discord_bot_token,
@@ -995,7 +1036,7 @@ def update_profile(
     if relay_type == "claude":
         if any(str(value or "").strip() for value in (startup_dm_user_ids, startup_dm_text, startup_channel_text)):
             raise ValueError("Startup notice fields are currently supported for Codex profiles only.")
-        _update_claude_profile(
+        return _update_claude_profile(
             profile,
             workspace=workspace,
             discord_bot_token=discord_bot_token,
@@ -1010,7 +1051,6 @@ def update_profile(
             operator_ids=operator_ids,
             channel_history_limit=channel_history_limit,
         )
-        return
     raise RuntimeError(f"Unknown relay type: {relay_type}")
 
 
@@ -1201,7 +1241,7 @@ def cmd_update(args: argparse.Namespace) -> int:
                 discord_bot_token = fallback
                 os.environ.pop("CLADEX_REGISTER_DISCORD_BOT_TOKEN", None)
     try:
-        update_profile(
+        updated_profile = update_profile(
             profiles[0],
             workspace=getattr(args, "workspace", None),
             discord_bot_token=discord_bot_token,
@@ -1229,7 +1269,10 @@ def cmd_update(args: argparse.Namespace) -> int:
         else:
             print(message, file=sys.stderr)
         return 2
-    refreshed = _filter_profiles(name=args.name, relay_type=args.type)
+    updated_name = str(updated_profile.get("name", "")).strip() if isinstance(updated_profile, dict) else ""
+    refreshed = _filter_profiles(name=updated_name or args.name, relay_type=args.type)
+    if not refreshed and updated_name and updated_name != args.name:
+        refreshed = _filter_profiles(name=args.name, relay_type=args.type)
     record = _profile_json_record(refreshed[0]) if refreshed else {}
     if getattr(args, "json", False):
         print(json.dumps(record))
@@ -1256,9 +1299,7 @@ def _remove_claude_profile(profile: dict[str, Any]) -> None:
     env_file = Path(str(profile.get("env_file", "")).strip())
     registry = _load_claude_registry()
     registry["profiles"] = [item for item in registry.get("profiles", []) if item.get("name") != profile.get("name")]
-    _claude_registry_path = CLAUDE_REGISTRY_PATH
-    _claude_registry_path.parent.mkdir(parents=True, exist_ok=True)
-    _claude_registry_path.write_text(json.dumps(registry, indent=2) + "\n", encoding="utf-8")
+    _save_claude_registry(registry)
     if env_file.exists():
         env_file.unlink(missing_ok=True)
 

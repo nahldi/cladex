@@ -6,7 +6,29 @@ require('dotenv').config({ path: path.join(__dirname, '..', '.env'), quiet: true
 
 let mainWindow = null;
 let apiServer = null;
-const API_PORT = Number(process.env.API_PORT || 3001);
+let startupConfigError = null;
+function parseApiPort(value, defaultPort = 3001) {
+  const raw = value === undefined || value === null ? '' : String(value).trim();
+  if (!raw) {
+    return defaultPort;
+  }
+  if (!/^\d+$/.test(raw)) {
+    throw new Error('API_PORT must be an integer port between 1 and 65535');
+  }
+  const port = Number(raw);
+  if (!Number.isSafeInteger(port) || port < 1 || port > 65535) {
+    throw new Error('API_PORT must be an integer port between 1 and 65535');
+  }
+  return port;
+}
+const API_PORT = (() => {
+  try {
+    return parseApiPort(process.env.API_PORT, 3001);
+  } catch (error) {
+    startupConfigError = error;
+    return 3001;
+  }
+})();
 const API_HOST = process.env.API_HOST || '127.0.0.1';
 let activeApiPort = API_PORT;
 
@@ -79,6 +101,52 @@ function readRuntimeInfo(port, timeoutMs = 1000) {
   });
 }
 
+function escapeHtml(value) {
+  return String(value || '')
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
+}
+
+function startupErrorUrl(error) {
+  const detail = error && error.stack ? error.stack : (error?.message || String(error || 'Unknown startup error'));
+  const html = `<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>CLADEX startup failed</title>
+    <style>
+      body { margin: 0; min-height: 100vh; background: #050505; color: #f5f5f5; font: 14px/1.5 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; display: grid; place-items: center; }
+      main { width: min(720px, calc(100vw - 48px)); }
+      h1 { font-size: 28px; line-height: 1.2; margin: 0 0 12px; }
+      p { color: #c7c7c7; margin: 0 0 18px; }
+      pre { white-space: pre-wrap; word-break: break-word; background: #171717; border: 1px solid #333; border-radius: 8px; padding: 16px; color: #fca5a5; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>CLADEX could not start its local API</h1>
+      <p>The desktop shell stopped before loading the app UI because the backend API did not become ready.</p>
+      <pre>${escapeHtml(detail)}</pre>
+    </main>
+  </body>
+</html>`;
+  return `data:text/html;charset=utf-8,${encodeURIComponent(html)}`;
+}
+
+function rendererUrl() {
+  const explicit = String(process.env.CLADEX_ELECTRON_RENDERER_URL || '').trim();
+  if (explicit) {
+    return explicit;
+  }
+  if (!app.isPackaged && process.argv.includes('--dev-renderer')) {
+    return 'http://127.0.0.1:3000/';
+  }
+  return `http://${API_HOST}:${activeApiPort}/`;
+}
+
 function waitForApi(port = activeApiPort, timeoutMs = 8000) {
   const startedAt = Date.now();
   return new Promise((resolve, reject) => {
@@ -107,7 +175,7 @@ async function stopApiServer() {
   apiServer = null;
 }
 
-function createWindow() {
+function createWindow(options = {}) {
   const iconPath = app.isPackaged
     ? path.join(process.resourcesPath, 'assets', 'icon.png')
     : path.join(__dirname, '..', 'assets', 'icon.png');
@@ -136,10 +204,9 @@ function createWindow() {
     mainWindow?.show();
   });
 
-  // Load the built UI from the loopback API server so the renderer is
-  // same-origin with `/api`. This avoids exposing the remote API bearer token
-  // to a file:// renderer while keeping browser/remote callers token-gated.
-  const appUrl = `http://${API_HOST}:${activeApiPort}/`;
+  // Production loads the built UI from the loopback API server so the renderer
+  // is same-origin with `/api`; dev can opt into Vite for live frontend edits.
+  const appUrl = options.startupError ? startupErrorUrl(options.startupError) : rendererUrl();
   console.log('Loading:', appUrl);
   mainWindow.loadURL(appUrl);
 
@@ -169,14 +236,19 @@ ipcMain.handle('cladex:choose-directory', async () => {
 });
 
 app.whenReady().then(async () => {
+  let startupError = null;
   try {
+    if (startupConfigError) {
+      throw startupConfigError;
+    }
     await startApiServer();
     await waitForApi();
   } catch (error) {
     console.error(error);
     logDesktop(`Startup error: ${error && error.stack ? error.stack : error}`);
+    startupError = error;
   }
-  createWindow();
+  createWindow({ startupError });
 
   app.on('second-instance', () => {
     if (!mainWindow) {

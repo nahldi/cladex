@@ -172,16 +172,20 @@ def build_turn_start_params(
     session,
     *,
     thread_id: str,
-    prompt: str,
-    injected_context: str,
+    prompt: str = "",
+    injected_context: str = "",
+    input_items: list[dict[str, Any]] | None = None,
+    effort: str | None = None,
 ) -> dict[str, Any]:
+    if input_items is None:
+        input_items = codex_text_input(f"{injected_context}\n\n{prompt}")
     params = {
         "threadId": thread_id,
-        "input": codex_text_input(f"{injected_context}\n\n{prompt}"),
+        "input": input_items,
         "cwd": None,
         "model": None,
         "serviceTier": None,
-        "effort": session._turn_effort("implementation"),
+        "effort": effort if effort is not None else session._turn_effort("implementation"),
         "summary": None,
         "personality": None,
         "outputSchema": None,
@@ -190,17 +194,26 @@ def build_turn_start_params(
     return params
 
 
-def build_turn_steer_params(*, thread_id: str, prompt: str, expected_turn_id: str | None = None) -> dict[str, Any]:
-    params = {"threadId": thread_id, "input": codex_text_input(prompt)}
-    if expected_turn_id:
-        params["expectedTurnId"] = expected_turn_id
-    return params
+def build_turn_steer_params(
+    *,
+    thread_id: str,
+    prompt: str = "",
+    expected_turn_id: str | None = None,
+    input_items: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    if not expected_turn_id:
+        raise BackendUnavailableError("Cannot steer Codex turn because no active turn id is available.")
+    return {
+        "threadId": thread_id,
+        "input": input_items if input_items is not None else codex_text_input(prompt),
+        "expectedTurnId": expected_turn_id,
+    }
 
 
 def build_turn_interrupt_params(*, thread_id: str, turn_id: str | None = None) -> dict[str, Any]:
-    if turn_id:
-        return {"threadId": thread_id, "turnId": turn_id}
-    return {"threadId": thread_id}
+    if not turn_id:
+        raise BackendUnavailableError("Cannot interrupt Codex turn because no active turn id is available.")
+    return {"threadId": thread_id, "turnId": turn_id}
 
 
 class AppServerCodexBackend(CodexBackend):

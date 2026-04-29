@@ -49,6 +49,7 @@ def _review_with_findings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> di
 
 def test_start_fix_run_requires_completed_review_and_creates_backup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     review = _review_with_findings(tmp_path, monkeypatch)
+    monkeypatch.delenv("CLADEX_FIX_ALLOW_TARGET_VALIDATION", raising=False)
 
     run = fix_orchestrator.start_fix_run(review["id"], launch=False)
 
@@ -57,6 +58,8 @@ def test_start_fix_run_requires_completed_review_and_creates_backup(tmp_path: Pa
     assert run["sourceBackup"]["id"].startswith("backup-")
     assert run["progress"]["total"] == 1
     assert run["tasks"][0]["findingId"] == "F0001"
+    assert run["validationCommands"] == []
+    assert run["validationPolicy"]["targetCommandsApproved"] is False
     assert Path(run["reportPath"]).exists()
 
 
@@ -492,9 +495,41 @@ def test_discover_validation_commands_includes_backend_tests(tmp_path: Path) -> 
         encoding="utf-8",
     )
 
-    commands = fix_orchestrator.discover_validation_commands(tmp_path)
+    commands = fix_orchestrator.discover_validation_commands(tmp_path, approved=True)
 
     assert [sys.executable, "-m", "pytest", "backend/tests", "--tb=short", "-q"] in commands
+
+
+def test_discover_validation_commands_disabled_by_default_for_untrusted_targets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "package.json").write_text(
+        json.dumps({"scripts": {"test": "node -e \"require('child_process').exec('whoami')\""}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "tests").mkdir()
+    monkeypatch.delenv("CLADEX_FIX_ALLOW_TARGET_VALIDATION", raising=False)
+
+    assert fix_orchestrator.discover_validation_commands(tmp_path) == []
+
+
+def test_discover_validation_commands_honors_explicit_allowlist(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "package.json").write_text(
+        json.dumps({"scripts": {"lint": "eslint .", "test": "vitest", "build": "vite build"}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "tests").mkdir()
+    monkeypatch.setenv("CLADEX_FIX_ALLOW_TARGET_VALIDATION", "1")
+    monkeypatch.setenv("CLADEX_FIX_VALIDATION_ALLOWLIST", "npm:lint,pytest:root")
+
+    joined = [" ".join(command) for command in fix_orchestrator.discover_validation_commands(tmp_path)]
+
+    assert any("npm run lint" in item for item in joined)
+    assert any("pytest" in item for item in joined)
+    assert not any("npm run test" in item for item in joined)
+    assert not any("npm run build" in item for item in joined)
 
 
 def test_fix_run_honors_same_phase_task_dependencies(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -585,14 +620,39 @@ def test_claude_fix_task_sends_large_prompt_through_stdin(tmp_path: Path, monkey
         "Claude fix worker must NOT use --tools — that flag is ignored by Claude Code 2.1+."
     )
     pmode_idx = command.index("--permission-mode")
-    assert command[pmode_idx + 1] in {"acceptEdits", "bypassPermissions"}, (
-        "Claude fix worker permission mode must allow Edit/Write/Bash; "
-        "`dontAsk` denies every write tool because they normally need a prompt."
-    )
+    assert command[pmode_idx + 1] == "acceptEdits"
     allowed_idx = command.index("--allowedTools")
     allowed_value = command[allowed_idx + 1]
-    for required_tool in ("Edit", "Write", "Bash"):
+    for required_tool in ("Edit", "Write"):
         assert required_tool in allowed_value, f"Claude fix worker must allow {required_tool} to make patches."
+    assert "Bash" not in allowed_value
+
+
+def test_claude_fix_task_requires_explicit_opt_in_for_bash_and_bypass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    review = _review_with_findings(tmp_path, monkeypatch)
+    run = fix_orchestrator.start_fix_run(review["id"], launch=False)
+    run["provider"] = "claude"
+    run["tasks"][0]["provider"] = "claude"
+    captured: dict[str, object] = {}
+
+    def fake_run_cli(command: list[str], prompt: str, **_kwargs: object) -> review_swarm.AIRunResult:
+        captured["command"] = command
+        return review_swarm.AIRunResult(text="changed", ok=True)
+
+    monkeypatch.setattr(claude_relay, "claude_code_bin", lambda: "claude")
+    monkeypatch.setattr(fix_orchestrator, "_run_cli", fake_run_cli)
+    monkeypatch.setenv("CLADEX_FIX_CLAUDE_ALLOW_BASH", "1")
+    monkeypatch.setenv("CLADEX_FIX_CLAUDE_PERMISSION_MODE", "bypassPermissions")
+    monkeypatch.setenv("CLADEX_FIX_CLAUDE_ALLOW_BYPASS", "1")
+
+    fix_orchestrator._run_provider_fix_task(run, run["tasks"][0])
+
+    command = captured["command"]
+    assert isinstance(command, list)
+    assert command[command.index("--permission-mode") + 1] == "bypassPermissions"
+    assert "Bash" in command[command.index("--allowedTools") + 1]
 
 
 def test_stable_scope_check_ignores_transient_outside_change(
@@ -656,6 +716,32 @@ def test_stable_scope_check_keeps_real_outside_change(
     assert outside == ["outside.py"]
 
 
+def test_restore_paths_removes_out_of_scope_symlink_artifact(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    snapshot = tmp_path / "snapshot"
+    outside = tmp_path / "outside.txt"
+    workspace.mkdir()
+    snapshot.mkdir()
+    outside.write_text("outside\n", encoding="utf-8")
+    link = workspace / "outside-link"
+    try:
+        link.symlink_to(outside)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"symlink creation is unavailable: {exc}")
+
+    restored = fix_orchestrator._restore_paths_from_source_backup(
+        {
+            "workspace": str(workspace),
+            "sourceBackup": {"snapshot": str(snapshot)},
+        },
+        ["outside-link"],
+    )
+
+    assert restored == ["outside-link"]
+    assert not link.exists()
+    assert not link.is_symlink()
+
+
 def test_fix_run_failed_validation_stops_with_restore_hint(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     review = _review_with_findings(tmp_path, monkeypatch)
     monkeypatch.setattr(
@@ -688,6 +774,34 @@ def test_cancel_fix_run_marks_queued_tasks_cancelled(tmp_path: Path, monkeypatch
     assert cancelled["status"] == "cancelled"
     assert cancelled["cancelRequested"] is True
     assert cancelled["progress"]["cancelled"] == 1
+
+
+def test_cancel_fix_run_waits_for_state_lock_and_preserves_task_progress(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    review = _review_with_findings(tmp_path, monkeypatch)
+    run = fix_orchestrator.start_fix_run(review["id"], launch=False)
+    run["status"] = "running"
+    fix_orchestrator._save_run(run)
+    run_id = run["id"]
+
+    with fix_orchestrator._run_state_lock(run_id):
+        current = fix_orchestrator.load_fix_run(run_id)
+        current["tasks"][0]["status"] = "done"
+        current["tasks"][0]["finishedAt"] = fix_orchestrator.utc_now()
+        fix_orchestrator._save_run_unlocked(current)
+        result: dict[str, dict] = {}
+        worker = threading.Thread(target=lambda: result.setdefault("run", fix_orchestrator.cancel_fix_run(run_id)))
+        worker.start()
+        time.sleep(0.1)
+        assert worker.is_alive()
+    worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    cancelled = result["run"]
+    assert cancelled["cancelRequested"] is True
+    assert cancelled["tasks"][0]["status"] == "done"
+    assert cancelled["progress"]["done"] == 1
 
 
 def test_validation_command_cancel_terminates_promptly(tmp_path: Path) -> None:
@@ -755,7 +869,7 @@ def test_discover_validation_commands_uses_existing_project_scripts(tmp_path: Pa
     (project / "package.json").write_text(json.dumps({"scripts": {"lint": "eslint .", "build": "vite build"}}), encoding="utf-8")
     (project / "tests").mkdir()
 
-    commands = fix_orchestrator.discover_validation_commands(project)
+    commands = fix_orchestrator.discover_validation_commands(project, approved=True)
     joined = [" ".join(command) for command in commands]
 
     assert any("npm run lint" in item for item in joined)

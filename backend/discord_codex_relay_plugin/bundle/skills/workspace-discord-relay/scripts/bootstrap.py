@@ -8,6 +8,8 @@ import sys
 
 
 PACKAGE_NAME = "discord-codex-relay"
+PACKAGE_VERSION = "2.5.4"
+DEFAULT_PACKAGE_SPEC = f"{PACKAGE_NAME}=={PACKAGE_VERSION}"
 DEFAULT_TIMEOUT_SECONDS = 900
 MAX_CAPTURED_OUTPUT = 12000
 
@@ -59,7 +61,7 @@ def _install_with_pip(spec: str) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Bootstrap the discord-codex-relay Python package.")
-    parser.add_argument("--spec", default=PACKAGE_NAME, help="Package spec to install. Defaults to the published package name.")
+    parser.add_argument("--spec", default=DEFAULT_PACKAGE_SPEC, help="Package spec to install. Defaults to the pinned published package.")
     parser.add_argument("--prefer-pip", action="store_true", default=False, help="Use pip instead of pipx even when pipx is available.")
     args = parser.parse_args()
 

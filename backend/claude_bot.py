@@ -399,12 +399,11 @@ class ClaudeRelayBot(commands.Bot):
         return "gui"
 
     async def _reclaim_orphaned_operator_requests(self) -> None:
-        """Recover .processing files that survived a previous bot crash.
+        """Fail .processing files that survived a previous bot crash.
 
-        Without this, requests that started before a crash never get a response
-        and the caller blocks until its client-side timeout. We rename them
-        back to .json so the regular loop picks them up, but if a request has
-        already been retried we mark it as failed so the caller can move on.
+        A .processing file means the previous worker may already have delivered
+        the request to Claude before crashing. Replaying it can duplicate a
+        stale operator turn, so recovery reports a local failure instead.
         """
         try:
             stale = sorted(self._operator_requests_dir.glob("*.processing"))
@@ -428,19 +427,14 @@ class ClaudeRelayBot(commands.Bot):
                 except OSError:
                     pass
                 continue
+            atomic_write_text(
+                response_path,
+                json.dumps({"ok": False, "error": "Operator request orphaned by relay restart."}, indent=2),
+            )
             try:
-                os.replace(processing_path, request_path)
+                processing_path.unlink()
             except OSError:
-                # Last resort: surface the orphan as a failure so the caller
-                # stops waiting on a response that will never come.
-                atomic_write_text(
-                    response_path,
-                    json.dumps({"ok": False, "error": "Operator request orphaned by relay restart."}, indent=2),
-                )
-                try:
-                    processing_path.unlink()
-                except OSError:
-                    pass
+                pass
 
     async def _operator_bridge_loop(self) -> None:
         await self._reclaim_orphaned_operator_requests()

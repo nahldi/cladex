@@ -25,15 +25,16 @@ codex-discord reset
 codex-discord self-update
 codex-discord skill list
 codex-discord skill install --name <skill_name>
-codex-discord register --discord-bot-token <token> --allowed-channel-id <channel_id>
-codex-discord register --discord-bot-token <token> --allow-dms --allowed-user-id <user_id>
-codex-discord register --discord-bot-token <token> --allowed-channel-id <channel_id> --allow-dms --allowed-user-id <user_id>
+codex-discord register --allowed-channel-id <channel_id>
+codex-discord register --allow-dms --allowed-user-id <user_id>
+codex-discord register --allowed-channel-id <channel_id> --allow-dms --allowed-user-id <user_id>
 ```
 
 Notes:
 
 - Install path: prefer the published Python package entrypoint `codex-discord`; repo-local helper scripts are only for development.
 - If `codex-discord` is missing after the plugin is installed, run `scripts/bootstrap.py` from this skill directory to install the Python package.
+- Do not put Discord bot tokens on the command line. Set `CLADEX_REGISTER_DISCORD_BOT_TOKEN` in the shell environment first, run `codex-discord register ...` without `--discord-bot-token`, then clear the variable after registration.
 - `codex-discord` with no subcommand launches the relay for the current workspace.
 - The launcher is workspace-scoped and profile-scoped, so stop/reset/status target the selected profile for the current workspace only.
 - On first run, the launcher asks only for the bot token, optional bot name, optional main channel, optional DM user IDs, and optional extra trigger IDs.

@@ -28,12 +28,19 @@ const {
   backendRuntimeSignature,
   bootstrapBackendRuntime,
   csvValues,
+  managedRuntimeDataRoot,
+  managedRuntimePythonPath,
+  parseApiPort,
   packageVersion,
   profileCreateAccessError,
   readLogTail,
+  repeatedAllowedChannelArgs,
+  runPython,
   startServer,
   stopServer,
 } = require('../server.cjs');
+
+const packageJson = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
 
 const originalBootstrapTimeout = process.env.CLADEX_BACKEND_BOOTSTRAP_TIMEOUT_MS;
 process.env.CLADEX_BACKEND_BOOTSTRAP_TIMEOUT_MS = '900000';
@@ -57,9 +64,33 @@ if (originalApiTimeout === undefined) {
   process.env.CLADEX_API_COMMAND_TIMEOUT_MS = originalApiTimeout;
 }
 
-assert.equal(packageVersion(), JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version);
+assert.equal(parseApiPort(undefined, 3001), 3001);
+assert.equal(parseApiPort('0', 3001, { name: 'test port', allowZero: true }), 0);
+assert.equal(parseApiPort('65535', 3001), 65535);
+assert.throws(() => parseApiPort('bad', 3001), /API_PORT must be an integer port/);
+assert.throws(() => parseApiPort('65536', 3001), /API_PORT must be an integer port/);
+
+assert.equal(packageVersion(), packageJson.version);
 assert.equal(backendRuntimeSignature().appVersion, packageVersion());
 assert.deepEqual(csvValues('111, 222,,333 '), ['111', '222', '333']);
+assert.deepEqual(repeatedAllowedChannelArgs('111, 222,,333 '), [
+  '--allowed-channel-id',
+  '111',
+  '--allowed-channel-id',
+  '222',
+  '--allowed-channel-id',
+  '333',
+]);
+
+const packageFiles = new Set(packageJson.build.files || []);
+assert.ok(packageFiles.has('dist/**/*'));
+assert.ok(packageFiles.has('electron/**/*'));
+assert.ok(packageFiles.has('package.json'));
+assert.ok(packageFiles.has('server.cjs'));
+const resourceByDestination = new Map((packageJson.build.extraResources || []).map((entry) => [entry.to, entry]));
+assert.equal(resourceByDestination.get('backend')?.from, 'backend');
+assert.equal(resourceByDestination.get('assets')?.from, 'assets');
+assert.ok((resourceByDestination.get('backend')?.filter || []).includes('!**/tests/**'));
 
 assert.equal(
   profileCreateAccessError({
@@ -161,25 +192,68 @@ function assertSameFilesystemPath(actual, expected) {
 }
 
 async function main() {
-  const originalLocalAppData = process.env.LOCALAPPDATA;
   const runtimeRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cladex-runtime-manifest-'));
-  process.env.LOCALAPPDATA = runtimeRoot;
-  const managedPython = process.platform === 'win32'
-    ? path.join(runtimeRoot, 'discord-codex-relay', 'runtime', 'Scripts', 'python.exe')
-    : path.join(runtimeRoot, 'discord-codex-relay', 'runtime', 'bin', 'python');
+  const originalRuntimeDataRoot = process.env.CLADEX_RUNTIME_DATA_ROOT;
+  process.env.CLADEX_RUNTIME_DATA_ROOT = runtimeRoot;
+  assertSameFilesystemPath(managedRuntimeDataRoot(), runtimeRoot);
+  const managedPython = managedRuntimePythonPath();
+  assert.equal(
+    managedPython.endsWith(process.platform === 'win32' ? path.join('runtime', 'Scripts', 'python.exe') : path.join('runtime', 'bin', 'python')),
+    true,
+  );
   fs.mkdirSync(path.dirname(managedPython), { recursive: true });
   fs.writeFileSync(managedPython, '', 'utf8');
   assert.equal(backendRuntimeNeedsRefresh(managedPython), true);
   fs.writeFileSync(
-    path.join(runtimeRoot, 'discord-codex-relay', 'runtime', '.cladex-runtime-manifest.json'),
+    path.join(path.dirname(path.dirname(managedPython)), '.cladex-runtime-manifest.json'),
     JSON.stringify({ signature: backendRuntimeSignature() }),
     'utf8',
   );
   assert.equal(backendRuntimeNeedsRefresh(managedPython), false);
-  if (originalLocalAppData === undefined) {
-    delete process.env.LOCALAPPDATA;
+  if (originalRuntimeDataRoot === undefined) {
+    delete process.env.CLADEX_RUNTIME_DATA_ROOT;
   } else {
-    process.env.LOCALAPPDATA = originalLocalAppData;
+    process.env.CLADEX_RUNTIME_DATA_ROOT = originalRuntimeDataRoot;
+  }
+
+  if (!RUN_BOOTSTRAP_SMOKE) {
+    const malformedCalls = [];
+    const malformed = await runPython(['cladex.py', 'status', '--json'], __dirname, {}, {
+      platform: 'win32',
+      pythonwLaunchers: ['pythonw-smoke'],
+      pythonLaunchers: ['python-smoke'],
+      execFileAsync: async (launcher, args) => {
+        malformedCalls.push(launcher);
+        if (launcher === 'pythonw-smoke') {
+          fs.writeFileSync(args[2], '{not-json', 'utf8');
+          return { stdout: '', stderr: '' };
+        }
+        throw new Error('fallback launcher should not run');
+      },
+    });
+    assert.deepEqual(malformedCalls, ['pythonw-smoke']);
+    assert.equal(malformed.code, 1);
+    assert.match(malformed.stderr, /api_runner output was not valid JSON/);
+
+    const failedCalls = [];
+    const failed = await runPython(['cladex.py', 'status', '--json'], __dirname, {}, {
+      platform: 'win32',
+      pythonwLaunchers: ['pythonw-smoke'],
+      pythonLaunchers: ['python-smoke'],
+      execFileAsync: async (launcher, args) => {
+        failedCalls.push(launcher);
+        if (launcher === 'pythonw-smoke') {
+          fs.writeFileSync(args[2], JSON.stringify({ stdout: '', stderr: 'backend failed', code: 7 }), 'utf8');
+          const error = new Error('api runner exited');
+          error.code = 7;
+          throw error;
+        }
+        throw new Error('fallback launcher should not run');
+      },
+    });
+    assert.deepEqual(failedCalls, ['pythonw-smoke']);
+    assert.equal(failed.code, 7);
+    assert.equal(failed.stderr, 'backend failed');
   }
 
   const logPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'cladex-log-tail-')), 'relay.log');

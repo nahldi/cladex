@@ -21,7 +21,7 @@ import aiohttp
 import discord
 from agent_guardrails import discover_workspace_guidance, format_workspace_guidance
 from dotenv import load_dotenv
-from relay_backend import AppServerCodexBackend, CliResumeCodexBackend
+from relay_backend import AppServerCodexBackend, CliResumeCodexBackend, build_turn_start_params, build_turn_steer_params
 from relay_common import (
     atomic_write_json,
     atomic_write_text,
@@ -1120,6 +1120,8 @@ class ApprovalView(discord.ui.View):
         return allowed_ids
 
     async def _resolve(self, interaction: discord.Interaction, result: dict, label: str) -> None:
+        if not await _interaction_authorized_or_send(interaction):
+            return
         allowed_ids = self._allowed_actor_ids()
         if allowed_ids and interaction.user.id not in allowed_ids:
             await interaction.response.send_message("You cannot approve this relay action.", ephemeral=True)
@@ -1758,6 +1760,43 @@ def _message_is_observable_by_relay(message: discord.Message, bot_user: discord.
     if CONFIG.allowed_channel_author_ids and message.author.id not in CONFIG.allowed_channel_author_ids:
         return False
     return True
+
+
+def _interaction_is_observable_by_relay(interaction: discord.Interaction) -> bool:
+    user = getattr(interaction, "user", None)
+    channel = getattr(interaction, "channel", None)
+    if user is None or channel is None:
+        return False
+    user_id = getattr(user, "id", None)
+    channel_id = getattr(channel, "id", None)
+
+    if getattr(interaction, "guild", None) is None:
+        if not CONFIG.allow_dms:
+            return False
+        if not CONFIG.allowed_user_ids:
+            return False
+        return user_id in CONFIG.allowed_user_ids
+
+    if getattr(user, "bot", False) and user_id not in CONFIG.allowed_bot_ids:
+        return False
+    if not CONFIG.allowed_channel_ids:
+        return False
+    if channel_id not in CONFIG.allowed_channel_ids:
+        return False
+    if CONFIG.allowed_channel_author_ids and user_id not in CONFIG.allowed_channel_author_ids:
+        return False
+    return True
+
+
+async def _interaction_authorized_or_send(interaction: discord.Interaction) -> bool:
+    if _interaction_is_observable_by_relay(interaction):
+        return True
+    payload = "This relay is not authorized for that Discord channel or user."
+    if interaction.response.is_done():
+        await interaction.followup.send(payload, allowed_mentions=SAFE_ALLOWED_MENTIONS, ephemeral=True)
+    else:
+        await interaction.response.send_message(payload, ephemeral=True)
+    return False
 
 
 def _message_targets_bot(message: discord.Message, bot_user: discord.ClientUser | None) -> bool:
@@ -2942,11 +2981,11 @@ class CodexSession:
                     steer_input = await _make_turn_input(turn_input, source_message=latest_message)
                     await self._request(
                         "turn/steer",
-                        {
-                            "threadId": self.thread_id,
-                            "input": steer_input,
-                            "expectedTurnId": active.turn_id,
-                        },
+                        build_turn_steer_params(
+                            thread_id=self.thread_id or "",
+                            input_items=steer_input,
+                            expected_turn_id=active.turn_id,
+                        ),
                     )
                     return
                 except JsonRpcError as exc:
@@ -2958,11 +2997,11 @@ class CodexSession:
                         )
                         await self._request(
                             "turn/steer",
-                            {
-                                "threadId": self.thread_id,
-                                "input": fallback_input,
-                                "expectedTurnId": active.turn_id,
-                            },
+                            build_turn_steer_params(
+                                thread_id=self.thread_id or "",
+                                input_items=fallback_input,
+                                expected_turn_id=active.turn_id,
+                            ),
                         )
                         return
                     if active.completion.done() or _is_stale_steer_error(exc):
@@ -2989,21 +3028,12 @@ class CodexSession:
         try:
             response = await self._request(
                 "turn/start",
-                {
-                    "threadId": self.thread_id,
-                    "input": input_items,
-                    "cwd": None,
-                    "approvalPolicy": None,
-                    "approvalsReviewer": None,
-                    "sandboxPolicy": None,
-                    "model": None,
-                    "serviceTier": None,
-                    "effort": effort,
-                    "summary": None,
-                    "personality": None,
-                    "outputSchema": None,
-                    "collaborationMode": None,
-                },
+                build_turn_start_params(
+                    self,
+                    thread_id=self.thread_id or "",
+                    input_items=input_items,
+                    effort=effort,
+                ),
             )
         except JsonRpcError as exc:
             if not _is_invalid_image_error(exc):
@@ -3015,21 +3045,12 @@ class CodexSession:
             )
             response = await self._request(
                 "turn/start",
-                {
-                    "threadId": self.thread_id,
-                    "input": fallback_items,
-                    "cwd": None,
-                    "approvalPolicy": None,
-                    "approvalsReviewer": None,
-                    "sandboxPolicy": None,
-                    "model": None,
-                    "serviceTier": None,
-                    "effort": effort,
-                    "summary": None,
-                    "personality": None,
-                    "outputSchema": None,
-                    "collaborationMode": None,
-                },
+                build_turn_start_params(
+                    self,
+                    thread_id=self.thread_id or "",
+                    input_items=fallback_items,
+                    effort=effort,
+                ),
             )
 
         loop = asyncio.get_running_loop()
@@ -3229,11 +3250,11 @@ class CodexSession:
                     steer_input = await _make_turn_input(turn_input, source_message=message)
                     await self._request(
                         "turn/steer",
-                        {
-                            "threadId": self.thread_id,
-                            "input": steer_input,
-                            "expectedTurnId": active.turn_id,
-                        },
+                        build_turn_steer_params(
+                            thread_id=self.thread_id or "",
+                            input_items=steer_input,
+                            expected_turn_id=active.turn_id,
+                        ),
                     )
                     return active, False
                 except JsonRpcError as exc:
@@ -3246,11 +3267,11 @@ class CodexSession:
                             )
                             await self._request(
                                 "turn/steer",
-                                {
-                                    "threadId": self.thread_id,
-                                    "input": fallback_input,
-                                    "expectedTurnId": active.turn_id,
-                                },
+                                build_turn_steer_params(
+                                    thread_id=self.thread_id or "",
+                                    input_items=fallback_input,
+                                    expected_turn_id=active.turn_id,
+                                ),
                             )
                             return active, False
                         if self.active_turn is active:
@@ -3952,21 +3973,12 @@ class CodexSession:
             input_items = await _make_turn_input(turn_input)
             response = await self._request(
                 "turn/start",
-                {
-                    "threadId": self.thread_id,
-                    "input": input_items,
-                    "cwd": None,
-                    "approvalPolicy": None,
-                    "approvalsReviewer": None,
-                    "sandboxPolicy": None,
-                    "model": None,
-                    "serviceTier": None,
-                    "effort": self._turn_effort("verification", turn_input),
-                    "summary": None,
-                    "personality": None,
-                    "outputSchema": None,
-                    "collaborationMode": None,
-                },
+                build_turn_start_params(
+                    self,
+                    thread_id=self.thread_id or "",
+                    input_items=input_items,
+                    effort=self._turn_effort("verification", turn_input),
+                ),
             )
             loop = asyncio.get_running_loop()
             completion: asyncio.Future[str] = loop.create_future()
@@ -4800,6 +4812,8 @@ class RetryView(discord.ui.View):
 
     @discord.ui.button(label="Retry", style=discord.ButtonStyle.success)
     async def retry_button(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        if not await _interaction_authorized_or_send(interaction):
+            return
         if interaction.user.id != self.requester_id:
             await interaction.response.send_message("Only the original requester can retry this.", ephemeral=True)
             return
@@ -5043,7 +5057,12 @@ async def _interaction_send(interaction: discord.Interaction, text: str) -> None
         await interaction.response.send_message(payload, ephemeral=True)
 
 
-codex_group = discord.app_commands.Group(name="codex", description="Durable relay runtime controls")
+class AuthorizedCommandGroup(discord.app_commands.Group):
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return await _interaction_authorized_or_send(interaction)
+
+
+codex_group = AuthorizedCommandGroup(name="codex", description="Durable relay runtime controls")
 
 
 @codex_group.command(name="status", description="Show durable relay status for this channel.")

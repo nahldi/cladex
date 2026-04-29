@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import concurrent.futures
 import hashlib
 import json
@@ -28,7 +29,16 @@ DEFAULT_FIX_MAX_AGENTS = 1
 MAX_FIX_AGENTS = 10
 VALIDATION_TIMEOUT_SECONDS = 600
 _TASK_STATE_LOCK = threading.Lock()
+_STATE_LOCK_LOCAL = threading.local()
 TERMINAL_FIX_STATUSES = {"completed", "completed_with_warnings", "failed", "cancelled"}
+VALIDATION_COMMAND_IDS = {
+    "npm:lint",
+    "npm:test",
+    "npm:build",
+    "pytest:backend",
+    "pytest:root",
+    "git:diff-check",
+}
 
 
 def utc_now() -> str:
@@ -97,6 +107,10 @@ def _cancel_requested(run_id: str) -> bool:
 
 def _run_lock_path(run_id: str) -> Path:
     return run_dir(run_id) / "run.lock"
+
+
+def _state_lock_path(run_id: str) -> Path:
+    return run_dir(run_id) / "state.lock"
 
 
 def _start_lock_path(review_id: str) -> Path:
@@ -174,6 +188,59 @@ def _release_run_lock(run_id: str) -> None:
         _run_lock_path(run_id).unlink()
     except OSError:
         pass
+
+
+def _state_lock_stack() -> list[str]:
+    stack = getattr(_STATE_LOCK_LOCAL, "stack", None)
+    if stack is None:
+        stack = []
+        _STATE_LOCK_LOCAL.stack = stack
+    return stack
+
+
+@contextlib.contextmanager
+def _run_state_lock(run_id: str, *, wait_seconds: float = 8.0) -> Any:
+    run_id = validate_fix_run_id(run_id)
+    stack = _state_lock_stack()
+    if run_id in stack:
+        yield
+        return
+    deadline = time.monotonic() + wait_seconds
+    lock_path = _state_lock_path(run_id)
+    with _TASK_STATE_LOCK:
+        while True:
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                break
+            except FileExistsError:
+                try:
+                    existing = lock_path.read_text(encoding="utf-8").strip()
+                    existing_pid = int(existing.split(":", 1)[0]) if existing else 0
+                except Exception:
+                    existing_pid = 0
+                if existing_pid and existing_pid != os.getpid() and not _pid_alive(existing_pid):
+                    try:
+                        lock_path.unlink()
+                        continue
+                    except OSError:
+                        pass
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("Fix Review state is busy; try again.")
+                time.sleep(0.05)
+        try:
+            os.write(fd, f"{os.getpid()}:{utc_now()}".encode("utf-8"))
+        finally:
+            os.close(fd)
+        stack.append(run_id)
+        try:
+            yield
+        finally:
+            stack.pop()
+            try:
+                lock_path.unlink()
+            except OSError:
+                pass
 
 
 def _severity_phase(severity: str) -> int:
@@ -672,20 +739,48 @@ def _load_package_json(workspace: Path) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
-def discover_validation_commands(workspace: str | Path) -> list[list[str]]:
+def _env_truthy(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _validation_allowlist_from_env() -> set[str]:
+    raw = os.environ.get("CLADEX_FIX_VALIDATION_ALLOWLIST", "").strip()
+    if not raw:
+        return set(VALIDATION_COMMAND_IDS)
+    values = {item.strip().lower() for item in raw.split(",") if item.strip()}
+    if "all" in values:
+        return set(VALIDATION_COMMAND_IDS)
+    return values & VALIDATION_COMMAND_IDS
+
+
+def _validation_enabled() -> bool:
+    return _env_truthy("CLADEX_FIX_ALLOW_TARGET_VALIDATION")
+
+
+def discover_validation_commands(
+    workspace: str | Path,
+    *,
+    approved: bool | None = None,
+    allowlist: set[str] | None = None,
+) -> list[list[str]]:
+    if approved is None:
+        approved = _validation_enabled()
+    if not approved:
+        return []
+    allowed = set(allowlist) if allowlist is not None else _validation_allowlist_from_env()
     root = Path(workspace).expanduser().resolve()
     commands: list[list[str]] = []
     package_json = _load_package_json(root)
     scripts = package_json.get("scripts", {}) if isinstance(package_json, dict) else {}
     if isinstance(scripts, dict):
-        for name in ("lint", "test", "build"):
-            if name in scripts:
+        for name, command_id in (("lint", "npm:lint"), ("test", "npm:test"), ("build", "npm:build")):
+            if command_id in allowed and name in scripts:
                 commands.append(["cmd", "/c", "npm", "run", name] if os.name == "nt" else ["npm", "run", name])
-    if (root / "backend" / "pyproject.toml").exists() or (root / "backend" / "tests").exists():
+    if "pytest:backend" in allowed and ((root / "backend" / "pyproject.toml").exists() or (root / "backend" / "tests").exists()):
         commands.append([sys.executable, "-m", "pytest", "backend/tests", "--tb=short", "-q"])
-    if (root / "pyproject.toml").exists() or (root / "pytest.ini").exists() or (root / "tests").exists():
+    if "pytest:root" in allowed and ((root / "pyproject.toml").exists() or (root / "pytest.ini").exists() or (root / "tests").exists()):
         commands.append([sys.executable, "-m", "pytest", "--tb=short", "-q"])
-    if (root / ".git").exists():
+    if "git:diff-check" in allowed and (root / ".git").exists():
         commands.append(["git", "diff", "--check"])
     return commands[:4]
 
@@ -731,21 +826,38 @@ def _blocked_phase_tasks(tasks: list[dict[str, Any]], phase: int) -> list[dict[s
     return blocked
 
 
-def _save_run(run: dict[str, Any]) -> None:
+def _save_run_unlocked(run: dict[str, Any]) -> None:
     run["updatedAt"] = utc_now()
     run["progress"] = _progress(run.get("tasks", []))
     _write_json(run_json_path(run["id"]), run)
     _atomic_write_text(run_markdown_path(run["id"]), build_fix_run_markdown(run))
 
 
+def _merge_cancel_state(run: dict[str, Any]) -> None:
+    run_id = str(run.get("id") or "")
+    try:
+        existing = _read_json(run_json_path(run_id), {})
+    except Exception:
+        existing = {}
+    if _cancel_requested(run_id) or existing.get("cancelRequested"):
+        run["cancelRequested"] = True
+
+
+def _save_run(run: dict[str, Any]) -> None:
+    run_id = str(run.get("id") or "")
+    with _run_state_lock(run_id):
+        _merge_cancel_state(run)
+        _save_run_unlocked(run)
+
+
 def _update_task(run_id: str, task_id: str, update: Callable[[dict[str, Any], dict[str, Any]], None]) -> dict[str, Any]:
-    with _TASK_STATE_LOCK:
+    with _run_state_lock(run_id):
         run = load_fix_run(run_id)
         task = next((item for item in run.get("tasks", []) if item.get("id") == task_id), None)
         if task is None:
             raise ValueError("unknown fix task id")
         update(run, task)
-        _save_run(run)
+        _save_run_unlocked(run)
         return run
 
 
@@ -828,6 +940,9 @@ def build_fix_run_markdown(run: dict[str, Any]) -> str:
     ])
     if run.get("error"):
         lines.extend(["## Error", "", str(run.get("error")), ""])
+    validation_policy = run.get("validationPolicy") if isinstance(run.get("validationPolicy"), dict) else {}
+    if validation_policy:
+        lines.extend(["## Validation Policy", "", str(validation_policy.get("message") or ""), ""])
     restore_command = restore_command_for_run(run)
     if restore_command:
         lines.extend(["## Restore", "", f"`{restore_command}`", ""])
@@ -915,6 +1030,7 @@ def start_fix_run(
         run_dir(run_id).mkdir(parents=True, exist_ok=True)
         backup = review_swarm.create_source_backup(workspace, reason="fix-start", source_job_id=review_id)
         validation_commands = discover_validation_commands(workspace)
+        validation_enabled = _validation_enabled()
         # AI orchestrator picks per-task provider + agent count; falls back to
         # a deterministic 1:1 plan if the planner is unreachable so Fix Review
         # never blocks on a missing or rate-limited provider.
@@ -951,6 +1067,15 @@ def start_fix_run(
             "requestedMaxAgents": max_agent_count,
             "plan": plan_metadata,
             "sourceBackup": backup,
+            "validationPolicy": {
+                "targetCommandsApproved": validation_enabled,
+                "allowlist": sorted(_validation_allowlist_from_env()) if validation_enabled else [],
+                "message": (
+                    "Target-defined validation commands are disabled by default for untrusted Fix Review runs."
+                    if not validation_enabled
+                    else "Target-defined validation commands were explicitly enabled for this Fix Review run."
+                ),
+            },
             "validationCommands": validation_commands,
             "validationResults": [],
             "tasks": tasks,
@@ -965,22 +1090,25 @@ def start_fix_run(
 
 
 def cancel_fix_run(run_id: str) -> dict[str, Any]:
-    run = load_fix_run(run_id)
-    if run.get("status") in TERMINAL_FIX_STATUSES:
-        return show_fix_run(run_id)
+    run_id = validate_fix_run_id(run_id)
     flag = cancel_flag_path(run_id)
     flag.parent.mkdir(parents=True, exist_ok=True)
     flag.write_text(utc_now(), encoding="utf-8")
-    run["cancelRequested"] = True
-    if run.get("status") == "queued":
-        run["status"] = "cancelled"
-        run["finishedAt"] = utc_now()
-        run["error"] = run.get("error") or "Cancelled before execution."
-        for task in run.get("tasks", []):
-            if task.get("status") == "queued":
-                task["status"] = "cancelled"
-                task["error"] = task.get("error") or "Cancelled before launch."
-    _save_run(run)
+
+    with _run_state_lock(run_id):
+        run = load_fix_run(run_id)
+        if run.get("status") in TERMINAL_FIX_STATUSES:
+            return show_fix_run(run_id)
+        run["cancelRequested"] = True
+        if run.get("status") == "queued":
+            run["status"] = "cancelled"
+            run["finishedAt"] = utc_now()
+            run["error"] = run.get("error") or "Cancelled before execution."
+            for task in run.get("tasks", []):
+                if task.get("status") == "queued":
+                    task["status"] = "cancelled"
+                    task["error"] = task.get("error") or "Cancelled before launch."
+        _save_run_unlocked(run)
     return show_fix_run(run_id)
 
 
@@ -1071,9 +1199,15 @@ def _scan_file_snapshot(workspace: Path) -> dict[str, str]:
         for name in files:
             path = current / name
             try:
-                if path.is_symlink() or not path.is_file():
-                    continue
                 rel = _normalize_rel_path(path.relative_to(workspace).as_posix())
+                if path.is_symlink():
+                    try:
+                        snapshot[rel] = f"__symlink__:{os.readlink(path)}"
+                    except OSError:
+                        snapshot[rel] = "__symlink__"
+                    continue
+                if not path.is_file():
+                    continue
                 snapshot[rel] = _hash_file(path)
             except Exception:
                 continue
@@ -1181,8 +1315,8 @@ def _restore_paths_from_source_backup(run: dict[str, Any], paths: list[str]) -> 
         rel = _normalize_rel_path(item)
         if not rel or rel == ".":
             continue
-        target = (workspace / rel).resolve()
-        source = (snapshot_root / rel).resolve()
+        target = workspace / rel
+        source = snapshot_root / rel
         try:
             target.relative_to(workspace)
             source.relative_to(snapshot_root)
@@ -1222,25 +1356,37 @@ def _run_cli(
     return review_swarm._run_cli(command, prompt, env=env, cwd=cwd, cancel_check=cancel_check)
 
 
+def _claude_fix_permission_mode() -> str:
+    requested = os.environ.get("CLADEX_FIX_CLAUDE_PERMISSION_MODE", "").strip()
+    if requested == "bypassPermissions" and _env_truthy("CLADEX_FIX_CLAUDE_ALLOW_BYPASS"):
+        return "bypassPermissions"
+    if requested in {"default", "acceptEdits"}:
+        return requested
+    return "acceptEdits"
+
+
+def _claude_fix_allowed_tools() -> str:
+    tools = ["Read", "Grep", "Glob", "LS", "Edit", "MultiEdit", "Write"]
+    if _env_truthy("CLADEX_FIX_CLAUDE_ALLOW_BASH"):
+        tools.append("Bash")
+    return ",".join(tools)
+
+
 def _run_provider_fix_task(run: dict[str, Any], task: dict[str, Any]) -> review_swarm.AIRunResult:
     workspace = Path(str(run.get("workspace"))).expanduser().resolve()
     provider = str(task.get("provider") or run.get("provider") or "codex")
     account_home = str(run.get("accountHome") or "").strip()
     if provider == "claude":
-        # `--allowedTools` is the canonical Claude Code flag (the deprecated
-        # `--tools` was being silently ignored, which combined with
-        # `--permission-mode dontAsk` denied every write tool and turned
-        # every Claude fix task into a no-op).
-        # `bypassPermissions` is required so Edit/Write/Bash run without
-        # prompting; the operator already opted in to write access via the
-        # `--allow-cladex-self-fix`-gated Fix Review backup.
+        # Fix Review tasks are prompt-derived, so Claude defaults to edit-only
+        # tools and does not get shell access or permission bypass unless the
+        # local operator explicitly opts into those capabilities.
         command = [
             claude_relay.claude_code_bin(),
             "-p",
             "--permission-mode",
-            "bypassPermissions",
+            _claude_fix_permission_mode(),
             "--allowedTools",
-            "Read,Grep,Glob,LS,Edit,MultiEdit,Write,Bash",
+            _claude_fix_allowed_tools(),
             "--no-session-persistence",
             "--output-format",
             "text",

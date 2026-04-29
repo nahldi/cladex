@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -514,6 +515,32 @@ def test_claude_bot_releases_inbound_when_typing_setup_fails(monkeypatch) -> Non
         asyncio.run(bound_on_message(message))
 
     assert events == ["claim", "typing-enter", "release"]
+
+
+def test_claude_bot_fails_orphaned_operator_processing_without_replay(tmp_path: Path) -> None:
+    import importlib
+
+    claude_bot = importlib.import_module("claude_bot")
+    requests_dir = tmp_path / "requests"
+    responses_dir = tmp_path / "responses"
+    requests_dir.mkdir()
+    responses_dir.mkdir()
+    processing = requests_dir / "abc.processing"
+    processing.write_text(json.dumps({"message": "stale request"}), encoding="utf-8")
+
+    fake = SimpleNamespace(
+        _operator_requests_dir=requests_dir,
+        _operator_responses_dir=responses_dir,
+    )
+
+    bound_reclaim = claude_bot.ClaudeRelayBot._reclaim_orphaned_operator_requests.__get__(fake)
+    asyncio.run(bound_reclaim())
+
+    assert not processing.exists()
+    assert not (requests_dir / "abc.json").exists()
+    response = json.loads((responses_dir / "abc.json").read_text(encoding="utf-8"))
+    assert response["ok"] is False
+    assert "orphaned" in response["error"]
 
 
 def test_profile_from_env_marks_backend(tmp_path: Path, monkeypatch) -> None:

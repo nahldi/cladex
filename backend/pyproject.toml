@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "discord-codex-relay"
-version = "2.5.3"
+version = "2.5.4"
 description = "Unified Discord relay manager for Claude Code and Codex CLI."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -43,7 +43,10 @@ cladex = "cladex:main"
 
 [project.optional-dependencies]
 dev = [
+  "build>=1.4,<2",
   "pytest>=8,<9",
+  "setuptools>=68",
+  "wheel>=0.45,<1",
 ]
 
 [tool.setuptools]
@@ -63,3 +66,6 @@ discord_codex_relay_plugin = [
   "bundle/skills/workspace-discord-relay/agents/openai.yaml",
   "bundle/skills/workspace-discord-relay/scripts/bootstrap.py",
 ]
+
+[tool.setuptools.data-files]
+"share/discord-codex-relay" = ["constraints.txt"]

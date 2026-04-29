@@ -59,6 +59,37 @@ def _message(*, channel_id: int, author_id: int = 1, content: str = "", mentions
     )
 
 
+class _FakeInteractionResponse:
+    def __init__(self) -> None:
+        self.messages: list[tuple[str, dict]] = []
+        self.done = False
+
+    def is_done(self) -> bool:
+        return self.done
+
+    async def send_message(self, content: str, **kwargs):
+        self.done = True
+        self.messages.append((content, kwargs))
+
+
+class _FakeInteractionFollowup:
+    def __init__(self) -> None:
+        self.messages: list[tuple[str, dict]] = []
+
+    async def send(self, content: str, **kwargs):
+        self.messages.append((content, kwargs))
+
+
+def _interaction(*, channel_id: int, user_id: int, guild=True, user_bot=False):
+    return SimpleNamespace(
+        guild=object() if guild else None,
+        channel=SimpleNamespace(id=channel_id),
+        user=SimpleNamespace(id=user_id, bot=user_bot),
+        response=_FakeInteractionResponse(),
+        followup=_FakeInteractionFollowup(),
+    )
+
+
 def test_allowed_channel_does_not_bypass_mention_mode() -> None:
     bot = _load_bot_module()
     relay_user = SimpleNamespace(id=999)
@@ -433,6 +464,71 @@ def test_allowed_channel_respects_author_allowlist() -> None:
 
     assert bot._message_targets_bot(blocked, relay_user) is False
     assert bot._message_targets_bot(allowed, relay_user) is True
+
+
+def test_interaction_authorization_respects_channel_and_author_allowlists() -> None:
+    bot = _load_bot_module()
+    bot.CONFIG.allowed_channel_ids = {42}
+    bot.CONFIG.allowed_channel_author_ids = {7}
+    bot.CONFIG.allowed_user_ids = {99}
+    bot.CONFIG.allow_dms = True
+
+    assert bot._interaction_is_observable_by_relay(_interaction(channel_id=42, user_id=7)) is True
+    assert bot._interaction_is_observable_by_relay(_interaction(channel_id=42, user_id=8)) is False
+    assert bot._interaction_is_observable_by_relay(_interaction(channel_id=43, user_id=7)) is False
+    assert bot._interaction_is_observable_by_relay(_interaction(channel_id=123, user_id=99, guild=False)) is True
+    assert bot._interaction_is_observable_by_relay(_interaction(channel_id=123, user_id=7, guild=False)) is False
+
+
+def test_codex_slash_group_rejects_unauthorized_interaction() -> None:
+    bot = _load_bot_module()
+    bot.CONFIG.allowed_channel_ids = {42}
+    bot.CONFIG.allowed_channel_author_ids = {7}
+    bot.CONFIG.allowed_user_ids = set()
+    bot.CONFIG.allow_dms = False
+    interaction = _interaction(channel_id=43, user_id=7)
+
+    allowed = asyncio.run(bot.codex_group.interaction_check(interaction))
+
+    assert allowed is False
+    assert interaction.response.messages == [
+        (
+            "This relay is not authorized for that Discord channel or user.",
+            {"ephemeral": True},
+        )
+    ]
+
+
+def test_approval_button_rejects_unauthorized_interaction() -> None:
+    bot = _load_bot_module()
+    bot.CONFIG.allowed_channel_ids = {42}
+    bot.CONFIG.allowed_channel_author_ids = {7}
+    bot.CONFIG.allowed_user_ids = set()
+    bot.CONFIG.allow_dms = False
+    source_message = _message(channel_id=42, author_id=7, content="<@999> approve this", mentions=[SimpleNamespace(id=999)])
+    interaction = _interaction(channel_id=43, user_id=7)
+
+    async def _run() -> tuple[bool, list[tuple[str, dict]]]:
+        pending = bot.PendingApproval(
+            request_id="approval-1",
+            method="apply_patch",
+            params={},
+            source_message=source_message,
+            completion=asyncio.get_running_loop().create_future(),
+        )
+        view = bot.ApprovalView(pending=pending, allow_session=False)
+        await view._allow_turn(interaction)
+        return pending.completion.done(), interaction.response.messages
+
+    done, messages = asyncio.run(_run())
+
+    assert done is False
+    assert messages == [
+        (
+            "This relay is not authorized for that Discord channel or user.",
+            {"ephemeral": True},
+        )
+    ]
 
 
 def test_allowed_channel_rejects_unapproved_bot_author() -> None:
@@ -1027,6 +1123,53 @@ def test_complete_tracked_turn_clears_auth_failure_marker() -> None:
         assert not bot.AUTH_FAILURE_MARKER_PATH.exists()
 
     asyncio.run(_run())
+
+
+def test_codex_session_start_turn_uses_schema_builder_payload() -> None:
+    bot = _load_bot_module()
+
+    class FakeTyping:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    async def _run() -> dict:
+        session = bot.CodexSession("channel-42")
+        session.thread_id = "thread-1"
+        captured: dict[str, dict] = {}
+
+        async def _request(method: str, params: dict | None) -> dict:
+            captured[method] = params or {}
+            return {"turn": {"id": "turn-1"}}
+
+        session._request = _request
+        message = _message(channel_id=42, author_id=7, content="<@999> ship it", mentions=[SimpleNamespace(id=999)])
+        message.id = 1001
+        message.channel.typing = lambda: FakeTyping()
+
+        turn = await session._start_turn_locked(
+            message=message,
+            turn_input="Ship it.",
+            directive=bot.RelayDirective(kind="direct_mention", authoritative=True, reply_required=True, reason=""),
+        )
+        turn.completion.set_result("done")
+        for task in [turn.watchdog_task, turn.lease_heartbeat_task, turn.typing_task, turn.progress_task]:
+            if task is not None:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+        return captured["turn/start"]
+
+    payload = asyncio.run(_run())
+
+    assert "collaborationMode" not in payload
+    assert payload["threadId"] == "thread-1"
+    assert payload["input"][0] == {"type": "text", "text": "Ship it.", "text_elements": []}
+    assert set(payload).issubset({"threadId", "input", "cwd", "approvalPolicy", "approvalsReviewer", "sandboxPolicy", "model", "serviceTier", "effort", "summary", "personality", "outputSchema", "permissionProfile"})
 
 
 def test_developer_instructions_include_soul() -> None:

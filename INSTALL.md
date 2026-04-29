@@ -9,8 +9,8 @@
    - `codex` for Codex relays
    - `claude` for Claude relays
 3. Download the packaged release asset from GitHub, or build it locally with `cmd /c npm run electron:build`.
-4. Open `release\CLADEX Setup 2.5.3.exe` and install it.
-5. Or run `release\CLADEX 2.5.3.exe` or `release\win-unpacked\CLADEX.exe` directly.
+4. Open `release\CLADEX Setup 2.5.4.exe` and install it.
+5. Or run `release\CLADEX 2.5.4.exe` or `release\win-unpacked\CLADEX.exe` directly.
 6. In CLADEX, choose `Add Relay`, then enter:
    - a workspace folder
    - a Discord bot token

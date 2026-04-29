@@ -117,6 +117,8 @@ def test_idle_processes_are_evicted_after_ttl(tmp_path: Path, monkeypatch) -> No
 
     assert "stale" in terminated
     assert "fresh" not in terminated
+    assert "stale" not in backend._sessions
+    assert "fresh" in backend._sessions
 
 
 def test_lru_cap_evicts_least_recently_used_inactive_channel(tmp_path: Path, monkeypatch) -> None:
@@ -162,6 +164,9 @@ def test_lru_cap_evicts_least_recently_used_inactive_channel(tmp_path: Path, mon
 
     # Cap is 2 with 3 live processes; oldest inactive must go first.
     assert terminated == ["oldest"]
+    assert "oldest" not in backend._sessions
+    assert "middle" in backend._sessions
+    assert "newest" in backend._sessions
 
 
 def test_run_turn_uses_persistent_stream_json(tmp_path: Path) -> None:

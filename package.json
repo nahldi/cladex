@@ -1,7 +1,7 @@
 {
   "name": "cladex",
   "private": true,
-  "version": "2.5.3",
+  "version": "2.5.4",
   "author": "CLADEX Contributors",
   "license": "MIT",
   "description": "Unified desktop and CLI manager for Codex and Claude Discord relays.",
@@ -24,7 +24,7 @@
     "api:smoke": "node scripts/server-contract-smoke.cjs",
     "frontend:smoke": "node src/App.workflow.test.mjs",
     "electron": "npm run build && electron .",
-    "electron:dev": "concurrently \"npm run server\" \"npm run dev\" \"wait-on http://127.0.0.1:3000 && electron .\"",
+    "electron:dev": "concurrently \"npm run dev\" \"wait-on http://127.0.0.1:3000 && electron . --dev-renderer\"",
     "electron:build": "npm run build && electron-builder --publish never",
     "app": "npm run build && electron ."
   },

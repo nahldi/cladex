@@ -1,6 +1,11 @@
 from __future__ import annotations
 
 import json
+import re
+import shutil
+import subprocess
+import sys
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -104,6 +109,7 @@ def test_start_claude_profile_uses_existing_runtime(tmp_path: Path, monkeypatch)
     monkeypatch.setattr(cladex.relayctl.install_plugin, "runtime_python_path", lambda: runtime_python)
     monkeypatch.setattr(cladex, "_claude_state_dir", lambda profile: state_dir)
     monkeypatch.setattr(cladex, "_load_claude_env", lambda profile: dict(CLAUDE_SAFE_ENV))
+    monkeypatch.setattr(cladex, "_wait_for_claude_worker_startup", lambda profile, *, pid: None)
     monkeypatch.setattr(cladex.relayctl, "_background_python_windowless_executable", lambda: "pythonw.exe")
     monkeypatch.setattr(
         cladex.subprocess,
@@ -148,6 +154,7 @@ def test_start_claude_profile_bootstraps_missing_runtime(tmp_path: Path, monkeyp
     monkeypatch.setattr(cladex.relayctl.install_plugin, "_ensure_runtime", fake_ensure_runtime)
     monkeypatch.setattr(cladex, "_claude_state_dir", lambda profile: state_dir)
     monkeypatch.setattr(cladex, "_load_claude_env", lambda profile: dict(CLAUDE_SAFE_ENV))
+    monkeypatch.setattr(cladex, "_wait_for_claude_worker_startup", lambda profile, *, pid: None)
     monkeypatch.setattr(cladex.relayctl, "_background_python_windowless_executable", lambda: "pythonw.exe")
     monkeypatch.setattr(
         cladex.subprocess,
@@ -207,6 +214,65 @@ def test_start_claude_profile_returns_when_already_running(tmp_path: Path, monke
     assert runtime_checks == ["forge-ce0eef1b-09de"]
     assert launches == []
     assert runtime_bootstraps == []
+
+
+def test_start_claude_profile_waits_when_existing_worker_not_ready(tmp_path: Path, monkeypatch) -> None:
+    env_file = tmp_path / "forge.env"
+    env_file.write_text("DISCORD_BOT_TOKEN=test\n", encoding="utf-8")
+    workspace = tmp_path / "forge"
+    workspace.mkdir()
+    state_dir = tmp_path / "state"
+    waited: list[int] = []
+
+    monkeypatch.setattr(cladex, "_claude_state_dir", lambda profile: state_dir)
+    monkeypatch.setattr(cladex, "_load_claude_env", lambda profile: dict(CLAUDE_SAFE_ENV))
+    monkeypatch.setattr(cladex, "_claude_profile_runtime_state", lambda profile: {"running": True, "ready": False, "pid": 987})
+    monkeypatch.setattr(cladex, "_wait_for_claude_worker_startup", lambda profile, *, pid: waited.append(pid))
+    monkeypatch.setattr(cladex, "_ensure_claude_background_runtime", lambda: (_ for _ in ()).throw(AssertionError("no bootstrap")))
+    monkeypatch.setattr(cladex.subprocess, "Popen", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("no launch")))
+
+    profile = {
+        "name": "forge-ce0eef1b-09de",
+        "_relay_type": "claude",
+        "workspace": str(workspace),
+        "env_file": str(env_file),
+        "state_namespace": "forge-ce0eef1b",
+    }
+
+    cladex.start_profile(profile)
+
+    assert waited == [987]
+
+
+def test_wait_for_claude_worker_startup_requires_ready_state(monkeypatch) -> None:
+    states = iter(
+        [
+            {"running": True, "ready": False, "raw_status": "starting", "status_message": "connecting"},
+            {"running": True, "ready": True, "raw_status": "ready", "status_message": "ready"},
+        ]
+    )
+    sleeps: list[float] = []
+    monkeypatch.setattr(cladex, "_claude_profile_runtime_state", lambda profile: next(states))
+    monkeypatch.setattr(cladex.time, "sleep", lambda seconds: sleeps.append(seconds))
+
+    cladex._wait_for_claude_worker_startup({"name": "claude-one"}, pid=123, timeout_seconds=1.0)
+
+    assert sleeps == [0.25]
+
+
+def test_wait_for_claude_worker_startup_raises_on_error(monkeypatch) -> None:
+    monkeypatch.setattr(
+        cladex,
+        "_claude_profile_runtime_state",
+        lambda profile: {"running": True, "ready": False, "raw_status": "error", "status_message": "bad token"},
+    )
+
+    try:
+        cladex._wait_for_claude_worker_startup({"name": "claude-one"}, pid=123, timeout_seconds=1.0)
+    except RuntimeError as exc:
+        assert "bad token" in str(exc)
+    else:
+        raise AssertionError("expected startup error")
 
 
 def test_start_claude_profile_rejects_existing_empty_allowlists(tmp_path: Path, monkeypatch) -> None:
@@ -410,6 +476,25 @@ def test_update_claude_profile_persists_via_local_save(tmp_path: Path, monkeypat
 
     saved = json.loads((config_root / "workspaces.json").read_text(encoding="utf-8"))
     assert any(p.get("bot_name") == "Renamed" for p in saved["profiles"])
+
+
+def test_remove_claude_profile_uses_atomic_registry_writer(tmp_path: Path, monkeypatch) -> None:
+    env_file = tmp_path / "claude.env"
+    env_file.write_text("DISCORD_BOT_TOKEN=test\n", encoding="utf-8")
+    saved: list[dict] = []
+
+    monkeypatch.setattr(cladex, "stop_profile", lambda profile: None)
+    monkeypatch.setattr(
+        cladex,
+        "_load_claude_registry",
+        lambda: {"profiles": [{"name": "claude-one"}, {"name": "claude-two"}], "projects": []},
+    )
+    monkeypatch.setattr(cladex, "_save_claude_registry", lambda registry: saved.append(registry))
+
+    cladex._remove_claude_profile({"name": "claude-one", "env_file": str(env_file)})
+
+    assert saved == [{"profiles": [{"name": "claude-two"}], "projects": []}]
+    assert not env_file.exists()
 
 
 def test_claude_running_state_uses_relay_pid(tmp_path: Path, monkeypatch) -> None:
@@ -834,6 +919,67 @@ def test_cmd_update_passes_fields_to_update_profile(monkeypatch, capsys) -> None
     assert "Updated codex-one [codex]." in capsys.readouterr().out
 
 
+def test_cmd_update_json_returns_renamed_profile(monkeypatch, capsys) -> None:
+    old_profile = {"name": "old", "_relay_type": "claude"}
+    new_profile = {
+        "name": "new",
+        "_relay_type": "claude",
+        "_running": False,
+        "_ready": False,
+        "_provider": "claude-code",
+        "workspace": "C:/repo",
+    }
+    updated = False
+
+    def fake_filter(name=None, relay_type=None):
+        if not updated:
+            return [old_profile]
+        if name == "new":
+            return [new_profile]
+        return []
+
+    def fake_update(profile, **kwargs):
+        nonlocal updated
+        updated = True
+        return {"name": "new", "_relay_type": "claude"}
+
+    monkeypatch.setattr(cladex, "_filter_profiles", fake_filter)
+    monkeypatch.setattr(cladex, "update_profile", fake_update)
+
+    rc = cladex.cmd_update(
+        SimpleNamespace(
+            name="old",
+            type="claude",
+            workspace=None,
+            discord_bot_token=None,
+            discord_bot_token_env=None,
+            bot_name="New",
+            model=None,
+            codex_home=None,
+            claude_config_dir=None,
+            trigger_mode=None,
+            allow_dms=False,
+            deny_dms=False,
+            operator_ids=None,
+            allowed_user_ids=None,
+            allowed_bot_ids=None,
+            allowed_channel_id=None,
+            allowed_channel_author_ids=None,
+            channel_no_mention_author_ids=None,
+            channel_history_limit=None,
+            startup_dm_user_ids=None,
+            startup_dm_text=None,
+            startup_channel_text=None,
+            json=True,
+        )
+    )
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["id"] == "new"
+    assert payload["relayType"] == "claude"
+
+
 def test_update_profile_rejects_non_numeric_user_ids(monkeypatch) -> None:
     """F0004: PATCH /api/profiles forwards the raw allowed-user CSV; the
     update path must reject non-numeric IDs rather than silently dropping
@@ -959,6 +1105,59 @@ def test_cmd_update_returns_error_for_invalid_id(monkeypatch, capsys) -> None:
     payload = json.loads(capsys.readouterr().out)
     assert payload["success"] is False
     assert "numeric Discord IDs" in payload["error"]
+
+
+def test_workspace_relay_skill_avoids_command_line_token_examples() -> None:
+    backend_root = Path(__file__).resolve().parents[1]
+    skill_path = backend_root / "discord_codex_relay_plugin" / "bundle" / "skills" / "workspace-discord-relay" / "SKILL.md"
+    text = skill_path.read_text(encoding="utf-8")
+
+    assert "--discord-bot-token <token>" not in text
+    assert "CLADEX_REGISTER_DISCORD_BOT_TOKEN" in text
+
+
+def test_workspace_relay_bootstrap_default_is_pinned_to_project_version() -> None:
+    backend_root = Path(__file__).resolve().parents[1]
+    pyproject = (backend_root / "pyproject.toml").read_text(encoding="utf-8")
+    bootstrap = (
+        backend_root
+        / "discord_codex_relay_plugin"
+        / "bundle"
+        / "skills"
+        / "workspace-discord-relay"
+        / "scripts"
+        / "bootstrap.py"
+    ).read_text(encoding="utf-8")
+
+    version = re.search(r'^version = "([^"]+)"', pyproject, flags=re.MULTILINE)
+    assert version is not None
+    assert f'PACKAGE_VERSION = "{version.group(1)}"' in bootstrap
+    assert "DEFAULT_PACKAGE_SPEC" in bootstrap
+
+
+def test_backend_wheel_includes_constraints_and_workspace_relay_skill(tmp_path: Path) -> None:
+    backend_root = Path(__file__).resolve().parents[1]
+    src = tmp_path / "backend-src"
+    ignore = shutil.ignore_patterns("build", "*.egg-info", "__pycache__", ".pytest_cache")
+    shutil.copytree(backend_root, src, ignore=ignore)
+    out_dir = tmp_path / "dist"
+    out_dir.mkdir()
+
+    subprocess.run(
+        [sys.executable, "-m", "build", "--wheel", "--no-isolation", "--outdir", str(out_dir), str(src)],
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    wheel = next(out_dir.glob("discord_codex_relay-*.whl"))
+    with zipfile.ZipFile(wheel) as archive:
+        names = set(archive.namelist())
+
+    assert any(name.endswith(".data/data/share/discord-codex-relay/constraints.txt") for name in names)
+    assert "discord_codex_relay_plugin/bundle/skills/workspace-discord-relay/SKILL.md" in names
+    assert "discord_codex_relay_plugin/bundle/skills/workspace-discord-relay/scripts/bootstrap.py" in names
 
 
 def test_project_list_json(monkeypatch, capsys) -> None:

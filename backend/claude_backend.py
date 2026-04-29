@@ -809,6 +809,7 @@ class ClaudeBackend:
             except Exception:
                 logger.exception("Failed to evict idle Claude process for channel %s", channel_key)
             self._persistent_processes.pop(channel_key, None)
+            self._sessions.pop(channel_key, None)
 
     async def _enforce_worker_max_live(self, *, except_channel: str) -> None:
         """If too many live processes exist, drop the LRU inactive one."""
@@ -837,6 +838,7 @@ class ClaudeBackend:
         except Exception:
             logger.exception("Failed to LRU-evict Claude process for channel %s", evict_key)
         self._persistent_processes.pop(evict_key, None)
+        self._sessions.pop(evict_key, None)
 
     async def _persistent_process_for_channel(self, channel_key: str, prompt_workspace: Path) -> PersistentClaudeProcess:
         """Get or create a persistent Claude subprocess for a channel."""
