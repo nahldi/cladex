@@ -56,6 +56,7 @@ else:
 
 
 NATIVE_PATH_CLASS = type(Path.cwd())
+IS_WINDOWS = os.name == "nt"
 
 
 ENV_KEY_ORDER = [
@@ -372,8 +373,8 @@ def _launch_gui_detached() -> int:
     env[GUI_CHILD_ENV] = "1"
     command = [_gui_python_executable(), _backend_script_path("relayctl.py"), "gui"]
     kwargs: dict[str, object] = {"env": env, "close_fds": True}
-    if os.name == "nt":
-        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+    if IS_WINDOWS:
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     else:
         kwargs["start_new_session"] = True
         kwargs["stdout"] = subprocess.DEVNULL
@@ -534,8 +535,8 @@ for profile in profiles:
         "stdout": subprocess.DEVNULL,
         "stderr": subprocess.DEVNULL,
     }
-    if os.name == "nt":
-        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+    if IS_WINDOWS:
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     subprocess.Popen(command, **kwargs)
 
 

@@ -2130,23 +2130,24 @@ def test_launch_external_windows_update_background_uses_windowless_python(tmp_pa
 
     original_background_python = relayctl._background_python_windowless_executable
     original_popen = relayctl.subprocess.Popen
-    original_os_name = relayctl.os.name
+    original_is_windows = relayctl.IS_WINDOWS
     captured: dict[str, object] = {}
 
     relayctl._background_python_windowless_executable = lambda: str(helper_python)
-    relayctl.os.name = "nt"
+    relayctl.IS_WINDOWS = True
     relayctl.subprocess.Popen = lambda command, **kwargs: captured.update(command=command, kwargs=kwargs) or argparse.Namespace()
     try:
         relayctl._launch_external_windows_update_background(str(repo_root), restarted_profiles=[])
     finally:
         relayctl._background_python_windowless_executable = original_background_python
         relayctl.subprocess.Popen = original_popen
-        relayctl.os.name = original_os_name
+        relayctl.IS_WINDOWS = original_is_windows
 
     assert Path(captured["command"][0]).name.lower() == "pythonw.exe"
     assert captured["kwargs"]["stdin"] is relayctl.subprocess.DEVNULL
     assert captured["kwargs"]["stdout"] is relayctl.subprocess.DEVNULL
     assert captured["kwargs"]["stderr"] is relayctl.subprocess.DEVNULL
+    assert captured["kwargs"]["creationflags"] == getattr(relayctl.subprocess, "CREATE_NO_WINDOW", 0)
 
 
 def test_build_parser_supports_update_alias() -> None:
