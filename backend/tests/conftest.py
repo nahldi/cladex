@@ -17,3 +17,9 @@ for module_name in ("bot", "install_plugin", "relay_common", "relayctl"):
 # Individual tests that exercise the planner explicitly opt back in via
 # monkeypatching `_ai_plan_fix_tasks`.
 os.environ["CLADEX_FIX_PLANNER_DISABLE"] = "1"
+
+# The post-lane synthesizer pass invokes `_run_cli` against the real Codex/Claude
+# binary, which would block tests that mock only `_run_codex_ai_review` or
+# `_run_claude_ai_review`. Disable it by default; tests that exercise the
+# synthesizer set CLADEX_REVIEW_SYNTHESIZER=1 explicitly.
+os.environ.setdefault("CLADEX_REVIEW_SYNTHESIZER", "0")

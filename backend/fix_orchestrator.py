@@ -1126,6 +1126,15 @@ def _minimal_env(extra: dict[str, str] | None = None) -> dict[str, str]:
     return env
 
 
+_FIX_WORKER_DISCIPLINE = (
+    "Working principles (distilled from Karpathy's LLM-coding-pitfall guidelines):\n"
+    "- Think before editing. State your one-line plan, then execute it. If two interpretations of the finding exist, name them and pick the safer one explicitly.\n"
+    "- Simplicity first. Write the minimum code that closes the finding. No speculative abstractions, no `flexibility` knobs that weren't requested, no error handling for impossible cases.\n"
+    "- Surgical changes. Touch only what the finding demands. Do not 'improve' adjacent code, comments, or formatting. Match existing style even if you would do it differently. If you spot unrelated dead code, mention it; do not delete it.\n"
+    "- Goal-driven verification. Before you call yourself done, name the concrete check that proves the fix works (a unit test that fails on the bad version, a doctor check, a smoke run). Run it. Quote the result.\n"
+)
+
+
 def _task_prompt(run: dict[str, Any], task: dict[str, Any]) -> str:
     files = "\n".join(f"- {item}" for item in task.get("files") or ["."])
     return (
@@ -1134,6 +1143,7 @@ def _task_prompt(run: dict[str, Any], task: dict[str, Any]) -> str:
         "Do not edit files outside the assigned files unless the assignment is `.`. Do not edit CLADEX unless this workspace is CLADEX and the operator explicitly selected a CLADEX self-fix run.\n"
         "Do not use `git stash`, `git reset`, or checkout commands to hide unrelated local changes; validate against the workspace as given.\n"
         "Keep the patch minimal, preserve existing style, and stop if the task requires secrets or external credentials.\n\n"
+        f"{_FIX_WORKER_DISCIPLINE}\n"
         f"Workspace: {run.get('workspace')}\n"
         f"Run: {run.get('id')}\n"
         f"Task: {task.get('id')}\n"
@@ -1142,7 +1152,7 @@ def _task_prompt(run: dict[str, Any], task: dict[str, Any]) -> str:
         f"Assigned files:\n{files}\n\n"
         f"Evidence:\n{task.get('detail')}\n\n"
         f"Required fix:\n{task.get('recommendation')}\n\n"
-        "After editing, summarize changed files and validation commands you ran. Do not include secret values."
+        "After editing, summarize changed files and the concrete verification you ran (test, doctor, smoke). Do not include secret values."
     )
 
 

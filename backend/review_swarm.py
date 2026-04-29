@@ -2044,6 +2044,134 @@ def _run_claude_ai_review(
     )
 
 
+def _synthesizer_prompt(job: dict[str, Any], lane_findings: list[dict[str, Any]]) -> str:
+    """Prompt for the cross-cutting synthesizer pass.
+
+    The synthesizer reads what every specialist lane reported and looks for
+    issues that only become visible when you stand back from any single
+    lane — the kind of bug that is invisible to a security lane reading
+    auth.py alone OR a runtime lane reading lifecycle.py alone, because
+    the bug lives in how those two pieces interact.
+
+    It explicitly de-prioritizes anything already reported by a lane: its
+    job is to add value the lanes individually couldn't.
+    """
+    workspace = Path(job["workspace"])
+    coordination_path = coordination_markdown_path(job["id"])
+    # Compact the lane findings — the synthesizer doesn't need full detail,
+    # just enough to spot correlations. Keep severity, category, path, line,
+    # and a short title; drop detail/recommendation to keep the prompt small.
+    compact: list[dict[str, Any]] = []
+    for finding in lane_findings:
+        compact.append(
+            {
+                "agentId": str(finding.get("agentId") or ""),
+                "severity": str(finding.get("severity") or ""),
+                "category": str(finding.get("category") or ""),
+                "path": str(finding.get("path") or ""),
+                "line": finding.get("line"),
+                "title": str(finding.get("title") or "")[:140],
+            }
+        )
+    findings_json = json.dumps(compact, ensure_ascii=False)[:60000]
+    return (
+        "You are the CLADEX review-swarm synthesizer.\n"
+        "The specialist lanes have already finished. Your job is to find what they could not — issues that require evidence from multiple lanes to spot, contradictions between lane reports, drift between code and the docs/specs, and architectural risks no single lane was scoped to see.\n"
+        "Do NOT restate findings the lanes already reported. Add only cross-cutting findings that the lanes individually could not produce.\n"
+        "Examples of synthesizer-grade findings:\n"
+        "- Lane A says X is safe under assumption Y; lane B independently shows Y can fail. The bug is the gap, not either lane's claim.\n"
+        "- Two findings independently fix one half of a problem; together they leave a third half unfixed.\n"
+        "- Public docs (README, INSTALL, CLI --help) claim behavior that the code does not implement.\n"
+        "- A configuration default in one file silently overrides a guardrail in another.\n"
+        "- Concurrency: lane A pinned a lock; lane B's path bypasses that code path entirely.\n"
+        "Stay grounded in concrete file:line evidence. If you cannot tie a synthesizer finding to specific files and lines, drop it.\n"
+        "Only emit findings whose confidence is high enough to ship. Skip speculative items.\n\n"
+        f"Provider lane: {job['provider']}\n"
+        f"Review job: {job['id']}\n"
+        f"Workspace: {workspace}\n"
+        f"Shared coordination artifact: {coordination_path}\n\n"
+        f"Findings already reported by specialist lanes (compact):\n{findings_json}\n\n"
+        f"{_json_schema_prompt()}"
+    )
+
+
+def _run_synthesizer_pass(
+    job: dict[str, Any],
+    lane_findings: list[dict[str, Any]],
+    *,
+    scratch: Path,
+    cancel_check: Callable[[], bool] | None = None,
+) -> list[dict[str, Any]]:
+    """Run the synthesizer pass and return parsed findings (best-effort).
+
+    Returns [] on any failure — this phase is opt-out best-effort and must
+    never block job finalization.
+    """
+    if not lane_findings:
+        return []
+    if cancel_check is not None and cancel_check():
+        return []
+    if os.environ.get("CLADEX_REVIEW_SYNTHESIZER", "1").strip().lower() in {"0", "false", "no", "off"}:
+        return []
+    provider = str(job.get("provider") or "codex").lower()
+    prompt = _synthesizer_prompt(job, lane_findings)
+    if provider == "claude":
+        import claude_relay
+
+        command = [
+            claude_relay.claude_code_bin(),
+            "-p",
+            "--permission-mode",
+            "dontAsk",
+            "--allowedTools",
+            "Read,Grep,Glob,LS",
+            "--disallowedTools",
+            "Bash,Edit,MultiEdit,Write,NotebookEdit",
+            "--no-session-persistence",
+            "--output-format",
+            "text",
+            "Read the synthesizer instructions from stdin and return only the requested JSON findings.",
+        ]
+        extra: dict[str, str] = {}
+        if job.get("accountHome"):
+            extra["CLAUDE_CONFIG_DIR"] = str(job["accountHome"])
+        env = _minimal_reviewer_env(account_home=extra)
+        result = _run_cli(command, prompt, env=env, cwd=scratch, cancel_check=cancel_check)
+    else:
+        import relayctl
+
+        output_path = job_dir(job["id"]) / "synthesizer-codex.md"
+        command = [
+            relayctl.resolve_codex_bin(),
+            "--cd",
+            str(scratch),
+            "--sandbox",
+            "read-only",
+            "--ask-for-approval",
+            "never",
+            "exec",
+            "--ephemeral",
+            "--skip-git-repo-check",
+            "--output-last-message",
+            str(output_path),
+            "-",
+        ]
+        env = _minimal_reviewer_env(
+            account_home={"CODEX_HOME": str(job.get("accountHome"))} if job.get("accountHome") else {}
+        )
+        result = _run_cli(command, prompt, env=env, cancel_check=cancel_check)
+        if result.ok and output_path.exists():
+            result = AIRunResult(text=_read_text_with_limit(output_path), ok=True)
+    if not result.ok:
+        return []
+    workspace = Path(str(job.get("workspace") or scratch))
+    synth_agent = {"id": "synthesizer", "focus": "synthesizer"}
+    parsed = parse_ai_findings(result.text, workspace=workspace, agent=synth_agent, scratch=scratch)
+    if not parsed:
+        return []
+    return _agent_finding_prefix("synthesizer", str(job.get("provider") or ""), parsed)
+
+
 _REVIEWER_ENV_PASSTHROUGH = (
     "PATH",
     "PATHEXT",
@@ -2173,17 +2301,33 @@ def _run_cli(
     except Exception as exc:
         return AIRunResult(text="", ok=False, error=f"AI reviewer failed to start: {exc}")
 
+    # Defaults are deliberately generous so a deep, slow-but-progressing
+    # reviewer does not get killed mid-thought. Kill-conditions remain:
+    #   - explicit operator cancel
+    #   - subprocess emits no bytes for `idle_timeout` seconds (default 30 min)
+    #   - subprocess never emits anything for `initial_idle_timeout` (default 1 h)
+    #   - absolute wall-clock ceiling `max_runtime` (default 6 h, set to 0 to disable)
+    # All knobs are env-overridable for fast iteration without a code change.
     idle_timeout_env = os.environ.get("CLADEX_REVIEW_AGENT_IDLE_TIMEOUT")
-    idle_timeout = max(_safe_int(idle_timeout_env, 600), 1)
-    initial_idle_default = idle_timeout if idle_timeout_env is not None else max(idle_timeout, 1800)
+    idle_timeout = max(_safe_int(idle_timeout_env, 1800), 1)
+    initial_idle_default = idle_timeout if idle_timeout_env is not None else max(idle_timeout, 3600)
     initial_idle_timeout = max(
         _safe_int(os.environ.get("CLADEX_REVIEW_AGENT_INITIAL_IDLE_TIMEOUT"), initial_idle_default),
         1,
     )
-    max_runtime = max(_safe_int(os.environ.get("CLADEX_REVIEW_AGENT_MAX_RUNTIME"), 10800), idle_timeout)
+    max_runtime_env = os.environ.get("CLADEX_REVIEW_AGENT_MAX_RUNTIME")
+    max_runtime_raw = _safe_int(max_runtime_env, 21600) if max_runtime_env is not None else 21600
+    # `0` (or any non-positive) disables the absolute ceiling — only the idle
+    # timeouts can kill the lane. Useful for very deep audits where the
+    # operator wants the reviewer to keep going as long as it produces output.
+    max_runtime = max(max_runtime_raw, idle_timeout) if max_runtime_raw > 0 else 0
     legacy_timeout = os.environ.get("CLADEX_REVIEW_AGENT_TIMEOUT")
     if legacy_timeout:
-        max_runtime = max(_safe_int(legacy_timeout, max_runtime), idle_timeout)
+        legacy = _safe_int(legacy_timeout, 0)
+        if legacy > 0:
+            max_runtime = max(legacy, idle_timeout)
+        else:
+            max_runtime = 0
     started_at = time.monotonic()
     last_output_at = started_at
     saw_output = False
@@ -2256,7 +2400,7 @@ def _run_cli(
             _terminate_process_tree(process)
             _close_process_pipes(process)
             break
-        if now - started_at >= max_runtime:
+        if max_runtime > 0 and now - started_at >= max_runtime:
             timed_out = f"AI reviewer exceeded the maximum runtime of {int(max_runtime)}s."
             _terminate_process_tree(process)
             _close_process_pipes(process)
@@ -2786,24 +2930,51 @@ def _run_review_job_locked(job_id: str) -> dict[str, Any]:
                     if provider_limit_reached.is_set():
                         raise RuntimeError(provider_limit_message["text"] or _provider_limit_detail(str(job["provider"]), ""))
                     slot_limit = _safe_int(job.get("maxParallel"), DEFAULT_AI_MAX_PARALLEL)
-                    with _global_ai_lane_slot(
-                        slot_limit,
-                        label=f"{job['id']}:{agent['id']}",
-                        provider=str(job.get("provider") or ""),
-                        account_home=str(job.get("accountHome") or ""),
-                        cancel_check=cancel_check,
-                    ):
+                    # Reviewers are stochastic: a transient parse-stall, network
+                    # blip, or one-shot idle-timeout shouldn't drop a whole
+                    # lane. Retry once on non-fatal failures (anything except
+                    # explicit cancel or a provider rate limit, which both mean
+                    # "stop trying" rather than "try again"). Operators can
+                    # tune via CLADEX_REVIEW_AGENT_MAX_RETRIES (default 1).
+                    max_retries = max(_safe_int(os.environ.get("CLADEX_REVIEW_AGENT_MAX_RETRIES"), 1), 0)
+                    ai_result = None
+                    last_error = ""
+                    for attempt in range(max_retries + 1):
+                        if cancel_check():
+                            break
                         if provider_limit_reached.is_set():
                             raise RuntimeError(provider_limit_message["text"] or _provider_limit_detail(str(job["provider"]), ""))
-                        lane_scratch = prepare_agent_scratch_workspace(job, agent, scratch)
-                        with lock:
-                            agent["scratchWorkspace"] = str(lane_scratch)
-                            agent["detail"] = "Reviewing assigned shard in isolated scratch workspace."
-                            save_job(job)
-                        if str(job.get("provider")) == "codex":
-                            ai_result = _run_codex_ai_review(job, agent, shard, cancel_check=cancel_check)
-                        else:
-                            ai_result = _run_claude_ai_review(job, agent, shard, cancel_check=cancel_check)
+                        with _global_ai_lane_slot(
+                            slot_limit,
+                            label=f"{job['id']}:{agent['id']}{':retry-' + str(attempt) if attempt else ''}",
+                            provider=str(job.get("provider") or ""),
+                            account_home=str(job.get("accountHome") or ""),
+                            cancel_check=cancel_check,
+                        ):
+                            if provider_limit_reached.is_set():
+                                raise RuntimeError(provider_limit_message["text"] or _provider_limit_detail(str(job["provider"]), ""))
+                            lane_scratch = prepare_agent_scratch_workspace(job, agent, scratch)
+                            with lock:
+                                agent["scratchWorkspace"] = str(lane_scratch)
+                                if attempt:
+                                    agent["detail"] = f"Retrying lane in isolated scratch workspace (attempt {attempt + 1}; previous error: {_compact_ai_error(last_error)[:120]})."
+                                else:
+                                    agent["detail"] = "Reviewing assigned shard in isolated scratch workspace."
+                                save_job(job)
+                            if str(job.get("provider")) == "codex":
+                                ai_result = _run_codex_ai_review(job, agent, shard, cancel_check=cancel_check)
+                            else:
+                                ai_result = _run_claude_ai_review(job, agent, shard, cancel_check=cancel_check)
+                        if ai_result.ok:
+                            break
+                        # Don't retry if the operator cancelled or the provider
+                        # is rate-limited — those mean "stop", not "try again".
+                        last_error = ai_result.error or ""
+                        if cancel_check() or "cancelled by operator" in last_error.lower():
+                            break
+                        if _is_provider_limit_error(last_error):
+                            break
+                    assert ai_result is not None, "ai_result must be populated by retry loop"
                     if not ai_result.ok:
                         if cancel_check() or "cancelled by operator" in (ai_result.error or "").lower():
                             with lock:
@@ -2884,6 +3055,43 @@ def _run_review_job_locked(job_id: str) -> dict[str, Any]:
                 future.result()
 
         findings = _persist_findings(job_id, findings)
+
+        # Synthesizer pass: cross-cutting reviewer that reads every lane's
+        # findings + the source and emits issues that require multiple
+        # lanes' evidence to see. Best-effort — never blocks finalization.
+        # Skip if everything was cancelled, every lane failed, or no lane
+        # produced any findings to correlate.
+        if (
+            findings
+            and not _cancel_requested(job_id)
+            and not job.get("preflightOnly")
+            and any(str(item.get("status")) == "done" for item in job["agents"])
+        ):
+            try:
+                with lock:
+                    job["synthesizerStatus"] = "running"
+                    save_job(job)
+                synth_findings = _run_synthesizer_pass(
+                    job,
+                    findings,
+                    scratch=scratch,
+                    cancel_check=lambda: _cancel_requested(job_id),
+                )
+                with lock:
+                    if synth_findings:
+                        findings.extend(synth_findings)
+                    job["synthesizerStatus"] = "done"
+                    job["synthesizerFindings"] = len(synth_findings)
+                    save_job(job)
+            except Exception as exc:  # noqa: BLE001 — best-effort, must not block finalization
+                with lock:
+                    job["synthesizerStatus"] = "skipped"
+                    job["synthesizerError"] = _compact_ai_error(str(exc))[:500]
+                    detail = f"synthesizer pass skipped: {_compact_ai_error(str(exc))[:200]}"
+                    if detail not in job.setdefault("warnings", []):
+                        job["warnings"].append(detail)
+                    save_job(job)
+            findings = _persist_findings(job_id, findings)
 
         statuses = [str(item.get("status")) for item in job["agents"]]
         cancelled = sum(1 for status in statuses if status == "cancelled")

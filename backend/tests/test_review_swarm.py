@@ -1510,3 +1510,156 @@ def test_run_cli_large_stdin_prompt_does_not_block_timeout(monkeypatch: pytest.M
     assert time.monotonic() - started < 4
     assert result.ok is False
     assert "idle" in result.error.lower()
+
+
+def test_run_cli_max_runtime_zero_disables_absolute_ceiling(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Operators auditing slow, deep code should be able to disable the wall-clock
+    ceiling and rely only on idle timeout + cancel. Setting MAX_RUNTIME to 0
+    should mean 'no absolute ceiling' rather than 'kill immediately'."""
+    monkeypatch.setenv("CLADEX_REVIEW_AGENT_IDLE_TIMEOUT", "5")
+    monkeypatch.setenv("CLADEX_REVIEW_AGENT_INITIAL_IDLE_TIMEOUT", "5")
+    monkeypatch.setenv("CLADEX_REVIEW_AGENT_MAX_RUNTIME", "0")
+    # Chatty process: emits a byte per 0.1s for 2s, then exits cleanly. The old
+    # behavior with a low MAX_RUNTIME kills it; with MAX_RUNTIME=0 the only
+    # kill path is idle (which never triggers because the process keeps emitting).
+    started = time.monotonic()
+    result = review_swarm._run_cli(
+        [
+            sys.executable,
+            "-c",
+            "import sys, time\n"
+            "for _ in range(20):\n"
+            "    sys.stdout.write('.')\n"
+            "    sys.stdout.flush()\n"
+            "    time.sleep(0.1)\n"
+            "print('done')\n",
+        ],
+        "",
+        env=os.environ.copy(),
+    )
+    elapsed = time.monotonic() - started
+    assert elapsed < 6, f"process exited cleanly so should not be killed; elapsed={elapsed}"
+    assert result.ok is True
+    assert "done" in result.text
+
+
+def test_run_cli_legacy_timeout_zero_also_disables_ceiling(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The legacy CLADEX_REVIEW_AGENT_TIMEOUT env knob is still honored. Setting
+    it to 0 should also disable the absolute ceiling, matching the new
+    MAX_RUNTIME=0 contract so old configs do not behave inconsistently."""
+    monkeypatch.setenv("CLADEX_REVIEW_AGENT_IDLE_TIMEOUT", "5")
+    monkeypatch.setenv("CLADEX_REVIEW_AGENT_INITIAL_IDLE_TIMEOUT", "5")
+    monkeypatch.delenv("CLADEX_REVIEW_AGENT_MAX_RUNTIME", raising=False)
+    monkeypatch.setenv("CLADEX_REVIEW_AGENT_TIMEOUT", "0")
+    started = time.monotonic()
+    result = review_swarm._run_cli(
+        [
+            sys.executable,
+            "-c",
+            "import sys, time\n"
+            "for _ in range(8):\n"
+            "    sys.stdout.write('.')\n"
+            "    sys.stdout.flush()\n"
+            "    time.sleep(0.1)\n"
+            "print('done')\n",
+        ],
+        "",
+        env=os.environ.copy(),
+    )
+    elapsed = time.monotonic() - started
+    assert elapsed < 4
+    assert result.ok is True
+    assert "done" in result.text
+
+
+def test_run_synthesizer_pass_skipped_when_no_findings(tmp_path: Path) -> None:
+    """The synthesizer is best-effort and should return [] without contacting
+    any provider when the lanes produced nothing to correlate."""
+    job = {"id": "review-20260101-000000-deadbeef", "provider": "codex", "workspace": str(tmp_path)}
+    result = review_swarm._run_synthesizer_pass(job, [], scratch=tmp_path)
+    assert result == []
+
+
+def test_run_synthesizer_pass_disabled_via_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Operators must be able to opt out (CLADEX_REVIEW_SYNTHESIZER=0) so a
+    swarm in a tightly rate-limited account doesn't burn the extra Codex
+    call. Once disabled, the synthesizer must return [] without invoking
+    the underlying CLI subprocess at all."""
+    monkeypatch.setenv("CLADEX_REVIEW_SYNTHESIZER", "0")
+    invoked: list[bool] = []
+
+    def boom(*_args: object, **_kwargs: object) -> None:
+        invoked.append(True)
+        raise AssertionError("synthesizer must not invoke _run_cli when disabled")
+
+    monkeypatch.setattr(review_swarm, "_run_cli", boom)
+    job = {"id": "review-20260101-000000-deadbeef", "provider": "codex", "workspace": str(tmp_path)}
+    findings = [
+        {"id": "F1", "severity": "high", "category": "auth", "path": "src/x.py", "line": 1, "title": "boom"},
+    ]
+    result = review_swarm._run_synthesizer_pass(job, findings, scratch=tmp_path)
+    assert result == []
+    assert invoked == []
+
+
+def test_run_synthesizer_pass_returns_parsed_findings_with_synth_agent_id(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """When the synthesizer subprocess returns valid JSON, the orchestrator
+    must parse it, prefix every finding with `agentId: synthesizer`, and
+    return them so the caller can append them to the run's findings list."""
+    monkeypatch.setenv("CLADEX_REVIEW_SYNTHESIZER", "1")
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    (workspace / "auth.py").write_text("def login():\n    pass\n", encoding="utf-8")
+    (workspace / "lifecycle.py").write_text("def start():\n    pass\n", encoding="utf-8")
+
+    payload = (
+        '{"summary":"cross-cutting","findings":['
+        '{"severity":"high","category":"cross-cutting","path":"auth.py","line":1,'
+        '"title":"auth bypass via lifecycle path",'
+        '"detail":"lane A says auth is safe under start order X, lane B shows X reversed in lifecycle.py.",'
+        '"recommendation":"merge the two paths.","confidence":"high"}]}'
+    )
+    monkeypatch.setattr(
+        review_swarm,
+        "_run_cli",
+        lambda *_a, **_k: review_swarm.AIRunResult(text=payload, ok=True),
+    )
+    monkeypatch.setattr(review_swarm, "_read_text_with_limit", lambda *_a, **_k: payload)
+
+    job = {"id": "review-20260101-000000-deadbeef", "provider": "codex", "workspace": str(workspace), "accountHome": ""}
+    lane_findings = [
+        {"agentId": "agent-01", "severity": "high", "category": "auth", "path": "auth.py", "line": 5, "title": "auth"},
+        {"agentId": "agent-02", "severity": "high", "category": "runtime", "path": "lifecycle.py", "line": 10, "title": "race"},
+    ]
+    result = review_swarm._run_synthesizer_pass(job, lane_findings, scratch=workspace)
+    assert len(result) == 1
+    assert result[0]["agentId"] == "synthesizer"
+    assert result[0]["category"] == "cross-cutting"
+    assert result[0]["title"].startswith("auth bypass")
+
+
+def test_fix_worker_prompt_includes_karpathy_discipline() -> None:
+    """The fix-worker prompt must carry the four Karpathy-derived working
+    principles: think before editing, simplicity first, surgical changes,
+    goal-driven verification. These materially reduce scope creep and
+    over-edits in real Claude/Codex fix runs."""
+    import fix_orchestrator
+
+    run = {"id": "fix-1", "workspace": "/tmp/x"}
+    task = {
+        "id": "task-0001",
+        "title": "fix it",
+        "files": ["src/x.py"],
+        "findingId": "F1",
+        "severity": "high",
+        "category": "auth",
+        "detail": "evidence",
+        "recommendation": "do the fix",
+    }
+    prompt = fix_orchestrator._task_prompt(run, task)
+    assert "Working principles" in prompt
+    assert "Karpathy" in prompt
+    for phrase in ("Simplicity first", "Surgical changes", "Goal-driven verification"):
+        assert phrase in prompt, f"prompt missing principle: {phrase}"

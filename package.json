@@ -1,7 +1,7 @@
 {
   "name": "cladex",
   "private": true,
-  "version": "2.5.4",
+  "version": "2.5.5",
   "author": "CLADEX Contributors",
   "license": "MIT",
   "description": "Unified desktop and CLI manager for Codex and Claude Discord relays.",
