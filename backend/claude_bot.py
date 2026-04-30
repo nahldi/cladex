@@ -372,12 +372,24 @@ class ClaudeRelayBot(commands.Bot):
         return messages if isinstance(messages, list) else []
 
     def _append_operator_history(self, *, role: str, content: str, channel_id: str, sender_name: str) -> None:
+        # T4.5 / official-patterns 4.4: Redact secret-shaped values before
+        # persisting operator history to disk. A user pasting `MY_TOKEN=...`
+        # into chat should not have that token sit unredacted in
+        # `%LOCALAPPDATA%/.../state/<ns>/operator-history.json`. Reuse
+        # `review_swarm.sanitize_text` which already redacts the well-known
+        # token formats (Discord, GitHub, Anthropic, OpenAI) and any
+        # `KEY=value` line where the key looks secret-ish.
+        try:
+            import review_swarm
+            safe_content = review_swarm.sanitize_text(content.strip(), limit=12000)
+        except Exception:
+            safe_content = content.strip()
         history = self._load_operator_history()
         history.append(
             {
                 "id": str(uuid.uuid4()),
                 "role": role,
-                "content": content.strip(),
+                "content": safe_content,
                 "channelId": channel_id,
                 "senderName": sender_name,
                 "timestamp": datetime.utcnow().isoformat(),
@@ -488,7 +500,43 @@ async def run_bot(config: BotConfig) -> None:
     pid_file.write_text(current_pid, encoding="utf-8")
 
     try:
-        await bot.start(config.token)
+        try:
+            await bot.start(config.token)
+        except discord.PrivilegedIntentsRequired as exc:
+            # T4.1 / official-patterns 1.3: code 4014 (disallowed intents)
+            # is non-resumable AND non-reconnectable. Without this, the
+            # outer auto-restart would burn through the 1000-IDENTIFY/24h
+            # limit. Write fail status and exit non-zero so cladex-stop
+            # doesn't auto-restart.
+            try:
+                bot._write_status(
+                    "error",
+                    "Discord refused our gateway intents (privileged intent disabled in the Discord Developer Portal). Re-enable MESSAGE_CONTENT under Bot > Privileged Gateway Intents, then start the relay again.",
+                )
+            except Exception:
+                pass
+            raise SystemExit(13) from exc
+        except discord.LoginFailure as exc:
+            try:
+                bot._write_status(
+                    "error",
+                    "Discord rejected the bot token. Check the token in CLADEX > Edit Relay; if it was regenerated, paste the new value.",
+                )
+            except Exception:
+                pass
+            raise SystemExit(13) from exc
+        except discord.errors.ConnectionClosed as exc:
+            code = getattr(exc, "code", None)
+            if code in {4013, 4014}:
+                try:
+                    bot._write_status(
+                        "error",
+                        f"Discord gateway refused the connection with non-recoverable code {code}. Verify gateway intents in the Discord Developer Portal.",
+                    )
+                except Exception:
+                    pass
+                raise SystemExit(13) from exc
+            raise
     finally:
         try:
             if pid_file.read_text(encoding="utf-8").strip() == current_pid:

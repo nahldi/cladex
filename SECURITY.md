@@ -28,6 +28,7 @@ Treat these as secrets:
 - any local profile `.env` files
 - `%LOCALAPPDATA%\discord-codex-relay\profiles\*`
 - `%LOCALAPPDATA%\discord-claude-relay\profiles\*`
+- `%LOCALAPPDATA%\cladex\secrets\*` (DPAPI-encrypted blobs; see "Secret-at-rest storage" below)
 - relay logs and state directories if they contain prompts, replies, channel ids, or workspace paths
 
 Do not:
@@ -36,6 +37,32 @@ Do not:
 - paste tokens into screenshots or shared logs
 - publish `%LOCALAPPDATA%` relay state directories
 - reuse broad-permission Discord bot tokens across unrelated projects
+
+## Secret-at-rest storage
+
+CLADEX 3.0+ stores Discord bot tokens encrypted at rest. Profile env files no longer contain the literal token — they contain a placeholder of the form `DISCORD_BOT_TOKEN=secret-ref:dpapi:<id>`, and the actual token is encrypted under `%LOCALAPPDATA%\cladex\secrets\<id>.bin`.
+
+How it works:
+
+- **Windows: DPAPI** via `CryptProtectData` / `CryptUnprotectData` (`backend/secret_store.py`). Each secret is bound to the current Windows user account AND mixed with per-secret entropy (`hashlib.sha256(f"cladex/v1/{secret_id}")`), so a single secret-blob leak does not allow decrypting other secrets even by the same user.
+- **macOS / Linux: 0o600 file fallback** (`fs0600` scheme). Filesystem permissions are the protection. Acceptable for single-user dev machines; the documentation calls out the reduced threat surface.
+- **Backward compatibility:** legacy plaintext profile env values pass through `materialize_env_secrets` unchanged. The next time a profile is saved, the writer transparently migrates to the secret-ref format.
+
+What this protects against:
+- Cloud sync (OneDrive / Dropbox / iCloud) of `%LOCALAPPDATA%\discord-codex-relay\profiles\` no longer leaks the token (the env file no longer contains it).
+- Accidental `git add` of a profile env captures only the placeholder, not the token.
+- Support-bundle copies, screenshots, and casual `cat`/`ls` no longer expose the token.
+
+What this does NOT protect against:
+- A kernel-level adversary on the host.
+- In-process malware running as the same Windows user (it can call DPAPI itself).
+- A relay process that has already loaded the token into its own memory.
+
+Recovery:
+- If the secret blob is deleted (or DPAPI fails because the user account changed), CLADEX will not be able to decrypt the token. Re-enter the token via the desktop app's Edit Relay flow or `cladex update <profile>` and the new write goes through the secret store.
+
+Operator visibility:
+- `cladex doctor --gc` walks the secret store and removes orphan blobs (blobs whose id is not referenced by any profile env). Run with `--dry-run` to preview.
 
 ## Public repo hygiene
 
@@ -70,6 +97,12 @@ A packaged user still needs those installed and authenticated locally before sta
 CLADEX relays can read and act within the configured workspace through the installed model CLIs. Only point a relay at a workspace and machine you trust for that model to access.
 
 The Codex relay copies the user's `auth.json` and `cap_sid` from `~/.codex` into a managed relay `CODEX_HOME` and writes a `config.toml` that marks the workspace as trusted (and on Windows, sets `sandbox = "elevated"`). This is intentional so the relayed Codex CLI can authenticate and act on the workspace without prompting for approval per command; treat the managed relay home as the same trust boundary as `~/.codex`. Discord-driven Codex prompts inside the relay can read their own `CODEX_HOME`, so do not point the relay at workspaces or accounts you would not trust the operator to use through the same Codex CLI directly.
+
+## Reviewer + fix-worker isolation
+
+Review and fix subprocesses run with an isolated per-lane HOME directory so a prompt-injected repository cannot ask Claude/Codex to Read/Grep host secret stores like `%LOCALAPPDATA%\cladex\remote-access-token.json`, `~/.codex/auth.json`, `~/.aws/credentials`, or `~/.ssh/`. The reviewer/fix subprocess sees an empty HOME/USERPROFILE/APPDATA/LOCALAPPDATA/XDG_* set rooted under the lane's scratch workspace.
+
+The provider's actual credential home (CODEX_HOME / CLAUDE_CONFIG_DIR) is still passed through explicitly so the CLI can authenticate. Discord-driven reviewer/fix prompts can still walk into that directory through the read-only filesystem tools — treat the chosen `accountHome` as on-the-record state for the duration of the review or fix run, the same way you would treat `~/.codex/auth.json` if you ran `codex` in a directory under unknown-quality input. A future CLADEX release may broker provider auth through a low-privilege account home or sandbox deny rule; for now, do not point a CLADEX self-review or self-fix at an `accountHome` you would not trust the operator to read directly.
 
 ## Project Review swarm
 

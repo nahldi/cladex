@@ -394,7 +394,7 @@ def _strip_relay_secrets(env: dict[str, str]) -> dict[str, str]:
     that looks like a secret based on its suffix.
     """
     sanitized: dict[str, str] = {}
-    suffix_blocked = ("_TOKEN", "_KEY", "_SECRET", "_PASSWORD", "_PRIVATE_KEY")
+    suffix_blocked = ("_TOKEN", "_KEY", "_SECRET", "_PASSWORD", "_PRIVATE_KEY", "_CREDENTIALS")
     for key, value in env.items():
         upper = key.upper()
         if upper in _RELAY_CHILD_SECRET_KEYS:
@@ -405,10 +405,91 @@ def _strip_relay_secrets(env: dict[str, str]) -> dict[str, str]:
     return sanitized
 
 
+# Positive allowlist for the Codex relay child env. The 2.5.6 Claude env
+# fix flipped Claude from prefix-allowlist to explicit-allowlist + secret-
+# suffix-deny; the Codex side kept a pure denylist, which only catches
+# *_TOKEN/_KEY/_SECRET/_PASSWORD/_PRIVATE_KEY/_CREDENTIALS-shaped names
+# and lets credential carriers like authenticated package index URLs,
+# kubeconfig pointers, and SSH agent sockets through. This list mirrors
+# the host-machine entries the Codex CLI legitimately needs to start.
+_CODEX_RELAY_ALLOWED_NAMES = {
+    "PATH",
+    "PATHEXT",
+    "SystemRoot",
+    "SYSTEMROOT",
+    "TEMP",
+    "TMP",
+    "TMPDIR",
+    "USERPROFILE",
+    "HOME",
+    "LOCALAPPDATA",
+    "APPDATA",
+    "ProgramFiles",
+    "ProgramFiles(x86)",
+    "ProgramData",
+    "PYTHONIOENCODING",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TERM",
+    "WINDIR",
+    "COMSPEC",
+    "COMPUTERNAME",
+    "USERNAME",
+    "USERDOMAIN",
+    "OS",
+    "PROCESSOR_ARCHITECTURE",
+    "NUMBER_OF_PROCESSORS",
+    "SHELL",
+    "USER",
+    "LOGNAME",
+    "DISPLAY",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_RUNTIME_DIR",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "ALL_PROXY",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "REQUESTS_CA_BUNDLE",
+    "CURL_CA_BUNDLE",
+    "CODEX_HOME",
+    "CODEX_DEBUG",
+    "CODEX_LOG_LEVEL",
+    "CODEX_DISABLE_TELEMETRY",
+}
+_CODEX_RELAY_ALLOWED_NAMES_UPPER = {name.upper() for name in _CODEX_RELAY_ALLOWED_NAMES}
+
+
+def _codex_relay_env_allowlist(env: dict[str, str]) -> dict[str, str]:
+    """Positive-allowlist the Codex child env the same way Claude does.
+
+    The denylist version (`_strip_relay_secrets`) misses non-suffix
+    credential carriers (authenticated package index URLs, agent sockets,
+    kubeconfig-style pointers, future provider-specific env names). A
+    positive allowlist restricts the child env to known-needed runtime
+    keys so a future-named credential cannot leak silently."""
+    allowed: dict[str, str] = {}
+    suffix_blocked = ("_TOKEN", "_KEY", "_SECRET", "_PASSWORD", "_PRIVATE_KEY", "_CREDENTIALS")
+    for key, value in env.items():
+        upper = key.upper()
+        if upper not in _CODEX_RELAY_ALLOWED_NAMES_UPPER:
+            continue
+        # Defense-in-depth: even if a future allowlist entry is added that
+        # matches a secret-shaped key, drop it.
+        if any(upper.endswith(suffix) for suffix in suffix_blocked):
+            continue
+        allowed[key] = value
+    return allowed
+
+
 def relay_codex_env(workspace: Path, base_env: dict[str, str] | None = None) -> dict[str, str]:
-    env = dict((base_env or os.environ).items())
-    env = _strip_relay_secrets(env)
-    configured_home = str(env.get("CODEX_HOME", "")).strip()
+    source_env = dict((base_env or os.environ).items())
+    env = _codex_relay_env_allowlist(source_env)
+    configured_home = str(source_env.get("CODEX_HOME", "")).strip()
     if configured_home:
         relay_home = Path(configured_home).expanduser().resolve()
         env["CODEX_HOME"] = str(

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import getpass
 import json
 import os
@@ -70,7 +71,25 @@ ENV_KEY_ORDER = [
 
 
 def _load_env_file(path: Path) -> dict[str, str]:
-    """Load .env file."""
+    """Load .env file, transparently resolving secret-ref values via the
+    OS-native secret store (Windows DPAPI / fs0600 elsewhere)."""
+    import secret_store
+
+    env: dict[str, str] = {}
+    if not path.exists():
+        return env
+    text = path.read_text(encoding="utf-8").lstrip("\ufeff")
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        env[key.strip()] = value.strip()
+    return secret_store.materialize_env_secrets(env)
+
+
+def _load_env_file_raw(path: Path) -> dict[str, str]:
+    """Load .env values without resolving secret refs."""
     env: dict[str, str] = {}
     if not path.exists():
         return env
@@ -98,16 +117,29 @@ def _sanitize_env_value(key: str, value: str) -> str:
 
 
 def _write_env_file(path: Path, env: dict[str, str]) -> None:
-    """Write .env file with ordered keys."""
+    """Write .env file with ordered keys; route sensitive values through
+    the OS-native secret store and persist `secret-ref:scheme:id`
+    placeholders instead of plaintext tokens."""
+    import secret_store
+
     safe_env: dict[str, str] = {}
     for key, value in env.items():
         if not _ENV_KEY_RE.match(str(key)):
             raise ValueError(f"Refusing to persist profile env key with unsupported characters: {key!r}")
         safe_env[str(key)] = _sanitize_env_value(str(key), value)
+    profile_hint = path.stem
+    existing_env = _load_env_file_raw(path) if path.exists() else {}
+    safe_env, stale_secret_refs = secret_store.prepare_sensitive_env_for_write(
+        safe_env,
+        profile_hint=profile_hint,
+        existing_env=existing_env,
+    )
     ordered_keys = [key for key in ENV_KEY_ORDER if key in safe_env]
     ordered_keys.extend(sorted(key for key in safe_env if key not in ordered_keys))
     lines = [f"{key}={safe_env[key]}" for key in ordered_keys]
     atomic_write_text(path, "\n".join(lines) + "\n")
+    for reference in stale_secret_refs:
+        secret_store.delete_secret(reference)
     try:
         path.chmod(0o600)
     except OSError:
@@ -130,6 +162,23 @@ def _load_registry() -> dict:
 def _save_registry(registry: dict) -> None:
     """Save workspace registry."""
     atomic_write_json(REGISTRY_PATH, registry)
+
+
+@contextlib.contextmanager
+def _registry_lock():
+    """Cross-process file lock around the Claude registry load+mutate+save
+    transaction. Without this two concurrent profile registrations (e.g. a
+    desktop API call racing a CLI register) can read the same registry
+    snapshot, each append a new profile, and have one of them lose the
+    other's append on save."""
+    from relay_common import _acquire_file_lock, _release_file_lock
+
+    lock_path = REGISTRY_PATH.with_suffix(REGISTRY_PATH.suffix + ".lock")
+    handle = _acquire_file_lock(lock_path)
+    try:
+        yield
+    finally:
+        _release_file_lock(handle)
 
 
 def _parse_csv_ids(value: str) -> str:
@@ -220,20 +269,49 @@ def _is_profile_running(profile: dict) -> bool:
     pid_file = state_dir / "relay.pid"
     if not pid_file.exists():
         return False
+    namespace = str(profile.get("state_namespace", "")).strip() or None
     try:
         pid = int(pid_file.read_text().strip())
-        return pid_exists(pid) and _pid_matches_claude_relay(pid)
+        return pid_exists(pid) and _pid_matches_claude_relay(pid, namespace=namespace)
     except Exception:
         return False
 
 
-def _pid_matches_claude_relay(pid: int) -> bool:
+def _pid_matches_claude_relay(pid: int, *, namespace: str | None = None) -> bool:
+    """Check whether `pid` is one of OUR Claude bot processes.
+
+    The historical liveness check matched any process with `claude_bot.py`,
+    `claude_relay.py`, or `claude-discord` in its command line. F0002 audit
+    finding: a stale or reused `relay.pid` from a different profile (or a
+    user's own `python -m claude_relay`) would pass that check, and
+    `cmd_stop` would terminate the wrong process. The fix is to ALSO
+    require an environment match: if a `state_namespace` is provided and
+    the process exposes a different `STATE_NAMESPACE` env var, refuse.
+    """
     try:
         process = psutil.Process(pid)
         command_line = " ".join(process.cmdline()).lower()
     except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
         return False
-    return "claude_bot.py" in command_line or "claude_relay.py" in command_line or "claude-discord" in command_line
+    if not (
+        "claude_bot.py" in command_line
+        or "claude_relay.py" in command_line
+        or "claude-discord" in command_line
+    ):
+        return False
+    if not namespace:
+        # Legacy callers without namespace context — fall back to the
+        # cmdline-only check so existing helpers don't break.
+        return True
+    try:
+        proc_env = process.environ()
+        proc_namespace = str(proc_env.get("STATE_NAMESPACE", "")).strip()
+    except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+        # Env unreadable on Windows for cross-user / elevated processes.
+        # Be conservative: do NOT match — refuse to act on a pid we
+        # cannot positively identify as ours.
+        return False
+    return proc_namespace == namespace
 
 
 def _package_version() -> str:
@@ -310,11 +388,12 @@ def interactive_setup(workspace: Path) -> dict:
     profile = _profile_from_env(env)
 
     # Save to registry
-    registry = _load_registry()
-    profiles = registry.setdefault("profiles", [])
-    profiles[:] = [p for p in profiles if p.get("workspace") != str(workspace)]
-    profiles.append(profile)
-    _save_registry(registry)
+    with _registry_lock():
+        registry = _load_registry()
+        profiles = registry.setdefault("profiles", [])
+        profiles[:] = [p for p in profiles if p.get("workspace") != str(workspace)]
+        profiles.append(profile)
+        _save_registry(registry)
 
     print(f"\n[OK] Profile saved: {profile['name']}")
     print(f"[OK] Config: {profile['env_file']}")
@@ -438,11 +517,12 @@ def cmd_register(args: argparse.Namespace) -> int:
 
     profile = _profile_from_env(env)
 
-    registry = _load_registry()
-    profiles = registry.setdefault("profiles", [])
-    profiles[:] = [p for p in profiles if p.get("workspace") != str(workspace)]
-    profiles.append(profile)
-    _save_registry(registry)
+    with _registry_lock():
+        registry = _load_registry()
+        profiles = registry.setdefault("profiles", [])
+        profiles[:] = [p for p in profiles if p.get("workspace") != str(workspace)]
+        profiles.append(profile)
+        _save_registry(registry)
 
     print(f"[OK] Registered: {profile['name']}")
     print(f"[OK] Workspace: {workspace}")
@@ -515,10 +595,11 @@ def cmd_stop(args: argparse.Namespace) -> int:
         print("Relay not running.")
         return 0
 
+    namespace = str(profile.get("state_namespace", "")).strip() or None
     try:
         pid = int(pid_file.read_text().strip())
-        if not _pid_matches_claude_relay(pid):
-            print(f"Removed stale relay PID file (PID {pid} is not a Claude relay).")
+        if not _pid_matches_claude_relay(pid, namespace=namespace):
+            print(f"Removed stale relay PID file (PID {pid} is not this profile's Claude relay).")
             pid_file.unlink(missing_ok=True)
             return 0
         if terminate_process_tree(pid):
@@ -595,6 +676,19 @@ def cmd_run(args: argparse.Namespace) -> int:
     env = _load_env_file(env_file)
     _require_profile_access_invariant(env)
     _require_workspace_allowed(workspace, env)
+
+    # Refuse to launch a duplicate Claude bot for this profile. Without this
+    # guard a second `cmd_run` (e.g. operator double-click, supervisor
+    # restart racing a slow shutdown, accidental re-launch from the desktop
+    # app) overwrites the same `relay.pid` file and leaves the original
+    # process unstoppable via the PID file. _is_profile_running checks for
+    # an existing live PID + matching command line.
+    if _is_profile_running(profile):
+        print(
+            f"Claude relay for `{profile.get('name', '?')}` is already running; "
+            f"refusing to start a duplicate. Stop the existing relay first."
+        )
+        return 0
 
     # Create state directory
     state_dir = state_dir_for_namespace(profile.get("state_namespace", ""))

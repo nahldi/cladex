@@ -298,6 +298,12 @@ def _sanitize_auth_status_text(text: str) -> str:
 
 
 def _load_env_file(path: Path) -> dict[str, str]:
+    """Load profile env from disk, transparently resolving any
+    `secret-ref:scheme:id` values via the OS-native secret store. Existing
+    plaintext values pass through unchanged so legacy profiles keep
+    working until they're next saved."""
+    import secret_store
+
     env: dict[str, str] = {}
     text = path.read_text(encoding="utf-8").lstrip("\ufeff")
     for raw_line in text.splitlines():
@@ -306,7 +312,7 @@ def _load_env_file(path: Path) -> dict[str, str]:
             continue
         key, value = line.split("=", 1)
         env[key.strip()] = value.strip()
-    return env
+    return secret_store.materialize_env_secrets(env)
 
 
 _ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -323,15 +329,31 @@ def _sanitize_env_value(key: str, value: str) -> str:
 
 
 def _write_env_file(path: Path, env: dict[str, str]) -> None:
+    """Persist a profile env file, routing any sensitive values
+    (DISCORD_BOT_TOKEN, etc.) through the OS-native secret store and
+    writing the .env with `secret-ref:scheme:id` placeholders instead
+    of plaintext tokens. The file still gets mode 0o600 as a defense
+    layer; the secret-at-rest path is the primary protection."""
+    import secret_store
+
     safe_env: dict[str, str] = {}
     for key, value in env.items():
         if not _ENV_KEY_RE.match(str(key)):
             raise ValueError(f"Refusing to persist profile env key with unsupported characters: {key!r}")
         safe_env[str(key)] = _sanitize_env_value(str(key), value)
+    profile_hint = path.stem
+    existing_env = _load_env_file_raw(path) if path.exists() else {}
+    safe_env, stale_secret_refs = secret_store.prepare_sensitive_env_for_write(
+        safe_env,
+        profile_hint=profile_hint,
+        existing_env=existing_env,
+    )
     ordered_keys = [key for key in ENV_KEY_ORDER if key in safe_env]
     ordered_keys.extend(sorted(key for key in safe_env if key not in ordered_keys))
     lines = [f"{key}={safe_env[key]}" for key in ordered_keys]
     atomic_write_text(path, "\n".join(lines) + "\n")
+    for reference in stale_secret_refs:
+        secret_store.delete_secret(reference)
     try:
         path.chmod(0o600)
     except OSError:
@@ -1044,7 +1066,7 @@ def _replace_profile_registration(previous_profile: dict, new_profile: dict) -> 
     previous_env_path = Path(str(previous_profile.get("env_file", "")).strip()) if previous_profile.get("env_file") else None
     new_env_path = Path(str(new_profile.get("env_file", "")).strip()) if new_profile.get("env_file") else None
     if previous_env_path and previous_env_path != new_env_path:
-        previous_env_path.unlink(missing_ok=True)
+        _delete_env_file_and_secrets(previous_env_path)
 
 
 def _remove_profile_registration(profile: dict) -> None:
@@ -1065,8 +1087,62 @@ def _remove_profile_registration(profile: dict) -> None:
         remaining_projects.append({"name": project.get("name", ""), "profiles": members})
     registry["projects"] = remaining_projects
     _save_registry(registry)
-    if profile.get("env_file"):
-        Path(str(profile["env_file"])).unlink(missing_ok=True)
+    env_file_path = Path(str(profile["env_file"])) if profile.get("env_file") else None
+    _delete_env_file_and_secrets(env_file_path)
+    _remove_profile_state_dir(profile)
+
+
+def _delete_env_file_and_secrets(env_file_path: Path | None) -> None:
+    # Delete the encrypted secret blobs BEFORE deleting the env file: once
+    # the env file is gone we can no longer learn which secret-ref ids
+    # belonged to this profile, so the blobs would leak forever.
+    if env_file_path and env_file_path.exists():
+        try:
+            existing = _load_env_file_raw(env_file_path)
+        except Exception:
+            existing = {}
+        import secret_store
+
+        for key in secret_store.SENSITIVE_KEYS:
+            value = existing.get(key)
+            if value:
+                secret_store.delete_secret(value)
+    if env_file_path is not None:
+        env_file_path.unlink(missing_ok=True)
+
+
+def _remove_profile_state_dir(profile: dict) -> None:
+    # Sweep state-namespace dir for this profile so a future profile of the
+    # same name doesn't inherit stale attachments / durable sqlite.
+    namespace = str(profile.get("state_namespace", "")).strip()
+    if namespace:
+        try:
+            from relay_common import state_dir_for_namespace as _state_dir_for_namespace
+        except ImportError:
+            _state_dir_for_namespace = None
+        if _state_dir_for_namespace is not None:
+            try:
+                state_dir = _state_dir_for_namespace(namespace)
+                if state_dir.exists() and state_dir.is_dir():
+                    shutil.rmtree(state_dir, ignore_errors=True)
+            except Exception:
+                pass
+
+
+def _load_env_file_raw(path: Path) -> dict[str, str]:
+    """Like `_load_env_file` but returns RAW values (does not resolve
+    secret-refs). Used by the profile-remove path so we can read the
+    secret-ref ids and call `delete_secret` on them before deleting the
+    env file."""
+    env: dict[str, str] = {}
+    text = path.read_text(encoding="utf-8").lstrip("﻿")
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        env[key.strip()] = value.strip()
+    return env
 
 
 def _select_profile_for_workspace(workspace: Path) -> dict:

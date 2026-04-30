@@ -4763,8 +4763,9 @@ async def _deliver_reply(turn: ActiveTurn, reply_text: str) -> None:
     latest_message = turn.latest_message
     if latest_message is None:
         return
+    history_key = _history_key(latest_message)
     if not DURABLE_RUNTIME.claim_outbound_discord_reply(
-        _history_key(latest_message),
+        history_key,
         latest_message.id,
         reply_text,
     ):
@@ -4777,31 +4778,60 @@ async def _deliver_reply(turn: ActiveTurn, reply_text: str) -> None:
     chunks = _split_message(reply_text)
     progress_message = turn.progress_message
 
+    # Track whether at least one chunk was actually delivered. If delivery
+    # raises before the first chunk lands, release the receipt so a retry
+    # of the same content can proceed; otherwise a transient Discord
+    # send/edit error permanently suppresses the user-visible reply.
+    sent_any = False
+
+    def _release_receipt() -> None:
+        with contextlib.suppress(Exception):
+            DURABLE_RUNTIME.release_outbound_discord_reply(
+                history_key,
+                latest_message.id,
+                reply_text,
+            )
+
     if progress_message is not None:
         try:
             await progress_message.edit(content=chunks[0], allowed_mentions=SAFE_ALLOWED_MENTIONS, view=None)
             _remember_relay_message_id(progress_message.id)
+            sent_any = True
             for chunk in chunks[1:]:
                 sent = await latest_message.channel.send(chunk, allowed_mentions=SAFE_ALLOWED_MENTIONS)
                 _remember_relay_message_id(sent.id)
+            _log_observer_event("delivered", _short_observer_text(reply_text, limit=240))
             return
         except Exception:
-            pass
+            if not sent_any:
+                _release_receipt()
+                # Fall through to the reply()/send() retry path below.
+            else:
+                # Partial delivery: keep the receipt so the same content
+                # is not resent on retry.
+                _log_observer_event("partial-delivery", "Reply edit failed mid-chunk; retry suppressed.")
+                return
 
     first = True
-    for chunk in chunks:
-        if first:
-            sent = await latest_message.reply(
-                chunk,
-                mention_author=False,
-                allowed_mentions=SAFE_ALLOWED_MENTIONS,
-            )
-            _remember_relay_message_id(sent.id)
-            first = False
-        else:
-            sent = await latest_message.channel.send(chunk, allowed_mentions=SAFE_ALLOWED_MENTIONS)
-            _remember_relay_message_id(sent.id)
-    _log_observer_event("delivered", _short_observer_text(reply_text, limit=240))
+    try:
+        for chunk in chunks:
+            if first:
+                sent = await latest_message.reply(
+                    chunk,
+                    mention_author=False,
+                    allowed_mentions=SAFE_ALLOWED_MENTIONS,
+                )
+                _remember_relay_message_id(sent.id)
+                sent_any = True
+                first = False
+            else:
+                sent = await latest_message.channel.send(chunk, allowed_mentions=SAFE_ALLOWED_MENTIONS)
+                _remember_relay_message_id(sent.id)
+        _log_observer_event("delivered", _short_observer_text(reply_text, limit=240))
+    except Exception:
+        if not sent_any:
+            _release_receipt()
+        raise
 
 
 class RetryView(discord.ui.View):
@@ -5436,7 +5466,33 @@ async def _run() -> None:
     await _startup_preflight()
     try:
         async with client:
-            await client.start(CONFIG.discord_bot_token)
+            try:
+                await client.start(CONFIG.discord_bot_token)
+            except discord.PrivilegedIntentsRequired:
+                # T4.1 / official-patterns 1.3: code 4014 is non-resumable
+                # AND non-reconnectable. Without this, the supervisor
+                # auto-restart would burn through the 1000-IDENTIFY/24h
+                # limit. Mark auth-failure and exit non-zero.
+                _record_auth_failure_marker(
+                    "Discord refused our gateway intents (privileged intent disabled in the Developer Portal). "
+                    "Re-enable MESSAGE_CONTENT under Bot > Privileged Gateway Intents, then start the relay again."
+                )
+                raise SystemExit(13)
+            except discord.LoginFailure:
+                _record_auth_failure_marker(
+                    "Discord rejected the bot token (4004). Check the token in CLADEX > Edit Relay; "
+                    "if it was regenerated, paste the new value."
+                )
+                raise SystemExit(13)
+            except discord.errors.ConnectionClosed as exc:
+                code = getattr(exc, "code", None)
+                if code in {4013, 4014}:
+                    _record_auth_failure_marker(
+                        f"Discord gateway refused the connection with non-recoverable code {code}. "
+                        "Verify gateway intents in the Discord Developer Portal."
+                    )
+                    raise SystemExit(13)
+                raise
     finally:
         global OPERATOR_BRIDGE_TASK
         if OPERATOR_BRIDGE_TASK is not None:
@@ -5462,10 +5518,74 @@ def main() -> None:
         older_than_seconds=ATTACHMENT_MAX_AGE_SECONDS,
         max_files=ATTACHMENT_MAX_FILES,
     )
+    # Prune Codex CLI rollouts/sessions under the relay-managed CODEX_HOME.
+    # Codex appends a per-turn rollout JSONL into `sessions/`; without
+    # pruning, a long-lived relay accumulates hundreds of MB of rollouts
+    # over a few weeks (operator observed 165 jsonl + a 368MB sqlite log).
+    # We prune by age (default 14 days) and absolute count (default 200)
+    # so an active power user keeps recent rollouts but stale ones reap.
+    _prune_codex_home_state()
     try:
         asyncio.run(_run())
     except KeyboardInterrupt:
         pass
+
+
+def _prune_codex_home_state() -> None:
+    """Best-effort cleanup of CODEX_HOME/sessions/ rollouts.
+
+    Operates only on the relay-managed CODEX_HOME (the env var the relay
+    sets up via `prepare_relay_codex_home`). Never touches the operator's
+    `~/.codex` directly, even if CODEX_HOME points there. Knobs:
+    `CLADEX_CODEX_SESSIONS_MAX_AGE_DAYS` (default 14, 0 disables age),
+    `CLADEX_CODEX_SESSIONS_MAX_FILES` (default 200, 0 disables count).
+    """
+    codex_home = os.environ.get("CODEX_HOME", "").strip()
+    if not codex_home:
+        return
+    sessions_dir = Path(codex_home) / "sessions"
+    if not sessions_dir.exists():
+        return
+    try:
+        max_age_days = int(os.environ.get("CLADEX_CODEX_SESSIONS_MAX_AGE_DAYS", "14").strip() or "14")
+    except (TypeError, ValueError):
+        max_age_days = 14
+    try:
+        max_files = int(os.environ.get("CLADEX_CODEX_SESSIONS_MAX_FILES", "200").strip() or "200")
+    except (TypeError, ValueError):
+        max_files = 200
+    older = float(max_age_days) * 86400 if max_age_days > 0 else None
+    cap = max_files if max_files > 0 else None
+    try:
+        prune_directory_files(sessions_dir, older_than_seconds=older, max_files=cap)
+    except Exception:
+        pass
+    # T2.4 / prod-audit #3: Codex sqlite WAL checkpoint + (optionally)
+    # VACUUM for `logs_2.sqlite` and `state_5.sqlite`. After ~3 weeks of
+    # daily relay use the message log alone reaches 368 MB; without
+    # periodic checkpointing the WAL grows unbounded too.
+    try:
+        vacuum_days = int(os.environ.get("CLADEX_CODEX_LOGS_VACUUM_DAYS", "30").strip() or "30")
+    except (TypeError, ValueError):
+        vacuum_days = 30
+    home_path = Path(codex_home)
+    for db_name in ("logs_2.sqlite", "state_5.sqlite"):
+        db_path = home_path / db_name
+        if not db_path.exists():
+            continue
+        try:
+            import sqlite3
+
+            with sqlite3.connect(str(db_path), timeout=2.0) as conn:
+                # Always checkpoint the WAL so it stops growing.
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                if vacuum_days > 0:
+                    age_seconds = time.time() - db_path.stat().st_mtime
+                    if age_seconds > vacuum_days * 86400:
+                        conn.execute("VACUUM")
+        except Exception:
+            # sqlite locked / Codex CLI running / unsupported pragma — skip.
+            pass
 
 
 if __name__ == "__main__":

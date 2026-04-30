@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "discord-codex-relay"
-version = "2.5.7"
+version = "3.0.0"
 description = "Unified Discord relay manager for Claude Code and Codex CLI."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -51,7 +51,7 @@ dev = [
 
 [tool.setuptools]
 include-package-data = false
-py-modules = ["agent_guardrails", "api_runner", "bot", "cladex", "claude_backend", "claude_bot", "claude_common", "claude_relay", "fix_orchestrator", "install_plugin", "relay_backend", "relay_common", "relay_runtime", "relayctl", "review_swarm"]
+py-modules = ["agent_guardrails", "api_runner", "bootstrap_runtime", "bot", "cladex", "claude_backend", "claude_bot", "claude_common", "claude_relay", "fix_orchestrator", "install_plugin", "relay_backend", "relay_common", "relay_runtime", "relayctl", "review_swarm", "secret_store"]
 
 [tool.setuptools.packages.find]
 include = ["discord_codex_relay_plugin*"]

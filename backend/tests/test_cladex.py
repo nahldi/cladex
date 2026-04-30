@@ -1,16 +1,22 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
 import sys
+import time
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 
 import api_runner
 import cladex
+import claude_common
+import relay_common
+import review_swarm
+import secret_store
 
 
 CLAUDE_SAFE_ENV = {
@@ -445,6 +451,48 @@ def test_doctor_python_version_uses_declared_floor() -> None:
     assert result["requiredVersion"] == ">=3.10"
 
 
+def test_doctor_gc_dry_run_does_not_delete_backups_scratch_locks_or_state(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    review_root = tmp_path / "reviews"
+    backup_root = tmp_path / "backups"
+    codex_data_root = tmp_path / "codex-data"
+    claude_data_root = tmp_path / "claude-data"
+    monkeypatch.setattr(review_swarm, "REVIEW_DATA_ROOT", review_root)
+    monkeypatch.setattr(review_swarm, "BACKUP_DATA_ROOT", backup_root)
+    monkeypatch.setattr(relay_common, "DATA_ROOT", codex_data_root)
+    monkeypatch.setattr(claude_common, "DATA_ROOT", claude_data_root)
+    monkeypatch.setattr(cladex, "get_all_profiles", lambda: [])
+
+    backup_dir = backup_root / "backup-20260430-000000-deadbeef"
+    backup_dir.mkdir(parents=True)
+    scratch_dir = review_root / "review-20260430-000000-deadbeef" / "scratch"
+    scratch_dir.mkdir(parents=True)
+    lock_dir = review_root / "_workspace-start-locks"
+    lock_dir.mkdir(parents=True)
+    lock_path = lock_dir / "stale.lock"
+    lock_path.write_text("{}", encoding="utf-8")
+    old = time.time() - (13 * 60 * 60)
+    os.utime(lock_path, (old, old))
+    codex_state = codex_data_root / "state" / "orphan-codex"
+    claude_state = claude_data_root / "state" / "orphan-claude"
+    codex_state.mkdir(parents=True)
+    claude_state.mkdir(parents=True)
+
+    rc = cladex._cmd_doctor_gc(SimpleNamespace(json=True, dry_run=True))
+    output = json.loads(capsys.readouterr().out)
+
+    assert rc == 0
+    assert output["dryRun"] is True
+    assert backup_dir.exists()
+    assert scratch_dir.exists()
+    assert lock_path.exists()
+    assert codex_state.exists()
+    assert claude_state.exists()
+
+
 def test_update_claude_profile_persists_via_local_save(tmp_path: Path, monkeypatch) -> None:
     """`_update_claude_profile` historically called a bare `_save_registry`
     that was undefined in `cladex.py`, so the path crashed at runtime with
@@ -476,6 +524,41 @@ def test_update_claude_profile_persists_via_local_save(tmp_path: Path, monkeypat
 
     saved = json.loads((config_root / "workspaces.json").read_text(encoding="utf-8"))
     assert any(p.get("bot_name") == "Renamed" for p in saved["profiles"])
+
+
+def test_update_claude_profile_deletes_previous_env_secret_when_path_changes(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("CLADEX_SECRETS_ROOT", str(tmp_path / "secrets"))
+    config_root = tmp_path / "config"
+    profiles_dir = tmp_path / "profiles"
+    profiles_dir.mkdir(parents=True)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    env_file = profiles_dir / "claude-old.env"
+    cladex.claude_relay._write_env_file(
+        env_file,
+        {
+            "DISCORD_BOT_TOKEN": "old-token",
+            "CLAUDE_WORKDIR": str(workspace),
+            "ALLOWED_CHANNEL_IDS": "42",
+            "ALLOWED_USER_IDS": "7",
+            "BOT_TRIGGER_MODE": "mention_or_dm",
+        },
+    )
+    old_ref = cladex.claude_relay._load_env_file_raw(env_file)["DISCORD_BOT_TOKEN"]
+
+    monkeypatch.setattr(cladex, "CLAUDE_CONFIG_ROOT", config_root)
+    monkeypatch.setattr(cladex, "CLAUDE_REGISTRY_PATH", config_root / "workspaces.json")
+    monkeypatch.setattr(
+        cladex,
+        "_load_claude_registry",
+        lambda: {"profiles": [{"name": "claude-old", "env_file": str(env_file)}], "projects": []},
+    )
+    monkeypatch.setattr(cladex.claude_relay, "PROFILES_DIR", profiles_dir)
+
+    cladex._update_claude_profile({"name": "claude-old", "env_file": str(env_file)}, discord_bot_token="new-token")
+
+    assert not env_file.exists()
+    assert not secret_store._secret_blob_path(old_ref.rsplit(":", 1)[1]).exists()
 
 
 def test_remove_claude_profile_uses_atomic_registry_writer(tmp_path: Path, monkeypatch) -> None:

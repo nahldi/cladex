@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { AnimatePresence, motion, useMotionTemplate, useMotionValue, useReducedMotion, useSpring, useTransform } from 'motion/react';
+import { AnimatePresence, motion, useReducedMotion } from 'motion/react';
 import {
   Activity,
   AlertTriangle,
@@ -1067,50 +1067,42 @@ function RelayCard({
   const isClaude = profile.type === 'Claude';
   const running = profile.running;
   const accent = isClaude ? '#d4735e' : '#7db5a5';
-  const tiltX = useMotionValue(0);
-  const tiltY = useMotionValue(0);
-  const pointerX = useMotionValue(0);
-  const pointerY = useMotionValue(0);
-  const springX = useSpring(tiltX, { stiffness: 280, damping: 26, mass: 0.4 });
-  const springY = useSpring(tiltY, { stiffness: 280, damping: 26, mass: 0.4 });
-  const rotateX = useTransform(springY, [-0.5, 0.5], ['8deg', '-8deg']);
-  const rotateY = useTransform(springX, [-0.5, 0.5], ['-8deg', '8deg']);
-  const spotlight = useMotionTemplate`radial-gradient(300px circle at ${pointerX}px ${pointerY}px, ${isClaude ? 'rgba(212,115,94,0.18)' : 'rgba(125,181,165,0.18)'}, transparent 48%)`;
-
-  function handlePointerMove(event: React.MouseEvent<HTMLDivElement>) {
-    const bounds = event.currentTarget.getBoundingClientRect();
-    pointerX.set(event.clientX - bounds.left);
-    pointerY.set(event.clientY - bounds.top);
-    tiltX.set((event.clientX - (bounds.left + bounds.width / 2)) / bounds.width);
-    tiltY.set((event.clientY - (bounds.top + bounds.height / 2)) / bounds.height);
-  }
-
-  function resetPointer() {
-    tiltX.set(0);
-    tiltY.set(0);
-  }
+  // v3 ui-design pass: each relay is a "rack channel" on a dispatch console.
+  // Hover should feel like moving a hand near the channel — the LED-strip
+  // brightens, the chassis lifts a hair from the rack. NOT marketing-card
+  // 3D-tilt + spotlight + scale. Removed: rotateX/rotateY tilt (felt jarring,
+  // exposed corner clipping with the new truncate min-w-0); pointer-following
+  // spotlight (decorative, not informational); whileHover scale (the chassis
+  // doesn't get bigger — the indicator brightens).
 
   return (
     <motion.div
-      onMouseMove={handlePointerMove}
-      onMouseLeave={resetPointer}
-      style={{ rotateX, rotateY, transformStyle: 'preserve-3d' }}
-      whileHover={{ scale: 1.01 }}
-      className="group relative h-[262px] sm:h-[276px] [perspective:1200px]"
+      className="group relative h-[262px] sm:h-[276px]"
     >
-      <div className="absolute inset-0 rounded-[32px] bg-black/25 blur-2xl dark:bg-black/35" />
-      <div className="relative h-full overflow-hidden rounded-[28px] border border-slate-200/70 bg-white/70 p-5 shadow-[0_18px_44px_rgba(15,23,42,0.12)] backdrop-blur-xl transition-colors duration-500 dark:border-white/10 dark:bg-[#09090b]/90 dark:shadow-2xl">
+      <div className="absolute inset-0 rounded-[32px] bg-black/20 blur-2xl transition-opacity duration-300 group-hover:bg-black/35 dark:bg-black/30 dark:group-hover:bg-black/45" />
+      <div className="relative h-full overflow-hidden rounded-[28px] border border-slate-200/70 bg-white/70 p-5 shadow-[0_18px_44px_rgba(15,23,42,0.12)] backdrop-blur-xl transition-[box-shadow,border-color,transform] duration-300 ease-out group-hover:-translate-y-[2px] group-hover:shadow-[0_22px_56px_rgba(15,23,42,0.18)] dark:border-white/10 dark:bg-[#09090b]/90 dark:shadow-2xl dark:group-hover:border-white/20">
         <div className="absolute inset-0 bg-[linear-gradient(to_right,#0f172a08_1px,transparent_1px),linear-gradient(to_bottom,#0f172a08_1px,transparent_1px)] bg-[size:24px_24px] opacity-60 dark:bg-[linear-gradient(to_right,#ffffff05_1px,transparent_1px),linear-gradient(to_bottom,#ffffff05_1px,transparent_1px)]" />
-        <motion.div className="pointer-events-none absolute inset-0 rounded-[28px] opacity-0 transition-opacity duration-300 group-hover:opacity-100" style={{ background: spotlight }} />
+        {/* The channel's status LED strip — single accent strip on the right
+            edge that brightens on hover. Replaces the pointer-tracking
+            spotlight. The opacity step (18% → 42%) is what acknowledges the
+            user, not a 3D tilt. */}
+        <div
+          className="pointer-events-none absolute inset-y-6 right-0 w-[3px] rounded-full opacity-[0.18] transition-opacity duration-300 group-hover:opacity-[0.42]"
+          style={{ background: accent, boxShadow: `0 0 12px ${accent}40` }}
+        />
         <div className="pointer-events-none absolute -right-14 top-8 h-24 w-24 rounded-full blur-3xl" style={{ background: `${accent}28` }} />
         <div className="relative z-10 flex h-full flex-col">
         <div className="flex items-start justify-between gap-3 sm:gap-4">
-          <div>
+          {/* T3.4 / frontend-audit #4: min-w-0 + truncate so a long display
+              name doesn't push the connector graphic and Stop/Start button
+              out of the fixed-height card. title= surfaces the full name
+              on hover. */}
+          <div className="min-w-0 flex-1">
             <div className={`inline-flex rounded-full border px-2.5 py-1 text-[10px] font-bold uppercase tracking-[0.24em] ${isClaude ? 'border-orange-500/30 bg-orange-500/10 text-orange-700 dark:text-orange-200' : 'border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-200'}`}>{profile.type}</div>
-            <h3 className="mt-3 text-[1.55rem] leading-none font-bold tracking-tight text-slate-900 sm:text-[1.9rem] dark:text-white">{labelFor(profile)}</h3>
-            <p className="mt-2 text-sm text-slate-500 dark:text-gray-400"># {workspaceFor(profile)}</p>
+            <h3 title={labelFor(profile)} className="mt-3 truncate text-[1.55rem] leading-none font-bold tracking-tight text-slate-900 sm:text-[1.9rem] dark:text-white">{labelFor(profile)}</h3>
+            <p title={workspaceFor(profile)} className="mt-2 truncate text-sm text-slate-500 dark:text-gray-400"># {workspaceFor(profile)}</p>
           </div>
-          <div className="flex gap-1.5 sm:gap-2">
+          <div className="flex shrink-0 gap-1.5 sm:gap-2">
             <MiniIconButton label="Logs" icon={<FileText size={14} />} onClick={onLogs} />
             <MiniIconButton label="Edit" icon={<Pencil size={14} />} onClick={onEdit} />
             <MiniIconButton label="Remove" icon={<Trash2 size={14} />} tone="danger" onClick={onDelete} />
@@ -3244,10 +3236,24 @@ function LogsModal({ profile, onClose }: { profile: Profile; onClose: () => void
     };
   }, [profile.id, profile.relayType]);
 
+  // T3.1 / frontend-audit #1: Render `errorText` as a banner ABOVE the
+  // log buffer, never as a replacement. A single failed 3-second poll
+  // used to wipe the entire scrollback the operator was reading.
   return (
     <ModalShell title={`Live logs · ${labelFor(profile)}`} onClose={onClose} wide>
+      {errorText ? (
+        <div className="mb-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-300">
+          {errorText} — last successful logs shown below.
+        </div>
+      ) : null}
       <div className="h-80 overflow-y-auto rounded-2xl border border-white/5 bg-black p-4 font-mono text-xs text-gray-300">
-        {loading ? <div className="flex items-center gap-2 text-indigo-300"><Loader2 size={14} className="animate-spin" /> Loading logs...</div> : errorText ? <div className="text-amber-300">{errorText}</div> : logs.length ? logs.map((line, index) => <div key={`${profile.id}-${index}`}>{line}</div>) : <div className="text-gray-500">No log lines recorded yet for this relay.</div>}
+        {loading && logs.length === 0 ? (
+          <div className="flex items-center gap-2 text-indigo-300"><Loader2 size={14} className="animate-spin" /> Loading logs...</div>
+        ) : logs.length ? (
+          logs.map((line, index) => <div key={`${profile.id}-${index}`}>{line}</div>)
+        ) : !errorText ? (
+          <div className="text-gray-500">No log lines recorded yet for this relay.</div>
+        ) : null}
       </div>
     </ModalShell>
   );
@@ -3469,13 +3475,65 @@ function DirectoryBrowserModal({
 }
 
 function ModalShell({ title, children, onClose, wide = false }: { title: string; children: React.ReactNode; onClose: () => void; wide?: boolean }) {
-  return <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="fixed inset-0 z-[100] flex items-end justify-center overflow-y-auto bg-black/60 p-3 pt-8 backdrop-blur-sm sm:items-start sm:p-6 sm:pt-12" onClick={onClose}><motion.div initial={{ scale: 0.94, y: 18 }} animate={{ scale: 1, y: 0 }} exit={{ scale: 0.94, y: 18 }} onClick={(event) => event.stopPropagation()} className={`mb-3 max-h-[calc(100vh-1.5rem)] w-full overflow-hidden rounded-2xl border border-slate-200/80 bg-[#f8f6f0] shadow-[0_28px_80px_rgba(15,23,42,0.22)] sm:mb-12 dark:border-white/10 dark:bg-[#0a0a0c] dark:shadow-2xl ${wide ? 'max-w-2xl' : 'max-w-md'}`}><div className="flex items-center justify-between border-b border-slate-200 bg-white/50 px-4 py-4 sm:px-5 dark:border-white/5 dark:bg-white/[0.03]"><div><div className="text-[9px] font-bold uppercase tracking-[0.2em] text-slate-500 dark:text-gray-500">CLADEX</div><div className="mt-0.5 text-lg font-semibold text-slate-900 dark:text-white">{title}</div></div><button onClick={onClose} className="rounded-full bg-slate-200/70 p-1.5 text-slate-500 transition-colors hover:bg-slate-300 hover:text-slate-900 dark:bg-white/5 dark:text-gray-400 dark:hover:bg-white/10 dark:hover:text-white"><X size={14} /></button></div><div className="max-h-[calc(100vh-6.5rem)] overflow-y-auto p-4 sm:p-5">{children}</div></motion.div></motion.div>;
+  // T3.3 / frontend-audit #3: Escape dismisses, role="dialog" + aria-modal,
+  // close button has aria-label. Without these, modals were undismissible
+  // by keyboard and screen readers had no announcement that they were
+  // inside a dialog.
+  useEffect(() => {
+    const handler = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [onClose]);
+  return (
+    <motion.div
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      exit={{ opacity: 0 }}
+      className="fixed inset-0 z-[100] flex items-end justify-center overflow-y-auto bg-black/60 p-3 pt-8 backdrop-blur-sm sm:items-start sm:p-6 sm:pt-12"
+      onClick={onClose}
+    >
+      <motion.div
+        role="dialog"
+        aria-modal="true"
+        aria-label={title}
+        initial={{ scale: 0.98, y: 8 }}
+        animate={{ scale: 1, y: 0 }}
+        exit={{ scale: 0.98, y: 8 }}
+        transition={{ duration: 0.18, ease: [0.32, 0.72, 0, 1] }}
+        onClick={(event) => event.stopPropagation()}
+        className={`mb-3 max-h-[calc(100vh-1.5rem)] w-full overflow-hidden rounded-2xl border border-slate-200/80 bg-[#f8f6f0] shadow-[0_28px_80px_rgba(15,23,42,0.22)] sm:mb-12 dark:border-white/10 dark:bg-[#0a0a0c] dark:shadow-2xl ${wide ? 'max-w-2xl' : 'max-w-md'}`}
+      >
+        <div className="flex items-center justify-between border-b border-slate-200 bg-white/50 px-4 py-4 sm:px-5 dark:border-white/5 dark:bg-white/[0.03]">
+          <div>
+            <div className="text-[9px] font-bold uppercase tracking-[0.2em] text-slate-500 dark:text-gray-500">CLADEX</div>
+            <div className="mt-0.5 text-lg font-semibold text-slate-900 dark:text-white">{title}</div>
+          </div>
+          <button
+            type="button"
+            aria-label="Close dialog"
+            onClick={onClose}
+            className="rounded-full bg-slate-200/70 p-1.5 text-slate-500 transition-colors hover:bg-slate-300 hover:text-slate-900 dark:bg-white/5 dark:text-gray-400 dark:hover:bg-white/10 dark:hover:text-white"
+          >
+            <X size={14} />
+          </button>
+        </div>
+        <div className="max-h-[calc(100vh-6.5rem)] overflow-y-auto p-4 sm:p-5">{children}</div>
+      </motion.div>
+    </motion.div>
+  );
 }
 
 function DockButton({ icon, label, active, onClick, light = false }: { icon: React.ReactNode; label: string; active?: boolean; onClick: () => void; light?: boolean }) {
+  // v3 ui-design pass: the dock magnetism is THE one weird decision — the
+  // operator's hand drifts toward a control. Keep it, but tighten:
+  // displacement coefficient 0.3 → 0.18 (smaller pull); spring stiffness/
+  // damping bumped (snappier, less floaty); whileHover scale 1.08 → 1.04
+  // (the button doesn't grow much, it just catches your hand).
   const ref = useRef<HTMLButtonElement>(null);
   const [position, setPosition] = useState({ x: 0, y: 0 });
-  return <div className="group relative"><motion.button type="button" aria-label={label} aria-current={active ? 'page' : undefined} ref={ref} onMouseMove={(event) => { if (!ref.current) return; const bounds = ref.current.getBoundingClientRect(); setPosition({ x: (event.clientX - (bounds.left + bounds.width / 2)) * 0.3, y: (event.clientY - (bounds.top + bounds.height / 2)) * 0.3 }); }} onMouseLeave={() => setPosition({ x: 0, y: 0 })} animate={{ x: position.x, y: position.y }} transition={{ type: 'spring', stiffness: 150, damping: 15, mass: 0.1 }} whileHover={{ scale: 1.08 }} whileTap={{ scale: 0.96 }} onClick={onClick} className={`rounded-xl p-3 transition-colors ${active ? 'bg-indigo-500 text-white shadow-[0_0_20px_rgba(99,102,241,0.5)]' : light ? 'text-slate-600 hover:bg-black/5 hover:text-slate-900' : 'text-gray-400 hover:bg-white/10 hover:text-white'}`}>{icon}</motion.button><div className={`pointer-events-none absolute bottom-full left-1/2 mb-3 -translate-x-1/2 whitespace-nowrap rounded-lg border px-3 py-1.5 text-xs font-bold opacity-0 transition-opacity group-hover:opacity-100 ${light ? 'border-slate-200 bg-white text-slate-800 shadow-xl' : 'border-white/10 bg-black/80 text-white'}`}>{label}</div></div>;
+  return <div className="group relative"><motion.button type="button" aria-label={label} aria-current={active ? 'page' : undefined} ref={ref} onMouseMove={(event) => { if (!ref.current) return; const bounds = ref.current.getBoundingClientRect(); setPosition({ x: (event.clientX - (bounds.left + bounds.width / 2)) * 0.18, y: (event.clientY - (bounds.top + bounds.height / 2)) * 0.18 }); }} onMouseLeave={() => setPosition({ x: 0, y: 0 })} animate={{ x: position.x, y: position.y }} transition={{ type: 'spring', stiffness: 240, damping: 22, mass: 0.1 }} whileHover={{ scale: 1.04 }} whileTap={{ scale: 0.96 }} onClick={onClick} className={`rounded-xl p-3 transition-colors ${active ? 'bg-indigo-500 text-white shadow-[0_0_20px_rgba(99,102,241,0.5)]' : light ? 'text-slate-600 hover:bg-black/5 hover:text-slate-900' : 'text-gray-400 hover:bg-white/10 hover:text-white'}`}>{icon}</motion.button><div className={`pointer-events-none absolute bottom-full left-1/2 mb-3 -translate-x-1/2 whitespace-nowrap rounded-lg border px-3 py-1.5 text-xs font-bold opacity-0 transition-opacity group-hover:opacity-100 ${light ? 'border-slate-200 bg-white text-slate-800 shadow-xl' : 'border-white/10 bg-black/80 text-white'}`}>{label}</div></div>;
 }
 
 function ActionButton({ label, icon, onClick, busy = false, disabled = false, tone = 'default', light = false }: { label: string; icon: React.ReactNode; onClick: () => void; busy?: boolean; disabled?: boolean; tone?: 'default' | 'danger'; light?: boolean }) {

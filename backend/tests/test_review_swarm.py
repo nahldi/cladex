@@ -956,6 +956,20 @@ def test_global_ai_lane_slots_are_scoped_by_provider_account(tmp_path: Path, mon
             assert len(scoped_locks) == 2
 
 
+def test_global_ai_lane_slot_reclaims_same_process_orphan(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(review_swarm, "REVIEW_DATA_ROOT", tmp_path / "reviews")
+    lane_dir = review_swarm.global_review_lane_dir()
+    lane_dir.mkdir(parents=True)
+    orphan = lane_dir / "slot-0.lock"
+    orphan.write_text(json.dumps({"pid": os.getpid(), "label": "orphan"}), encoding="utf-8")
+
+    assert review_swarm._global_lane_lock_stale(orphan)
+
+    with review_swarm._global_ai_lane_slot(1, label="live"):
+        payload = json.loads(orphan.read_text(encoding="utf-8"))
+        assert payload["label"] == "live"
+
+
 def test_ai_reviewer_failure_marks_agent_failed_not_completed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     project = tmp_path / "target"
     project.mkdir()

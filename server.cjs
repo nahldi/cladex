@@ -459,9 +459,9 @@ function packageVersion() {
   }
   try {
     const payload = JSON.parse(fsSync.readFileSync(path.join(__dirname, 'package.json'), 'utf8'));
-    return String(payload.version || '').trim() || '2.5.7';
+    return String(payload.version || '').trim() || '3.0.0';
   } catch {
-    return '2.5.7';
+    return '3.0.0';
   }
 }
 
@@ -864,6 +864,32 @@ async function allowedDirectoryForRequest(req, requestedPath) {
   return roots.some((root) => isSubpathOrSame(target, root)) ? target : '';
 }
 
+// Gate any remote API endpoint that takes a workspace/path through the
+// same allowed-roots policy as the read-only filesystem browser. Without
+// this, a remote client with the CLADEX access token could ask the server
+// to back up, review, or run a fix workflow against an arbitrary path on
+// the host. The 2.5.7 audit found four such endpoints (/api/reviews,
+// /api/reviews/analyze, /api/backups, profile create/update) that were
+// accepting raw workspace paths and forwarding them to backend operations.
+async function ensureRemoteWorkspaceAllowed(req, res, requestedPath) {
+  if (!requestedPath) {
+    res.status(400).json({ success: false, error: 'workspace is required' });
+    return null;
+  }
+  const allowed = await allowedDirectoryForRequest(req, requestedPath);
+  if (!allowed) {
+    res.status(403).json({
+      success: false,
+      error:
+        'Workspace path is outside the allowed remote filesystem roots. '
+        + 'Loopback (same-machine) callers are not affected; remote callers must operate '
+        + 'within configured profile workspaces or CLADEX_REMOTE_FS_ROOTS.',
+    });
+    return null;
+  }
+  return allowed;
+}
+
 app.get('/api/runtime-info', async (req, res) => {
   const payload = {
     apiBase: `${requestBase(req)}/api`,
@@ -1014,6 +1040,26 @@ app.patch('/api/profiles/:id', async (req, res) => {
         res.status(400).json({ success: false, error });
         return;
       }
+      const allowedWorkspace = await ensureRemoteWorkspaceAllowed(req, res, workspace);
+      if (!allowedWorkspace) return;
+    }
+  }
+  // Same gate for codex_home / claude_config_dir on update — without this,
+  // a remote client could rewrite an existing profile's account_home to an
+  // arbitrary host path and (per F0036) silently expand the remote browse
+  // roots through the next /api/profiles read.
+  if (Object.prototype.hasOwnProperty.call(req.body, 'codexHome')) {
+    const v = String(req.body?.codexHome || '').trim();
+    if (v) {
+      const allowed = await ensureRemoteWorkspaceAllowed(req, res, v);
+      if (!allowed) return;
+    }
+  }
+  if (Object.prototype.hasOwnProperty.call(req.body, 'claudeConfigDir')) {
+    const v = String(req.body?.claudeConfigDir || '').trim();
+    if (v) {
+      const allowed = await ensureRemoteWorkspaceAllowed(req, res, v);
+      if (!allowed) return;
     }
   }
   const args = ['cladex.py', 'update-profile', id, '--type', relayType, '--json'];
@@ -1189,6 +1235,17 @@ app.post('/api/profiles', async (req, res) => {
     return;
   }
 
+  const allowedWorkspace = await ensureRemoteWorkspaceAllowed(req, res, workspace);
+  if (!allowedWorkspace) return;
+  if (codexHome) {
+    const allowedCodexHome = await ensureRemoteWorkspaceAllowed(req, res, codexHome);
+    if (!allowedCodexHome) return;
+  }
+  if (claudeConfigDir) {
+    const allowedClaudeConfigDir = await ensureRemoteWorkspaceAllowed(req, res, claudeConfigDir);
+    if (!allowedClaudeConfigDir) return;
+  }
+
   const absoluteWorkspace = path.resolve(workspace);
   // Tokens flow through CLADEX_REGISTER_DISCORD_BOT_TOKEN so the secret never
   // appears in subprocess command lines (visible in tasklist/ps output).
@@ -1352,6 +1409,8 @@ app.post('/api/reviews/analyze', async (req, res) => {
     res.status(400).json({ success: false, error: allowSelfReviewInput.error });
     return;
   }
+  const allowedWorkspace = await ensureRemoteWorkspaceAllowed(req, res, workspace);
+  if (!allowedWorkspace) return;
   const args = [
     'cladex.py',
     'review',
@@ -1398,6 +1457,12 @@ app.post('/api/reviews', async (req, res) => {
     res.status(400).json({ success: false, error: backupBeforeReviewInput.error });
     return;
   }
+  const allowedWorkspace = await ensureRemoteWorkspaceAllowed(req, res, workspace);
+  if (!allowedWorkspace) return;
+  if (accountHome) {
+    const allowedAccountHome = await ensureRemoteWorkspaceAllowed(req, res, accountHome);
+    if (!allowedAccountHome) return;
+  }
   const allowSelfReview = allowSelfReviewInput.value;
   const backupBeforeReview = backupBeforeReviewInput.value;
   const args = [
@@ -1434,10 +1499,8 @@ app.get('/api/backups', async (_req, res) => {
 app.post('/api/backups', async (req, res) => {
   const workspace = String(req.body?.workspace || '').trim();
   const reason = String(req.body?.reason || 'manual').trim();
-  if (!workspace) {
-    res.status(400).json({ success: false, error: 'workspace is required' });
-    return;
-  }
+  const allowedWorkspace = await ensureRemoteWorkspaceAllowed(req, res, workspace);
+  if (!allowedWorkspace) return;
   const args = ['cladex.py', 'backup', 'create', '--workspace', path.resolve(workspace), '--reason', reason, '--json'];
   try {
     res.json(await runJson(args));

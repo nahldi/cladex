@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 import claude_relay
+import secret_store
 
 
 def test_cmd_gui_delegates_to_cladex(monkeypatch) -> None:
@@ -38,6 +39,36 @@ def test_cmd_gui_errors_when_cladex_missing(monkeypatch, capsys) -> None:
 
     assert rc == 1
     assert "cladex is not installed" in capsys.readouterr().out.lower()
+
+
+def test_write_env_file_reuses_existing_secret_ref_for_unchanged_token(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("CLADEX_SECRETS_ROOT", str(tmp_path / "secrets"))
+    env_file = tmp_path / "profile.env"
+
+    claude_relay._write_env_file(env_file, {"DISCORD_BOT_TOKEN": "token-one", "CLAUDE_WORKDIR": str(tmp_path)})
+    first_ref = env_file.read_text(encoding="utf-8").split("DISCORD_BOT_TOKEN=", 1)[1].splitlines()[0]
+
+    claude_relay._write_env_file(env_file, {"DISCORD_BOT_TOKEN": "token-one", "CLAUDE_WORKDIR": str(tmp_path)})
+    second_ref = env_file.read_text(encoding="utf-8").split("DISCORD_BOT_TOKEN=", 1)[1].splitlines()[0]
+
+    assert second_ref == first_ref
+    assert claude_relay._load_env_file(env_file)["DISCORD_BOT_TOKEN"] == "token-one"
+    assert len(list((tmp_path / "secrets").glob("*.bin"))) == 1
+
+
+def test_write_env_file_deletes_replaced_secret_ref(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("CLADEX_SECRETS_ROOT", str(tmp_path / "secrets"))
+    env_file = tmp_path / "profile.env"
+
+    claude_relay._write_env_file(env_file, {"DISCORD_BOT_TOKEN": "token-one", "CLAUDE_WORKDIR": str(tmp_path)})
+    old_ref = env_file.read_text(encoding="utf-8").split("DISCORD_BOT_TOKEN=", 1)[1].splitlines()[0]
+    claude_relay._write_env_file(env_file, {"DISCORD_BOT_TOKEN": "token-two", "CLAUDE_WORKDIR": str(tmp_path)})
+    new_ref = env_file.read_text(encoding="utf-8").split("DISCORD_BOT_TOKEN=", 1)[1].splitlines()[0]
+
+    assert new_ref != old_ref
+    assert claude_relay._load_env_file(env_file)["DISCORD_BOT_TOKEN"] == "token-two"
+    assert not secret_store._secret_blob_path(old_ref.rsplit(":", 1)[1]).exists()
+    assert secret_store._secret_blob_path(new_ref.rsplit(":", 1)[1]).exists()
 
 
 def _register_args(workspace: Path, **overrides) -> SimpleNamespace:
@@ -647,7 +678,7 @@ def test_claude_relay_stop_removes_stale_pid_without_killing(tmp_path: Path, mon
     monkeypatch.chdir(workspace)
     monkeypatch.setattr(claude_relay, "_get_profile_for_workspace", lambda _workspace: profile)
     monkeypatch.setattr(claude_relay, "state_dir_for_namespace", lambda _namespace: state_dir)
-    monkeypatch.setattr(claude_relay, "_pid_matches_claude_relay", lambda _pid: False)
+    monkeypatch.setattr(claude_relay, "_pid_matches_claude_relay", lambda _pid, **_kwargs: False)
     monkeypatch.setattr(claude_relay, "terminate_process_tree", lambda pid: killed.append(pid) or True)
 
     assert claude_relay.cmd_stop(SimpleNamespace()) == 0

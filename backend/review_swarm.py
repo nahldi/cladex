@@ -38,6 +38,8 @@ STALE_ACTIVE_REVIEW_SECONDS = 60 * 60
 HARDLINK_SCRATCH_OVERHEAD_RATIO = 0.05
 REVIEW_DATA_ROOT = Path(user_data_dir("cladex", False)) / "reviews"
 BACKUP_DATA_ROOT = Path(user_data_dir("cladex", False)) / "backups"
+_ACTIVE_GLOBAL_LANE_LOCKS: set[str] = set()
+_ACTIVE_GLOBAL_LANE_LOCKS_GUARD = threading.Lock()
 REVIEW_STRATEGY = "ai-review-swarm"
 REVIEW_ID_RE = re.compile(r"^review-\d{8}-\d{6}-[a-f0-9]{8}$")
 BACKUP_ID_RE = re.compile(r"^backup-\d{8}-\d{6}-[a-f0-9]{8}$")
@@ -689,6 +691,26 @@ def _workspace_start_lock_path(workspace: Path, *, preflight_only: bool) -> Path
     return REVIEW_DATA_ROOT / "_workspace-start-locks" / f"{digest}.lock"
 
 
+def sweep_stale_lock_files(*, dry_run: bool = False) -> int:
+    """Reap stale workspace-start lock files left behind by hard-killed
+    runs (terminal closed, machine power loss, etc.). Without a sweep,
+    on Windows the next start has to wait for the staleness check to fire
+    before unlinking. Returns the count of stale files found/reaped."""
+    locks_dir = REVIEW_DATA_ROOT / "_workspace-start-locks"
+    if not locks_dir.exists():
+        return 0
+    reaped = 0
+    for lock_path in locks_dir.glob("*.lock"):
+        try:
+            if _global_lane_lock_stale(lock_path):
+                if not dry_run:
+                    lock_path.unlink()
+                reaped += 1
+        except OSError:
+            continue
+    return reaped
+
+
 @contextmanager
 def _workspace_start_lock(workspace: Path, *, preflight_only: bool):
     lock_path = _workspace_start_lock_path(workspace, preflight_only=preflight_only)
@@ -785,7 +807,129 @@ def create_source_backup(workspace: str | Path, *, reason: str = "manual", sourc
         "status": "ready",
     }
     _write_json(backup_manifest_path(backup_id), manifest)
+    # Cleanup-after-create so a long-running operator doesn't accumulate
+    # thousands of stale backup dirs (the operator-flagged 1326-folder
+    # state). Tunable via env knobs; defaults keep the most recent
+    # snapshots PER WORKSPACE so a multi-workspace setup doesn't lose
+    # one workspace's history because another is busy.
+    # CLADEX_BACKUP_SKIP_PRUNE=1 suppresses prune for this call (used by
+    # restore_backup so the in-flight restore source is never pruned).
+    if str(os.environ.get("CLADEX_BACKUP_SKIP_PRUNE", "")).strip().lower() not in {"1", "true", "yes"}:
+        try:
+            prune_backups()
+        except Exception:
+            # Best-effort: never block a successful backup on cleanup.
+            pass
     return manifest
+
+
+def _backup_retention_settings() -> tuple[int, int]:
+    """Return (keep_per_workspace, max_age_days) from env or defaults.
+
+    Defaults keep 10 most recent backups per workspace plus anything from
+    the last 7 days. CLADEX_BACKUP_KEEP_PER_WORKSPACE / CLADEX_BACKUP_MAX_AGE_DAYS
+    override. Set either to 0 to disable that dimension."""
+    try:
+        keep = int(os.environ.get("CLADEX_BACKUP_KEEP_PER_WORKSPACE", "10").strip() or "10")
+    except (TypeError, ValueError):
+        keep = 10
+    try:
+        days = int(os.environ.get("CLADEX_BACKUP_MAX_AGE_DAYS", "7").strip() or "7")
+    except (TypeError, ValueError):
+        days = 7
+    return max(keep, 0), max(days, 0)
+
+
+def prune_backups(*, dry_run: bool = False) -> dict[str, Any]:
+    """Apply backup retention policy: keep N most recent per workspace +
+    anything newer than M days. Returns a summary so CLI/UI can show what
+    was removed (or would be removed in dry-run mode).
+
+    Per-workspace retention is important: an operator with 5 active
+    project workspaces shouldn't lose one workspace's history because
+    a different workspace happens to be heavily backed up.
+    """
+    BACKUP_DATA_ROOT.mkdir(parents=True, exist_ok=True)
+    keep_per_workspace, max_age_days = _backup_retention_settings()
+    now_ts = datetime.now(timezone.utc).timestamp()
+    age_cutoff = now_ts - (max_age_days * 86400) if max_age_days > 0 else None
+    by_workspace: dict[str, list[dict[str, Any]]] = {}
+    orphan_dirs: list[Path] = []
+    for child in BACKUP_DATA_ROOT.iterdir():
+        if not child.is_dir() or not child.name.startswith("backup-"):
+            continue
+        manifest_path = child / "backup.json"
+        if not manifest_path.exists():
+            # Orphan dir: snapshot left behind without a manifest. Always remove.
+            orphan_dirs.append(child)
+            continue
+        payload = _read_json(manifest_path, default={})
+        workspace = str(payload.get("workspace") or "")
+        # Prune backups whose workspace no longer exists on disk. The vast
+        # majority of accumulating test-artifact backups have this shape:
+        # pytest tempdir created, backup taken, tempdir cleaned up by
+        # pytest, manifest's `workspace` path now points at nothing. The
+        # backup snapshot is unrecoverable to a useful target — remove it.
+        # Empty/missing workspace → also orphan (no point keeping).
+        if not workspace or not Path(workspace).exists():
+            orphan_dirs.append(child)
+            continue
+        by_workspace.setdefault(workspace, []).append(
+            {"id": payload.get("id") or child.name, "dir": child, "createdAt": payload.get("createdAt") or "", "_payload": payload}
+        )
+    removed: list[str] = []
+    # Safety: if BOTH retention dimensions are disabled (count=0 AND
+    # age=0), keep everything. The intent of "0 disables that dimension"
+    # is to fall back on the other; both-zero accidentally became
+    # "delete all" which would silently destroy operator state on the
+    # next backup-create. F0006 audit finding.
+    keep_everything = keep_per_workspace == 0 and age_cutoff is None
+    for workspace, records in by_workspace.items():
+        records.sort(key=lambda r: str(r.get("createdAt") or ""), reverse=True)
+        kept = 0
+        for record in records:
+            if keep_everything:
+                kept += 1
+                continue
+            should_keep = False
+            if keep_per_workspace > 0 and kept < keep_per_workspace:
+                should_keep = True
+            if age_cutoff is not None and not should_keep:
+                # Parse createdAt as ISO-8601 and keep if newer than cutoff.
+                ts = _parse_iso_timestamp(str(record.get("createdAt") or ""))
+                if ts is not None and ts >= age_cutoff:
+                    should_keep = True
+            if should_keep:
+                kept += 1
+                continue
+            target_dir: Path = record["dir"]
+            removed.append(target_dir.name)
+            if not dry_run:
+                shutil.rmtree(target_dir, ignore_errors=True)
+    for orphan in orphan_dirs:
+        removed.append(orphan.name)
+        if not dry_run:
+            shutil.rmtree(orphan, ignore_errors=True)
+    return {
+        "kept": sum(min(len(v), keep_per_workspace) if keep_per_workspace else len(v) for v in by_workspace.values()),
+        "removed": removed,
+        "removedCount": len(removed),
+        "keepPerWorkspace": keep_per_workspace,
+        "maxAgeDays": max_age_days,
+        "dryRun": bool(dry_run),
+    }
+
+
+def _parse_iso_timestamp(text: str) -> float | None:
+    """Best-effort ISO-8601 -> POSIX timestamp; returns None on parse failure."""
+    if not text:
+        return None
+    try:
+        # `utc_now()` produces e.g. "2026-04-29T17:30:00.000000+00:00".
+        # `fromisoformat` handles the 'T' and offset.
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        return None
 
 
 def list_backups() -> list[dict[str, Any]]:
@@ -832,7 +976,21 @@ def restore_backup(backup_id: str, *, confirm: str) -> dict[str, Any]:
     if not target.exists() or not target.is_dir():
         raise ValueError(f"restore target is missing: {target}")
 
-    pre_restore = create_source_backup(target, reason=f"pre-restore:{backup_id}")
+    # Suppress automatic prune during the pre-restore backup. F0007 audit
+    # finding: `create_source_backup` always calls `prune_backups()`,
+    # whose retention path could delete the backup we are about to
+    # restore from before `_restore_snapshot_into_target` reads it.
+    # Inline the suppression via the env knob so the same code path is
+    # used for all backup creation (no duplicate snapshot logic).
+    prior_skip = os.environ.get("CLADEX_BACKUP_SKIP_PRUNE")
+    os.environ["CLADEX_BACKUP_SKIP_PRUNE"] = "1"
+    try:
+        pre_restore = create_source_backup(target, reason=f"pre-restore:{backup_id}")
+    finally:
+        if prior_skip is None:
+            os.environ.pop("CLADEX_BACKUP_SKIP_PRUNE", None)
+        else:
+            os.environ["CLADEX_BACKUP_SKIP_PRUNE"] = prior_skip
     try:
         _restore_snapshot_into_target(snapshot, target)
     except Exception:
@@ -2813,6 +2971,28 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+def _global_lane_slot_key(path: Path) -> str:
+    try:
+        return str(path.resolve())
+    except OSError:
+        return str(path.absolute())
+
+
+def _mark_global_lane_slot_active(path: Path) -> None:
+    with _ACTIVE_GLOBAL_LANE_LOCKS_GUARD:
+        _ACTIVE_GLOBAL_LANE_LOCKS.add(_global_lane_slot_key(path))
+
+
+def _mark_global_lane_slot_inactive(path: Path) -> None:
+    with _ACTIVE_GLOBAL_LANE_LOCKS_GUARD:
+        _ACTIVE_GLOBAL_LANE_LOCKS.discard(_global_lane_slot_key(path))
+
+
+def _global_lane_slot_active_in_process(path: Path) -> bool:
+    with _ACTIVE_GLOBAL_LANE_LOCKS_GUARD:
+        return _global_lane_slot_key(path) in _ACTIVE_GLOBAL_LANE_LOCKS
+
+
 def _global_lane_lock_stale(path: Path) -> bool:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -2822,6 +3002,8 @@ def _global_lane_lock_stale(path: Path) -> bool:
         pid = int(payload.get("pid", 0) or 0)
     except Exception:
         pid = 0
+    if pid == os.getpid() and not _global_lane_slot_active_in_process(path):
+        return True
     if pid and not _pid_alive(pid):
         return True
     try:
@@ -2829,6 +3011,22 @@ def _global_lane_lock_stale(path: Path) -> bool:
     except OSError:
         return False
     return age_seconds > 12 * 60 * 60
+
+
+def _release_global_lane_slot(path: Path) -> None:
+    try:
+        for attempt in range(5):
+            try:
+                path.unlink()
+                return
+            except FileNotFoundError:
+                return
+            except OSError:
+                if attempt == 4:
+                    return
+                time.sleep(0.05 * (attempt + 1))
+    finally:
+        _mark_global_lane_slot_inactive(path)
 
 
 @contextmanager
@@ -2854,11 +3052,10 @@ def _global_ai_lane_slot(
                     fd = os.open(str(candidate), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
                 except FileExistsError:
                     if _global_lane_lock_stale(candidate):
-                        try:
-                            candidate.unlink()
-                        except OSError:
-                            pass
+                        _release_global_lane_slot(candidate)
                     continue
+                slot_path = candidate
+                _mark_global_lane_slot_active(candidate)
                 try:
                     os.write(
                         fd,
@@ -2866,17 +3063,13 @@ def _global_ai_lane_slot(
                     )
                 finally:
                     os.close(fd)
-                slot_path = candidate
                 break
             if slot_path is None:
                 time.sleep(0.25)
         yield
     finally:
         if slot_path is not None:
-            try:
-                slot_path.unlink()
-            except OSError:
-                pass
+            _release_global_lane_slot(slot_path)
 
 
 def run_review_job(job_id: str) -> dict[str, Any]:
@@ -3210,6 +3403,17 @@ def _run_review_job_locked(job_id: str) -> dict[str, Any]:
         # Render the report after the final job state is saved so it never
         # captures a transient `running` snapshot.
         _atomic_write_text(report_markdown_path(job_id), build_report(job, findings, files))
+        # Now that the report is on disk, recover the per-lane scratch
+        # workspaces. These can balloon to hundreds of MB per lane (npm/
+        # playwright caches the lane created inside its isolated HOME),
+        # and one busy operator quickly accumulates a multi-GB
+        # `%LOCALAPPDATA%/cladex/reviews/` even though the actual
+        # findings + report are tiny. Best-effort: never block job
+        # finalization on cleanup.
+        try:
+            _cleanup_review_scratch(job_id)
+        except Exception:
+            pass
     except Exception as exc:
         job["status"] = "failed"
         job["finishedAt"] = utc_now()
@@ -3217,7 +3421,27 @@ def _run_review_job_locked(job_id: str) -> dict[str, Any]:
         findings = _persist_findings(job_id, findings)
         save_job(job)
         _atomic_write_text(report_markdown_path(job_id), build_report(job, findings, []))
+        try:
+            _cleanup_review_scratch(job_id)
+        except Exception:
+            pass
     return show_review(job_id)
+
+
+def _cleanup_review_scratch(job_id: str) -> None:
+    """Delete the per-lane scratch tree for a finished review job.
+
+    The scratch tree contains a copy of the source workspace per lane
+    plus the per-lane isolated HOME (which can carry npm/playwright/pip
+    caches the reviewer process created during the run). Once the
+    findings + report are written, the scratch tree is just disposable
+    cache. Operators who want to inspect lane working state can opt out
+    via `CLADEX_REVIEW_KEEP_SCRATCH=1`."""
+    if str(os.environ.get("CLADEX_REVIEW_KEEP_SCRATCH", "")).strip().lower() in {"1", "true", "yes"}:
+        return
+    scratch_root = job_dir(job_id) / "scratch"
+    if scratch_root.exists() and scratch_root.is_dir():
+        shutil.rmtree(scratch_root, ignore_errors=True)
 
 
 def _severity_counts(findings: list[dict[str, Any]]) -> dict[str, int]:

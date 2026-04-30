@@ -8,6 +8,20 @@
 }
 
 @layer utilities {
+  /* T3.2 / frontend-audit #2: global keyboard focus indicator. ~140
+     interactive elements in the app had no `:focus-visible` ring; Tab
+     navigation was invisible. WCAG 2.4.7. The ring is constrained to
+     `focus-visible` so mouse clicks don't surface the outline. */
+  button:not(:disabled),
+  [role="button"]:not(:disabled),
+  a,
+  input:not([type="hidden"]),
+  select,
+  textarea,
+  summary {
+    @apply focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-400/70 focus-visible:ring-offset-2 focus-visible:ring-offset-[#050505];
+  }
+
   @keyframes shimmer {
     100% {
       transform: translateX(100%);
@@ -23,10 +37,14 @@
     100% { transform: translateY(-50px) scale(1.5); opacity: 0; }
   }
 
+  /* v3 ui-design pass: the scan sweep on active swarm cards is the
+     "scanner is in progress" indicator. Slowed from 6.5s to 9s and the
+     opacity peak knocked from 0.55 to 0.32 so it reads as a calm scan
+     pass, not a marketing shine. */
   @keyframes swarm-scan-sweep {
     0% { transform: translateX(-35%) rotate(8deg); opacity: 0; }
-    12% { opacity: 0.55; }
-    55% { opacity: 0.22; }
+    14% { opacity: 0.32; }
+    55% { opacity: 0.14; }
     100% { transform: translateX(135%) rotate(8deg); opacity: 0; }
   }
 }
@@ -74,9 +92,9 @@ body {
 }
 
 .swarm-run-card::before {
-  background: linear-gradient(105deg, transparent 0%, rgba(125, 181, 165, 0.12) 45%, transparent 58%);
+  background: linear-gradient(105deg, transparent 0%, rgba(125, 181, 165, 0.10) 45%, transparent 58%);
   transform: translateX(-35%) rotate(8deg);
-  animation: swarm-scan-sweep 6.5s ease-in-out infinite;
+  animation: swarm-scan-sweep 9s ease-in-out infinite;
 }
 
 .swarm-standby-field::before {

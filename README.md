@@ -23,13 +23,23 @@ The shipped product is local-first:
 
 ## Quick Start
 
-### Fastest Path For Most People
+CLADEX has two install paths. Pick one:
+
+### Path A — Packaged desktop app (most users)
+
+This is the easiest path. Download the latest `.exe` from [GitHub Releases](https://github.com/nahldi/cladex/releases) and follow [INSTALL.md](./INSTALL.md). Required prerequisites:
+
+- Python 3.10+
+- `codex` for Codex relays, installed and logged in with your own account/subscription
+- `claude` for Claude relays, installed and logged in with your own account/subscription
+
+The packaged `.exe` bundles the CLADEX UI and backend files but **does not** bundle Python or the AI CLIs — those still install separately.
+
+### Path B — Source checkout (for development)
 
 1. Install Node.js 22.12+ and Python 3.10+.
-2. Install the AI CLIs you want to use:
-   - `codex`
-   - `claude`
-3. From this repo root, run:
+2. Install the AI CLIs you want to use (`codex`, `claude`).
+3. From this repo root:
 
 ```bash
 cmd /c npm ci
@@ -42,12 +52,7 @@ That gives you the desktop manager plus the Python relay commands:
 - `codex-discord`
 - `claude-discord`
 
-### Desktop App
-
-Important for packaged users: the `.exe` bundles the CLADEX UI and bundled backend files, but it does not bundle Python or the external AI CLIs. You still need:
-- Python 3.10+
-- `codex` for Codex relays, installed and logged in with your own account/subscription
-- `claude` for Claude relays, installed and logged in with your own account/subscription
+See [CONTRIBUTING.md](./CONTRIBUTING.md) for the validation gates and the audit-fix-ship loop.
 - a Discord bot token plus an allowed channel id or approved DM user/operator id
 
 ```bash
@@ -73,8 +78,8 @@ cmd /c npm run electron:build  # Creates installer in release/
 ```
 
 Packaged launchers produced by the build:
-- `release\CLADEX Setup 2.5.7.exe`
-- `release\CLADEX 2.5.7.exe`
+- `release\CLADEX Setup 3.0.0.exe`
+- `release\CLADEX 3.0.0.exe`
 - `release\win-unpacked\CLADEX.exe`
 
 Portable/installer first run:

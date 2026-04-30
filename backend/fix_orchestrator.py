@@ -447,8 +447,16 @@ def _run_claude_planner(prompt: str, account_home: str | None) -> dict[str, Any]
         json.dumps(FIX_PLAN_SCHEMA),
     ]
     extra = {"CLAUDE_CONFIG_DIR": account_home} if account_home else {}
-    env = review_swarm._minimal_reviewer_env(account_home=extra)
-    result = review_swarm._run_cli(cmd, prompt, env=env, cwd=None)
+    # Planners drive an LLM with untrusted prompt content but run before the
+    # fix-run dir exists, so use an ephemeral isolated HOME for the planner
+    # subprocess to keep host secret stores out of reach via Read/Grep.
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix="cladex-fix-planner-home-") as planner_home:
+        env = review_swarm._minimal_reviewer_env(
+            account_home=extra,
+            isolated_home=Path(planner_home),
+        )
+        result = review_swarm._run_cli(cmd, prompt, env=env, cwd=None)
     if not result.ok or not result.text.strip():
         return None
     return _parse_planner_payload(result.text)
@@ -469,8 +477,13 @@ def _run_codex_planner(prompt: str, account_home: str | None) -> dict[str, Any] 
         "-",
     ]
     extra = {"CODEX_HOME": account_home} if account_home else {}
-    env = review_swarm._minimal_reviewer_env(account_home=extra)
-    result = review_swarm._run_cli(cmd, prompt, env=env, cwd=None)
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix="cladex-fix-planner-home-") as planner_home:
+        env = review_swarm._minimal_reviewer_env(
+            account_home=extra,
+            isolated_home=Path(planner_home),
+        )
+        result = review_swarm._run_cli(cmd, prompt, env=env, cwd=None)
     if not result.ok or not result.text.strip():
         return None
     return _parse_planner_payload(result.text)
@@ -1166,8 +1179,39 @@ def active_fix_run_for_review(review_id: str) -> dict[str, Any] | None:
     return None
 
 
-def _minimal_env(extra: dict[str, str] | None = None) -> dict[str, str]:
-    env = review_swarm._minimal_reviewer_env(account_home=extra or {})
+def _fix_isolated_home(run_id: str | None) -> Path | None:
+    """Return a per-run empty directory used as HOME/USERPROFILE for the
+    fix planner and fix-worker subprocesses. None when no run_id is
+    available (e.g. one-off planner calls outside a managed run); callers
+    should fall back to the host home only when they cannot construct an
+    isolated path."""
+    if not run_id:
+        return None
+    base = run_dir(run_id) / ".cladex-fix-home"
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
+
+def _minimal_env(
+    extra: dict[str, str] | None = None,
+    *,
+    run_id: str | None = None,
+) -> dict[str, str]:
+    """Build a minimal env for a fix planner / fix worker subprocess.
+
+    Fix workers actually write to the user's workspace AND drive an LLM with
+    untrusted prompts derived from the project source — so they need at
+    least the same HOME-like isolation reviewers got in 2.5.7. Callers pass
+    `run_id` so we can root each fix run's HOME under its own per-run
+    artifact dir, ensuring `~/.codex/auth.json`, `%LOCALAPPDATA%/cladex/
+    remote-access-token.json`, etc. are not reachable through Read/Grep
+    tools even when the fix worker is allowed Edit/Write on the workspace.
+    """
+    isolated_home = _fix_isolated_home(run_id)
+    env = review_swarm._minimal_reviewer_env(
+        account_home=extra or {},
+        isolated_home=isolated_home,
+    )
     env["CLADEX_FIX_WORKER"] = "1"
     return env
 
@@ -1359,6 +1403,17 @@ def _stable_scope_check(
     return changed_files, outside_assigned
 
 
+def _path_is_backup_preserved(rel: str) -> bool:
+    """True if any segment of `rel` matches the snapshot/restore preserve
+    policy (.env-style files, .codex/.claude/etc dirs, memory/, build caches,
+    template-config exemptions). Source backups deliberately omit these,
+    so absence-from-snapshot does NOT mean "delete from workspace" — it
+    means "this file was never backed up, leave it alone."
+    """
+    parts = [part for part in rel.replace("\\", "/").split("/") if part]
+    return any(review_swarm._skip_from_snapshot_or_restore(part) for part in parts)
+
+
 def _restore_paths_from_source_backup(run: dict[str, Any], paths: list[str]) -> list[str]:
     backup = run.get("sourceBackup") if isinstance(run.get("sourceBackup"), dict) else {}
     snapshot = Path(str(backup.get("snapshot") or "")).expanduser()
@@ -1390,12 +1445,24 @@ def _restore_paths_from_source_backup(run: dict[str, Any], paths: list[str]) -> 
                     shutil.copytree(source, target, symlinks=True)
                 else:
                     shutil.copy2(source, target, follow_symlinks=False)
+                restored.append(rel)
             elif target.exists() or target.is_symlink():
+                # Source snapshot does NOT have this path. Two cases:
+                # 1. Path is on the snapshot preserve list (.env, memory/,
+                #    .codex/, .claude/, etc.) — the worker touched a file
+                #    the backup deliberately skipped. Deleting it would
+                #    silently destroy operator state. Leave it; report
+                #    the drift via the failed-task error message.
+                # 2. Path is genuinely absent — the worker created it
+                #    out of scope. Delete to honor the assigned-files
+                #    boundary. Existing behavior.
+                if _path_is_backup_preserved(rel):
+                    continue
                 if target.is_dir() and not target.is_symlink():
                     shutil.rmtree(target)
                 else:
                     target.unlink()
-            restored.append(rel)
+                restored.append(rel)
         except OSError:
             continue
     return sorted(set(restored))
@@ -1452,7 +1519,7 @@ def _run_provider_fix_task(run: dict[str, Any], task: dict[str, Any]) -> review_
         return _run_cli(
             command,
             _task_prompt(run, task),
-            env=_minimal_env(extra),
+            env=_minimal_env(extra, run_id=str(run.get("id") or "")),
             cwd=workspace,
             cancel_check=lambda: _cancel_requested(str(run.get("id") or "")),
         )
@@ -1473,7 +1540,7 @@ def _run_provider_fix_task(run: dict[str, Any], task: dict[str, Any]) -> review_
     return _run_cli(
         command,
         _task_prompt(run, task),
-        env=_minimal_env(extra),
+        env=_minimal_env(extra, run_id=str(run.get("id") or "")),
         cwd=workspace,
         cancel_check=lambda: _cancel_requested(str(run.get("id") or "")),
     )
@@ -1548,12 +1615,13 @@ def _run_one_validation_command(
     *,
     workspace: Path,
     cancel_check: Callable[[], bool] | None = None,
+    run_id: str | None = None,
 ) -> tuple[str, int, str]:
     if cancel_check is not None and cancel_check():
         return "cancelled", -1, "Cancelled before validation command launched."
     popen_kwargs: dict[str, Any] = {
         "cwd": str(workspace),
-        "env": _minimal_env(),
+        "env": _minimal_env(run_id=run_id),
         "text": True,
         "stdout": subprocess.PIPE,
         "stderr": subprocess.PIPE,
@@ -1603,6 +1671,7 @@ def _run_validation_commands(
             command,
             workspace=workspace,
             cancel_check=cancel_check,
+            run_id=str(run.get("id") or "") or None,
         )
         results.append(
             {
@@ -1720,7 +1789,23 @@ def run_fix_run(run_id: str) -> dict[str, Any]:
 
 
 def restore_command_for_run(run: dict[str, Any]) -> str:
+    """Build the operator-visible restore command for a fix run.
+
+    Synth-F0003 audit finding: a fix run records its source backup id at
+    start time, but later `prune_backups()` calls (after subsequent
+    backups, or via `cladex doctor --gc`) can delete that backup before
+    the operator runs the restore. Surfacing a command for an absent
+    backup is worse than surfacing nothing, so we verify the backup's
+    snapshot still exists on disk and emit a clearly-labeled
+    placeholder otherwise."""
     backup_id = str((run.get("sourceBackup") or {}).get("id") or "").strip()
     if not backup_id:
         return ""
+    snapshot = str((run.get("sourceBackup") or {}).get("snapshot") or "").strip()
+    if snapshot:
+        try:
+            if not Path(snapshot).expanduser().exists():
+                return f"# (backup {backup_id} pruned; no automatic restore available)"
+        except OSError:
+            pass
     return f"cladex backup restore {backup_id} --confirm {backup_id}"

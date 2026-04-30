@@ -12,6 +12,7 @@ import install_plugin
 import pytest
 import relay_common
 import relayctl
+import secret_store
 
 
 def _windows_project_path(*parts: str) -> str:
@@ -141,7 +142,71 @@ def test_register_reads_discord_token_from_env_and_clears_it(tmp_path: Path, mon
     env_files = list(profiles_dir.glob("*.env"))
     assert env_files, "register should write a profile env file"
     contents = env_files[0].read_text(encoding="utf-8")
-    assert "DISCORD_BOT_TOKEN=secret-token-from-env" in contents
+    # 2.5.8: bot tokens are routed through the OS-native secret store, so the
+    # .env file holds a `secret-ref:` placeholder, not the literal token. The
+    # important invariants are:
+    #   1. The literal token is NOT on disk in the .env file.
+    #   2. A `DISCORD_BOT_TOKEN=secret-ref:...` line IS present so the loader
+    #      knows to resolve it via `secret_store.materialize_env_secrets`.
+    #   3. The env-file loader returns the literal value when read back.
+    assert "secret-token-from-env" not in contents, (
+        "Bot token literal must not appear in the .env file (must be routed via secret_store)."
+    )
+    assert "DISCORD_BOT_TOKEN=secret-ref:" in contents
+    resolved = relayctl._load_env_file(env_files[0])
+    assert resolved.get("DISCORD_BOT_TOKEN") == "secret-token-from-env"
+
+
+def test_write_env_file_reuses_existing_secret_ref_for_unchanged_token(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("CLADEX_SECRETS_ROOT", str(tmp_path / "secrets"))
+    env_file = tmp_path / "profile.env"
+
+    relayctl._write_env_file(env_file, {"DISCORD_BOT_TOKEN": "token-one", "CODEX_WORKDIR": str(tmp_path)})
+    first_raw = relayctl._load_env_file_raw(env_file)
+    first_ref = first_raw["DISCORD_BOT_TOKEN"]
+
+    relayctl._write_env_file(env_file, {"DISCORD_BOT_TOKEN": "token-one", "CODEX_WORKDIR": str(tmp_path)})
+    second_raw = relayctl._load_env_file_raw(env_file)
+
+    assert second_raw["DISCORD_BOT_TOKEN"] == first_ref
+    assert relayctl._load_env_file(env_file)["DISCORD_BOT_TOKEN"] == "token-one"
+    assert len(list((tmp_path / "secrets").glob("*.bin"))) == 1
+
+
+def test_write_env_file_deletes_replaced_secret_ref(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("CLADEX_SECRETS_ROOT", str(tmp_path / "secrets"))
+    env_file = tmp_path / "profile.env"
+
+    relayctl._write_env_file(env_file, {"DISCORD_BOT_TOKEN": "token-one", "CODEX_WORKDIR": str(tmp_path)})
+    old_ref = relayctl._load_env_file_raw(env_file)["DISCORD_BOT_TOKEN"]
+    relayctl._write_env_file(env_file, {"DISCORD_BOT_TOKEN": "token-two", "CODEX_WORKDIR": str(tmp_path)})
+    new_ref = relayctl._load_env_file_raw(env_file)["DISCORD_BOT_TOKEN"]
+
+    assert new_ref != old_ref
+    assert relayctl._load_env_file(env_file)["DISCORD_BOT_TOKEN"] == "token-two"
+    assert not secret_store._secret_blob_path(old_ref.rsplit(":", 1)[1]).exists()
+    assert secret_store._secret_blob_path(new_ref.rsplit(":", 1)[1]).exists()
+
+
+def test_replace_profile_registration_deletes_previous_env_secret_when_path_changes(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("CLADEX_SECRETS_ROOT", str(tmp_path / "secrets"))
+    monkeypatch.setattr(relayctl, "REGISTRY_PATH", tmp_path / "workspaces.json")
+    old_env = tmp_path / "old.env"
+    new_env = tmp_path / "new.env"
+    relayctl._write_env_file(old_env, {"DISCORD_BOT_TOKEN": "old-token", "CODEX_WORKDIR": str(tmp_path)})
+    old_ref = relayctl._load_env_file_raw(old_env)["DISCORD_BOT_TOKEN"]
+    relayctl._write_env_file(new_env, {"DISCORD_BOT_TOKEN": "new-token", "CODEX_WORKDIR": str(tmp_path)})
+    previous_profile = {"name": "old-profile", "env_file": str(old_env)}
+    new_profile = {"name": "new-profile", "env_file": str(new_env), "workspace": str(tmp_path)}
+    relayctl._save_registry({"profiles": [previous_profile], "projects": []})
+
+    relayctl._replace_profile_registration(previous_profile, new_profile)
+
+    assert not old_env.exists()
+    assert not secret_store._secret_blob_path(old_ref.rsplit(":", 1)[1]).exists()
 
 
 def test_register_requires_token_via_arg_or_env(tmp_path: Path, monkeypatch) -> None:
@@ -489,8 +554,29 @@ def test_relay_codex_env_strips_inherited_secrets(tmp_path: Path, monkeypatch) -
     for blocked in ("DISCORD_BOT_TOKEN", "CLADEX_REMOTE_ACCESS_TOKEN", "ANTHROPIC_API_KEY", "AWS_SECRET_ACCESS_KEY", "MY_CUSTOM_TOKEN", "MY_CUSTOM_PASSWORD", "MY_CUSTOM_API_KEY"):
         assert blocked not in sanitized, f"{blocked} should be stripped"
     assert sanitized.get("PATH") == "/usr/bin"
-    assert sanitized.get("REGULAR_VAR") == "fine"
+    # 2.5.8: Codex relay env switched from prefix-allowlist+denylist to a
+    # positive allowlist (parity with claude_backend's 2.5.6 fix). REGULAR_VAR
+    # is intentionally NOT in the allowlist, so it must NOT pass through —
+    # the whole point of the rewrite is that unknown env vars do not leak.
+    assert "REGULAR_VAR" not in sanitized
     assert sanitized.get("CODEX_HOME") == str(tmp_path / "codex-home")
+
+
+def test_relay_codex_env_preserves_windows_runtime_path_vars(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(relay_common, "prepare_relay_codex_home", lambda *args, **kwargs: tmp_path / "codex-home")
+    sanitized = relay_common.relay_codex_env(
+        tmp_path,
+        {
+            "PATH": "C:\\Windows\\System32",
+            "ProgramFiles": "C:\\Program Files",
+            "ProgramFiles(x86)": "C:\\Program Files (x86)",
+            "ProgramData": "C:\\ProgramData",
+        },
+    )
+
+    assert sanitized["ProgramFiles"] == "C:\\Program Files"
+    assert sanitized["ProgramFiles(x86)"] == "C:\\Program Files (x86)"
+    assert sanitized["ProgramData"] == "C:\\ProgramData"
 
 
 def test_register_rejects_protected_cladex_workspace(monkeypatch) -> None:

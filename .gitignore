@@ -18,6 +18,12 @@ coverage/
 .pytest-basetemp/
 .pytest-tmp/
 manual-mode-test/
+# PowerShell ModuleAnalysisCache leak (tools that invoke `powershell` with
+# a custom HOME but didn't override LOCALAPPDATA used to drop this here).
+# `_doctor_command` now isolates LOCALAPPDATA/APPDATA/USERPROFILE/HOME*,
+# but keep this guard in case a future caller forgets.
+Microsoft/
+backend/Microsoft/
 .DS_Store
 *.log
 .env*

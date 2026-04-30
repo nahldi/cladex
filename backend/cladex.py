@@ -106,6 +106,17 @@ def _save_claude_registry(registry: dict[str, Any]) -> None:
 
 
 def _load_claude_env(profile: dict[str, Any]) -> dict[str, str]:
+    """Load a Claude profile env, transparently resolving any
+    `secret-ref:scheme:id` values via the OS-native secret store.
+
+    `cmd_start` injects this dict into the Claude bot subprocess; without
+    secret-ref resolution, post-2.5.8 profiles whose `DISCORD_BOT_TOKEN`
+    is stored as `secret-ref:dpapi:<id>` will be passed that literal
+    placeholder string to discord.py and fail to authenticate. The
+    relay-side `claude_relay._load_env_file` already resolves refs; this
+    matches that behavior for the unified `cladex` start path."""
+    import secret_store
+
     env_file = str(profile.get("env_file", "")).strip()
     if not env_file:
         return {}
@@ -120,7 +131,7 @@ def _load_claude_env(profile: dict[str, Any]) -> dict[str, str]:
             continue
         key, value = line.split("=", 1)
         env[key.strip()] = value.strip()
-    return env
+    return secret_store.materialize_env_secrets(env)
 
 
 def _claude_state_dir(profile: dict[str, Any]) -> Path:
@@ -541,8 +552,17 @@ def start_profile(profile: dict[str, Any], *, start_reason: str = "operator-star
         run_env["STATE_NAMESPACE"] = state_namespace
         run_env["CLADEX_START_REASON"] = start_reason
 
-        # Log file
+        # Log file. Truncate-tail before opening so the Claude relay log
+        # has the same self-bounded behavior as the Codex relay log
+        # (relayctl truncates on every start). Without this a long-lived
+        # claude profile accumulates an unbounded relay.log across
+        # restarts.
         log_file = state_dir / "relay.log"
+        try:
+            from relayctl import truncate_file_tail as _truncate_file_tail
+            _truncate_file_tail(log_file, max_bytes=5 * 1024 * 1024, keep_bytes=1024 * 1024)
+        except Exception:
+            pass
         log_handle = log_file.open("a")
 
         # Launch bot.py in background
@@ -984,6 +1004,7 @@ def _update_claude_profile(
     previous_env_path = Path(str(profile.get("env_file", "")).strip()) if profile.get("env_file") else None
     new_env_path = Path(str(new_profile.get("env_file", "")).strip()) if new_profile.get("env_file") else None
     if previous_env_path and previous_env_path != new_env_path:
+        _delete_profile_env_secrets(previous_env_path)
         previous_env_path.unlink(missing_ok=True)
     return new_profile
 
@@ -1281,8 +1302,64 @@ def cmd_update(args: argparse.Namespace) -> int:
     return 0
 
 
+def _purge_profile_secrets_and_state(profile: dict[str, Any]) -> None:
+    """On profile remove, also delete the encrypted secret blobs and the
+    state-namespace dir. Without this, deleted profiles leave dangling
+    secret-ref blobs in `%LOCALAPPDATA%/cladex/secrets/` and stale state
+    directories with attachments / durable sqlite that the next profile
+    of the same name would inherit."""
+    env_file = Path(str(profile.get("env_file", "")).strip())
+    if env_file.exists():
+        try:
+            existing = relayctl._load_env_file_raw(env_file)
+        except Exception:
+            existing = {}
+        try:
+            import secret_store
+
+            for key in secret_store.SENSITIVE_KEYS:
+                value = existing.get(key)
+                if value:
+                    secret_store.delete_secret(value)
+        except Exception:
+            pass
+    namespace = str(profile.get("state_namespace", "")).strip()
+    if namespace:
+        try:
+            import shutil as _shutil
+            from relay_common import state_dir_for_namespace as _state_dir_for_namespace
+
+            state_dir = _state_dir_for_namespace(namespace)
+            if state_dir.exists() and state_dir.is_dir():
+                _shutil.rmtree(state_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+
+def _delete_profile_env_secrets(env_file: Path) -> None:
+    try:
+        if not env_file.exists():
+            return
+        try:
+            existing = relayctl._load_env_file_raw(env_file)
+        except Exception:
+            try:
+                existing = claude_relay._load_env_file_raw(env_file)
+            except Exception:
+                existing = {}
+        import secret_store
+
+        for key in secret_store.SENSITIVE_KEYS:
+            value = existing.get(key)
+            if value:
+                secret_store.delete_secret(value)
+    except Exception:
+        pass
+
+
 def _remove_codex_profile(profile: dict[str, Any]) -> None:
     relayctl._stop_profile(profile)
+    _purge_profile_secrets_and_state(profile)
     env_file = Path(str(profile.get("env_file", "")).strip())
     registry = relayctl._load_registry()
     registry["profiles"] = [item for item in registry.get("profiles", []) if item.get("name") != profile.get("name")]
@@ -1296,6 +1373,7 @@ def _remove_codex_profile(profile: dict[str, Any]) -> None:
 
 def _remove_claude_profile(profile: dict[str, Any]) -> None:
     stop_profile({**profile, "_relay_type": "claude"})
+    _purge_profile_secrets_and_state(profile)
     env_file = Path(str(profile.get("env_file", "")).strip())
     registry = _load_claude_registry()
     registry["profiles"] = [item for item in registry.get("profiles", []) if item.get("name") != profile.get("name")]
@@ -1347,17 +1425,42 @@ def cmd_logs(args: argparse.Namespace) -> int:
 
 
 def _doctor_command(command: list[str], *, cwd: Path | None = None) -> dict[str, Any]:
-    try:
-        result = subprocess.run(
-            command,
-            cwd=str(cwd) if cwd else None,
-            capture_output=True,
-            text=True,
-            check=False,
-            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
-        )
-    except Exception as exc:
-        return {"ok": False, "command": command, "error": str(exc)}
+    """Run a doctor probe with full PowerShell-cwd-and-LOCALAPPDATA isolation.
+
+    PowerShell writes its `Microsoft\\Windows\\PowerShell\\ModuleAnalysisCache`
+    under `%LOCALAPPDATA%`; if `%LOCALAPPDATA%` resolves under the operator's
+    git working tree (or if PowerShell falls back to cwd because its profile
+    resolution can't reach a writable user dir), the cache lands inside the
+    repo and dirties `git status`. Pinning cwd alone is not enough — we also
+    have to override LOCALAPPDATA / APPDATA / USERPROFILE so PowerShell
+    writes its cache into the per-call tempdir that gets reaped on exit.
+    """
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="cladex-doctor-cwd-") as doctor_cwd:
+        try:
+            doctor_env = os.environ.copy()
+            if os.name == "nt":
+                # Redirect every HOME-like env to the per-call tempdir so
+                # PowerShell + any other tool that probes the user profile
+                # writes there instead of into the operator's repo or
+                # %LOCALAPPDATA%. Fixes the recurring leak where
+                # `backend/Microsoft/Windows/PowerShell/ModuleAnalysisCache`
+                # appeared in `git status` after `cladex doctor --json`.
+                for key in ("LOCALAPPDATA", "APPDATA", "USERPROFILE", "HOMEPATH", "HOMEDRIVE"):
+                    if key in doctor_env:
+                        doctor_env[key] = doctor_cwd
+            result = subprocess.run(
+                command,
+                cwd=str(cwd) if cwd else doctor_cwd,
+                env=doctor_env,
+                capture_output=True,
+                text=True,
+                check=False,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            )
+        except Exception as exc:
+            return {"ok": False, "command": command, "error": str(exc)}
     output = ((result.stdout or "") + (result.stderr or "")).strip()
     return {"ok": result.returncode == 0, "command": command, "returncode": result.returncode, "output": output}
 
@@ -1753,6 +1856,8 @@ def _doctor_profiles() -> dict[str, Any]:
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
+    if getattr(args, "gc", False):
+        return _cmd_doctor_gc(args)
     checks = [
         _doctor_required_version("node", ["node", "--version"], minimum=_declared_engine_minimum("node")),
         _doctor_required_version(
@@ -1823,6 +1928,224 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             if shared:
                 print(f"- shared account homes: {shared}")
     return 0 if ok else 1
+
+
+def _dir_size_bytes(path: Path) -> int:
+    """Best-effort recursive size in bytes; OSErrors swallowed."""
+    total = 0
+    try:
+        for current, _dirs, names in os.walk(path):
+            for name in names:
+                try:
+                    total += (Path(current) / name).stat().st_size
+                except OSError:
+                    continue
+    except OSError:
+        pass
+    return total
+
+
+def _cmd_doctor_gc(args: argparse.Namespace) -> int:
+    """`cladex doctor --gc`: garbage-collect operator-visible cruft.
+
+    - prune backups by retention policy (per-workspace count + age + orphan)
+    - delete review scratch trees for finished review jobs
+    - reap stale workspace-start lock files
+    - delete state-namespace dirs whose profile no longer exists
+
+    Reports a JSON or text summary with what was reaped. Safe to run
+    while relays are stopped; a running relay's state-namespace dir is
+    not removed because the namespace check matches a real profile.
+    """
+    dry_run = bool(getattr(args, "dry_run", False))
+    summary: dict[str, Any] = {"ok": True, "dryRun": dry_run}
+    # Backup retention.
+    try:
+        backup_summary = review_swarm.prune_backups(dry_run=dry_run)
+        summary["backups"] = backup_summary
+    except Exception as exc:
+        summary["backups"] = {"error": str(exc)}
+        summary["ok"] = False
+    # Review scratch trees: walk completed review jobs and delete the
+    # `scratch/` subtree if present. Two-pass: first attempt rmtree;
+    # if any subtree remains (read-only files left by npm/playwright
+    # caches the reviewer subprocess created in its isolated HOME),
+    # walk and chmod 0o700 then unlink. T2.2 / prod-audit #2.
+    review_scratch_removed = 0
+    review_scratch_bytes_recovered = 0
+    review_scratch_retained = 0
+    try:
+        review_root = review_swarm.REVIEW_DATA_ROOT
+        if review_root.exists():
+            for job_dir in review_root.iterdir():
+                if not job_dir.is_dir() or not review_swarm.REVIEW_ID_RE.fullmatch(job_dir.name):
+                    continue
+                scratch_dir = job_dir / "scratch"
+                if not scratch_dir.exists():
+                    continue
+                size_before = _dir_size_bytes(scratch_dir)
+                if not dry_run:
+                    shutil.rmtree(scratch_dir, ignore_errors=True)
+                    if scratch_dir.exists():
+                        # Second pass: chmod read-only files then unlink.
+                        for current, dirs, names in os.walk(scratch_dir, topdown=False):
+                            for name in names:
+                                p = Path(current) / name
+                                try:
+                                    os.chmod(p, 0o700)
+                                except OSError:
+                                    pass
+                                try:
+                                    p.unlink()
+                                except OSError:
+                                    pass
+                            for name in dirs:
+                                try:
+                                    (Path(current) / name).rmdir()
+                                except OSError:
+                                    pass
+                        try:
+                            scratch_dir.rmdir()
+                        except OSError:
+                            pass
+                if scratch_dir.exists() and not dry_run:
+                    review_scratch_retained += 1
+                else:
+                    review_scratch_removed += 1
+                    review_scratch_bytes_recovered += size_before
+        summary["reviewScratchRemoved"] = review_scratch_removed
+        summary["reviewScratchBytesRecovered"] = review_scratch_bytes_recovered
+        summary["reviewScratchRetained"] = review_scratch_retained
+    except Exception as exc:
+        summary["reviewScratchRemoved"] = 0
+        summary.setdefault("errors", []).append(f"review-scratch: {exc}")
+        summary["ok"] = False
+    # Stale workspace-start lock files.
+    try:
+        summary["staleLocksReaped"] = review_swarm.sweep_stale_lock_files(dry_run=dry_run)
+    except Exception as exc:
+        summary["staleLocksReaped"] = 0
+        summary.setdefault("errors", []).append(f"locks: {exc}")
+        summary["ok"] = False
+    # Orphan state-namespace dirs: dirs without any matching profile.
+    orphan_state_dirs: list[str] = []
+    try:
+        from relay_common import DATA_ROOT as _CODEX_DATA_ROOT
+        from claude_common import DATA_ROOT as _CLAUDE_DATA_ROOT
+
+        active_namespaces: set[str] = set()
+        for profile in get_all_profiles():
+            ns = str(profile.get("state_namespace", "")).strip()
+            if ns:
+                active_namespaces.add(ns)
+        for state_root in (_CODEX_DATA_ROOT / "state", _CLAUDE_DATA_ROOT / "state"):
+            if not state_root.exists():
+                continue
+            for child in state_root.iterdir():
+                if not child.is_dir():
+                    continue
+                if child.name in active_namespaces:
+                    continue
+                orphan_state_dirs.append(str(child))
+                if not getattr(args, "dry_run", False):
+                    shutil.rmtree(child, ignore_errors=True)
+        summary["orphanStateDirs"] = orphan_state_dirs
+    except Exception as exc:
+        summary["orphanStateDirs"] = []
+        summary.setdefault("errors", []).append(f"orphan-state: {exc}")
+        summary["ok"] = False
+    # T2.1 / prod-audit #5: Orphan secret blob cleanup. Walk every
+    # profile env, collect every `secret-ref:scheme:<id>` value, then
+    # remove `_secrets_root()/*.bin` whose id is not referenced.
+    orphan_secret_count = 0
+    orphan_secret_bytes = 0
+    try:
+        import secret_store
+
+        referenced_ids: set[str] = set()
+        for profile in get_all_profiles():
+            env_file = str(profile.get("env_file", "")).strip()
+            if not env_file:
+                continue
+            try:
+                raw = relayctl._load_env_file_raw(Path(env_file))
+            except Exception:
+                continue
+            for value in raw.values():
+                if not secret_store.is_secret_ref(value):
+                    continue
+                m = secret_store._SECRET_REF_RE.fullmatch(value.strip())
+                if m:
+                    referenced_ids.add(m.group("sid"))
+        secrets_dir = secret_store._secrets_root()
+        if secrets_dir.exists():
+            for blob in secrets_dir.glob("*.bin"):
+                sid = blob.stem
+                if sid in referenced_ids:
+                    continue
+                try:
+                    size = blob.stat().st_size
+                except OSError:
+                    size = 0
+                orphan_secret_count += 1
+                orphan_secret_bytes += size
+                if not dry_run:
+                    try:
+                        blob.unlink()
+                    except OSError:
+                        pass
+        summary["orphanSecretsRemoved"] = orphan_secret_count
+        summary["orphanSecretBytesRecovered"] = orphan_secret_bytes
+    except Exception as exc:
+        summary["orphanSecretsRemoved"] = 0
+        summary.setdefault("errors", []).append(f"orphan-secrets: {exc}")
+        summary["ok"] = False
+    # T2.3 / prod-audit #11: Truncate cladex log files older than threshold.
+    log_files_truncated = 0
+    log_bytes_recovered = 0
+    try:
+        from platformdirs import user_data_dir as _udd
+
+        cladex_root = Path(_udd("cladex", False))
+        try:
+            max_age_days = int(os.environ.get("CLADEX_LOG_MAX_AGE_DAYS", "30").strip() or "30")
+        except (TypeError, ValueError):
+            max_age_days = 30
+        if max_age_days > 0 and cladex_root.exists():
+            cutoff = time.time() - (max_age_days * 86400)
+            for log_path in cladex_root.glob("*.log"):
+                try:
+                    stat = log_path.stat()
+                except OSError:
+                    continue
+                if stat.st_mtime >= cutoff:
+                    continue
+                size = stat.st_size
+                if not dry_run:
+                    try:
+                        log_path.write_text("", encoding="utf-8")
+                    except OSError:
+                        continue
+                log_files_truncated += 1
+                log_bytes_recovered += size
+        summary["logsTruncated"] = log_files_truncated
+        summary["logBytesRecovered"] = log_bytes_recovered
+    except Exception as exc:
+        summary["logsTruncated"] = 0
+        summary.setdefault("errors", []).append(f"logs: {exc}")
+        summary["ok"] = False
+    if getattr(args, "json", False):
+        print(json.dumps(summary, indent=2))
+    else:
+        print("CLADEX doctor --gc:")
+        print(f"- backups: kept {summary.get('backups', {}).get('kept', 0)}, removed {summary.get('backups', {}).get('removedCount', 0)}")
+        print(f"- review scratch trees removed: {review_scratch_removed}")
+        print(f"- stale workspace-start locks reaped: {summary.get('staleLocksReaped', 0)}")
+        print(f"- orphan state-namespace dirs removed: {len(orphan_state_dirs)}")
+        if orphan_state_dirs:
+            for orphan in orphan_state_dirs[:10]:
+                print(f"    {orphan}")
+    return 0 if summary.get("ok", True) else 1
 
 
 def cmd_chat(args: argparse.Namespace) -> int:
@@ -2450,6 +2773,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     doctor_parser = subparsers.add_parser("doctor", help="Check local prerequisites and profile collisions.")
     doctor_parser.add_argument("--json", action="store_true", help="Output as JSON for automation")
+    doctor_parser.add_argument(
+        "--gc",
+        action="store_true",
+        help="Garbage-collect operator-visible cruft: prune backups, remove finished review scratch trees, reap stale lock files, delete state dirs whose profile no longer exists.",
+    )
+    doctor_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="With --gc, report what would be removed without deleting it.",
+    )
     doctor_parser.set_defaults(func=cmd_doctor)
 
     chat_parser = subparsers.add_parser("chat", help="Send a local operator message through a running relay.")
