@@ -5468,22 +5468,24 @@ async def _run() -> None:
         async with client:
             try:
                 await client.start(CONFIG.discord_bot_token)
-            except discord.PrivilegedIntentsRequired:
+            except discord.PrivilegedIntentsRequired as exc:
                 # T4.1 / official-patterns 1.3: code 4014 is non-resumable
                 # AND non-reconnectable. Without this, the supervisor
                 # auto-restart would burn through the 1000-IDENTIFY/24h
-                # limit. Mark auth-failure and exit non-zero.
+                # limit. Mark auth-failure and exit non-zero. `from exc`
+                # preserves the original cause in the traceback for
+                # operator debugging via `cladex logs`.
                 _record_auth_failure_marker(
                     "Discord refused our gateway intents (privileged intent disabled in the Developer Portal). "
                     "Re-enable MESSAGE_CONTENT under Bot > Privileged Gateway Intents, then start the relay again."
                 )
-                raise SystemExit(13)
-            except discord.LoginFailure:
+                raise SystemExit(13) from exc
+            except discord.LoginFailure as exc:
                 _record_auth_failure_marker(
                     "Discord rejected the bot token (4004). Check the token in CLADEX > Edit Relay; "
                     "if it was regenerated, paste the new value."
                 )
-                raise SystemExit(13)
+                raise SystemExit(13) from exc
             except discord.errors.ConnectionClosed as exc:
                 code = getattr(exc, "code", None)
                 if code in {4013, 4014}:
@@ -5491,7 +5493,7 @@ async def _run() -> None:
                         f"Discord gateway refused the connection with non-recoverable code {code}. "
                         "Verify gateway intents in the Discord Developer Portal."
                     )
-                    raise SystemExit(13)
+                    raise SystemExit(13) from exc
                 raise
     finally:
         global OPERATOR_BRIDGE_TASK

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 
@@ -23,3 +24,13 @@ os.environ["CLADEX_FIX_PLANNER_DISABLE"] = "1"
 # `_run_claude_ai_review`. Disable it by default; tests that exercise the
 # synthesizer set CLADEX_REVIEW_SYNTHESIZER=1 explicitly.
 os.environ.setdefault("CLADEX_REVIEW_SYNTHESIZER", "0")
+
+# Critical: the test suite must NEVER write encrypted secret blobs into the
+# operator's real DPAPI store at %LOCALAPPDATA%\cladex\secrets\. Without this
+# isolation every test pass through `secret_store.store_secret()` leaves a
+# permanent .bin file in production state — the post-v3 audit found 2,372
+# leaked test blobs on a single dev machine. Pin the secret root to a
+# pytest-session tempdir BEFORE any test code can import secret_store.
+# Auto-cleaned on Python exit.
+_PYTEST_SECRETS_ROOT = tempfile.mkdtemp(prefix="cladex-pytest-secrets-")
+os.environ["CLADEX_SECRETS_ROOT"] = _PYTEST_SECRETS_ROOT

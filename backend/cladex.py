@@ -2100,39 +2100,136 @@ def _cmd_doctor_gc(args: argparse.Namespace) -> int:
         summary["orphanSecretsRemoved"] = 0
         summary.setdefault("errors", []).append(f"orphan-secrets: {exc}")
         summary["ok"] = False
-    # T2.3 / prod-audit #11: Truncate cladex log files older than threshold.
+    # T2.3 / prod-audit #11: Truncate stale log files. Post-v3 audit found
+    # the original walk only covered %LOCALAPPDATA%\cladex\*.log and missed
+    # the per-relay state log dirs (40 MB Codex + 4.8 MB Claude on the test
+    # machine). Walk all three roots now.
     log_files_truncated = 0
     log_bytes_recovered = 0
     try:
         from platformdirs import user_data_dir as _udd
 
-        cladex_root = Path(_udd("cladex", False))
+        log_roots = [Path(_udd("cladex", False))]
+        try:
+            from relay_common import DATA_ROOT as _CODEX_DATA_ROOT
+            log_roots.append(_CODEX_DATA_ROOT / "state")
+        except Exception:
+            pass
+        try:
+            from claude_common import DATA_ROOT as _CLAUDE_DATA_ROOT
+            log_roots.append(_CLAUDE_DATA_ROOT / "state")
+        except Exception:
+            pass
         try:
             max_age_days = int(os.environ.get("CLADEX_LOG_MAX_AGE_DAYS", "30").strip() or "30")
         except (TypeError, ValueError):
             max_age_days = 30
-        if max_age_days > 0 and cladex_root.exists():
+        if max_age_days > 0:
             cutoff = time.time() - (max_age_days * 86400)
-            for log_path in cladex_root.glob("*.log"):
-                try:
-                    stat = log_path.stat()
-                except OSError:
+            for root in log_roots:
+                if not root.exists():
                     continue
-                if stat.st_mtime >= cutoff:
-                    continue
-                size = stat.st_size
-                if not dry_run:
+                for log_path in root.rglob("*.log"):
                     try:
-                        log_path.write_text("", encoding="utf-8")
+                        stat = log_path.stat()
                     except OSError:
                         continue
-                log_files_truncated += 1
-                log_bytes_recovered += size
+                    if stat.st_mtime >= cutoff:
+                        continue
+                    size = stat.st_size
+                    if not dry_run:
+                        try:
+                            log_path.write_text("", encoding="utf-8")
+                        except OSError:
+                            continue
+                    log_files_truncated += 1
+                    log_bytes_recovered += size
         summary["logsTruncated"] = log_files_truncated
         summary["logBytesRecovered"] = log_bytes_recovered
     except Exception as exc:
         summary["logsTruncated"] = 0
         summary.setdefault("errors", []).append(f"logs: {exc}")
+        summary["ok"] = False
+    # Post-v3 audit HIGH 2: also offer to prune the relay-managed
+    # CODEX_HOME state. `_prune_codex_home_state` (in `bot.py`) only runs
+    # at relay startup, so an operator can't reclaim a 368MB `logs_2.sqlite`
+    # without restarting the relay. Do the same prune here, but ONLY when
+    # the corresponding relay is NOT currently running (a live Codex CLI
+    # holds the sqlite WAL; checkpointing/VACUUM is a no-op or worse).
+    codex_home_pruned = 0
+    codex_home_bytes_recovered = 0
+    try:
+        for profile in get_all_profiles():
+            if str(profile.get("_relay_type", "")).lower() != "codex":
+                continue
+            if profile.get("running"):
+                continue
+            try:
+                env = relayctl._normalized_profile_env(
+                    relayctl._load_env_file(Path(str(profile.get("env_file", ""))))
+                )
+            except Exception:
+                env = {}
+            codex_home = str(env.get("CODEX_HOME") or "").strip()
+            if not codex_home:
+                continue
+            home_path = Path(codex_home)
+            if not home_path.exists():
+                continue
+            sessions_dir = home_path / "sessions"
+            if sessions_dir.exists():
+                size_before = _dir_size_bytes(sessions_dir)
+                if not dry_run:
+                    try:
+                        from relay_common import prune_directory_files
+                        try:
+                            max_age_days_codex = int(
+                                os.environ.get("CLADEX_CODEX_SESSIONS_MAX_AGE_DAYS", "14").strip() or "14"
+                            )
+                        except (TypeError, ValueError):
+                            max_age_days_codex = 14
+                        try:
+                            max_files_codex = int(
+                                os.environ.get("CLADEX_CODEX_SESSIONS_MAX_FILES", "200").strip() or "200"
+                            )
+                        except (TypeError, ValueError):
+                            max_files_codex = 200
+                        prune_directory_files(
+                            sessions_dir,
+                            older_than_seconds=float(max_age_days_codex) * 86400 if max_age_days_codex > 0 else None,
+                            max_files=max_files_codex if max_files_codex > 0 else None,
+                        )
+                    except Exception:
+                        pass
+                size_after = _dir_size_bytes(sessions_dir)
+                codex_home_bytes_recovered += max(size_before - size_after, 0)
+            for db_name in ("logs_2.sqlite", "state_5.sqlite"):
+                db_path = home_path / db_name
+                if not db_path.exists():
+                    continue
+                if not dry_run:
+                    try:
+                        import sqlite3
+                        with sqlite3.connect(str(db_path), timeout=2.0) as conn:
+                            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                            try:
+                                vacuum_days = int(
+                                    os.environ.get("CLADEX_CODEX_LOGS_VACUUM_DAYS", "30").strip() or "30"
+                                )
+                            except (TypeError, ValueError):
+                                vacuum_days = 30
+                            if vacuum_days > 0:
+                                age = time.time() - db_path.stat().st_mtime
+                                if age > vacuum_days * 86400:
+                                    conn.execute("VACUUM")
+                    except Exception:
+                        pass
+            codex_home_pruned += 1
+        summary["codexHomePruned"] = codex_home_pruned
+        summary["codexHomeBytesRecovered"] = codex_home_bytes_recovered
+    except Exception as exc:
+        summary["codexHomePruned"] = 0
+        summary.setdefault("errors", []).append(f"codex-home: {exc}")
         summary["ok"] = False
     if getattr(args, "json", False):
         print(json.dumps(summary, indent=2))
@@ -2142,6 +2239,9 @@ def _cmd_doctor_gc(args: argparse.Namespace) -> int:
         print(f"- review scratch trees removed: {review_scratch_removed}")
         print(f"- stale workspace-start locks reaped: {summary.get('staleLocksReaped', 0)}")
         print(f"- orphan state-namespace dirs removed: {len(orphan_state_dirs)}")
+        print(f"- orphan secret blobs removed: {orphan_secret_count} ({orphan_secret_bytes} bytes)")
+        print(f"- log files truncated: {log_files_truncated} ({log_bytes_recovered} bytes)")
+        print(f"- Codex relay homes pruned: {codex_home_pruned} ({codex_home_bytes_recovered} bytes)")
         if orphan_state_dirs:
             for orphan in orphan_state_dirs[:10]:
                 print(f"    {orphan}")

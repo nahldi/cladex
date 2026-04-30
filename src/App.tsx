@@ -698,11 +698,15 @@ export default function App() {
   const lastActionErrorRef = useRef('');
   const bootFailureCount = useRef(0);
   const loadAllInFlight = useRef(false);
+  // Dark mode is hardcoded (no toggle ships in v3). The constant is read
+  // by ~6 dock-style helpers below to pick the right surface tones.
   const isDark = true;
 
+  // One-shot mount effect — adds `.dark` to <html> for Tailwind's dark
+  // variants. Empty deps list because there is no toggle to track.
   useEffect(() => {
     document.documentElement.classList.add('dark');
-  }, [isDark]);
+  }, []);
 
   const loadAll = useCallback(async (silent = false) => {
     // Skip overlapping silent refreshes so a slow Promise.all (e.g. backend

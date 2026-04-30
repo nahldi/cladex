@@ -1965,3 +1965,60 @@ def test_load_review_findings_strict_rejects_empty_findings_list(tmp_path: Path,
     findings_path.write_text(json.dumps({"findings": []}), encoding="utf-8")
     with pytest.raises(ValueError, match="no findings"):
         fix_orchestrator._load_review_findings_strict(review_id)
+
+
+def test_prune_codex_home_state_runs_wal_checkpoint_and_age_vacuum(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """T2.4 regression: `_prune_codex_home_state` (in `bot.py`) must
+    actually open `logs_2.sqlite` / `state_5.sqlite` and run
+    `PRAGMA wal_checkpoint(TRUNCATE)`, plus `VACUUM` if the db's mtime
+    is older than `CLADEX_CODEX_LOGS_VACUUM_DAYS`. Operator on the
+    post-v3 audit machine had a 368MB unbounded `logs_2.sqlite` because
+    nothing else ever checkpointed it. `import bot` validates the
+    Discord token at module load time, so set a placeholder before the
+    import to clear the gate."""
+    import os as _os
+    import sys as _sys
+    import sqlite3
+
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-only-not-a-real-token")
+    monkeypatch.setenv("CHANNEL_ID", "1234567890")
+    # Force a fresh import so module-level CONFIG re-reads our env.
+    _sys.modules.pop("bot", None)
+    import bot as relay_bot
+
+    fake_codex_home = tmp_path / "codex-home"
+    fake_codex_home.mkdir()
+    sessions_dir = fake_codex_home / "sessions"
+    sessions_dir.mkdir()
+
+    old = time.time() - 30 * 86400
+    for name in ("rollout-old-1.jsonl", "rollout-old-2.jsonl"):
+        p = sessions_dir / name
+        p.write_text("{}\n", encoding="utf-8")
+        _os.utime(p, (old, old))
+
+    for db_name in ("logs_2.sqlite", "state_5.sqlite"):
+        db_path = fake_codex_home / db_name
+        with sqlite3.connect(str(db_path)) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("CREATE TABLE IF NOT EXISTS t (i INTEGER)")
+            for i in range(20):
+                conn.execute("INSERT INTO t (i) VALUES (?)", (i,))
+            conn.commit()
+        _os.utime(db_path, (old, old))
+
+    monkeypatch.setenv("CODEX_HOME", str(fake_codex_home))
+    monkeypatch.setenv("CLADEX_CODEX_SESSIONS_MAX_AGE_DAYS", "14")
+    monkeypatch.setenv("CLADEX_CODEX_LOGS_VACUUM_DAYS", "1")
+
+    relay_bot._prune_codex_home_state()
+
+    remaining = list(sessions_dir.glob("*.jsonl"))
+    assert remaining == [], f"stale rollouts not pruned: {remaining}"
+
+    for db_name in ("logs_2.sqlite", "state_5.sqlite"):
+        db_path = fake_codex_home / db_name
+        assert db_path.exists()
+        with sqlite3.connect(str(db_path)) as conn:
+            count = conn.execute("SELECT COUNT(*) FROM t").fetchone()[0]
+            assert count == 20, f"{db_name} lost rows after VACUUM"

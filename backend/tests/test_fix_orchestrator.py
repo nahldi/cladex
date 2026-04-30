@@ -875,3 +875,39 @@ def test_discover_validation_commands_uses_existing_project_scripts(tmp_path: Pa
     assert any("npm run lint" in item for item in joined)
     assert any("npm run build" in item for item in joined)
     assert any("pytest" in item for item in joined)
+
+
+def test_restore_command_for_run_returns_placeholder_when_snapshot_pruned(tmp_path: Path) -> None:
+    """T1.7 regression: a fix run records its source backup id at start
+    time, but later `prune_backups()` calls (after subsequent backups, or
+    via `cladex doctor --gc`) can delete that backup before the operator
+    runs the restore command. Surfacing a command for an absent backup is
+    worse than surfacing nothing — the operator types a `cladex backup
+    restore <id>` that errors with "snapshot not found" and they don't
+    know the underlying backup was pruned. Emit a clearly-labeled
+    placeholder when the snapshot path no longer exists on disk."""
+    missing_snapshot = tmp_path / "snapshots" / "backup-deleted-by-gc"
+    run_with_pruned = {
+        "id": "fix-test",
+        "sourceBackup": {
+            "id": "backup-20260101-000000-deadbeef",
+            "snapshot": str(missing_snapshot),
+        },
+    }
+    cmd = fix_orchestrator.restore_command_for_run(run_with_pruned)
+    assert "pruned" in cmd.lower(), f"expected pruned-placeholder, got {cmd!r}"
+    assert "no automatic restore" in cmd.lower()
+    assert "cladex backup restore" not in cmd, "must NOT emit a runnable command for a pruned backup"
+
+    # Live snapshot path -> regular runnable command.
+    live_snapshot = tmp_path / "snapshots" / "backup-still-here"
+    live_snapshot.mkdir(parents=True)
+    run_with_live = {
+        "id": "fix-test",
+        "sourceBackup": {
+            "id": "backup-20260101-000000-cafef00d",
+            "snapshot": str(live_snapshot),
+        },
+    }
+    cmd_live = fix_orchestrator.restore_command_for_run(run_with_live)
+    assert cmd_live == "cladex backup restore backup-20260101-000000-cafef00d --confirm backup-20260101-000000-cafef00d"

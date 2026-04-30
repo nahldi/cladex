@@ -104,6 +104,8 @@ Review and fix subprocesses run with an isolated per-lane HOME directory so a pr
 
 The provider's actual credential home (CODEX_HOME / CLAUDE_CONFIG_DIR) is still passed through explicitly so the CLI can authenticate. Discord-driven reviewer/fix prompts can still walk into that directory through the read-only filesystem tools — treat the chosen `accountHome` as on-the-record state for the duration of the review or fix run, the same way you would treat `~/.codex/auth.json` if you ran `codex` in a directory under unknown-quality input. A future CLADEX release may broker provider auth through a low-privilege account home or sandbox deny rule; for now, do not point a CLADEX self-review or self-fix at an `accountHome` you would not trust the operator to read directly.
 
+Per-lane agent scratch workspaces are hardlinked to the base scratch by default for performance — copying the source for every concurrent lane is too slow at 50-lane review counts. Reviewer subprocesses run with the read-only sandbox (`--sandbox read-only` for Codex; `--allowedTools Read,Grep,Glob,LS` and `--disallowedTools Bash,Edit,MultiEdit,Write,NotebookEdit` for Claude), so the hardlink-shared inodes cannot be modified through the reviewer's tool surface. If a future surface allows write through to the lane scratch, set `CLADEX_REVIEW_AGENT_SCRATCH_MODE=copy` on the run to defeat the inode sharing — the per-lane disk cost goes up, but writes in one lane stop being visible in the others.
+
 ## Project Review swarm
 
 - Review jobs read project source and write artifacts only under the local CLADEX data directory.

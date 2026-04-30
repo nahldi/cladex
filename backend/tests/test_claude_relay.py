@@ -685,3 +685,61 @@ def test_claude_relay_stop_removes_stale_pid_without_killing(tmp_path: Path, mon
 
     assert killed == []
     assert not (state_dir / "relay.pid").exists()
+
+
+def test_append_operator_history_redacts_secret_shaped_values(tmp_path: Path, monkeypatch) -> None:
+    """T4.5 regression: a user pasting `MY_TOKEN=ghp_xxx` (or any secret-
+    shaped key=value, or a known token format like a Discord bot token)
+    into the operator chat must NOT land unredacted in the persisted
+    `operator-history.json` on disk. The handler now routes content
+    through `review_swarm.sanitize_text` which redacts known token
+    shapes and `KEY=value` lines where the key looks secret-ish."""
+    from types import SimpleNamespace
+    import claude_bot
+
+    state_path = tmp_path / "state"
+    state_path.mkdir()
+    history_path = state_path / "operator-history.json"
+
+    backend = SimpleNamespace(
+        current_worktree=str(tmp_path),
+        current_channel=None,
+        session_id=None,
+        configured_model=None,
+        effort=None,
+    )
+    bot = SimpleNamespace(
+        state_dir=state_path,
+        config=SimpleNamespace(workspace=tmp_path),
+        user=None,
+        _backend=backend,
+        _operator_history_path=history_path,
+        _status="ready",
+        _status_detail="",
+        _load_operator_history=lambda: [],
+    )
+    # Three real redactor paths:
+    #   1. Discord-token-shape (DISCORD_TOKEN_RE: 23-28 . 6-7 . 27-45 chars)
+    #   2. GitHub `ghp_*` (GITHUB_TOKEN_RE)
+    #   3. `api_key=value` style (SECRET_ASSIGNMENT_RE — `api_key` matches
+    #      a word boundary because the `_` is INSIDE the keyword token list)
+    discord_token = "MTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMg.ABCDEF.ZyxwvutsrqponmlkjihgfedcbaABCDEFGHI"
+    github_token = "ghp_supersecretvalue1234567890XX"
+    api_key = "k-private-real-secret-value-9999"
+    claude_bot.ClaudeRelayBot._append_operator_history(
+        bot,
+        role="user",
+        content=(
+            f"please run this:\n"
+            f"discord token: {discord_token}\n"
+            f"and {github_token}\n"
+            f"api_key={api_key}"
+        ),
+        channel_id="123",
+        sender_name="op",
+    )
+    persisted = history_path.read_text(encoding="utf-8")
+    assert github_token not in persisted, "GitHub token leaked unredacted"
+    assert discord_token not in persisted, "Discord token leaked unredacted"
+    assert api_key not in persisted, "api_key value leaked unredacted"
+    assert "REDACTED" in persisted, "sanitize_text should have inserted a [REDACTED] marker"
