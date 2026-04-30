@@ -4,6 +4,26 @@ All notable changes to CLADEX will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] — Hardening on top of 3.0.0
+
+Post-v3.0.0 fresh-eyes audit closeout. No version bump; pure hardening commits on `master`.
+
+### Added
+- `cladex doctor --gc` now prunes Codex relay-managed `CODEX_HOME` state for any profile whose relay is currently stopped: rotates `sessions/*.jsonl` by age + count, runs `PRAGMA wal_checkpoint(TRUNCATE)` on `logs_2.sqlite` and `state_5.sqlite`, and runs `VACUUM` if the db is older than `CLADEX_CODEX_LOGS_VACUUM_DAYS` (default 30). Operator can now reclaim a 368 MB unbounded `logs_2.sqlite` without restarting the relay. New JSON fields `codexHomePruned` and `codexHomeBytesRecovered`.
+- `cladex doctor --gc` log-file truncation now walks the per-relay state log dirs (`%LOCALAPPDATA%\discord-codex-relay\state\<ns>\` and the Claude equivalent) in addition to `%LOCALAPPDATA%\cladex\`. Closes a gap where 40+ MB of stale `relay.log` content was untouched.
+- `SECURITY.md` "Reviewer + fix-worker isolation" section now documents the agent-scratch hardlink trade-off and the `CLADEX_REVIEW_AGENT_SCRATCH_MODE=copy` opt-out.
+
+### Fixed
+- `backend/tests/conftest.py` now isolates `CLADEX_SECRETS_ROOT` to a session tempdir BEFORE any test code can import `secret_store`. Prior to this, every test pass through `secret_store.store_secret(...)` wrote permanent .bin files into the operator's real DPAPI store at `%LOCALAPPDATA%\cladex\secrets\`. Fix shipped with a one-shot cleanup of 2,371 already-leaked test blobs (the 7 real profile secrets were preserved).
+- `backend/bot.py` Discord-fatal-close-code handlers (4004 / 4013 / 4014) now raise `SystemExit(13) from exc` so the chained gateway exception is preserved in the traceback for `cladex logs` debugging — parity with `claude_bot.py`.
+- `src/App.tsx` `useEffect` for the dark-mode class no longer carries a dead `[isDark]` deps list (`isDark = true` is a constant in v3 — there is no toggle).
+
+### Tests
+- New `test_restore_command_for_run_returns_placeholder_when_snapshot_pruned` (T1.7 regression coverage).
+- New `test_append_operator_history_redacts_secret_shaped_values` (T4.5 regression coverage).
+- New `test_prune_codex_home_state_runs_wal_checkpoint_and_age_vacuum` (T2.4 regression coverage).
+- Backend pytest count: 445 → 448 (3 new regressions; 0 removed).
+
 ## [3.0.0] — 2026-04-30
 
 CLADEX 3.0.0 is the production-ready milestone after the 2.5.x audit-fix-ship loop closed every confirmed cross-cutting finding from the self-review swarm. The release also rolls in operator-flagged hardening (token-at-rest encryption, backup retention, stale-process detection) and the official-platform pattern fixes from a deep audit against Discord, Anthropic Claude Code, and OpenAI Codex CLI April 2026 guidance.

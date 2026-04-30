@@ -5,6 +5,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+import pytest
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 repo_root_text = str(REPO_ROOT)
@@ -34,3 +36,34 @@ os.environ.setdefault("CLADEX_REVIEW_SYNTHESIZER", "0")
 # Auto-cleaned on Python exit.
 _PYTEST_SECRETS_ROOT = tempfile.mkdtemp(prefix="cladex-pytest-secrets-")
 os.environ["CLADEX_SECRETS_ROOT"] = _PYTEST_SECRETS_ROOT
+
+
+@pytest.fixture(autouse=True)
+def _isolate_cladex_data_roots(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Sister-fix to the secret-store isolation above. The post-v3 audit
+    found that without this fixture, every test that calls
+    `review_swarm.create_source_backup(...)` or starts a review job
+    permanently writes into the operator's real
+    `%LOCALAPPDATA%\\cladex\\backups\\` and `\\reviews\\` directories.
+    Tests that explicitly want to inspect production roots can override
+    these in their own bodies; the default is always isolated.
+    """
+    fake_backups = tmp_path / "_cladex_backups"
+    fake_reviews = tmp_path / "_cladex_reviews"
+    fake_fix_runs = tmp_path / "_cladex_fix_runs"
+    fake_backups.mkdir()
+    fake_reviews.mkdir()
+    fake_fix_runs.mkdir()
+    try:
+        import review_swarm as _review_swarm
+
+        monkeypatch.setattr(_review_swarm, "BACKUP_DATA_ROOT", fake_backups, raising=False)
+        monkeypatch.setattr(_review_swarm, "REVIEW_DATA_ROOT", fake_reviews, raising=False)
+    except ImportError:
+        pass
+    try:
+        import fix_orchestrator as _fix_orchestrator
+
+        monkeypatch.setattr(_fix_orchestrator, "FIX_DATA_ROOT", fake_fix_runs, raising=False)
+    except ImportError:
+        pass
