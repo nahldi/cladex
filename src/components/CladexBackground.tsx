@@ -28,11 +28,31 @@ export default function CladexBackground({ isDark }: { isDark: boolean }) {
       return;
     }
 
+    const reducedMotionQuery =
+      typeof window.matchMedia === 'function'
+        ? window.matchMedia('(prefers-reduced-motion: reduce)')
+        : null;
+
     let frame = 0;
     let animationFrameId = 0;
     let particles: Particle[] = [];
+    let paused = false;
     const mouse = { x: -1000, y: -1000, vx: 0, vy: 0 };
     const lastMouse = { x: -1000, y: -1000 };
+
+    const paintStatic = () => {
+      ctx.fillStyle = isDark ? '#050505' : '#f2efe7';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      for (const particle of particles) {
+        ctx.beginPath();
+        ctx.arc(particle.x, particle.y, particle.size, 0, Math.PI * 2);
+        ctx.shadowBlur = 0;
+        ctx.globalAlpha = 0.32;
+        ctx.fillStyle = particle.color;
+        ctx.fill();
+      }
+      ctx.globalAlpha = 1;
+    };
 
     const particleCount = () => Math.min(84, Math.max(42, Math.floor(window.innerWidth / 22)));
 
@@ -54,6 +74,9 @@ export default function CladexBackground({ isDark }: { isDark: boolean }) {
       canvas.width = window.innerWidth;
       canvas.height = window.innerHeight;
       initParticles();
+      if (reducedMotionQuery?.matches) {
+        paintStatic();
+      }
     };
 
     const onMouseMove = (event: MouseEvent) => {
@@ -122,20 +145,78 @@ export default function CladexBackground({ isDark }: { isDark: boolean }) {
 
       ctx.globalAlpha = 1;
       ctx.shadowBlur = 0;
+      if (!paused) {
+        animationFrameId = window.requestAnimationFrame(animate);
+      }
+    };
+
+    const startLoop = () => {
+      if (animationFrameId !== 0) {
+        return;
+      }
+      paused = false;
       animationFrameId = window.requestAnimationFrame(animate);
     };
 
+    const stopLoop = () => {
+      paused = true;
+      if (animationFrameId !== 0) {
+        window.cancelAnimationFrame(animationFrameId);
+        animationFrameId = 0;
+      }
+    };
+
+    const onVisibilityChange = () => {
+      if (reducedMotionQuery?.matches) {
+        return;
+      }
+      if (document.visibilityState === 'hidden') {
+        stopLoop();
+      } else {
+        startLoop();
+      }
+    };
+
+    const applyMotionPreference = () => {
+      if (reducedMotionQuery?.matches) {
+        stopLoop();
+        paintStatic();
+      } else if (document.visibilityState !== 'hidden') {
+        startLoop();
+      }
+    };
+
+    const onReducedMotionChange = () => {
+      applyMotionPreference();
+    };
+
     resize();
-    animate();
+    applyMotionPreference();
     window.addEventListener('resize', resize);
     window.addEventListener('mousemove', onMouseMove);
     window.addEventListener('mouseleave', onMouseLeave);
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    if (reducedMotionQuery) {
+      if (typeof reducedMotionQuery.addEventListener === 'function') {
+        reducedMotionQuery.addEventListener('change', onReducedMotionChange);
+      } else if (typeof reducedMotionQuery.addListener === 'function') {
+        reducedMotionQuery.addListener(onReducedMotionChange);
+      }
+    }
 
     return () => {
-      window.cancelAnimationFrame(animationFrameId);
+      stopLoop();
       window.removeEventListener('resize', resize);
       window.removeEventListener('mousemove', onMouseMove);
       window.removeEventListener('mouseleave', onMouseLeave);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+      if (reducedMotionQuery) {
+        if (typeof reducedMotionQuery.removeEventListener === 'function') {
+          reducedMotionQuery.removeEventListener('change', onReducedMotionChange);
+        } else if (typeof reducedMotionQuery.removeListener === 'function') {
+          reducedMotionQuery.removeListener(onReducedMotionChange);
+        }
+      }
     };
   }, [isDark]);
 

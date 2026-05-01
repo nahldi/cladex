@@ -56,14 +56,28 @@ import base64
 import ctypes
 import hashlib
 import json
+import logging
 import os
 import re
 import secrets as _stdlib_secrets
 import sys
+import time
 from ctypes import wintypes
 from pathlib import Path
 
+try:
+    from relay_common import atomic_write_text as _relay_atomic_write_text
+except Exception:  # pragma: no cover - import-cycle / standalone use
+    _relay_atomic_write_text = None  # type: ignore[assignment]
+
+_LOG = logging.getLogger(__name__)
+
+SECRET_BLOB_SCHEMA_VERSION = 1
 SECRET_REF_PREFIX = "secret-ref:"
+
+
+class CorruptSecretBlobError(RuntimeError):
+    """Raised when a secret blob fails JSON parse or schema validation."""
 _SECRET_REF_RE = re.compile(r"^secret-ref:(?P<scheme>[a-z0-9]+):(?P<sid>[a-zA-Z0-9_\-]+)$")
 # Sensitive env keys that get auto-routed through the secret store.
 SENSITIVE_KEYS = frozenset(
@@ -92,10 +106,11 @@ def _secrets_root() -> Path:
         xdg = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
         base = Path(xdg) / "cladex" / "secrets"
     base.mkdir(parents=True, exist_ok=True)
-    try:
-        os.chmod(base, 0o700)
-    except OSError:
-        pass
+    if os.name != "nt":
+        try:
+            os.chmod(base, 0o700)
+        except OSError as exc:
+            _LOG.warning("secret_store: chmod 0o700 failed for %s: %s", base, exc)
     return base
 
 
@@ -221,13 +236,24 @@ def store_secret(value: str, *, profile_hint: str | None = None) -> str:
     else:
         body = base64.b64encode(payload).decode("ascii")
         scheme = "fs0600"
-    blob = {"v": 1, "scheme": scheme, "id": secret_id, "body": body}
+    blob = {
+        "v": SECRET_BLOB_SCHEMA_VERSION,
+        "schemaVersion": SECRET_BLOB_SCHEMA_VERSION,
+        "scheme": scheme,
+        "id": secret_id,
+        "body": body,
+    }
     blob_path = _secret_blob_path(secret_id)
-    blob_path.write_text(json.dumps(blob), encoding="utf-8")
-    try:
-        os.chmod(blob_path, 0o600)
-    except OSError:
-        pass
+    payload = json.dumps(blob)
+    if _relay_atomic_write_text is not None:
+        _relay_atomic_write_text(blob_path, payload)
+    else:
+        blob_path.write_text(payload, encoding="utf-8")
+    if os.name != "nt":
+        try:
+            os.chmod(blob_path, 0o600)
+        except OSError as exc:
+            _LOG.warning("secret_store: chmod 0o600 failed for %s: %s", blob_path, exc)
     return f"{SECRET_REF_PREFIX}{scheme}:{secret_id}"
 
 
@@ -254,7 +280,23 @@ def resolve_secret(reference: str) -> str:
             f"Secret blob missing for reference {reference!r} (looked at {blob_path}). "
             "The profile token must be re-entered."
         )
-    blob = json.loads(blob_path.read_text(encoding="utf-8"))
+    raw = blob_path.read_text(encoding="utf-8")
+    try:
+        blob = json.loads(raw)
+    except Exception as exc:
+        quarantine = blob_path.with_suffix(blob_path.suffix + f".corrupt-{int(time.time())}.bak")
+        try:
+            blob_path.replace(quarantine)
+        except OSError:
+            quarantine = blob_path
+        raise CorruptSecretBlobError(
+            f"Secret blob {blob_path} is unreadable; quarantined copy: {quarantine}"
+        ) from exc
+    blob_version = blob.get("schemaVersion", blob.get("v"))
+    if blob_version != SECRET_BLOB_SCHEMA_VERSION:
+        raise CorruptSecretBlobError(
+            f"Secret blob {blob_path} schemaVersion {blob_version!r} unsupported (expected {SECRET_BLOB_SCHEMA_VERSION})"
+        )
     body = base64.b64decode(blob["body"])
     if scheme == "dpapi":
         return _dpapi_unprotect(body, entropy=_entropy_for(secret_id)).decode("utf-8")
@@ -289,9 +331,15 @@ def delete_secret(reference: str) -> None:
     try:
         blob_path.unlink()
     except FileNotFoundError:
-        pass
-    except OSError:
-        pass
+        return
+    except OSError as exc:
+        _LOG.warning("secret_store: delete_secret failed for %s: %s; retrying once", blob_path, exc)
+        try:
+            blob_path.unlink()
+        except FileNotFoundError:
+            return
+        except OSError as retry_exc:
+            _LOG.warning("secret_store: delete_secret retry failed for %s: %s", blob_path, retry_exc)
 
 
 def materialize_env_secrets(env: dict[str, str]) -> dict[str, str]:

@@ -137,18 +137,32 @@ try {
   try {
     await act(async () => {
       mountedRoot.render(React.createElement(app.default));
-      await new Promise((resolve) => setTimeout(resolve, 50));
     });
-    assert.match(rootElement.textContent, /Unified Relay Network/);
-    assert.match(rootElement.textContent, /Review Swarm/);
-    assert.deepEqual([...new Set(requestedPaths)].sort(), [
+    const expectedPaths = [
       '/api/backups',
       '/api/fix-runs',
       '/api/profiles',
       '/api/projects',
       '/api/reviews',
       '/api/runtime-info',
-    ]);
+    ];
+    const pollDeadline = Date.now() + 5000;
+    while (Date.now() < pollDeadline) {
+      const seen = new Set(requestedPaths);
+      const ready =
+        /Unified Relay Network/.test(rootElement.textContent || '') &&
+        /Review Swarm/.test(rootElement.textContent || '') &&
+        expectedPaths.every((path) => seen.has(path));
+      if (ready) {
+        break;
+      }
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      });
+    }
+    assert.match(rootElement.textContent, /Unified Relay Network/);
+    assert.match(rootElement.textContent, /Review Swarm/);
+    assert.deepEqual([...new Set(requestedPaths)].sort(), expectedPaths);
   } finally {
     await act(async () => {
       mountedRoot.unmount();

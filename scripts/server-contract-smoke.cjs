@@ -314,27 +314,30 @@ async function main() {
     assert.ok(local.json.remoteAccessToken.length > 0);
     const token = local.json.remoteAccessToken;
 
-    // Origin: null is no longer treated as trusted loopback. Without a token
-    // the request is rejected by the /api access-token gate, even though CORS
-    // preflight is allowed so authenticated file/Electron renderers can work.
+    // Opaque origin (Origin: null — sandboxed iframe, data: URI, certain file:
+    // contexts) is rejected outright at the /api gate, regardless of token
+    // validity. Closes the security:F0005 attack: an opaque-origin page that
+    // somehow learned the token cannot fire mutating /api requests. CORS
+    // preflight still echoes the origin so authenticated SAME-origin
+    // renderers (Electron loopback) keep working — they do NOT send Origin:
+    // null because they are loaded from http://127.0.0.1:<port>.
     const opaqueNoToken = await request(port, {
       path: '/api/runtime-info',
       headers: { Origin: 'null' },
     });
-    assert.equal(opaqueNoToken.status, 401);
-    assert.equal(opaqueNoToken.json.authRequired, true);
+    assert.equal(opaqueNoToken.status, 403);
+    assert.equal(opaqueNoToken.json.error, 'Opaque origin not allowed');
     assert.equal(opaqueNoToken.headers['access-control-allow-origin'], 'null');
 
-    // Opaque origin with a valid token authenticates, but the runtime-info
-    // payload still withholds the remote access token because the request is
-    // not from a trusted loopback origin.
+    // Opaque origin with a valid token is ALSO rejected — the gate runs
+    // before the token check because token possession alone is not a
+    // sufficient signal of legitimate caller for opaque-origin requests.
     const opaqueWithToken = await request(port, {
       path: '/api/runtime-info',
       headers: { Origin: 'null', 'X-CLADEX-Access-Token': token },
     });
-    assert.equal(opaqueWithToken.status, 200);
-    assert.equal(opaqueWithToken.json.remoteAccessProtected, true);
-    assert.equal(opaqueWithToken.json.remoteAccessToken, undefined);
+    assert.equal(opaqueWithToken.status, 403);
+    assert.equal(opaqueWithToken.json.error, 'Opaque origin not allowed');
     assert.equal(opaqueWithToken.headers['access-control-allow-origin'], 'null');
 
     // A different localhost browser origin is allowed by CORS for local dev,
@@ -501,13 +504,16 @@ async function main() {
       assert.match(backup.json.id || '', /^backup-/);
     }
 
-    // Token gate denies opaque-origin access to the privileged listing route.
+    // Opaque-origin gate denies the privileged listing route outright (403)
+    // before the token check runs — closes security:F0005 attacker scenario
+    // where a sandboxed iframe / data: URI / file: page somehow obtains the
+    // remote token and tries to fire mutating /api requests.
     const opaqueProfilesNoToken = await request(port, {
       path: '/api/profiles',
       headers: { Origin: 'null' },
     });
-    assert.equal(opaqueProfilesNoToken.status, 401);
-    assert.equal(opaqueProfilesNoToken.json.authRequired, true);
+    assert.equal(opaqueProfilesNoToken.status, 403);
+    assert.equal(opaqueProfilesNoToken.json.error, 'Opaque origin not allowed');
 
     // Unknown /api routes return JSON 404 rather than the SPA fallback.
     const notFound = await request(port, { path: '/api/does-not-exist' });

@@ -1,6 +1,8 @@
 import argparse
 import asyncio
 import json
+import os
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -8,6 +10,42 @@ import pytest
 
 import claude_relay
 import secret_store
+
+
+def _import_claude_bot():
+    """Mirror test_bot_logic._load_bot_module: ensure required env vars are
+    present before importing claude_bot, and pop the prior cached module so
+    the import re-runs with the fixture env. Otherwise import order across
+    tests can cache claude_bot built from a different (or missing) env."""
+    import importlib
+
+    env_updates = {
+        "DISCORD_BOT_TOKEN": "test-token",
+        "CHANNEL_ID": "0",
+        "ALLOWED_CHANNEL_IDS": "",
+        "STATE_NAMESPACE": "test-claude-relay",
+    }
+    for key, value in env_updates.items():
+        os.environ.setdefault(key, value)
+    sys.modules.pop("claude_bot", None)
+    return importlib.import_module("claude_bot")
+
+
+@pytest.fixture(autouse=True)
+def _stabilize_claude_bot_import_env(monkeypatch):
+    """Per-test guarantee the env claude_bot needs at import time is present.
+
+    discord.Client is constructed at module import; without a token / channel id
+    in env the import order across the suite becomes order-dependent on Windows
+    CI. Set defaults and force re-import so tests get a fresh module each time.
+    """
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", os.environ.get("DISCORD_BOT_TOKEN", "test-token"))
+    monkeypatch.setenv("CHANNEL_ID", os.environ.get("CHANNEL_ID", "0"))
+    monkeypatch.setenv("ALLOWED_CHANNEL_IDS", os.environ.get("ALLOWED_CHANNEL_IDS", ""))
+    monkeypatch.setenv("STATE_NAMESPACE", os.environ.get("STATE_NAMESPACE", "test-claude-relay"))
+    sys.modules.pop("claude_bot", None)
+    yield
+    sys.modules.pop("claude_bot", None)
 
 
 def test_cmd_gui_delegates_to_cladex(monkeypatch) -> None:

@@ -250,17 +250,33 @@ def best_windows_shell() -> str | None:
 
 
 # File locking for config
+class ClaudeLockTimeoutError(RuntimeError):
+    """Raised when Windows file lock acquisition exceeds bounded deadline."""
+
+
+def _claude_lock_deadline_seconds() -> float:
+    raw = os.environ.get("CLADEX_RUNTIME_LOCK_TIMEOUT", "")
+    try:
+        value = float(raw) if raw else 30.0
+    except ValueError:
+        value = 30.0
+    return max(value, 1.0)
+
+
 def acquire_file_lock(path: Path) -> object:
     """Acquire exclusive file lock."""
     path.parent.mkdir(parents=True, exist_ok=True)
     handle = open(path, "a+b")
     try:
         if os.name == "nt":
+            deadline = time.monotonic() + _claude_lock_deadline_seconds()
             while True:
                 try:
-                    msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
                     break
                 except OSError:
+                    if time.monotonic() >= deadline:
+                        raise ClaudeLockTimeoutError(f"timed out acquiring lock for {path}")
                     time.sleep(0.05)
         else:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX)

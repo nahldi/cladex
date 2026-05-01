@@ -451,7 +451,11 @@ class CliResumeCodexBackend(CodexBackend):
         timeout_seconds = max(_safe_int(os.environ.get("CLADEX_CODEX_FALLBACK_TIMEOUT"), 600), 60)
         max_output_bytes = max(_safe_int(os.environ.get("CLADEX_CODEX_FALLBACK_MAX_OUTPUT_BYTES"), 8 * 1024 * 1024), 256 * 1024)
         loop = asyncio.get_event_loop()
-        deadline = loop.time() + timeout_seconds
+        # F0007: cap stdin-write timeout so a stalled child cannot drain the
+        # entire turn budget before any stdout-read deadline starts. Read
+        # deadline is (re)computed AFTER write completes so the read phase
+        # always gets the full timeout_seconds window.
+        write_timeout = max(1.0, min(60.0, float(timeout_seconds) / 4.0))
 
         async def _write_prompt() -> None:
             try:
@@ -464,12 +468,13 @@ class CliResumeCodexBackend(CodexBackend):
                 pass
 
         try:
-            await asyncio.wait_for(_write_prompt(), timeout=timeout_seconds)
+            await asyncio.wait_for(_write_prompt(), timeout=write_timeout)
         except asyncio.TimeoutError:
             await self._terminate_cli_process_tree(process)
             raise BackendUnavailableError(
-                f"Degraded Codex CLI fallback timed out while sending prompt after {timeout_seconds}s."
+                f"Degraded Codex CLI fallback timed out while sending prompt after {write_timeout:.0f}s."
             )
+        deadline = loop.time() + timeout_seconds
         chunks: list[bytes] = []
         bytes_read = 0
         truncated = False

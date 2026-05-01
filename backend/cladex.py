@@ -757,15 +757,27 @@ def _chat_with_profile(
         "channelId": str(channel_id or "").strip(),
         "senderName": sender_name.strip() or "Operator",
         "senderId": str(sender_id or "0").strip() or "0",
-        "createdAt": time.time(),
+        "createdAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
     relayctl.atomic_write_text(request_path, json.dumps(payload, indent=2))
     deadline = time.time() + timeout_seconds
     while time.time() < deadline:
         if response_path.exists():
             try:
-                response = json.loads(response_path.read_text(encoding="utf-8"))
-            finally:
+                raw_response = response_path.read_text(encoding="utf-8")
+                response = json.loads(raw_response)
+            except Exception as exc:
+                quarantine = response_path.with_suffix(
+                    response_path.suffix + f".corrupt-{int(time.time())}.bak"
+                )
+                try:
+                    response_path.replace(quarantine)
+                except OSError:
+                    quarantine = response_path
+                raise RuntimeError(
+                    f"Operator bridge response unreadable; quarantined to {quarantine}: {exc}"
+                ) from exc
+            else:
                 response_path.unlink(missing_ok=True)
             if not isinstance(response, dict):
                 raise RuntimeError("Operator bridge returned invalid data.")
@@ -1182,7 +1194,10 @@ def cmd_status(args: argparse.Namespace) -> int:
 def cmd_start(args: argparse.Namespace) -> int:
     profiles = _filter_profiles(name=args.name, relay_type=args.type)
     if not profiles:
-        print("No matching profiles found.")
+        if getattr(args, "json", False):
+            print(json.dumps({"ok": False, "error": "No matching profiles found."}))
+        else:
+            print("No matching profiles found.")
         return 1
     for profile in profiles:
         start_profile(profile)
@@ -1193,7 +1208,10 @@ def cmd_start(args: argparse.Namespace) -> int:
 def cmd_stop(args: argparse.Namespace) -> int:
     profiles = _filter_profiles(name=args.name, relay_type=args.type)
     if not profiles:
-        print("No matching profiles found.")
+        if getattr(args, "json", False):
+            print(json.dumps({"ok": False, "error": "No matching profiles found."}))
+        else:
+            print("No matching profiles found.")
         return 1
     for profile in profiles:
         stop_profile(profile)
@@ -1204,7 +1222,10 @@ def cmd_stop(args: argparse.Namespace) -> int:
 def cmd_restart(args: argparse.Namespace) -> int:
     profiles = _filter_profiles(name=args.name, relay_type=args.type)
     if not profiles:
-        print("No matching profiles found.")
+        if getattr(args, "json", False):
+            print(json.dumps({"ok": False, "error": "No matching profiles found."}))
+        else:
+            print("No matching profiles found.")
         return 1
     for profile in profiles:
         restart_profile(profile)
@@ -1215,7 +1236,10 @@ def cmd_restart(args: argparse.Namespace) -> int:
 def cmd_stop_all(args: argparse.Namespace) -> int:
     profiles = stop_all_profiles(relay_type=args.type)
     if not profiles:
-        print("No matching profiles found.")
+        if getattr(args, "json", False):
+            print(json.dumps({"ok": False, "error": "No matching profiles found."}))
+        else:
+            print("No matching profiles found.")
         return 1
     if getattr(args, "json", False):
         print(json.dumps({"stopped": [profile.get("name", "") for profile in profiles]}))
@@ -1227,7 +1251,10 @@ def cmd_stop_all(args: argparse.Namespace) -> int:
 def cmd_show(args: argparse.Namespace) -> int:
     profiles = _filter_profiles(name=args.name, relay_type=args.type)
     if not profiles:
-        print("No matching profiles found.")
+        if getattr(args, "json", False):
+            print(json.dumps({"ok": False, "error": "No matching profiles found."}))
+        else:
+            print("No matching profiles found.")
         return 1
     record = _profile_json_record(profiles[0])
     if getattr(args, "json", False):
@@ -1240,7 +1267,10 @@ def cmd_show(args: argparse.Namespace) -> int:
 def cmd_update(args: argparse.Namespace) -> int:
     profiles = _filter_profiles(name=args.name, relay_type=args.type)
     if not profiles:
-        print("No matching profiles found.")
+        if getattr(args, "json", False):
+            print(json.dumps({"ok": False, "error": "No matching profiles found."}))
+        else:
+            print("No matching profiles found.")
         return 1
     allow_dms: bool | None = None
     if getattr(args, "allow_dms", False):
@@ -1388,7 +1418,10 @@ def cmd_remove(args: argparse.Namespace) -> int:
         return 1
     profiles = _filter_profiles(name=args.name, relay_type=args.type)
     if not profiles:
-        print("No matching profiles found.")
+        if getattr(args, "json", False):
+            print(json.dumps({"ok": False, "error": "No matching profiles found."}))
+        else:
+            print("No matching profiles found.")
         return 1
     profile = profiles[0]
     relay_type = profile.get("_relay_type")
@@ -1405,7 +1438,10 @@ def cmd_remove(args: argparse.Namespace) -> int:
 def cmd_logs(args: argparse.Namespace) -> int:
     profiles = _filter_profiles(name=args.name, relay_type=args.type)
     if not profiles:
-        print("No matching profiles found.")
+        if getattr(args, "json", False):
+            print(json.dumps({"ok": False, "error": "No matching profiles found."}))
+        else:
+            print("No matching profiles found.")
         return 1
     profile = profiles[0]
     log_path = Path(str(profile.get("_log_path", "")).strip())
@@ -2251,7 +2287,10 @@ def _cmd_doctor_gc(args: argparse.Namespace) -> int:
 def cmd_chat(args: argparse.Namespace) -> int:
     profiles = _filter_profiles(name=args.name, relay_type=args.type)
     if not profiles:
-        print("No matching profiles found.")
+        if getattr(args, "json", False):
+            print(json.dumps({"ok": False, "error": "No matching profiles found."}))
+        else:
+            print("No matching profiles found.")
         return 1
     message = str(args.message or "").strip()
     message_file = str(getattr(args, "message_file", "") or "").strip()
@@ -2266,7 +2305,10 @@ def cmd_chat(args: argparse.Namespace) -> int:
                 print(error_payload["error"])
             return 1
     if not message:
-        print("message is required.")
+        if getattr(args, "json", False):
+            print(json.dumps({"ok": False, "error": "message is required."}))
+        else:
+            print("message is required.")
         return 1
     payload = _chat_with_profile(
         profiles[0],
@@ -2285,7 +2327,10 @@ def cmd_chat(args: argparse.Namespace) -> int:
 def cmd_chat_history(args: argparse.Namespace) -> int:
     profiles = _filter_profiles(name=args.name, relay_type=args.type)
     if not profiles:
-        print("No matching profiles found.")
+        if getattr(args, "json", False):
+            print(json.dumps({"ok": False, "error": "No matching profiles found."}))
+        else:
+            print("No matching profiles found.")
         return 1
     payload = {"messages": _read_operator_history(profiles[0])}
     if getattr(args, "json", False):

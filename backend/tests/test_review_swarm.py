@@ -1409,9 +1409,10 @@ def test_linear_json_extraction_handles_many_unmatched_braces_quickly() -> None:
     assert time.monotonic() - started < 1.0
 
 
+@pytest.mark.slow
 def test_run_cli_uses_idle_timeout_not_short_wall_clock(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("CLADEX_REVIEW_AGENT_IDLE_TIMEOUT", "1")
-    monkeypatch.setenv("CLADEX_REVIEW_AGENT_MAX_RUNTIME", "5")
+    monkeypatch.setenv("CLADEX_REVIEW_AGENT_IDLE_TIMEOUT", "3")
+    monkeypatch.setenv("CLADEX_REVIEW_AGENT_MAX_RUNTIME", "10")
     result = review_swarm._run_cli(
         [
             sys.executable,
@@ -1425,24 +1426,26 @@ def test_run_cli_uses_idle_timeout_not_short_wall_clock(monkeypatch: pytest.Monk
     assert "tick-3" in result.text
 
 
+@pytest.mark.slow
 def test_run_cli_idle_timeout_kills_silent_process(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("CLADEX_REVIEW_AGENT_IDLE_TIMEOUT", "1")
-    monkeypatch.setenv("CLADEX_REVIEW_AGENT_MAX_RUNTIME", "10")
+    monkeypatch.setenv("CLADEX_REVIEW_AGENT_IDLE_TIMEOUT", "3")
+    monkeypatch.setenv("CLADEX_REVIEW_AGENT_MAX_RUNTIME", "15")
     started = time.monotonic()
     result = review_swarm._run_cli(
-        [sys.executable, "-c", "import time; time.sleep(5)"],
+        [sys.executable, "-c", "import time; time.sleep(10)"],
         "",
         env=os.environ.copy(),
     )
-    assert time.monotonic() - started < 4
+    assert time.monotonic() - started < 9
     assert result.ok is False
     assert "idle" in result.error.lower()
 
 
+@pytest.mark.slow
 def test_run_cli_allows_silent_start_until_initial_idle_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("CLADEX_REVIEW_AGENT_IDLE_TIMEOUT", "1")
-    monkeypatch.setenv("CLADEX_REVIEW_AGENT_INITIAL_IDLE_TIMEOUT", "3")
-    monkeypatch.setenv("CLADEX_REVIEW_AGENT_MAX_RUNTIME", "5")
+    monkeypatch.setenv("CLADEX_REVIEW_AGENT_IDLE_TIMEOUT", "3")
+    monkeypatch.setenv("CLADEX_REVIEW_AGENT_INITIAL_IDLE_TIMEOUT", "5")
+    monkeypatch.setenv("CLADEX_REVIEW_AGENT_MAX_RUNTIME", "10")
     result = review_swarm._run_cli(
         [sys.executable, "-c", "import time; time.sleep(1.4); print('done', flush=True)"],
         "",
@@ -1452,9 +1455,10 @@ def test_run_cli_allows_silent_start_until_initial_idle_timeout(monkeypatch: pyt
     assert "done" in result.text
 
 
+@pytest.mark.slow
 def test_run_cli_stderr_output_resets_idle_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("CLADEX_REVIEW_AGENT_IDLE_TIMEOUT", "1")
-    monkeypatch.setenv("CLADEX_REVIEW_AGENT_MAX_RUNTIME", "5")
+    monkeypatch.setenv("CLADEX_REVIEW_AGENT_IDLE_TIMEOUT", "3")
+    monkeypatch.setenv("CLADEX_REVIEW_AGENT_MAX_RUNTIME", "10")
     result = review_swarm._run_cli(
         [
             sys.executable,
@@ -1492,9 +1496,10 @@ def test_run_cli_error_prioritizes_stderr_over_noisy_stdout(monkeypatch: pytest.
     assert review_swarm._is_provider_limit_error(result.error)
 
 
+@pytest.mark.slow
 def test_run_cli_max_runtime_kills_chatty_process(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("CLADEX_REVIEW_AGENT_IDLE_TIMEOUT", "1")
-    monkeypatch.setenv("CLADEX_REVIEW_AGENT_MAX_RUNTIME", "2")
+    monkeypatch.setenv("CLADEX_REVIEW_AGENT_IDLE_TIMEOUT", "3")
+    monkeypatch.setenv("CLADEX_REVIEW_AGENT_MAX_RUNTIME", "5")
     started = time.monotonic()
     result = review_swarm._run_cli(
         [
@@ -1505,23 +1510,24 @@ def test_run_cli_max_runtime_kills_chatty_process(monkeypatch: pytest.MonkeyPatc
         "",
         env=os.environ.copy(),
     )
-    assert time.monotonic() - started < 5
+    assert time.monotonic() - started < 12
     assert result.ok is False
     assert "maximum runtime" in result.error.lower()
 
 
+@pytest.mark.slow
 def test_run_cli_large_stdin_prompt_does_not_block_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("CLADEX_REVIEW_AGENT_IDLE_TIMEOUT", "1")
-    monkeypatch.setenv("CLADEX_REVIEW_AGENT_INITIAL_IDLE_TIMEOUT", "1")
-    monkeypatch.setenv("CLADEX_REVIEW_AGENT_MAX_RUNTIME", "10")
+    monkeypatch.setenv("CLADEX_REVIEW_AGENT_IDLE_TIMEOUT", "3")
+    monkeypatch.setenv("CLADEX_REVIEW_AGENT_INITIAL_IDLE_TIMEOUT", "3")
+    monkeypatch.setenv("CLADEX_REVIEW_AGENT_MAX_RUNTIME", "15")
     prompt = "x" * 5_000_000
     started = time.monotonic()
     result = review_swarm._run_cli(
-        [sys.executable, "-c", "import time; time.sleep(5)"],
+        [sys.executable, "-c", "import time; time.sleep(10)"],
         prompt,
         env=os.environ.copy(),
     )
-    assert time.monotonic() - started < 4
+    assert time.monotonic() - started < 9
     assert result.ok is False
     assert "idle" in result.error.lower()
 

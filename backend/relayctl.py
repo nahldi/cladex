@@ -39,6 +39,7 @@ from relay_common import (
     pid_exists,
     prepare_relay_codex_home,
     relay_codex_env,
+    _strip_relay_secrets,
     resolve_codex_bin,
     slugify,
     state_dir_for_namespace,
@@ -360,9 +361,12 @@ def _write_env_file(path: Path, env: dict[str, str]) -> None:
         pass
 
 
+REGISTRY_SCHEMA_VERSION = 1
+
+
 def _load_registry() -> dict:
     if not REGISTRY_PATH.exists():
-        return {"profiles": [], "projects": []}
+        return {"schemaVersion": REGISTRY_SCHEMA_VERSION, "profiles": [], "projects": []}
     try:
         registry = json.loads(REGISTRY_PATH.read_text(encoding="utf-8"))
     except Exception as exc:
@@ -372,12 +376,20 @@ def _load_registry() -> dict:
         except OSError:
             quarantine = REGISTRY_PATH
         raise RuntimeError(f"Profile registry is unreadable; quarantined copy: {quarantine}") from exc
+    if isinstance(registry, dict):
+        version = registry.get("schemaVersion")
+        if version is not None and version != REGISTRY_SCHEMA_VERSION:
+            raise RuntimeError(
+                f"Profile registry schemaVersion {version!r} is not supported (expected {REGISTRY_SCHEMA_VERSION})"
+            )
+    registry.setdefault("schemaVersion", REGISTRY_SCHEMA_VERSION)
     registry.setdefault("profiles", [])
     registry.setdefault("projects", [])
     return registry
 
 
 def _save_registry(registry: dict) -> None:
+    registry.setdefault("schemaVersion", REGISTRY_SCHEMA_VERSION)
     atomic_write_json(REGISTRY_PATH, registry)
 
 
@@ -1952,7 +1964,7 @@ def _launch_bot_worker(
     env_data = _load_env_file(env_file)
     env_data.setdefault("CODEX_WORKDIR", str(workspace))
     env = _normalized_profile_env(env_data)
-    child_base_env = os.environ.copy()
+    child_base_env = _strip_relay_secrets(os.environ.copy())
     child_base_env.update(env)
     child_env = relay_codex_env(workspace, child_base_env)
     child_env["ENV_FILE"] = str(env_file)
@@ -2018,7 +2030,7 @@ def _run_profile_foreground(profile: dict) -> int:
         runtime["auth_failure_marker_path"].unlink(missing_ok=True)
         runtime["ready_marker_path"].unlink(missing_ok=True)
 
-        child_base_env = os.environ.copy()
+        child_base_env = _strip_relay_secrets(os.environ.copy())
         child_base_env.update(env)
         child_env = relay_codex_env(workspace, child_base_env)
         child_env["ENV_FILE"] = profile["env_file"]
@@ -2062,7 +2074,7 @@ def _run_profile(profile: dict) -> int:
         if runtime["running"]:
             return 0
 
-        launch_base_env = os.environ.copy()
+        launch_base_env = _strip_relay_secrets(os.environ.copy())
         launch_base_env.update(env)
         launch_env = relay_codex_env(workspace, launch_base_env)
         launch_env["ENV_FILE"] = profile["env_file"]

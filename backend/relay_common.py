@@ -6,8 +6,10 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import psutil
@@ -92,16 +94,32 @@ def _relay_codex_home_lock_path(relay_home: Path) -> Path:
     return relay_home / ".config.lock"
 
 
+class _RelayLockTimeoutError(RuntimeError):
+    """Raised when bounded retry deadline elapses on Windows file lock."""
+
+
+def _file_lock_deadline_seconds() -> float:
+    raw = os.environ.get("CLADEX_RUNTIME_LOCK_TIMEOUT", "")
+    try:
+        value = float(raw) if raw else 30.0
+    except ValueError:
+        value = 30.0
+    return max(value, 1.0)
+
+
 def _acquire_file_lock(path: Path) -> object:
     path.parent.mkdir(parents=True, exist_ok=True)
     handle = open(path, "a+b")
     try:
         if os.name == "nt":
+            deadline = time.monotonic() + _file_lock_deadline_seconds()
             while True:
                 try:
-                    msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
                     break
                 except OSError:
+                    if time.monotonic() >= deadline:
+                        raise _RelayLockTimeoutError(f"timed out acquiring lock for {path}")
                     time.sleep(0.05)
         else:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
@@ -168,8 +186,68 @@ def atomic_write_json(path: Path, payload: object, *, indent: int = 2) -> None:
     atomic_write_text(path, json.dumps(payload, indent=indent) + "\n")
 
 
+def _prune_stale_replace_directory_siblings(destination: Path) -> None:
+    """Remove .bak-<pid>* siblings whose owning PID is gone.
+
+    A previous replace_directory() call from a now-dead PID may have
+    left a backup behind if the final rmtree raised (e.g. AV/indexer
+    held a handle). Without this sweep, each subsequent invocation
+    picks a fresh per-PID suffix and the orphaned tree never goes away.
+    """
+    parent = destination.parent
+    if not parent.exists():
+        return
+    prefix = f".{destination.name}.bak-"
+    current_pid = os.getpid()
+    try:
+        entries = list(parent.iterdir())
+    except OSError:
+        return
+    for entry in entries:
+        name = entry.name
+        if not name.startswith(prefix):
+            continue
+        suffix = name[len(prefix) :]
+        pid_part = suffix.split(".", 1)[0]
+        try:
+            owning_pid = int(pid_part)
+        except ValueError:
+            continue
+        if owning_pid == current_pid:
+            continue
+        if pid_exists(owning_pid):
+            continue
+        try:
+            shutil.rmtree(entry, ignore_errors=True)
+        except OSError:
+            continue
+
+
+def _quarantine_stuck_backup(backup_destination: Path, error: BaseException) -> None:
+    """Rename a backup we can't delete and emit a clear warning."""
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    stale_name = f"{backup_destination.name}.stale-{timestamp}"
+    stale_path = backup_destination.parent / stale_name
+    try:
+        os.replace(backup_destination, stale_path)
+        message = (
+            f"replace_directory: could not remove backup {backup_destination}; "
+            f"renamed to {stale_path}. Reason: {error!r}"
+        )
+    except OSError as rename_error:
+        message = (
+            f"replace_directory: could not remove or rename backup {backup_destination}. "
+            f"rmtree error: {error!r}; rename error: {rename_error!r}"
+        )
+    try:
+        print(message, file=sys.stderr, flush=True)
+    except Exception:
+        pass
+
+
 def replace_directory(source: Path, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
+    _prune_stale_replace_directory_siblings(destination)
     temp_destination = destination.parent / f".{destination.name}.tmp-{os.getpid()}"
     backup_destination = destination.parent / f".{destination.name}.bak-{os.getpid()}"
     if temp_destination.exists():
@@ -202,7 +280,29 @@ def replace_directory(source: Path, destination: Path) -> None:
                 pass
         raise
     if backup_destination.exists():
-        shutil.rmtree(backup_destination)
+        try:
+            shutil.rmtree(backup_destination)
+        except OSError as first_error:
+            # Something (indexer, AV, lingering handle) is holding a file.
+            # Retry once after a short pause; if still stuck, quarantine the
+            # backup with a timestamped name + warn so disk doesn't silently
+            # fill across repeated calls.
+            time.sleep(0.25)
+            try:
+                shutil.rmtree(backup_destination)
+            except OSError as second_error:
+                if backup_destination.exists():
+                    _quarantine_stuck_backup(backup_destination, second_error)
+                else:
+                    try:
+                        print(
+                            f"replace_directory: backup {backup_destination} cleared on retry "
+                            f"after initial error {first_error!r}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                    except Exception:
+                        pass
 
 
 def prune_directory_files(
@@ -395,11 +495,16 @@ def _strip_relay_secrets(env: dict[str, str]) -> dict[str, str]:
     """
     sanitized: dict[str, str] = {}
     suffix_blocked = ("_TOKEN", "_KEY", "_SECRET", "_PASSWORD", "_PRIVATE_KEY", "_CREDENTIALS")
+    # Compact-spelling variants without underscore separators (e.g. GITHUBTOKEN,
+    # APIKEY) the suffix-with-underscore check above misses.
+    compact_suffix_blocked = ("TOKEN", "APIKEY", "SECRET", "PASSWORD", "PRIVATEKEY", "CREDENTIALS")
     for key, value in env.items():
         upper = key.upper()
         if upper in _RELAY_CHILD_SECRET_KEYS:
             continue
         if any(upper.endswith(suffix) for suffix in suffix_blocked):
+            continue
+        if any(upper.endswith(suffix) and len(upper) > len(suffix) for suffix in compact_suffix_blocked):
             continue
         sanitized[key] = value
     return sanitized

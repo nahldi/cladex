@@ -6,6 +6,7 @@ import io
 import json
 import os
 import sys
+import traceback
 from pathlib import Path
 
 import cladex
@@ -106,7 +107,8 @@ def main() -> int:
     try:
         payload = _run_module(ns.target, list(ns.args))
     except Exception as exc:
-        payload = {"stdout": "", "stderr": str(exc), "code": 1}
+        tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        payload = {"stdout": "", "stderr": f"{exc}\n{tb}", "code": 1}
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(payload), encoding="utf-8")
     return 0

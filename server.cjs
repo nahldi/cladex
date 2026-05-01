@@ -183,12 +183,24 @@ function isValidFixRunId(value) {
   return /^fix-\d{8}-\d{6}-[a-f0-9]{8}$/.test(String(value || '').trim());
 }
 
+// Mirror backend slugify(): lowercase alphanumerics + hyphens, length 1..64.
+// Without this, a path-shaped or option-shaped id (e.g. "--workspace=/etc")
+// is forwarded to argparse as a positional arg, surfacing as 500 + raw
+// stderr instead of a clean 400.
+function isValidProfileId(value) {
+  return /^[a-z0-9-]{1,64}$/.test(String(value || '').trim());
+}
+
 function rejectInvalidReviewId(res, extra = {}) {
   res.status(400).json({ ...extra, error: 'invalid review id' });
 }
 
 function rejectInvalidFixRunId(res, extra = {}) {
   res.status(400).json({ ...extra, error: 'invalid fix run id' });
+}
+
+function rejectInvalidProfileId(res, extra = {}) {
+  res.status(400).json({ ...extra, error: 'invalid profile id' });
 }
 
 app.use((req, res, next) => {
@@ -225,6 +237,16 @@ app.use((req, res, next) => {
 });
 
 app.use('/api', (req, res, next) => {
+  // Opaque origin (sandboxed iframe, data: URI, certain file:// contexts)
+  // serializes Origin as the literal string "null". Once an attacker page
+  // learns the access token, an opaque-origin POST with the header set
+  // would otherwise pass the gate below. Refuse outright — legitimate
+  // CLADEX UI is loaded same-origin or from loopback.
+  const origin = String(req.headers.origin || '').trim();
+  if (origin === 'null') {
+    res.status(403).json({ error: 'Opaque origin not allowed' });
+    return;
+  }
   if (!requiresRemoteAccessToken(req) || hasValidRemoteAccessToken(req)) {
     next();
     return;
@@ -290,19 +312,26 @@ function getRemoteAccessToken() {
   return remoteAccessTokenCache;
 }
 
+function trustProxyHeaders() {
+  return String(process.env.CLADEX_TRUST_PROXY || '').trim() === '1';
+}
+
 function requestHost(req) {
-  const forwarded = String(req.headers['x-forwarded-host'] || '').trim();
-  if (forwarded) {
-    return forwarded.split(',')[0].trim().replace(/:\d+$/, '');
+  if (trustProxyHeaders()) {
+    const forwarded = String(req.headers['x-forwarded-host'] || '').trim();
+    if (forwarded) {
+      return forwarded.split(',')[0].trim().replace(/:\d+$/, '');
+    }
   }
   const raw = String(req.headers.host || '').trim();
   return raw.replace(/:\d+$/, '');
 }
 
 function requestBase(req) {
-  const forwardedProto = String(req.headers['x-forwarded-proto'] || '').trim();
+  const trust = trustProxyHeaders();
+  const forwardedProto = trust ? String(req.headers['x-forwarded-proto'] || '').trim() : '';
   const proto = (forwardedProto ? forwardedProto.split(',')[0].trim() : req.protocol || 'http') || 'http';
-  const forwardedHost = String(req.headers['x-forwarded-host'] || '').trim();
+  const forwardedHost = trust ? String(req.headers['x-forwarded-host'] || '').trim() : '';
   const host = (forwardedHost ? forwardedHost.split(',')[0].trim() : String(req.get('host') || '').trim())
     || `${API_HOST}:${API_PORT}`;
   return `${proto}://${host}`;
@@ -371,7 +400,26 @@ function requiresRemoteAccessToken(req) {
 
 function hasValidRemoteAccessToken(req) {
   const provided = String(req.headers['x-cladex-access-token'] || '').trim();
-  return Boolean(provided) && provided === getRemoteAccessToken();
+  if (!provided) {
+    return false;
+  }
+  const expected = String(getRemoteAccessToken() || '');
+  if (!expected) {
+    return false;
+  }
+  // Constant-time compare: V8 `===` short-circuits on first mismatching byte
+  // and leaks token contents byte-by-byte to remote callers once
+  // CLADEX_ALLOW_REMOTE_API=1. Pad to common length so length mismatch alone
+  // does not become a fast-reject oracle either.
+  const providedBuf = Buffer.from(provided, 'utf8');
+  const expectedBuf = Buffer.from(expected, 'utf8');
+  const len = Math.max(providedBuf.length, expectedBuf.length);
+  const a = Buffer.alloc(len);
+  const b = Buffer.alloc(len);
+  providedBuf.copy(a);
+  expectedBuf.copy(b);
+  const equal = crypto.timingSafeEqual(a, b);
+  return equal && providedBuf.length === expectedBuf.length;
 }
 
 function isBaseInterpreterCandidateHealthy(candidate) {
@@ -582,6 +630,8 @@ function writeBackendRuntimeManifest() {
 }
 
 let backendBootstrapPromise = null;
+let backendBootstrapStatus = 'pending';
+let backendBootstrapLastError = '';
 
 function backendBootstrapTimeoutMs() {
   const raw = String(process.env.CLADEX_BACKEND_BOOTSTRAP_TIMEOUT_MS || '').trim();
@@ -614,9 +664,13 @@ function bootstrapBackendRuntime() {
   const promise = (async () => {
     const managed = managedRuntimePythonPath();
     if (managed && fsSync.existsSync(managed) && !backendRuntimeNeedsRefresh(managed)) {
+      backendBootstrapStatus = 'ok';
+      backendBootstrapLastError = '';
       return managed;
     }
     if (process.env.CLADEX_SKIP_BACKEND_BOOTSTRAP === '1') {
+      backendBootstrapStatus = 'skipped';
+      backendBootstrapLastError = '';
       return managed && fsSync.existsSync(managed) ? managed : '';
     }
     const candidates = process.platform === 'win32'
@@ -631,6 +685,8 @@ function bootstrapBackendRuntime() {
           { cwd: BACKEND_DIR, windowsHide: true, timeout: backendBootstrapTimeoutMs() }
         );
         writeBackendRuntimeManifest();
+        backendBootstrapStatus = 'ok';
+        backendBootstrapLastError = '';
         return managed;
       } catch (err) {
         if (err && err.code === 'ENOENT') {
@@ -641,6 +697,11 @@ function bootstrapBackendRuntime() {
     }
     if (lastError) {
       console.warn(`CLADEX backend runtime bootstrap failed: ${lastError}`);
+      backendBootstrapStatus = 'bootstrap-failed';
+      backendBootstrapLastError = lastError;
+    } else {
+      backendBootstrapStatus = 'no-launcher';
+      backendBootstrapLastError = 'No system Python launcher found (py/python/python3).';
     }
     return '';
   })();
@@ -693,8 +754,60 @@ function apiRunnerErrorResult(err, outputError = null) {
   };
 }
 
+// On Windows, execFileAsync timeout sends SIGTERM but pythonw can survive
+// briefly while still holding the output file handle. A bare unlink races
+// with the dying child (ENOENT or EBUSY), so over many timeouts %TEMP%
+// accumulates cladex-api-*.json. Retry up to 3x spaced 250ms.
+async function unlinkApiRunnerOutputWithRetries(outputPath) {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      await fs.unlink(outputPath);
+      return;
+    } catch (err) {
+      if (err && err.code === 'ENOENT') {
+        return;
+      }
+      if (attempt === 2) {
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+  }
+}
+
+let apiRunnerStaleSweepDone = false;
+
+// Sweep stale cladex-api-*.json older than 1h on first runPython call.
+// Catches files that survived previous timeouts before retry-unlink shipped.
+async function sweepStaleApiRunnerOutputs() {
+  if (apiRunnerStaleSweepDone) {
+    return;
+  }
+  apiRunnerStaleSweepDone = true;
+  try {
+    const tmpDir = os.tmpdir();
+    const entries = await fs.readdir(tmpDir);
+    const cutoff = Date.now() - 60 * 60 * 1000;
+    let removed = 0;
+    for (const entry of entries) {
+      if (!/^cladex-api-\d+-[a-f0-9]+\.json$/i.test(entry)) continue;
+      const fullPath = path.join(tmpDir, entry);
+      try {
+        const stat = await fs.stat(fullPath);
+        if (stat.mtimeMs >= cutoff) continue;
+        await fs.unlink(fullPath);
+        removed += 1;
+      } catch {}
+    }
+    if (removed > 0) {
+      console.warn(`CLADEX api_runner stale-output sweep removed ${removed} file(s) from ${tmpDir}`);
+    }
+  } catch {}
+}
+
 async function runPython(args, cwd = BACKEND_DIR, extraEnv = {}, options = {}) {
   await bootstrapBackendRuntime();
+  await sweepStaleApiRunnerOutputs();
   const childEnv = { ...process.env, ...extraEnv };
   const platform = options.platform || process.platform;
   const execAsync = options.execFileAsync || execFileAsync;
@@ -721,7 +834,7 @@ async function runPython(args, cwd = BACKEND_DIR, extraEnv = {}, options = {}) {
           return apiRunnerErrorResult(err, outputError);
         }
       } finally {
-        await fs.unlink(outputPath).catch(() => undefined);
+        await unlinkApiRunnerOutputWithRetries(outputPath);
       }
     }
   }
@@ -960,7 +1073,11 @@ app.get('/api/runtime-info', async (req, res) => {
     packaged: process.env.NODE_ENV === 'production' || !!process.resourcesPath,
     appVersion: packageVersion(),
     remoteAccessProtected: true,
+    runtimeStatus: backendBootstrapStatus,
   };
+  if (backendBootstrapLastError) {
+    payload.runtimeDetail = backendBootstrapLastError;
+  }
   if (isLoopbackRequest(req)) {
     payload.remoteAccessToken = getRemoteAccessToken();
   }
@@ -1013,6 +1130,10 @@ app.get('/api/profiles', async (_req, res) => {
 });
 
 app.get('/api/profiles/:id', async (req, res) => {
+  if (!isValidProfileId(req.params.id)) {
+    rejectInvalidProfileId(res);
+    return;
+  }
   const relayType = String(req.query.type || '').trim().toLowerCase();
   if (relayType !== 'claude' && relayType !== 'codex') {
     res.status(400).json({ error: 'type must be claude or codex' });
@@ -1038,6 +1159,10 @@ app.get('/api/status', async (_req, res) => {
 });
 
 app.post('/api/profiles/:id/start', async (req, res) => {
+  if (!isValidProfileId(req.params.id)) {
+    rejectInvalidProfileId(res, { success: false });
+    return;
+  }
   const { id } = req.params;
   const relayType = String(req.body?.type || '').trim().toLowerCase();
   if (relayType !== 'claude' && relayType !== 'codex') {
@@ -1053,6 +1178,10 @@ app.post('/api/profiles/:id/start', async (req, res) => {
 });
 
 app.post('/api/profiles/:id/stop', async (req, res) => {
+  if (!isValidProfileId(req.params.id)) {
+    rejectInvalidProfileId(res, { success: false });
+    return;
+  }
   const { id } = req.params;
   const relayType = String(req.body?.type || '').trim().toLowerCase();
   if (relayType !== 'claude' && relayType !== 'codex') {
@@ -1068,6 +1197,10 @@ app.post('/api/profiles/:id/stop', async (req, res) => {
 });
 
 app.post('/api/profiles/:id/restart', async (req, res) => {
+  if (!isValidProfileId(req.params.id)) {
+    rejectInvalidProfileId(res, { success: false });
+    return;
+  }
   const { id } = req.params;
   const relayType = String(req.body?.type || '').trim().toLowerCase();
   if (relayType !== 'claude' && relayType !== 'codex') {
@@ -1083,6 +1216,10 @@ app.post('/api/profiles/:id/restart', async (req, res) => {
 });
 
 app.patch('/api/profiles/:id', async (req, res) => {
+  if (!isValidProfileId(req.params.id)) {
+    rejectInvalidProfileId(res, { success: false });
+    return;
+  }
   const { id } = req.params;
   const relayType = String(req.body?.type || '').trim().toLowerCase();
   if (relayType !== 'claude' && relayType !== 'codex') {
@@ -1094,6 +1231,7 @@ app.patch('/api/profiles/:id', async (req, res) => {
     res.status(400).json({ success: false, error: channelHistoryLimitInput.error });
     return;
   }
+  let canonicalWorkspace = '';
   if (Object.prototype.hasOwnProperty.call(req.body, 'workspace')) {
     const workspace = String(req.body?.workspace || '').trim();
     if (workspace) {
@@ -1104,29 +1242,71 @@ app.patch('/api/profiles/:id', async (req, res) => {
       }
       const allowedWorkspace = await ensureRemoteWorkspaceAllowed(req, res, workspace);
       if (!allowedWorkspace) return;
+      canonicalWorkspace = allowedWorkspace;
     }
   }
   // Same gate for codex_home / claude_config_dir on update — without this,
   // a remote client could rewrite an existing profile's account_home to an
   // arbitrary host path and (per F0036) silently expand the remote browse
   // roots through the next /api/profiles read.
+  let canonicalCodexHome = '';
   if (Object.prototype.hasOwnProperty.call(req.body, 'codexHome')) {
     const v = String(req.body?.codexHome || '').trim();
     if (v) {
       const allowed = await ensureRemoteWorkspaceAllowed(req, res, v);
       if (!allowed) return;
+      canonicalCodexHome = allowed;
     }
   }
+  let canonicalClaudeConfigDir = '';
   if (Object.prototype.hasOwnProperty.call(req.body, 'claudeConfigDir')) {
     const v = String(req.body?.claudeConfigDir || '').trim();
     if (v) {
       const allowed = await ensureRemoteWorkspaceAllowed(req, res, v);
       if (!allowed) return;
+      canonicalClaudeConfigDir = allowed;
     }
+  }
+  // Re-validate profileCreateAccessError against merged state. Without this,
+  // a sequence like create(allowDms=false, channelId=X) → patch(allowDms=true,
+  // allowedUserIds="") leaves a profile with allowDms=true and zero approved
+  // senders, bypassing the POST invariant.
+  try {
+    const existing = await findProfile(id, relayType);
+    if (existing) {
+      const mergedAllowDms = Object.prototype.hasOwnProperty.call(req.body, 'allowDms')
+        ? Boolean(req.body.allowDms)
+        : Boolean(existing.allowDms);
+      const mergedChannelId = Object.prototype.hasOwnProperty.call(req.body, 'channelId')
+        ? String(req.body.channelId || '').trim()
+        : String(existing.channelId || existing.allowedChannelId || '').trim();
+      const mergedOperatorIds = Object.prototype.hasOwnProperty.call(req.body, 'operatorIds')
+        ? String(req.body.operatorIds || '').trim()
+        : String(existing.operatorIds || (Array.isArray(existing.operators) ? existing.operators.join(',') : '') || '').trim();
+      const mergedAllowedUserIds = Object.prototype.hasOwnProperty.call(req.body, 'allowedUserIds')
+        ? String(req.body.allowedUserIds || '').trim()
+        : String(existing.allowedUserIds || (Array.isArray(existing.allowedUsers) ? existing.allowedUsers.join(',') : '') || '').trim();
+      const accessError = profileCreateAccessError({
+        relayType,
+        channelId: mergedChannelId,
+        allowDms: mergedAllowDms,
+        operatorIds: mergedOperatorIds,
+        allowedUserIds: mergedAllowedUserIds,
+      });
+      if (accessError) {
+        res.status(400).json({ success: false, error: accessError });
+        return;
+      }
+    }
+  } catch {
+    // findProfile failure shouldn't block update path; backend will surface
+    // its own error if id genuinely missing.
   }
   const args = ['cladex.py', 'update-profile', id, '--type', relayType, '--json'];
   const updateEnv = {};
-  if (Object.prototype.hasOwnProperty.call(req.body, 'workspace')) args.push('--workspace', String(req.body?.workspace || '').trim());
+  if (Object.prototype.hasOwnProperty.call(req.body, 'workspace')) {
+    args.push('--workspace', canonicalWorkspace || String(req.body?.workspace || '').trim());
+  }
   if (Object.prototype.hasOwnProperty.call(req.body, 'discordToken')) {
     const tokenValue = String(req.body?.discordToken || '').trim();
     if (tokenValue) {
@@ -1136,8 +1316,12 @@ app.patch('/api/profiles/:id', async (req, res) => {
   }
   if (Object.prototype.hasOwnProperty.call(req.body, 'botName')) args.push('--bot-name', String(req.body?.botName || '').trim());
   if (Object.prototype.hasOwnProperty.call(req.body, 'model')) args.push('--model', String(req.body?.model || '').trim());
-  if (Object.prototype.hasOwnProperty.call(req.body, 'codexHome')) args.push('--codex-home', String(req.body?.codexHome || '').trim());
-  if (Object.prototype.hasOwnProperty.call(req.body, 'claudeConfigDir')) args.push('--claude-config-dir', String(req.body?.claudeConfigDir || '').trim());
+  if (Object.prototype.hasOwnProperty.call(req.body, 'codexHome')) {
+    args.push('--codex-home', canonicalCodexHome || String(req.body?.codexHome || '').trim());
+  }
+  if (Object.prototype.hasOwnProperty.call(req.body, 'claudeConfigDir')) {
+    args.push('--claude-config-dir', canonicalClaudeConfigDir || String(req.body?.claudeConfigDir || '').trim());
+  }
   if (Object.prototype.hasOwnProperty.call(req.body, 'triggerMode')) args.push('--trigger-mode', String(req.body?.triggerMode || '').trim() || 'mention_or_dm');
   if (req.body?.allowDms === true) args.push('--allow-dms');
   if (req.body?.allowDms === false) args.push('--deny-dms');
@@ -1159,6 +1343,10 @@ app.patch('/api/profiles/:id', async (req, res) => {
 });
 
 app.delete('/api/profiles/:id', async (req, res) => {
+  if (!isValidProfileId(req.params.id)) {
+    rejectInvalidProfileId(res, { success: false });
+    return;
+  }
   const { id } = req.params;
   const relayType = String(req.query.type || '').trim().toLowerCase();
   if (relayType !== 'claude' && relayType !== 'codex') {
@@ -1174,6 +1362,10 @@ app.delete('/api/profiles/:id', async (req, res) => {
 });
 
 app.get('/api/profiles/:id/logs', async (req, res) => {
+  if (!isValidProfileId(req.params.id)) {
+    rejectInvalidProfileId(res);
+    return;
+  }
   const { id } = req.params;
   const relayType = String(req.query.type || '').trim().toLowerCase();
   if (relayType !== 'claude' && relayType !== 'codex') {
@@ -1199,6 +1391,10 @@ app.get('/api/profiles/:id/logs', async (req, res) => {
 });
 
 app.get('/api/profiles/:id/chat/history', async (req, res) => {
+  if (!isValidProfileId(req.params.id)) {
+    rejectInvalidProfileId(res);
+    return;
+  }
   const relayType = String(req.query.type || '').trim().toLowerCase();
   if (relayType !== 'claude' && relayType !== 'codex') {
     res.status(400).json({ error: 'type must be claude or codex' });
@@ -1212,6 +1408,10 @@ app.get('/api/profiles/:id/chat/history', async (req, res) => {
 });
 
 app.post('/api/profiles/:id/chat', async (req, res) => {
+  if (!isValidProfileId(req.params.id)) {
+    rejectInvalidProfileId(res, { success: false });
+    return;
+  }
   const relayType = String(req.body?.type || '').trim().toLowerCase();
   const message = String(req.body?.message || '').trim();
   if (relayType !== 'claude' && relayType !== 'codex') {
@@ -1299,16 +1499,24 @@ app.post('/api/profiles', async (req, res) => {
 
   const allowedWorkspace = await ensureRemoteWorkspaceAllowed(req, res, workspace);
   if (!allowedWorkspace) return;
+  let allowedCodexHomePath = '';
   if (codexHome) {
     const allowedCodexHome = await ensureRemoteWorkspaceAllowed(req, res, codexHome);
     if (!allowedCodexHome) return;
+    allowedCodexHomePath = allowedCodexHome;
   }
+  let allowedClaudeConfigDirPath = '';
   if (claudeConfigDir) {
     const allowedClaudeConfigDir = await ensureRemoteWorkspaceAllowed(req, res, claudeConfigDir);
     if (!allowedClaudeConfigDir) return;
+    allowedClaudeConfigDirPath = allowedClaudeConfigDir;
   }
 
-  const absoluteWorkspace = path.resolve(workspace);
+  // Forward the realpath returned by ensureRemoteWorkspaceAllowed instead of
+  // the raw body field. If we re-resolved with path.resolve(workspace) here
+  // and the Python subprocess re-resolves again, a symlink swap between
+  // those two resolves breaks containment (TOCTOU).
+  const absoluteWorkspace = allowedWorkspace;
   // Tokens flow through CLADEX_REGISTER_DISCORD_BOT_TOKEN so the secret never
   // appears in subprocess command lines (visible in tasklist/ps output).
   const tokenEnv = { CLADEX_REGISTER_DISCORD_BOT_TOKEN: discordToken };
@@ -1329,7 +1537,7 @@ app.post('/api/profiles', async (req, res) => {
       ...repeatedAllowedChannelArgs(channelId),
       ...(allowDms ? ['--allow-dms'] : []),
       ...(model ? ['--model', model] : []),
-      ...(codexHome ? ['--codex-home', codexHome] : []),
+      ...(allowedCodexHomePath ? ['--codex-home', allowedCodexHomePath] : []),
       ...(channelHistoryLimit ? ['--channel-history-limit', channelHistoryLimit] : []),
       ...(startupDmUserIds ? ['--startup-dm-user-ids', startupDmUserIds] : []),
       ...(startupDmText ? ['--startup-dm-text', startupDmText] : []),
@@ -1352,7 +1560,7 @@ app.post('/api/profiles', async (req, res) => {
       ...(channelId ? ['--allowed-channel-id', channelId] : []),
       ...(allowDms ? ['--allow-dms'] : []),
       ...(model ? ['--model', model] : []),
-      ...(claudeConfigDir ? ['--claude-config-dir', claudeConfigDir] : []),
+      ...(allowedClaudeConfigDirPath ? ['--claude-config-dir', allowedClaudeConfigDirPath] : []),
       ...(channelHistoryLimit ? ['--channel-history-limit', channelHistoryLimit] : []),
       ...(operatorIds ? ['--operator-ids', operatorIds] : []),
       ...(allowedUserIds ? ['--allowed-user-ids', allowedUserIds] : []),
@@ -1473,12 +1681,15 @@ app.post('/api/reviews/analyze', async (req, res) => {
   }
   const allowedWorkspace = await ensureRemoteWorkspaceAllowed(req, res, workspace);
   if (!allowedWorkspace) return;
+  // Forward canonical realpath, not raw body. path.resolve(workspace) here
+  // would re-resolve through any symlink that swapped between the
+  // ensureRemoteWorkspaceAllowed check and this point (TOCTOU).
   const args = [
     'cladex.py',
     'review',
     'analyze',
     '--workspace',
-    path.resolve(workspace),
+    allowedWorkspace,
     '--provider',
     provider,
     '--json',
@@ -1521,18 +1732,22 @@ app.post('/api/reviews', async (req, res) => {
   }
   const allowedWorkspace = await ensureRemoteWorkspaceAllowed(req, res, workspace);
   if (!allowedWorkspace) return;
+  let allowedAccountHomePath = '';
   if (accountHome) {
     const allowedAccountHome = await ensureRemoteWorkspaceAllowed(req, res, accountHome);
     if (!allowedAccountHome) return;
+    allowedAccountHomePath = allowedAccountHome;
   }
   const allowSelfReview = allowSelfReviewInput.value;
   const backupBeforeReview = backupBeforeReviewInput.value;
+  // Forward canonical realpath to subprocess to close TOCTOU window
+  // between ensureRemoteWorkspaceAllowed and the Python re-resolve.
   const args = [
     'cladex.py',
     'review',
     'start',
     '--workspace',
-    path.resolve(workspace),
+    allowedWorkspace,
     '--provider',
     provider,
     '--agents',
@@ -1540,7 +1755,7 @@ app.post('/api/reviews', async (req, res) => {
     '--json',
   ];
   if (title) args.push('--title', title);
-  if (accountHome) args.push('--account-home', accountHome);
+  if (allowedAccountHomePath) args.push('--account-home', allowedAccountHomePath);
   if (allowSelfReview) args.push('--allow-cladex-self-review');
   if (!backupBeforeReview) args.push('--no-backup');
   try {
@@ -1563,7 +1778,8 @@ app.post('/api/backups', async (req, res) => {
   const reason = String(req.body?.reason || 'manual').trim();
   const allowedWorkspace = await ensureRemoteWorkspaceAllowed(req, res, workspace);
   if (!allowedWorkspace) return;
-  const args = ['cladex.py', 'backup', 'create', '--workspace', path.resolve(workspace), '--reason', reason, '--json'];
+  // Forward canonical realpath, not raw body, to close TOCTOU window.
+  const args = ['cladex.py', 'backup', 'create', '--workspace', allowedWorkspace, '--reason', reason, '--json'];
   try {
     res.json(await runJson(args));
   } catch (err) {

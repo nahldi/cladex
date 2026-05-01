@@ -28,8 +28,21 @@ FIX_RUN_ID_RE = re.compile(r"^fix-\d{8}-\d{6}-[a-f0-9]{8}$")
 DEFAULT_FIX_MAX_AGENTS = 1
 MAX_FIX_AGENTS = 10
 VALIDATION_TIMEOUT_SECONDS = 600
-_TASK_STATE_LOCK = threading.Lock()
+# Per-run_id threading locks. File lock provides cross-process exclusion;
+# per-run threading locks only need to cover same-process same-run threads,
+# so unrelated run_ids never serialize against each other.
+_PER_RUN_LOCK_REGISTRY: dict[str, threading.Lock] = {}
+_PER_RUN_LOCK_REGISTRY_GUARD = threading.Lock()
 _STATE_LOCK_LOCAL = threading.local()
+
+
+def _thread_lock_for_run(run_id: str) -> threading.Lock:
+    with _PER_RUN_LOCK_REGISTRY_GUARD:
+        lock = _PER_RUN_LOCK_REGISTRY.get(run_id)
+        if lock is None:
+            lock = threading.Lock()
+            _PER_RUN_LOCK_REGISTRY[run_id] = lock
+        return lock
 TERMINAL_FIX_STATUSES = {"completed", "completed_with_warnings", "failed", "cancelled"}
 VALIDATION_COMMAND_IDS = {
     "npm:lint",
@@ -127,12 +140,14 @@ def _acquire_run_lock(run_id: str) -> bool:
     try:
         fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
     except FileExistsError:
+        existing = ""
         try:
             existing = lock_path.read_text(encoding="utf-8").strip()
             existing_pid = int(existing.split(":", 1)[0]) if existing else 0
         except Exception:
             existing_pid = 0
-        if existing_pid and existing_pid != os.getpid() and not _pid_alive(existing_pid):
+        # Treat 0-byte / unparseable / dead-pid lockfiles as stale.
+        if not existing or not existing_pid or existing_pid == os.getpid() or not _pid_alive(existing_pid):
             try:
                 lock_path.unlink()
             except OSError:
@@ -154,12 +169,13 @@ def _acquire_start_lock(review_id: str, *, wait_seconds: float = 8.0) -> bool:
         try:
             fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         except FileExistsError:
+            existing = ""
             try:
                 existing = lock_path.read_text(encoding="utf-8").strip()
                 existing_pid = int(existing.split(":", 1)[0]) if existing else 0
             except Exception:
                 existing_pid = 0
-            if existing_pid and existing_pid != os.getpid() and not _pid_alive(existing_pid):
+            if not existing or not existing_pid or existing_pid == os.getpid() or not _pid_alive(existing_pid):
                 try:
                     lock_path.unlink()
                 except OSError:
@@ -207,19 +223,20 @@ def _run_state_lock(run_id: str, *, wait_seconds: float = 8.0) -> Any:
         return
     deadline = time.monotonic() + wait_seconds
     lock_path = _state_lock_path(run_id)
-    with _TASK_STATE_LOCK:
+    with _thread_lock_for_run(run_id):
         while True:
             lock_path.parent.mkdir(parents=True, exist_ok=True)
             try:
                 fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
                 break
             except FileExistsError:
+                existing = ""
                 try:
                     existing = lock_path.read_text(encoding="utf-8").strip()
                     existing_pid = int(existing.split(":", 1)[0]) if existing else 0
                 except Exception:
                     existing_pid = 0
-                if existing_pid and existing_pid != os.getpid() and not _pid_alive(existing_pid):
+                if not existing or not existing_pid or existing_pid == os.getpid() or not _pid_alive(existing_pid):
                     try:
                         lock_path.unlink()
                         continue
@@ -853,6 +870,12 @@ def _progress(tasks: list[dict[str, Any]]) -> dict[str, int]:
 def _safe_phase_parallelism(tasks: list[dict[str, Any]], requested: int) -> int:
     # Fix workers share one writable workspace. Keep phases serialized until
     # CLADEX has per-task worktree isolation and a merge step.
+    # TODO(per-task-worktree-isolation): once each fix task runs in its own
+    # git worktree with a deterministic merge step, honor `requested`
+    # (validated by validate_max_agents) instead of forcing 1. Operator UI
+    # advertises maxAgents + planner produces recommendedAgentCount today,
+    # but this stub returns 1 unconditionally — that mismatch is intentional
+    # until the isolation work lands.
     return 1
 
 
@@ -883,8 +906,12 @@ def _blocked_phase_tasks(tasks: list[dict[str, Any]], phase: int) -> list[dict[s
 def _save_run_unlocked(run: dict[str, Any]) -> None:
     run["updatedAt"] = utc_now()
     run["progress"] = _progress(run.get("tasks", []))
-    _write_json(run_json_path(run["id"]), run)
+    # Write markdown FIRST (derived/regeneratable), JSON LAST (source of truth).
+    # If crash between, stale markdown matches stale JSON -- consistent. Otherwise
+    # JSON could advance to done=5 while markdown still shows done=4 -> _public_run
+    # surfaces inconsistent state to UI.
     _atomic_write_text(run_markdown_path(run["id"]), build_fix_run_markdown(run))
+    _write_json(run_json_path(run["id"]), run)
 
 
 def _merge_cancel_state(run: dict[str, Any]) -> None:

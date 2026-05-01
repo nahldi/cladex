@@ -40,6 +40,10 @@ REVIEW_DATA_ROOT = Path(user_data_dir("cladex", False)) / "reviews"
 BACKUP_DATA_ROOT = Path(user_data_dir("cladex", False)) / "backups"
 _ACTIVE_GLOBAL_LANE_LOCKS: set[str] = set()
 _ACTIVE_GLOBAL_LANE_LOCKS_GUARD = threading.Lock()
+# F0011: serialize restore_backup so an operator double-click cannot stack
+# two restores against the same backup id (their pre-restore snapshots
+# would race the prune retention path).
+_RESTORE_BACKUP_LOCK = threading.Lock()
 REVIEW_STRATEGY = "ai-review-swarm"
 REVIEW_ID_RE = re.compile(r"^review-\d{8}-\d{6}-[a-f0-9]{8}$")
 BACKUP_ID_RE = re.compile(r"^backup-\d{8}-\d{6}-[a-f0-9]{8}$")
@@ -363,7 +367,10 @@ def backup_snapshot_path(backup_id: str) -> Path:
 def _atomic_write_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
-    tmp.write_text(text, encoding="utf-8")
+    with open(tmp, "w", encoding="utf-8") as handle:
+        handle.write(text)
+        handle.flush()
+        os.fsync(handle.fileno())
     last_error: BaseException | None = None
     for attempt in range(5):
         try:
@@ -788,7 +795,13 @@ def cancel_review(job_id: str) -> dict[str, Any]:
     return show_review(job_id)
 
 
-def create_source_backup(workspace: str | Path, *, reason: str = "manual", source_job_id: str = "") -> dict[str, Any]:
+def create_source_backup(
+    workspace: str | Path,
+    *,
+    reason: str = "manual",
+    source_job_id: str = "",
+    skip_prune: bool = False,
+) -> dict[str, Any]:
     source = Path(workspace).expanduser().resolve()
     if not source.exists() or not source.is_dir():
         raise ValueError(f"workspace does not exist or is not a directory: {source}")
@@ -812,9 +825,11 @@ def create_source_backup(workspace: str | Path, *, reason: str = "manual", sourc
     # state). Tunable via env knobs; defaults keep the most recent
     # snapshots PER WORKSPACE so a multi-workspace setup doesn't lose
     # one workspace's history because another is busy.
-    # CLADEX_BACKUP_SKIP_PRUNE=1 suppresses prune for this call (used by
-    # restore_backup so the in-flight restore source is never pruned).
-    if str(os.environ.get("CLADEX_BACKUP_SKIP_PRUNE", "")).strip().lower() not in {"1", "true", "yes"}:
+    # F0011: explicit skip_prune kwarg is the preferred path (race-free
+    # under concurrent restore_backup calls). CLADEX_BACKUP_SKIP_PRUNE=1
+    # remains as a back-compat shim for callers that still set the env.
+    env_skip = str(os.environ.get("CLADEX_BACKUP_SKIP_PRUNE", "")).strip().lower() in {"1", "true", "yes"}
+    if not (skip_prune or env_skip):
         try:
             prune_backups()
         except Exception:
@@ -968,41 +983,41 @@ def _skip_from_snapshot_or_restore(name: str) -> bool:
 def restore_backup(backup_id: str, *, confirm: str) -> dict[str, Any]:
     if confirm != backup_id:
         raise ValueError("restore requires --confirm with the exact backup id")
-    backup = load_backup(backup_id)
-    snapshot = Path(str(backup.get("snapshot", ""))).expanduser().resolve()
-    target = Path(str(backup.get("workspace", ""))).expanduser().resolve()
-    if not snapshot.exists() or not snapshot.is_dir():
-        raise ValueError(f"backup snapshot is missing: {snapshot}")
-    if not target.exists() or not target.is_dir():
-        raise ValueError(f"restore target is missing: {target}")
+    # F0011: serialize the restore path. Two concurrent restores (operator
+    # double-click, retried CLI invocation) would stack pre-restore
+    # snapshots whose env-var suppression races: the second's
+    # create_source_backup could see the first's finally-popped flag and
+    # call prune_backups, deleting the just-created pre-restore snapshot
+    # before _restore_snapshot_into_target reads it.
+    with _RESTORE_BACKUP_LOCK:
+        backup = load_backup(backup_id)
+        snapshot = Path(str(backup.get("snapshot", ""))).expanduser().resolve()
+        target = Path(str(backup.get("workspace", ""))).expanduser().resolve()
+        if not snapshot.exists() or not snapshot.is_dir():
+            raise ValueError(f"backup snapshot is missing: {snapshot}")
+        if not target.exists() or not target.is_dir():
+            raise ValueError(f"restore target is missing: {target}")
 
-    # Suppress automatic prune during the pre-restore backup. F0007 audit
-    # finding: `create_source_backup` always calls `prune_backups()`,
-    # whose retention path could delete the backup we are about to
-    # restore from before `_restore_snapshot_into_target` reads it.
-    # Inline the suppression via the env knob so the same code path is
-    # used for all backup creation (no duplicate snapshot logic).
-    prior_skip = os.environ.get("CLADEX_BACKUP_SKIP_PRUNE")
-    os.environ["CLADEX_BACKUP_SKIP_PRUNE"] = "1"
-    try:
-        pre_restore = create_source_backup(target, reason=f"pre-restore:{backup_id}")
-    finally:
-        if prior_skip is None:
-            os.environ.pop("CLADEX_BACKUP_SKIP_PRUNE", None)
-        else:
-            os.environ["CLADEX_BACKUP_SKIP_PRUNE"] = prior_skip
-    try:
-        _restore_snapshot_into_target(snapshot, target)
-    except Exception:
-        rollback_snapshot = Path(str(pre_restore.get("snapshot", ""))).expanduser().resolve()
-        if rollback_snapshot.exists() and rollback_snapshot.is_dir():
-            _restore_snapshot_into_target(rollback_snapshot, target)
-        raise
+        # Use the explicit skip_prune kwarg (race-free) instead of the
+        # process-global env var. The env var remains as a back-compat
+        # shim for callers outside this function.
+        pre_restore = create_source_backup(
+            target,
+            reason=f"pre-restore:{backup_id}",
+            skip_prune=True,
+        )
+        try:
+            _restore_snapshot_into_target(snapshot, target)
+        except Exception:
+            rollback_snapshot = Path(str(pre_restore.get("snapshot", ""))).expanduser().resolve()
+            if rollback_snapshot.exists() and rollback_snapshot.is_dir():
+                _restore_snapshot_into_target(rollback_snapshot, target)
+            raise
 
-    restored = dict(backup)
-    restored["restoredAt"] = utc_now()
-    restored["preRestoreBackupId"] = pre_restore["id"]
-    return restored
+        restored = dict(backup)
+        restored["restoredAt"] = utc_now()
+        restored["preRestoreBackupId"] = pre_restore["id"]
+        return restored
 
 
 def _restore_snapshot_into_target(snapshot: Path, target: Path) -> None:
@@ -3010,6 +3025,21 @@ def _global_lane_lock_stale(path: Path) -> bool:
         age_seconds = time.time() - path.stat().st_mtime
     except OSError:
         return False
+    # F0005: PID-recycle false positives can strand a slot for the full
+    # 12h window. Trust the in-process active-tracker for OUR pid, but
+    # for foreign-pid slots that LOOK alive we must guard against the OS
+    # having recycled the pid number to an unrelated process. If the slot
+    # is older than the foreign-pid threshold (default 1h) treat it as
+    # stale even when the pid still resolves — a real lane never holds a
+    # slot that long. Operators can tune via
+    # CLADEX_GLOBAL_LANE_FOREIGN_STALE_SECONDS.
+    foreign_stale_seconds = _safe_int(
+        os.environ.get("CLADEX_GLOBAL_LANE_FOREIGN_STALE_SECONDS"),
+        60 * 60,
+    )
+    foreign_stale_seconds = max(foreign_stale_seconds, 60)
+    if pid and pid != os.getpid() and age_seconds > foreign_stale_seconds:
+        return True
     return age_seconds > 12 * 60 * 60
 
 

@@ -24,6 +24,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import psutil
@@ -146,14 +147,35 @@ def _write_env_file(path: Path, env: dict[str, str]) -> None:
         pass
 
 
+CLAUDE_REGISTRY_SCHEMA_VERSION = 1
+
+
+class CorruptClaudeRegistryError(RuntimeError):
+    """Raised when claude_relay registry JSON is unreadable; quarantined copy attached."""
+
+
 def _load_registry() -> dict:
     """Load workspace registry."""
     if not REGISTRY_PATH.exists():
-        return {"profiles": [], "projects": []}
+        return {"schemaVersion": CLAUDE_REGISTRY_SCHEMA_VERSION, "profiles": [], "projects": []}
     try:
         registry = json.loads(REGISTRY_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        return {"profiles": [], "projects": []}
+    except Exception as exc:
+        quarantine = REGISTRY_PATH.with_suffix(REGISTRY_PATH.suffix + f".corrupt-{int(time.time())}.bak")
+        try:
+            shutil.copy2(REGISTRY_PATH, quarantine)
+        except OSError:
+            quarantine = REGISTRY_PATH
+        raise CorruptClaudeRegistryError(
+            f"Claude relay registry is unreadable; quarantined copy: {quarantine}"
+        ) from exc
+    if isinstance(registry, dict):
+        version = registry.get("schemaVersion")
+        if version is not None and version != CLAUDE_REGISTRY_SCHEMA_VERSION:
+            raise CorruptClaudeRegistryError(
+                f"Claude relay registry schemaVersion {version!r} is not supported (expected {CLAUDE_REGISTRY_SCHEMA_VERSION})"
+            )
+    registry.setdefault("schemaVersion", CLAUDE_REGISTRY_SCHEMA_VERSION)
     registry.setdefault("profiles", [])
     registry.setdefault("projects", [])
     return registry
@@ -161,6 +183,7 @@ def _load_registry() -> dict:
 
 def _save_registry(registry: dict) -> None:
     """Save workspace registry."""
+    registry.setdefault("schemaVersion", CLAUDE_REGISTRY_SCHEMA_VERSION)
     atomic_write_json(REGISTRY_PATH, registry)
 
 
@@ -710,6 +733,16 @@ def cmd_run(args: argparse.Namespace) -> int:
     # Run the Python bot
     bot_module = Path(__file__).parent / "claude_bot.py"
 
+    # Supervisor PID file. cmd_run is the parent process that spawned
+    # claude_bot.py via subprocess.Popen. claude_bot.py writes its own
+    # `relay.pid` once it starts up, but if cmd_run dies (KeyboardInterrupt,
+    # OOM, parent terminal closed) BEFORE the bot has a chance to register —
+    # or if the bot itself crashes between Popen and pid-file write — the
+    # child process and any grandchildren (the actual `claude` CLI launched
+    # via asyncio.create_subprocess_exec) leak with no handle to clean
+    # them up. Persist the supervisor pid so cmd_stop / external operators
+    # can locate and reap the entire tree even when relay.pid is missing.
+    supervisor_pid_file = state_dir / ".supervisor.pid"
     process: subprocess.Popen | None = None
     try:
         with open(log_file, "a") as log:
@@ -721,12 +754,34 @@ def cmd_run(args: argparse.Namespace) -> int:
                 cwd=str(workspace),
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
             )
+            try:
+                supervisor_pid_file.write_text(str(process.pid), encoding="utf-8")
+            except OSError:
+                # Best-effort — proceed even if state_dir is read-only.
+                pass
             process.wait()
             return process.returncode or 0
     except KeyboardInterrupt:
         print("\nStopping relay...")
-        if process is not None and process.poll() is None:
-            terminate_process_tree(process.pid)
+    finally:
+        # Always reap the bot subtree — Popen pid plus every descendant
+        # (claude CLI, node child processes) walked by psutil's
+        # children(recursive=True). Without this `finally`, an exception
+        # path between Popen and process.wait() returning leaves orphans.
+        if process is not None:
+            try:
+                still_alive = process.poll() is None
+            except Exception:
+                still_alive = True
+            if still_alive:
+                try:
+                    terminate_process_tree(process.pid)
+                except Exception:
+                    pass
+        try:
+            supervisor_pid_file.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     return 0
 

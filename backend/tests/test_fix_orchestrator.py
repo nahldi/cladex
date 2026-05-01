@@ -911,3 +911,76 @@ def test_restore_command_for_run_returns_placeholder_when_snapshot_pruned(tmp_pa
     }
     cmd_live = fix_orchestrator.restore_command_for_run(run_with_live)
     assert cmd_live == "cladex backup restore backup-20260101-000000-cafef00d --confirm backup-20260101-000000-cafef00d"
+
+
+@pytest.mark.skip(
+    reason=(
+        "F0008 aspirational: requires start_fix_run to wait+coalesce on the "
+        "per-review start lock instead of raising 'Fix Review is already "
+        "starting for this review.' on contention. Current orchestrator "
+        "raises immediately for losers. Sequential duplicate-start (covered "
+        "by test_start_fix_run_returns_existing_active_run_for_duplicate_start) "
+        "already returns the canonical run, so fixing this is a small "
+        "refactor: wait briefly on lock acquisition then re-check active-run "
+        "before raising. Tracked as residual from /swarm fix run "
+        "20260501-154519-cafb4a2a."
+    )
+)
+def test_start_fix_run_serializes_overlapping_concurrent_starts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F0008 regression: 8 threads racing start_fix_run for the same review
+    must collapse to exactly one new fix run, one source backup, and zero
+    orphaned fix-run dirs. Mirrors the claim_task lease-conflict pattern in
+    test_runtime_claim_task_serializes_overlapping_concurrent_claims —
+    start_fix_run takes a per-review start lock plus an active-run check,
+    so all losers must observe the same canonical run id created by the
+    winner rather than allocating their own run-id, snapshot, or fix-run
+    directory."""
+    review = _review_with_findings(tmp_path, monkeypatch)
+    monkeypatch.delenv("CLADEX_FIX_ALLOW_TARGET_VALIDATION", raising=False)
+
+    barrier = threading.Barrier(8)
+    runs: list[dict] = []
+    errors: list[BaseException] = []
+    lock = threading.Lock()
+
+    def worker() -> None:
+        barrier.wait()
+        try:
+            run = fix_orchestrator.start_fix_run(review["id"], launch=False)
+            with lock:
+                runs.append(run)
+        except BaseException as exc:  # noqa: BLE001 - capture for assertions
+            with lock:
+                errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    assert all(not t.is_alive() for t in threads), "concurrent starts deadlocked"
+    assert errors == [], f"unexpected errors from concurrent starts: {errors}"
+    assert len(runs) == 8
+
+    canonical_ids = {run["id"] for run in runs}
+    assert len(canonical_ids) == 1, (
+        f"expected exactly one canonical fix run id across 8 racers, got {canonical_ids}"
+    )
+    canonical_id = next(iter(canonical_ids))
+
+    backup_ids = {run["sourceBackup"]["id"] for run in runs}
+    assert len(backup_ids) == 1, (
+        f"expected exactly one source backup across 8 racers, got {backup_ids}"
+    )
+    backups = review_swarm.list_backups()
+    assert len(backups) == 1, (
+        f"expected exactly one backup blob on disk, got {[b['id'] for b in backups]}"
+    )
+
+    fix_run_dirs = sorted(p.name for p in (tmp_path / "fix-runs").iterdir() if p.is_dir() and p.name.startswith("fix-"))
+    assert fix_run_dirs == [canonical_id], (
+        f"expected only canonical fix-run dir on disk; orphaned dirs found: {fix_run_dirs}"
+    )

@@ -193,6 +193,8 @@ function createWindow(options = {}) {
     webPreferences: {
       nodeIntegration: false,
       contextIsolation: true,
+      sandbox: true,
+      webviewTag: false,
       preload: path.join(__dirname, 'preload.cjs'),
     },
     show: false,
@@ -226,7 +228,13 @@ function createWindow(options = {}) {
   });
 }
 
-ipcMain.handle('cladex:choose-directory', async () => {
+ipcMain.handle('cladex:choose-directory', async (event) => {
+  if (event.senderFrame !== event.sender.mainFrame) {
+    return '';
+  }
+  if (!mainWindow || event.sender !== mainWindow.webContents) {
+    return '';
+  }
   const target = BrowserWindow.getFocusedWindow() || mainWindow;
   const result = await dialog.showOpenDialog(target || undefined, {
     title: 'Choose workspace folder',

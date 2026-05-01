@@ -312,18 +312,49 @@ class ClaudeSession:
         self.last_success_at: str | None = None
         self._load_session()
 
+    SESSION_SCHEMA_VERSION = 1
+
     def _load_session(self) -> None:
         if self.session_file.exists():
             try:
-                data = json.loads(self.session_file.read_text(encoding="utf-8"))
-                self.session_id = data.get("session_id")
-                self.initialized = bool(data.get("initialized", False))
-                self.created_at = data.get("created_at")
-                self.last_success_at = data.get("last_success_at")
+                raw = self.session_file.read_text(encoding="utf-8")
+                data = json.loads(raw)
             except Exception as exc:
-                logger.warning("Failed to load Claude session file: %s", exc)
+                quarantine = self.session_file.with_suffix(
+                    self.session_file.suffix + f".corrupt-{int(time.time())}.bak"
+                )
+                try:
+                    self.session_file.replace(quarantine)
+                except OSError:
+                    quarantine = self.session_file
+                logger.warning(
+                    "Claude session file unreadable; quarantined to %s: %s", quarantine, exc
+                )
                 self.session_id = None
                 self.initialized = False
+            else:
+                version = data.get("schemaVersion") if isinstance(data, dict) else None
+                if version is not None and version != self.SESSION_SCHEMA_VERSION:
+                    quarantine = self.session_file.with_suffix(
+                        self.session_file.suffix + f".corrupt-{int(time.time())}.bak"
+                    )
+                    try:
+                        self.session_file.replace(quarantine)
+                    except OSError:
+                        quarantine = self.session_file
+                    logger.warning(
+                        "Claude session schemaVersion %r unsupported (expected %d); quarantined to %s",
+                        version,
+                        self.SESSION_SCHEMA_VERSION,
+                        quarantine,
+                    )
+                    self.session_id = None
+                    self.initialized = False
+                else:
+                    self.session_id = data.get("session_id")
+                    self.initialized = bool(data.get("initialized", False))
+                    self.created_at = data.get("created_at")
+                    self.last_success_at = data.get("last_success_at")
 
         if not self.session_id:
             self.reset()
@@ -331,6 +362,7 @@ class ClaudeSession:
     def _save(self) -> None:
         self.state_dir.mkdir(parents=True, exist_ok=True)
         payload = {
+            "schemaVersion": self.SESSION_SCHEMA_VERSION,
             "session_id": self.session_id,
             "workspace": str(self.workspace),
             "initialized": self.initialized,

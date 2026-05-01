@@ -45,6 +45,19 @@ def _thread_lock_for(path: Path) -> threading.Lock:
         return lock
 
 
+class LockTimeoutError(RuntimeError):
+    """Raised when a path-serialization lock cannot be acquired in time."""
+
+
+def _runtime_lock_timeout_seconds() -> float:
+    raw = os.environ.get("CLADEX_RUNTIME_LOCK_TIMEOUT", "")
+    try:
+        value = float(raw) if raw else 30.0
+    except ValueError:
+        value = 30.0
+    return max(value, 1.0)
+
+
 @contextlib.contextmanager
 def _serialize_path(path: Path):
     """Serialize read-modify-write of ``path`` across threads and processes."""
@@ -56,12 +69,15 @@ def _serialize_path(path: Path):
         lock_path = path.parent / f".{path.name}.lock"
         handle = open(lock_path, "a+b")
         if os.name == "nt":
+            deadline = time.monotonic() + _runtime_lock_timeout_seconds()
             while True:
                 try:
                     handle.seek(0)
-                    msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
                     break
                 except OSError:
+                    if time.monotonic() >= deadline:
+                        raise LockTimeoutError(f"timed out acquiring lock for {path}")
                     time.sleep(0.05)
         else:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
@@ -203,6 +219,8 @@ def _prune_markdown_history(path: Path, title: str, *, keep_entries: int, max_ch
 
 
 def _prune_markdown_history_locked(path: Path, title: str, *, keep_entries: int, max_chars: int | None = None) -> None:
+    if keep_entries < 1:
+        keep_entries = 1
     existing = _read_text(path).strip()
     header = f"# {title}"
     if not existing:
@@ -210,16 +228,25 @@ def _prune_markdown_history_locked(path: Path, title: str, *, keep_entries: int,
         return
     body = existing[len(header) :].lstrip("\n") if existing.startswith(header) else existing
     entries = _iter_markdown_entries(body)
+    truncated_marker = "\n\n[history truncated]\n"
+    truncated = len(entries) > keep_entries
     kept_entries: list[str] = []
+    # Don't reserve marker space proactively — the marker is informational,
+    # not contract. Existing tests assert exact entry counts at max_chars
+    # boundaries, and shrinking the budget here was excluding 1-2 entries
+    # that previously fit. Marker is appended at the end only when it still
+    # fits within max_chars.
     char_budget = None if max_chars is None else max(max_chars - len(header) - 2, 0)
     used_chars = 0
     for entry in entries[:keep_entries]:
         entry_len = len(entry) + (2 if kept_entries else 0)
         if char_budget is not None and kept_entries and used_chars + entry_len > char_budget:
+            truncated = True
             break
         if char_budget is not None and not kept_entries and len(entry) > char_budget:
             kept_entries.append(entry[: max(char_budget - 15, 0)].rstrip() + " ...[truncated]")
             used_chars = len(kept_entries[0])
+            truncated = True
             break
         kept_entries.append(entry)
         used_chars += entry_len
@@ -235,8 +262,21 @@ def _prune_markdown_history_locked(path: Path, title: str, *, keep_entries: int,
             payload = header + "\n"
             if kept_entries:
                 payload += "\n" + "\n\n".join(kept_entries).rstrip() + "\n"
+        truncated = True
         if len(payload) > max_chars:
-            payload = payload[:max_chars].rstrip() + "\n"
+            # Final fallback: hard slice but always keep header intact and append marker.
+            slice_budget = max(max_chars - len(truncated_marker), len(header) + 1)
+            payload = payload[:slice_budget].rstrip() + "\n"
+            if not payload.startswith(header):
+                payload = header + "\n" + payload.lstrip()
+    if truncated and not payload.rstrip().endswith("[history truncated]"):
+        candidate = payload.rstrip() + truncated_marker
+        # Only keep the marker when it still fits within max_chars; the
+        # truncation it documents is also visible via "...[truncated]" on
+        # the last kept entry, so dropping the marker is safe when the
+        # budget is tight.
+        if max_chars is None or len(candidate) <= max_chars:
+            payload = candidate
     atomic_write_text(path, payload)
 
 
@@ -322,6 +362,27 @@ def _summarize_commands(commands_run: list[str], *, limit: int = 8) -> list[str]
         if len(cleaned) >= limit:
             break
     return cleaned
+
+
+def _handoff_top_entry_matches(path: Path, *, task_id: str, fingerprint: str) -> bool:
+    """Return True if HANDOFF.md most-recent entry already encodes this task+fingerprint."""
+    try:
+        text = _read_text(path)
+    except Exception:
+        return False
+    if not text:
+        return False
+    body = text.split("\n", 1)[1] if text.startswith("# ") else text
+    entries = _iter_markdown_entries(body)
+    if not entries:
+        return False
+    top = entries[0]
+    if f"<!-- fp:{fingerprint} -->" in top:
+        return True
+    # Older entries pre-fingerprint: fall back to task id + result-line equality.
+    if f"- task id: {task_id}" not in top:
+        return False
+    return False
 
 
 def _iter_markdown_entries(text: str) -> list[str]:
@@ -436,8 +497,28 @@ def _is_transient_constraint_candidate(text: str) -> bool:
     return False
 
 
+_KNOWN_FACTS_SCHEMA_VERSION = 1
+_TASKS_SCHEMA_VERSION = 1
+
+
+def _refuse_future_schema(path: Path, payload: dict[str, Any], current: int) -> None:
+    """If JSON schema_version exceeds current, rename to .bak so caller can re-seed."""
+    try:
+        version = int(payload.get("schema_version", 0) or 0)
+    except (TypeError, ValueError):
+        version = 0
+    if version > current:
+        try:
+            backup = path.with_suffix(path.suffix + ".bak")
+            if backup.exists():
+                backup.unlink()
+            path.rename(backup)
+        except OSError:
+            pass
+
+
 def _prune_known_facts_payload(facts: dict[str, Any]) -> dict[str, Any]:
-    cleaned = {"preferences": [], "constraints": [], "facts": []}
+    cleaned: dict[str, Any] = {"schema_version": _KNOWN_FACTS_SCHEMA_VERSION, "preferences": [], "constraints": [], "facts": []}
     for key, limit in (("preferences", 8), ("constraints", 12), ("facts", 24)):
         seen: set[str] = set()
         for raw_item in facts.get(key, []) or []:
@@ -537,12 +618,18 @@ class RuntimeStore:
         return [dict(row) for row in rows]
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path)
+        conn = sqlite3.connect(self.path, timeout=30.0)
         conn.row_factory = sqlite3.Row
         return conn
 
     def _init_schema(self) -> None:
         with self._lock, self._connect() as conn:
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA synchronous=NORMAL")
+                conn.execute("PRAGMA busy_timeout=30000")
+            except sqlite3.OperationalError:
+                pass
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS channels (
@@ -665,6 +752,8 @@ class RuntimeStore:
             self._ensure_column(conn, "turn_records", "degraded", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(conn, "turn_records", "side_effects_synced_at", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "turn_records", "side_effects_claimed_at", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "turn_records", "side_effects_claimant_pid", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(conn, "turn_records", "artifact_persisted_at", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "channels", "last_rebind_at", "TEXT")
             conn.execute(
                 """
@@ -1044,20 +1133,52 @@ class RuntimeStore:
             ).fetchone()
         return bool(row and row["side_effects_synced_at"])
 
+    def turn_artifact_persisted(self, turn_id: str) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT artifact_persisted_at FROM turn_records WHERE turn_id = ? LIMIT 1",
+                (turn_id,),
+            ).fetchone()
+        return bool(row and row["artifact_persisted_at"])
+
+    def mark_turn_artifact_persisted(self, turn_id: str) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE turn_records SET artifact_persisted_at = ? WHERE turn_id = ? AND artifact_persisted_at = ''",
+                (_now_iso(), turn_id),
+            )
+
     def claim_turn_side_effects(self, turn_id: str, *, stale_after_seconds: int = 600) -> bool:
         cutoff = _now_iso_from_ts(time.time() - max(stale_after_seconds, 1))
-        with self._lock, self._connect() as conn:
-            cursor = conn.execute(
-                """
-                UPDATE turn_records
-                SET side_effects_claimed_at = ?
-                WHERE turn_id = ?
-                  AND side_effects_synced_at = ''
-                  AND (side_effects_claimed_at = '' OR side_effects_claimed_at < ?)
-                """,
-                (_now_iso(), turn_id, cutoff),
-            )
-            return cursor.rowcount > 0
+        our_pid = os.getpid()
+        with self._lock:
+            conn = self._connect()
+            conn.isolation_level = None
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    cursor = conn.execute(
+                        """
+                        UPDATE turn_records
+                        SET side_effects_claimed_at = ?, side_effects_claimant_pid = ?
+                        WHERE turn_id = ?
+                          AND side_effects_synced_at = ''
+                          AND (
+                              side_effects_claimed_at = ''
+                              OR side_effects_claimed_at < ?
+                              OR side_effects_claimant_pid != ?
+                          )
+                        """,
+                        (_now_iso(), our_pid, turn_id, cutoff, our_pid),
+                    )
+                    rowcount = cursor.rowcount
+                    conn.execute("COMMIT")
+                    return rowcount > 0
+                except Exception:
+                    conn.execute("ROLLBACK")
+                    raise
+            finally:
+                conn.close()
 
     def clear_turn_side_effect_claim(self, turn_id: str) -> None:
         with self._lock, self._connect() as conn:
@@ -1349,47 +1470,67 @@ class WorktreeManager:
             if worktree_path.exists():
                 return worktree_path, _repo_branch(worktree_path)
             try:
-                subprocess.run(
+                prune_result = subprocess.run(
                     ["git", "-C", str(repo_root), "worktree", "prune"],
                     check=False,
                     capture_output=True,
                     text=True,
                     creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
                 )
-                def _branch_exists(name: str) -> bool:
-                    return bool(
-                        subprocess.run(
-                            ["git", "-C", str(repo_root), "branch", "--list", name],
-                            check=True,
-                            capture_output=True,
-                            text=True,
-                            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
-                        ).stdout.strip()
+                if prune_result.returncode != 0:
+                    raise RuntimeError(
+                        f"git worktree prune failed for {repo_root}: "
+                        f"{(prune_result.stderr or '').strip()[:500]}"
                     )
+
+                def _branch_exists(name: str) -> bool:
+                    result = subprocess.run(
+                        ["git", "-C", str(repo_root), "branch", "--list", name],
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+                    )
+                    if result.returncode != 0:
+                        raise RuntimeError(
+                            f"git branch --list {name} failed for {repo_root}: "
+                            f"{(result.stderr or '').strip()[:500]}"
+                        )
+                    return bool(result.stdout.strip())
 
                 def _add_existing_branch(name: str) -> None:
-                    subprocess.run(
+                    result = subprocess.run(
                         ["git", "-C", str(repo_root), "worktree", "add", str(worktree_path), name],
-                        check=True,
+                        check=False,
                         capture_output=True,
                         text=True,
                         creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
                     )
+                    if result.returncode != 0:
+                        raise RuntimeError(
+                            f"git worktree add failed for {worktree_path} (branch {name}): "
+                            f"{(result.stderr or '').strip()[:500]}"
+                        )
 
                 def _add_new_branch(name: str) -> None:
-                    subprocess.run(
+                    result = subprocess.run(
                         ["git", "-C", str(repo_root), "worktree", "add", "-b", name, str(worktree_path), "HEAD"],
-                        check=True,
+                        check=False,
                         capture_output=True,
                         text=True,
                         creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
                     )
+                    if result.returncode != 0:
+                        raise RuntimeError(
+                            f"git worktree add -b failed for {worktree_path} (new branch {name}): "
+                            f"{(result.stderr or '').strip()[:500]}"
+                        )
 
                 branch_exists = _branch_exists(branch_name)
                 if branch_exists:
                     try:
                         _add_existing_branch(branch_name)
-                    except subprocess.CalledProcessError:
+                    except RuntimeError:
                         if _branch_exists(fallback_branch_name):
                             _add_existing_branch(fallback_branch_name)
                         else:
@@ -1653,6 +1794,12 @@ class DurableRuntime:
             handle.write(json.dumps(record, ensure_ascii=True) + "\n")
             handle.flush()
             os.fsync(handle.fileno())
+        # Mark DB row authoritative-dedup AFTER artifact is durable on disk.
+        try:
+            self.store.mark_turn_artifact_persisted(turn_id)
+        except Exception:
+            # Non-fatal: file scan fallback in _turn_artifact_exists keeps recovery working.
+            pass
 
     def _turn_artifact_exists(self, binding: ChannelBinding, turn_id: str) -> bool:
         artifact_path = self.turn_artifacts_dir / f"{binding.project_id}.jsonl"
@@ -1724,7 +1871,7 @@ class DurableRuntime:
         if not (memory_dir / "STATUS.md").exists():
             _ensure_sectioned_markdown(memory_dir / "STATUS.md", "STATUS", {heading: "" for heading in STATUS_SECTIONS})
         if not (memory_dir / "TASKS.json").exists():
-            atomic_write_json(memory_dir / "TASKS.json", {"tasks": []})
+            atomic_write_json(memory_dir / "TASKS.json", {"schema_version": 1, "tasks": []})
         if not (memory_dir / "DECISIONS.md").exists():
             atomic_write_text(memory_dir / "DECISIONS.md", "# DECISIONS\n")
         if not (memory_dir / "HANDOFF.md").exists():
@@ -1732,7 +1879,7 @@ class DurableRuntime:
         if not (memory_dir / "DRIFT_LOG.md").exists():
             atomic_write_text(memory_dir / "DRIFT_LOG.md", "# DRIFT_LOG\n")
         if not (memory_dir / "KNOWN_FACTS.json").exists():
-            atomic_write_json(memory_dir / "KNOWN_FACTS.json", {"preferences": [], "constraints": [], "facts": []})
+            atomic_write_json(memory_dir / "KNOWN_FACTS.json", {"schema_version": 1, "preferences": [], "constraints": [], "facts": []})
 
     def _agents_markdown(self) -> str:
         return "\n".join(
@@ -1912,10 +2059,11 @@ class DurableRuntime:
         binding = self.ensure_binding(channel_key)
         sender_type = "other-ai" if author_is_bot else "user"
         content = text.strip()
-        facts = _prune_known_facts_payload(
-            _read_json(binding.worktree_path / MEMORY_DIR_NAME / "KNOWN_FACTS.json", {"preferences": [], "constraints": [], "facts": []})
-        )
-        atomic_write_json(binding.worktree_path / MEMORY_DIR_NAME / "KNOWN_FACTS.json", _prune_known_facts_payload(facts))
+        known_facts_path = binding.worktree_path / MEMORY_DIR_NAME / "KNOWN_FACTS.json"
+        raw_known_facts = _read_json(known_facts_path, {"schema_version": _KNOWN_FACTS_SCHEMA_VERSION, "preferences": [], "constraints": [], "facts": []})
+        _refuse_future_schema(known_facts_path, raw_known_facts, _KNOWN_FACTS_SCHEMA_VERSION)
+        facts = _prune_known_facts_payload(raw_known_facts)
+        atomic_write_json(known_facts_path, _prune_known_facts_payload(facts))
         if sender_type == "user" and content:
             self._upsert_memory_fact(
                 binding,
@@ -2077,10 +2225,12 @@ class DurableRuntime:
         status = _read_text(memory_dir / "STATUS.md").strip()
         decisions = _read_text(memory_dir / "DECISIONS.md")
         handoff = _read_text(memory_dir / "HANDOFF.md")
-        raw_facts = _read_json(memory_dir / "KNOWN_FACTS.json", {"preferences": [], "constraints": [], "facts": []})
+        known_facts_path = memory_dir / "KNOWN_FACTS.json"
+        raw_facts = _read_json(known_facts_path, {"schema_version": _KNOWN_FACTS_SCHEMA_VERSION, "preferences": [], "constraints": [], "facts": []})
+        _refuse_future_schema(known_facts_path, raw_facts, _KNOWN_FACTS_SCHEMA_VERSION)
         facts = _prune_known_facts_payload(raw_facts)
         if facts != raw_facts:
-            atomic_write_json(memory_dir / "KNOWN_FACTS.json", facts)
+            atomic_write_json(known_facts_path, facts)
         unresolved = self.store.unresolved_claims(binding.project_id)
         active = self.store.active_task(channel_key)
         lines = [
@@ -2202,7 +2352,10 @@ class DurableRuntime:
         ):
             recovered_artifact = False
             missing_side_effects = not self.store.turn_side_effects_synced(turn_id)
-            if not self._turn_artifact_exists(binding, turn_id):
+            # Prefer DB marker (set after fsync) over JSONL scan to avoid duplicating
+            # entries when a partial line in the artifact file looks "missing" to the scan.
+            artifact_present = self.store.turn_artifact_persisted(turn_id) or self._turn_artifact_exists(binding, turn_id)
+            if not artifact_present:
                 self._append_turn_artifact(
                     binding,
                     thread_id=thread_id,
@@ -2452,6 +2605,21 @@ class DurableRuntime:
         next_step_text = next_step.strip()
         if next_step_text and _normalize_compare_text(next_step_text) == _normalize_compare_text(result_text):
             next_step_text = "Continue from STATUS.md."
+        handoff_path = binding.worktree_path / MEMORY_DIR_NAME / "HANDOFF.md"
+        # Idempotency guard: if the most-recent entry already has the same task id and
+        # same result body (after _record_turn_side_effects partial-failure retry),
+        # refresh prune+exit instead of appending a duplicate header.
+        # Hash to keep the embedded marker compact (~16 chars vs ~80 of the raw
+        # composite) so HANDOFF.md prune budgets stay within their max_chars cap.
+        fingerprint_source = (
+            f"task:{task_id}|result:{_normalize_compare_text(result_text)}"
+            f"|next:{_normalize_compare_text(next_step_text or 'Continue from STATUS.md.')}"
+            f"|blocker:{_normalize_compare_text(blocker or 'none')}"
+        )
+        fingerprint = hashlib.sha1(fingerprint_source.encode("utf-8")).hexdigest()[:16]
+        if _handoff_top_entry_matches(handoff_path, task_id=task_id, fingerprint=fingerprint):
+            _prune_markdown_history(handoff_path, "HANDOFF", keep_entries=20, max_chars=8000)
+            return
         entry = "\n".join(
             [
                 f"## {_now_iso()}",
@@ -2461,10 +2629,11 @@ class DurableRuntime:
                 f"- result: {result_text}",
                 f"- blocker: {blocker or 'none'}",
                 f"- exact next step: {next_step_text or 'Continue from STATUS.md.'}",
+                f"<!-- fp:{fingerprint} -->",
             ]
         )
-        _append_markdown_entry(binding.worktree_path / MEMORY_DIR_NAME / "HANDOFF.md", "HANDOFF", entry, prepend=True)
-        _prune_markdown_history(binding.worktree_path / MEMORY_DIR_NAME / "HANDOFF.md", "HANDOFF", keep_entries=20, max_chars=8000)
+        _append_markdown_entry(handoff_path, "HANDOFF", entry, prepend=True)
+        _prune_markdown_history(handoff_path, "HANDOFF", keep_entries=20, max_chars=8000)
 
     def _write_tasks_file(self, binding: ChannelBinding) -> None:
         task_rows = self.store.list_tasks(binding.channel_id)
@@ -2485,7 +2654,10 @@ class DurableRuntime:
                     "lease_expires_at": row["lease_expires_at"],
                 }
             )
-        atomic_write_json(binding.worktree_path / MEMORY_DIR_NAME / "TASKS.json", {"tasks": tasks})
+        tasks_path = binding.worktree_path / MEMORY_DIR_NAME / "TASKS.json"
+        existing_tasks = _read_json(tasks_path, {"schema_version": _TASKS_SCHEMA_VERSION, "tasks": []})
+        _refuse_future_schema(tasks_path, existing_tasks, _TASKS_SCHEMA_VERSION)
+        atomic_write_json(tasks_path, {"schema_version": _TASKS_SCHEMA_VERSION, "tasks": tasks})
 
     def _sync_status(
         self,

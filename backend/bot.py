@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -581,6 +582,10 @@ TURN_STALL_TIMEOUT_SECONDS = 10 * 60
 TURN_WATCHDOG_POLL_SECONDS = 15
 TASK_HEARTBEAT_INTERVAL_SECONDS = 60
 IDLE_CONNECTION_CLOSE_DELAY_SECONDS = 5
+# F0012: cap concurrent server-side approval tasks. A misbehaving Codex
+# app-server could otherwise fan out unbounded requests; we drop excess
+# requests with an error reply rather than spawn arbitrarily many tasks.
+MAX_CONCURRENT_SERVER_REQUEST_TASKS = 32
 READY_MARKER_PATH = CONFIG.state_dir / ".ready"
 AUTH_FAILURE_MARKER_PATH = CONFIG.state_dir / ".auth_failed"
 OPERATOR_DIR = CONFIG.state_dir / "operator"
@@ -588,12 +593,27 @@ OPERATOR_REQUESTS_DIR = OPERATOR_DIR / "requests"
 OPERATOR_RESPONSES_DIR = OPERATOR_DIR / "responses"
 OPERATOR_HISTORY_PATH = OPERATOR_DIR / "history.json"
 OPERATOR_HISTORY_LIMIT = 80
+# DURABLE_RUNTIME is eagerly constructed at module import. F0012 flagged this
+# as a side-effect hazard (two relays for same namespace racing startup both
+# touch sqlite schema concurrently before either acquires the instance lock).
+# A lazy module-level `__getattr__` was tried but Python only fires it for
+# attribute lookup (`bot.DURABLE_RUNTIME`), not for the bare-name references
+# inside this module (which raise NameError). Until the references are
+# refactored to go through a getter, eager construction stays — the instance
+# lock is the second line of defense and the schema migrations are
+# idempotent.
 DURABLE_RUNTIME = DurableRuntime(
     state_dir=CONFIG.state_dir,
     repo_path=CONFIG.codex_workdir,
     state_namespace=CONFIG.state_namespace,
     agent_name=CONFIG.relay_bot_name or "codex",
 )
+
+
+def _init_durable_runtime() -> "DurableRuntime":
+    return DURABLE_RUNTIME
+
+
 PROJECT_CONTEXT_BLOCK = _load_project_context_block(CONFIG.codex_workdir, CONFIG.relay_bot_name)
 
 
@@ -975,7 +995,22 @@ def _release_instance_lock() -> None:
         INSTANCE_LOCK_HANDLE = None
 
 
-def _acquire_instance_lock() -> None:
+def _instance_lock_pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Process exists but we lack signal rights; treat as alive.
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _acquire_instance_lock(_retry: bool = False) -> None:
     global INSTANCE_LOCK_HANDLE
     lock_path = INSTANCE_LOCK_PATH
     lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -986,6 +1021,21 @@ def _acquire_instance_lock() -> None:
             try:
                 msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
             except OSError as exc:
+                handle.close()
+                if not _retry:
+                    stale_pid = 0
+                    try:
+                        text = lock_path.read_text(encoding="utf-8").strip()
+                        stale_pid = int(text.split(":", 1)[0]) if text else 0
+                    except Exception:
+                        stale_pid = 0
+                    if not _instance_lock_pid_alive(stale_pid):
+                        try:
+                            lock_path.unlink()
+                        except OSError:
+                            pass
+                        _acquire_instance_lock(_retry=True)
+                        return
                 raise RuntimeError(
                     f"Relay instance `{CONFIG.state_namespace}` is already running. Stop the existing process before starting it again."
                 ) from exc
@@ -993,6 +1043,21 @@ def _acquire_instance_lock() -> None:
             try:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             except OSError as exc:
+                handle.close()
+                if not _retry:
+                    stale_pid = 0
+                    try:
+                        text = lock_path.read_text(encoding="utf-8").strip()
+                        stale_pid = int(text.split(":", 1)[0]) if text else 0
+                    except Exception:
+                        stale_pid = 0
+                    if not _instance_lock_pid_alive(stale_pid):
+                        try:
+                            lock_path.unlink()
+                        except OSError:
+                            pass
+                        _acquire_instance_lock(_retry=True)
+                        return
                 raise RuntimeError(
                     f"Relay instance `{CONFIG.state_namespace}` is already running. Stop the existing process before starting it again."
                 ) from exc
@@ -1004,7 +1069,10 @@ def _acquire_instance_lock() -> None:
         INSTANCE_LOCK_HANDLE = handle
         atexit.register(_release_instance_lock)
     except Exception:
-        handle.close()
+        try:
+            handle.close()
+        except Exception:
+            pass
         raise
 
 
@@ -3895,8 +3963,16 @@ class CodexSession:
             if process is None or process.returncode is not None or process.stdin is None:
                 raise RelayError("Codex session is not connected.")
 
+        # Use uuid4 instead of monotonic counter (F0006). On reconnect the
+        # CodexSession instance is reused: pending_requests is cleared but the
+        # counter was not reset, so two futures for the same id could coexist
+        # briefly and silently overwrite each other's response handler.
         self.request_counter += 1
-        request_id = f"{self.key}-{self.request_counter}"
+        request_id = f"{self.key}-{uuid.uuid4().hex}"
+        if request_id in self.pending_requests:
+            raise RelayError(
+                f"Duplicate Codex app-server request id `{request_id}`; refusing to overwrite pending future."
+            )
         loop = asyncio.get_running_loop()
         future: asyncio.Future[dict] = loop.create_future()
         self.pending_requests[request_id] = future
@@ -4402,6 +4478,40 @@ class CodexSession:
             return
 
         if "id" in payload and "method" in payload:
+            # F0012: bound concurrent server-request tasks and de-dupe by
+            # request id. A misbehaving Codex app-server could otherwise
+            # fan out hundreds of approval requests, or repeat the same
+            # id and create overlapping pending_approvals entries.
+            request_id = str(payload.get("id"))
+            if request_id in self.pending_approvals:
+                asyncio.create_task(
+                    self._send_transport_payload(
+                        {
+                            "id": payload.get("id"),
+                            "error": {
+                                "code": -32004,
+                                "message": f"Discord relay already has a pending approval for request id `{request_id}`.",
+                            },
+                        }
+                    )
+                )
+                return
+            if len(self.server_request_tasks) >= MAX_CONCURRENT_SERVER_REQUEST_TASKS:
+                asyncio.create_task(
+                    self._send_transport_payload(
+                        {
+                            "id": payload.get("id"),
+                            "error": {
+                                "code": -32005,
+                                "message": (
+                                    f"Discord relay is at the server-request task cap "
+                                    f"({MAX_CONCURRENT_SERVER_REQUEST_TASKS}); rejecting request `{request_id}`."
+                                ),
+                            },
+                        }
+                    )
+                )
+                return
             self._track_task(asyncio.create_task(self._handle_server_request(payload)))
             return
 
@@ -4411,7 +4521,15 @@ class CodexSession:
 
         if "compact" in method.lower() and self.thread_id:
             self.rehydrate_pending = True
-            DURABLE_RUNTIME.record_compaction_event(self.key, thread_id=self.thread_id, event_type=method)
+            # F0004: sqlite mutations are run via asyncio.to_thread so a slow
+            # disk fsync inside DurableRuntime does not stall the Discord
+            # gateway event loop.
+            await asyncio.to_thread(
+                DURABLE_RUNTIME.record_compaction_event,
+                self.key,
+                thread_id=self.thread_id,
+                event_type=method,
+            )
 
         if method == "item/started" and turn is not None:
             item = params.get("item") or {}
@@ -4444,7 +4562,10 @@ class CodexSession:
             if status == "completed":
                 reply_text = self._best_turn_text(turn)
                 thread_id = self.thread_id or ""
-                DURABLE_RUNTIME.bind_thread(
+                # F0004: offload sqlite mutations to a worker thread to keep
+                # the Discord event loop responsive.
+                await asyncio.to_thread(
+                    DURABLE_RUNTIME.bind_thread,
                     self.key,
                     thread_id=thread_id,
                     backend="codex-app-server",
@@ -4453,7 +4574,8 @@ class CodexSession:
                 )
                 if reply_text:
                     self._remember_reply(reply_text)
-                    DURABLE_RUNTIME.record_turn_result(
+                    await asyncio.to_thread(
+                        DURABLE_RUNTIME.record_turn_result,
                         channel_key=self.key,
                         thread_id=thread_id,
                         turn_id=str(turn_payload.get("id") or turn.turn_id),
@@ -4480,7 +4602,9 @@ class CodexSession:
                 self._remember_error("Codex turn was interrupted.")
                 turn.error_category = "interrupted"
                 if self.thread_id:
-                    DURABLE_RUNTIME.bind_thread(
+                    # F0004: offload sqlite mutations to a worker thread.
+                    await asyncio.to_thread(
+                        DURABLE_RUNTIME.bind_thread,
                         self.key,
                         thread_id=self.thread_id,
                         backend="codex-app-server",
@@ -4495,7 +4619,9 @@ class CodexSession:
             self._remember_error(message)
             turn.error_category = str(error.get("code") or "failed")
             if self.thread_id:
-                DURABLE_RUNTIME.bind_thread(
+                # F0004: offload sqlite mutations to a worker thread.
+                await asyncio.to_thread(
+                    DURABLE_RUNTIME.bind_thread,
                     self.key,
                     thread_id=self.thread_id,
                     backend="codex-app-server",
@@ -5513,6 +5639,10 @@ async def _run() -> None:
 
 def main() -> None:
     _acquire_instance_lock()
+    # Defer DurableRuntime construction until after we own the instance lock
+    # so two relays for the same namespace cannot race sqlite schema/migration
+    # work at startup (F0012).
+    _init_durable_runtime()
     _clear_auth_failure_marker()
     READY_MARKER_PATH.unlink(missing_ok=True)
     prune_directory_files(
@@ -5560,8 +5690,11 @@ def _prune_codex_home_state() -> None:
     cap = max_files if max_files > 0 else None
     try:
         prune_directory_files(sessions_dir, older_than_seconds=older, max_files=cap)
-    except Exception:
-        pass
+    except Exception as exc:
+        print(
+            f"cladex bot: _prune_codex_home_state prune failed for {sessions_dir}: {exc}",
+            file=sys.stderr,
+        )
     # T2.4 / prod-audit #3: Codex sqlite WAL checkpoint + (optionally)
     # VACUUM for `logs_2.sqlite` and `state_5.sqlite`. After ~3 weeks of
     # daily relay use the message log alone reaches 368 MB; without
@@ -5585,9 +5718,13 @@ def _prune_codex_home_state() -> None:
                     age_seconds = time.time() - db_path.stat().st_mtime
                     if age_seconds > vacuum_days * 86400:
                         conn.execute("VACUUM")
-        except Exception:
-            # sqlite locked / Codex CLI running / unsupported pragma — skip.
-            pass
+        except Exception as exc:
+            # sqlite locked / Codex CLI running / unsupported pragma — log and skip
+            # so a ballooning WAL is visible in operator logs instead of silent.
+            print(
+                f"cladex bot: _prune_codex_home_state sqlite checkpoint failed for {db_path}: {exc}",
+                file=sys.stderr,
+            )
 
 
 if __name__ == "__main__":

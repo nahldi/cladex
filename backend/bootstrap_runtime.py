@@ -35,8 +35,10 @@ from __future__ import annotations
 
 import os
 import shutil
+import stat
 import subprocess
 import sys
+import time
 import venv
 from pathlib import Path
 
@@ -114,23 +116,79 @@ def _venv_is_healthy(python: Path) -> bool:
     return base.exists()
 
 
+def _rmtree_force_handler(func, path, exc_info):
+    """shutil.rmtree onerror handler: clear read-only bit then retry once."""
+    try:
+        os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
+    except OSError:
+        pass
+    try:
+        func(path)
+    except OSError:
+        pass
+
+
+def _purge_pending(root: Path) -> None:
+    """Remove any leftover `<root>.purging-*` siblings from prior crashes."""
+    parent = root.parent
+    if not parent.exists():
+        return
+    prefix = f"{root.name}.purging-"
+    try:
+        for item in parent.iterdir():
+            if item.name.startswith(prefix):
+                shutil.rmtree(item, onerror=_rmtree_force_handler)
+    except OSError:
+        pass
+
+
 def _ensure_venv(root: Path) -> Path:
-    """Create the venv if missing OR rebuild it if the existing venv is orphaned."""
+    """Create the venv if missing OR rebuild it if the existing venv is orphaned.
+
+    Crash-safe rebuild:
+      1. Write `.rebuilding` sentinel under root.parent.
+      2. `os.rename` root -> `<root>.purging-<ts>` (atomic on Win+POSIX).
+      3. `shutil.rmtree` purge target with onerror chmod handler.
+      4. `venv.create` root.
+      5. Remove sentinel.
+    On entry the sentinel forces purge regardless of detection so a half-deleted
+    state from a prior crash cannot be mistaken for a healthy interpreter.
+    """
+    root.parent.mkdir(parents=True, exist_ok=True)
+    sentinel = root.parent / f".{root.name}.rebuilding"
+    _purge_pending(root)
     python = _runtime_python(root)
-    if python.exists() and not _venv_is_healthy(python):
-        # Stub-orphan: base interpreter was uninstalled. The stub will fire
-        # the Python Launcher modal on every invocation. Wipe and rebuild.
+    needs_rebuild = sentinel.exists() or (python.exists() and not _venv_is_healthy(python))
+    if needs_rebuild:
         try:
-            shutil.rmtree(root)
-        except OSError as exc:
-            raise RuntimeError(
-                f"Could not remove orphaned managed runtime at {root}: {exc}. "
-                "Delete it manually and retry."
-            ) from exc
+            sentinel.write_text(str(int(time.time())), encoding="utf-8")
+        except OSError:
+            pass
+        if root.exists():
+            purge_target = root.with_name(f"{root.name}.purging-{int(time.time())}")
+            try:
+                os.rename(root, purge_target)
+            except OSError as exc:
+                raise RuntimeError(
+                    f"Could not move orphaned managed runtime at {root} aside: {exc}. "
+                    "Delete it manually and retry."
+                ) from exc
+            try:
+                shutil.rmtree(purge_target, onerror=_rmtree_force_handler)
+            except OSError as exc:
+                raise RuntimeError(
+                    f"Could not remove orphaned managed runtime copy at {purge_target}: {exc}. "
+                    "Delete it manually and retry."
+                ) from exc
     if not python.exists():
         venv.EnvBuilder(with_pip=True, clear=False, upgrade_deps=False).create(root)
     if not python.exists():
         raise RuntimeError(f"venv created without Python interpreter at {python}")
+    if sentinel.exists():
+        try:
+            sentinel.unlink()
+        except OSError:
+            pass
     return python
 
 
@@ -209,8 +267,25 @@ def _pip_install(python: Path) -> int:
 def main() -> int:
     runtime_root = _runtime_root()
     runtime_root.parent.mkdir(parents=True, exist_ok=True)
-    python = _ensure_venv(runtime_root)
-    return _pip_install(python)
+    try:
+        python = _ensure_venv(runtime_root)
+    except RuntimeError as exc:
+        print(f"cladex bootstrap: venv setup failed at {runtime_root}: {exc}", file=sys.stderr)
+        return 2
+    try:
+        return _pip_install(python)
+    except subprocess.TimeoutExpired as exc:
+        print(
+            f"cladex bootstrap: pip install timed out after {exc.timeout}s installing {_resolve_install_source()}",
+            file=sys.stderr,
+        )
+        return 3
+    except OSError as exc:
+        print(
+            f"cladex bootstrap: pip install OS error installing {_resolve_install_source()}: {exc}",
+            file=sys.stderr,
+        )
+        return 4
 
 
 if __name__ == "__main__":

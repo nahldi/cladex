@@ -381,11 +381,73 @@ function isTrustedApiOrigin(value: string): boolean {
   }
 }
 
+// F0005 fix: Untrusted desktop entrypoints (e.g. opening index.html via
+// file://) used to accept ANY ?apiBase=http://127.0.0.1:<any-port>/api
+// query string. The persisted X-CLADEX-Access-Token in localStorage was
+// then echoed to that arbitrary loopback origin on every request, which
+// any local process could trivially listen on. Now:
+//   • only file:// shells can supply apiBase at all (other shells use
+//     window.location.origin like before),
+//   • the URL-supplied origin must match one we have already pinned in
+//     localStorage (or, on first run, becomes the pin),
+//   • if a different origin is supplied, the stored access token is
+//     wiped so it is never replayed to an unverified origin.
+const FILE_MODE_API_BASE_PIN_KEY = 'cladex.fileModeApiBase.origin';
+
+function originOf(value: string): string {
+  try {
+    return new URL(value).origin;
+  } catch {
+    return '';
+  }
+}
+
+function readPinnedFileModeOrigin(): string {
+  try {
+    return window.localStorage.getItem(FILE_MODE_API_BASE_PIN_KEY) || '';
+  } catch {
+    return '';
+  }
+}
+
+function writePinnedFileModeOrigin(origin: string): void {
+  try {
+    if (origin) {
+      window.localStorage.setItem(FILE_MODE_API_BASE_PIN_KEY, origin);
+    } else {
+      window.localStorage.removeItem(FILE_MODE_API_BASE_PIN_KEY);
+    }
+  } catch {
+    /* ignore quota / privacy-mode failures */
+  }
+}
+
 function readFileModeApiBase(): string {
   if (typeof window === 'undefined') return '';
+  if (window.location.protocol !== 'file:') return '';
   const raw = new URLSearchParams(window.location.search).get('apiBase') || '';
   if (!raw) return '';
-  return isTrustedApiOrigin(raw) ? raw : '';
+  if (!isTrustedApiOrigin(raw)) return '';
+  const candidateOrigin = originOf(raw);
+  if (!candidateOrigin) return '';
+  const pinnedOrigin = readPinnedFileModeOrigin();
+  if (!pinnedOrigin) {
+    // First run from a file:// shell — pin this origin going forward.
+    writePinnedFileModeOrigin(candidateOrigin);
+    return raw;
+  }
+  if (pinnedOrigin === candidateOrigin) {
+    return raw;
+  }
+  // Origin changed — wipe the persisted access token so we never replay it
+  // to an unverified origin and refuse the supplied apiBase. Operator must
+  // re-enter the token, which re-confirms intent.
+  try {
+    window.localStorage.removeItem(ACCESS_TOKEN_STORAGE_KEY);
+  } catch {
+    /* ignore */
+  }
+  return '';
 }
 
 const FILE_MODE_API_BASE = readFileModeApiBase();
@@ -619,8 +681,8 @@ const api = {
   runtimeInfo: () => fetchJson<RuntimeInfo>(`${API_BASE}/runtime-info`, { timeoutMs: API_POLL_TIMEOUT_MS }),
   logs: (id: string, relayType: RelayType) => fetchJson<{ logs: string[] }>(`${API_BASE}/profiles/${id}/logs?type=${relayType}`, { timeoutMs: API_POLL_TIMEOUT_MS }),
   chatHistory: (id: string, relayType: RelayType) => fetchJson<{ messages: ChatMessageRecord[] }>(`${API_BASE}/profiles/${id}/chat/history?type=${relayType}`, { timeoutMs: API_POLL_TIMEOUT_MS }),
-  sendChat: (id: string, relayType: RelayType, body: { message: string; channelId?: string; senderName?: string; senderId?: string }) =>
-    fetchJson<{ ok: boolean; reply: string; channelId?: string }>(`${API_BASE}/profiles/${id}/chat`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...body, type: relayType }) }),
+  sendChat: (id: string, relayType: RelayType, body: { message: string; channelId?: string; senderName?: string; senderId?: string }, signal?: AbortSignal) =>
+    fetchJson<{ ok: boolean; reply: string; channelId?: string }>(`${API_BASE}/profiles/${id}/chat`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...body, type: relayType }), signal }),
   createProfile: (body: ProfileFormData) => fetchJson(`${API_BASE}/profiles`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }),
   updateProfile: (id: string, relayType: RelayType, body: ProfileSettingsData) =>
     fetchJson(`${API_BASE}/profiles/${id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...body, type: relayType }) }),
@@ -705,6 +767,11 @@ export default function App() {
   const lastActionErrorRef = useRef('');
   const bootFailureCount = useRef(0);
   const loadAllInFlight = useRef(false);
+  // F0001 fix: bootPending used to be a dep on loadAll's useCallback. Every
+  // toggle (true→false on first success) tore down the 5s poll interval
+  // and rebuilt it, leaking closures. Read via ref so loadAll stays stable
+  // across the lifetime of the app and the poll interval is invariant.
+  const bootPendingRef = useRef(true);
   // Dark mode is hardcoded (no toggle ships in v3). The constant is read
   // by ~6 dock-style helpers below to pick the right surface tones.
   const isDark = true;
@@ -730,6 +797,12 @@ export default function App() {
       /* ignore quota / privacy-mode failures */
     }
   }, [viewMode]);
+
+  // F0001 fix: keep bootPendingRef in sync with state; loadAll reads ref so
+  // the useCallback identity does not churn on first-success toggle.
+  useEffect(() => {
+    bootPendingRef.current = bootPending;
+  }, [bootPending]);
 
   // One-shot mount effect — adds `.dark` to <html> for Tailwind's dark
   // variants. Empty deps list because there is no toggle to track.
@@ -798,7 +871,7 @@ export default function App() {
         const message = refreshStatusMessage(failures, 'Refresh failed') || 'Failed to refresh CLADEX state.';
         const nextFailures = bootFailureCount.current + 1;
         bootFailureCount.current = nextFailures;
-        if (bootPending && nextFailures < 5) {
+        if (bootPendingRef.current && nextFailures < 5) {
           keepLoading = true;
           setErrorText('');
         } else {
@@ -822,7 +895,7 @@ export default function App() {
       const message = error instanceof Error ? error.message : 'Failed to refresh CLADEX state.';
       const nextFailures = bootFailureCount.current + 1;
       bootFailureCount.current = nextFailures;
-      if (bootPending && nextFailures < 5) {
+      if (bootPendingRef.current && nextFailures < 5) {
         keepLoading = true;
         setErrorText('');
       } else {
@@ -835,7 +908,10 @@ export default function App() {
         setLoading(keepLoading ? true : false);
       }
     }
-  }, [bootPending]);
+    // F0001 fix: loadAll deps deliberately empty. bootPending is read via
+    // bootPendingRef so the useCallback identity is stable for the life of
+    // the component and the 5s poll interval below is never torn down.
+  }, []);
 
   useEffect(() => {
     void loadAll();
@@ -1989,12 +2065,30 @@ function warningList(record: LimitAwareRecord): string[] {
   ].filter((item, index, items) => item.trim().length > 0 && items.indexOf(item) === index);
 }
 
+// F0002 fix: previously this merge kept any locally-minted optimistic row
+// (`local-…`, `assistant-…`, `error-…`) forever as long as the backend
+// payload didn't echo the same id. Backend uses its own id scheme, so the
+// optimistic row was *never* displaced — operators saw every assistant
+// reply twice (once from the optimistic insert, once from the next poll
+// that fetched the persisted copy). We now treat optimistic rows as truly
+// transient: only `local-` (operator's own send) is allowed to survive a
+// refresh, and only when the fetched payload has not yet absorbed an
+// equivalent operator message. Backend-issued assistant replies and
+// transport-error rows are never re-attached after a refresh — the
+// authoritative payload owns them.
 function mergePendingChatMessages(fetched: ChatMessageRecord[], current: ChatMessageRecord[]): ChatMessageRecord[] {
-  const fetchedIds = new Set(fetched.map((message) => message.id));
-  const pending = current.filter((message) => (
-    (message.id.startsWith('local-') || message.id.startsWith('assistant-') || message.id.startsWith('error-')) &&
-    !fetchedIds.has(message.id)
-  ));
+  if (!current.length) return fetched;
+  const fetchedHasUserContent = new Set(
+    fetched.filter((m) => m.role === 'user').map((m) => m.content),
+  );
+  const pending = current.filter((message) => {
+    if (!message.id.startsWith('local-')) return false;
+    if (message.role !== 'user') return false;
+    // If the next poll already contains a user message with the same
+    // content, the backend has persisted our send — drop the optimistic
+    // row to avoid duplicates.
+    return !fetchedHasUserContent.has(message.content);
+  });
   return pending.length ? [...fetched, ...pending] : fetched;
 }
 
@@ -2501,6 +2595,20 @@ function FindingsExplorer({ jobId, totalFindings, partial = false }: { jobId: st
     setCategoryFilter('');
   }, [jobId]);
 
+  // F0008 fix: in-flight reviews append findings over time, but we used to
+  // cache the very first fetch and never refresh until the operator closed
+  // and re-opened the explorer (or jobId changed). Auto-invalidate when
+  // totalFindings has grown beyond what we last loaded so the explorer
+  // stays in sync with the panel header count.
+  useEffect(() => {
+    if (!open) return;
+    if (!findings) return;
+    if (totalFindings > findings.length) {
+      setRequested(false);
+      setFindings(null);
+    }
+  }, [open, findings, totalFindings]);
+
   useEffect(() => {
     if (!open || findings !== null || loading || requested) return;
     let cancelled = false;
@@ -2597,6 +2705,19 @@ function FindingsExplorer({ jobId, totalFindings, partial = false }: { jobId: st
               </select>
               <span className="ml-auto flex items-center gap-2">
                 <span className="text-gray-400">{filtered.length} / {findings.length} shown</span>
+                {/* F0008 fix: explicit refresh so the operator can pull a
+                    fresh findings snapshot without re-toggling the section. */}
+                <button
+                  onClick={() => {
+                    setFindings(null);
+                    setErrorText('');
+                    setRequested(false);
+                  }}
+                  className="rounded-full border border-white/10 bg-white/5 px-2.5 py-1 font-semibold text-gray-200 hover:border-indigo-400/40 hover:bg-indigo-500/15 hover:text-indigo-100"
+                  aria-label="Refresh findings"
+                >
+                  Refresh
+                </button>
                 <button
                   onClick={handleExport}
                   className="rounded-full border border-indigo-500/40 bg-indigo-500/20 px-2.5 py-1 font-semibold text-indigo-100 hover:bg-indigo-500/30"
@@ -2978,6 +3099,12 @@ function LiveFeed({
   const [sending, setSending] = useState(false);
   const [draft, setDraft] = useState('');
   const [unreadBelow, setUnreadBelow] = useState(0);
+  // F0003 fix: track the in-flight send AbortController + elapsed seconds
+  // so the operator can cancel a stuck send and see how long it has been
+  // hanging. The composer is otherwise locked for the full 900s default
+  // API_REQUEST_TIMEOUT_MS with no Cancel control.
+  const [sendController, setSendController] = useState<AbortController | null>(null);
+  const [sendElapsed, setSendElapsed] = useState(0);
   const sendingRef = useRef(false);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
@@ -3022,6 +3149,21 @@ function LiveFeed({
 
   useEffect(() => {
     sendingRef.current = sending;
+  }, [sending]);
+
+  // F0003 fix: tick elapsed-since-send while a send is in flight so the
+  // composer can show "Sending… (12s)" after a few seconds without the
+  // operator wondering whether the relay hung.
+  useEffect(() => {
+    if (!sending) {
+      setSendElapsed(0);
+      return;
+    }
+    const startedAt = Date.now();
+    const id = window.setInterval(() => {
+      setSendElapsed(Math.floor((Date.now() - startedAt) / 1000));
+    }, 1000);
+    return () => window.clearInterval(id);
   }, [sending]);
 
   useEffect(() => {
@@ -3073,27 +3215,46 @@ function LiveFeed({
     return () => node.removeEventListener('scroll', handleScroll);
   }, []);
 
+  // F0007 + F0010 fix: depend on the messages array reference (not just
+  // .length) so poll-driven content changes also trigger scroll handling;
+  // clamp unreadBelow >= 0 and reset to 0 when the profile (and therefore
+  // the visible feed) changes; if backend prunes history, treat as a reset
+  // rather than letting `delta` go negative and rendering "-3 new".
   useEffect(() => {
     const node = scrollRef.current;
     if (!node) return;
     const profileKeyValue = activeProfile ? profileKey(activeProfile) : null;
     const profileChanged = previousProfileIdRef.current !== profileKeyValue;
-    const messageCountChanged = previousMessageCountRef.current !== messages.length;
+    const previousCount = previousMessageCountRef.current;
+    const nextCount = messages.length;
+    const countDecreased = nextCount < previousCount;
+    const messagesChanged = nextCount !== previousCount;
     if (profileChanged) {
       node.scrollTop = node.scrollHeight;
       wasNearBottomRef.current = true;
       setUnreadBelow(0);
-    } else if (messageCountChanged) {
+    } else if (countDecreased) {
+      // Backend pruned history — clamp unread to 0 and re-pin to bottom
+      // if the operator was already there. Avoids negative-delta math.
+      if (wasNearBottomRef.current) {
+        node.scrollTop = node.scrollHeight;
+      }
+      setUnreadBelow(0);
+    } else if (messagesChanged) {
       if (wasNearBottomRef.current) {
         node.scrollTop = node.scrollHeight;
       } else {
-        const delta = messages.length - previousMessageCountRef.current;
-        if (delta > 0) setUnreadBelow((current) => current + delta);
+        const delta = nextCount - previousCount;
+        if (delta > 0) setUnreadBelow((current) => Math.max(0, current + delta));
       }
+    } else if (wasNearBottomRef.current) {
+      // Same length but content may have changed (e.g. an in-place poll
+      // replacement). Keep the operator pinned to the latest content.
+      node.scrollTop = node.scrollHeight;
     }
     previousProfileIdRef.current = profileKeyValue;
-    previousMessageCountRef.current = messages.length;
-  }, [activeProfile, messages.length]);
+    previousMessageCountRef.current = nextCount;
+  }, [activeProfile, messages]);
 
   // Auto-grow composer up to ~7 lines.
   useEffect(() => {
@@ -3118,6 +3279,18 @@ function LiveFeed({
     setUnreadBelow(0);
   }
 
+  // F0002 / F0003 / F0009 fix:
+  //   • optimistic operator row uses a `local-` id; the next 3s history poll
+  //     deduplicates against fetched user content (see mergePendingChatMessages),
+  //     so duplicates no longer appear once the backend persists the send;
+  //   • we no longer optimistically insert an `assistant-` row — the next
+  //     poll surfaces the authoritative reply with the backend-issued id;
+  //   • the send is wired through an AbortController exposed as `cancelSend`
+  //     so the operator can interrupt a stuck send instead of being locked
+  //     out of the composer for the full 900s default timeout;
+  //   • transport-error rows render under a distinct "System" sender (not
+  //     the assistantLabel + assistant avatar) so the operator can tell a
+  //     real reply from a network failure.
   async function sendMessage() {
     if (!activeProfile || !activeProfileCanChat || !draft.trim() || sending) {
       return;
@@ -3125,6 +3298,8 @@ function LiveFeed({
     const content = draft.trim();
     setDraft('');
     setSending(true);
+    const controller = new AbortController();
+    setSendController(controller);
     setMessages((current) => [
       ...current,
       {
@@ -3137,37 +3312,39 @@ function LiveFeed({
       },
     ]);
     try {
-      const payload = await api.sendChat(activeProfile.id, activeProfile.relayType, {
+      await api.sendChat(activeProfile.id, activeProfile.relayType, {
         message: content,
         channelId: activeProfile.activeChannel || activeProfile.discordChannel,
         senderName: 'Operator',
         senderId: '0',
-      });
-      setMessages((current) => [
-        ...current,
-        {
-          id: `assistant-${Date.now()}`,
-          role: 'assistant',
-          content: payload.reply || 'No reply returned from the relay.',
-          channelId: payload.channelId || activeProfile.activeChannel || activeProfile.discordChannel,
-          senderName: assistantLabel,
-          timestamp: new Date().toISOString(),
-        },
-      ]);
+      }, controller.signal);
+      // Authoritative assistant reply will arrive on the next chatHistory
+      // poll — no optimistic insert needed.
     } catch (error) {
+      const aborted = controller.signal.aborted;
+      const detail = aborted
+        ? 'Send cancelled by operator before the relay responded.'
+        : error instanceof Error ? error.message : 'Failed to send local operator message.';
       setMessages((current) => [
         ...current,
         {
           id: `error-${Date.now()}`,
           role: 'assistant',
-          content: error instanceof Error ? error.message : 'Failed to send local operator message.',
+          content: detail,
           channelId: activeProfile.activeChannel || activeProfile.discordChannel,
-          senderName: assistantLabel,
+          senderName: 'System',
           timestamp: new Date().toISOString(),
         },
       ]);
     } finally {
       setSending(false);
+      setSendController(null);
+    }
+  }
+
+  function cancelSend() {
+    if (sendController) {
+      sendController.abort();
     }
   }
 
@@ -3392,6 +3569,21 @@ function LiveFeed({
                       <div className="flex items-center gap-2 pt-2 text-[12px] text-gray-500">
                         <ChatTypingDots accentClass={accentClass} />
                         <span className="font-mono text-[10px] uppercase tracking-[0.18em]">{assistantLabel} is typing</span>
+                        {/* F0003 fix: surface elapsed seconds + Cancel after
+                            ~10s so the operator can interrupt a stuck send. */}
+                        {sendElapsed >= 10 ? (
+                          <span className="font-mono text-[10px] text-gray-600">{sendElapsed}s</span>
+                        ) : null}
+                        {sendController ? (
+                          <button
+                            type="button"
+                            onClick={cancelSend}
+                            className="ml-1 rounded-full border border-white/10 bg-white/5 px-2 py-0.5 font-mono text-[10px] uppercase tracking-[0.16em] text-gray-300 transition-colors hover:border-red-400/40 hover:bg-red-500/10 hover:text-red-200"
+                            aria-label="Cancel pending message"
+                          >
+                            Cancel
+                          </button>
+                        ) : null}
                       </div>
                     </div>
                   ) : null}
@@ -4230,10 +4422,17 @@ function SettingsModal({
   );
 }
 
+// F0013 fix: cap log buffer at the last LOGS_MAX_LINES on the client. Long
+// relay sessions used to render unbounded <div>s (one per line, fully
+// re-rendered every 3s on poll), causing main-thread stutter. We slice the
+// payload before storing so React only diffs at most LOGS_MAX_LINES rows.
+const LOGS_MAX_LINES = 1000;
+
 function LogsModal({ profile, onClose }: { profile: Profile; onClose: () => void }) {
   const [logs, setLogs] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
   const [errorText, setErrorText] = useState('');
+  const [truncated, setTruncated] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -4241,7 +4440,12 @@ function LogsModal({ profile, onClose }: { profile: Profile; onClose: () => void
       try {
         const payload = await api.logs(profile.id, profile.relayType);
         if (!cancelled) {
-          setLogs(payload.logs || []);
+          const incoming = payload.logs || [];
+          const capped = incoming.length > LOGS_MAX_LINES
+            ? incoming.slice(incoming.length - LOGS_MAX_LINES)
+            : incoming;
+          setTruncated(incoming.length > LOGS_MAX_LINES);
+          setLogs(capped);
           setErrorText('');
         }
       } catch (error) {
@@ -4276,7 +4480,14 @@ function LogsModal({ profile, onClose }: { profile: Profile; onClose: () => void
         {loading && logs.length === 0 ? (
           <div className="flex items-center gap-2 text-indigo-300"><Loader2 size={14} className="animate-spin" /> Loading logs...</div>
         ) : logs.length ? (
-          logs.map((line, index) => <div key={`${profile.id}-${index}`}>{line}</div>)
+          <>
+            {truncated ? (
+              <div className="mb-2 text-[10px] uppercase tracking-[0.18em] text-gray-500">
+                Showing last {LOGS_MAX_LINES} lines (older entries trimmed for UI performance).
+              </div>
+            ) : null}
+            {logs.map((line, index) => <div key={`${profile.id}-${index}`}>{line}</div>)}
+          </>
         ) : !errorText ? (
           <div className="text-gray-500">No log lines recorded yet for this relay.</div>
         ) : null}
@@ -4545,9 +4756,66 @@ function ModalShell({ title, children, onClose, wide = false }: { title: string;
   // close button has aria-label. Without these, modals were undismissible
   // by keyboard and screen readers had no announcement that they were
   // inside a dialog.
+  // F0015 fix: trap Tab/Shift+Tab focus inside the modal, focus the first
+  // focusable element on mount, and restore focus to the invoking element
+  // on unmount. Affects every dialog: AddProfile, EditProfile, Logs,
+  // Settings, Workgroup, RemoteAccess, DirectoryBrowser.
+  const dialogRef = useRef<HTMLDivElement | null>(null);
+  const previouslyFocusedRef = useRef<Element | null>(null);
+
+  useEffect(() => {
+    previouslyFocusedRef.current = typeof document !== 'undefined' ? document.activeElement : null;
+    const node = dialogRef.current;
+    if (node) {
+      const focusables = node.querySelectorAll<HTMLElement>(
+        'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
+      );
+      const first = Array.from(focusables).find((el) => !el.hasAttribute('disabled'));
+      if (first) {
+        first.focus();
+      } else {
+        node.focus();
+      }
+    }
+    return () => {
+      const previouslyFocused = previouslyFocusedRef.current;
+      if (previouslyFocused && previouslyFocused instanceof HTMLElement) {
+        try { previouslyFocused.focus(); } catch { /* ignore */ }
+      }
+    };
+  }, []);
+
   useEffect(() => {
     const handler = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') onClose();
+      if (event.key === 'Escape') {
+        onClose();
+        return;
+      }
+      if (event.key !== 'Tab') return;
+      const node = dialogRef.current;
+      if (!node) return;
+      const focusables = Array.from(
+        node.querySelectorAll<HTMLElement>(
+          'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
+        ),
+      ).filter((el) => !el.hasAttribute('disabled') && el.tabIndex !== -1);
+      if (focusables.length === 0) {
+        event.preventDefault();
+        node.focus();
+        return;
+      }
+      const first = focusables[0];
+      const last = focusables[focusables.length - 1];
+      const active = document.activeElement as HTMLElement | null;
+      if (event.shiftKey) {
+        if (active === first || !node.contains(active)) {
+          event.preventDefault();
+          last.focus();
+        }
+      } else if (active === last || !node.contains(active)) {
+        event.preventDefault();
+        first.focus();
+      }
     };
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
@@ -4561,9 +4829,11 @@ function ModalShell({ title, children, onClose, wide = false }: { title: string;
       onClick={onClose}
     >
       <motion.div
+        ref={dialogRef}
         role="dialog"
         aria-modal="true"
         aria-label={title}
+        tabIndex={-1}
         initial={{ scale: 0.98, y: 8 }}
         animate={{ scale: 1, y: 0 }}
         exit={{ scale: 0.98, y: 8 }}
