@@ -1828,6 +1828,93 @@ def test_bootstrap_runtime_module_imports_with_stdlib_only() -> None:
     assert callable(getattr(module, "_resolve_install_source"))
 
 
+def test_bootstrap_runtime_venv_is_healthy_detects_stub_orphan(tmp_path: Path) -> None:
+    """Regression for the post-v3 stacked-modal bug: when a managed venv's
+    base interpreter has been uninstalled (operator removed Python 3.10
+    after creating the venv from it), the stub `python.exe` / `pythonw.exe`
+    still passes Path.exists() but invoking it triggers the unblockable
+    Windows Python Launcher modal `No Python at <home>\\pythonw.exe`. The
+    health check must read pyvenv.cfg and reject the orphan."""
+    import bootstrap_runtime
+
+    runtime_root = tmp_path / "runtime"
+    scripts = runtime_root / "Scripts"
+    scripts.mkdir(parents=True)
+    stub = scripts / "python.exe"
+    stub.write_text("", encoding="utf-8")
+
+    # Healthy when no pyvenv.cfg present (raw Python install).
+    assert bootstrap_runtime._venv_is_healthy(stub) is True
+
+    # Unhealthy when pyvenv.cfg points at a missing base interpreter.
+    missing_base = tmp_path / "missing-base"
+    (runtime_root / "pyvenv.cfg").write_text(
+        f"home = {missing_base}\nversion = 3.10.11\n",
+        encoding="utf-8",
+    )
+    assert bootstrap_runtime._venv_is_healthy(stub) is False
+
+    # Healthy again when the base interpreter exists at `home`.
+    base_dir = tmp_path / "base"
+    base_dir.mkdir()
+    base_python = base_dir / ("python.exe" if os.name == "nt" else "python")
+    base_python.write_text("", encoding="utf-8")
+    (runtime_root / "pyvenv.cfg").write_text(
+        f"home = {base_dir}\nversion = 3.12.4\n",
+        encoding="utf-8",
+    )
+    assert bootstrap_runtime._venv_is_healthy(stub) is True
+
+
+def test_bootstrap_runtime_ensure_venv_rebuilds_orphaned_stub(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`_ensure_venv` must shutil.rmtree() a stub-orphaned venv root before
+    re-creating it. Otherwise the orphan stub passes the existence check
+    and `venv.EnvBuilder` is skipped."""
+    import bootstrap_runtime
+
+    runtime_root = tmp_path / "runtime"
+    scripts_dir_name = "Scripts" if os.name == "nt" else "bin"
+    scripts = runtime_root / scripts_dir_name
+    scripts.mkdir(parents=True)
+    stub_name = "python.exe" if os.name == "nt" else "python"
+    stub = scripts / stub_name
+    stub.write_text("orphan-stub-content", encoding="utf-8")
+    (runtime_root / "pyvenv.cfg").write_text(
+        f"home = {tmp_path / 'missing'}\nversion = 3.10.11\n",
+        encoding="utf-8",
+    )
+    sentinel_other_file = runtime_root / "Lib" / "site-packages" / "marker.txt"
+    sentinel_other_file.parent.mkdir(parents=True)
+    sentinel_other_file.write_text("from-old-broken-venv", encoding="utf-8")
+
+    rebuilt: dict[str, object] = {}
+
+    class _FakeBuilder:
+        def __init__(self, **kwargs: object) -> None:
+            rebuilt["init_kwargs"] = kwargs
+
+        def create(self, target: object) -> None:
+            rebuilt["create_target"] = str(target)
+            target_path = Path(str(target))
+            (target_path / scripts_dir_name).mkdir(parents=True, exist_ok=True)
+            (target_path / scripts_dir_name / stub_name).write_text(
+                "fresh", encoding="utf-8"
+            )
+
+    monkeypatch.setattr(bootstrap_runtime.venv, "EnvBuilder", _FakeBuilder)
+
+    result = bootstrap_runtime._ensure_venv(runtime_root)
+
+    # Old broken venv content must be gone (proof of rmtree).
+    assert not sentinel_other_file.exists(), "orphaned venv contents must be removed"
+    # Builder was called.
+    assert rebuilt.get("create_target") == str(runtime_root)
+    # The stub now exists under the rebuilt venv.
+    assert result.exists()
+
+
 def test_bootstrap_runtime_resolves_local_install_source(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """The bootstrap install source must come from the bundled `pyproject.toml`
     when the script ships next to one (packaged bundle / dev tree). On a

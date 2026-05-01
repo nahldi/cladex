@@ -1186,6 +1186,106 @@ def test_background_python_windowless_executable_prefers_runtime_pythonw(tmp_pat
         relayctl.os.name = original_os_name
 
 
+def test_background_python_windowless_executable_skips_stub_orphan_venv(tmp_path: Path) -> None:
+    """Regression: a venv whose base interpreter has been uninstalled must
+    not be returned to the spawner — invoking it on Windows fires the
+    Python Launcher modal "No Python at <home>\\pythonw.exe" once per
+    spawn attempt. The resolver should treat it as missing and fall back."""
+    runtime_root = tmp_path / "runtime"
+    runtime_scripts = runtime_root / "Scripts"
+    runtime_scripts.mkdir(parents=True)
+    runtime_python = runtime_scripts / "python.exe"
+    runtime_pythonw = runtime_scripts / "pythonw.exe"
+    runtime_python.write_text("", encoding="utf-8")
+    runtime_pythonw.write_text("", encoding="utf-8")
+    # pyvenv.cfg points at a base interpreter that does NOT exist on disk.
+    missing_base = tmp_path / "missing-base-python"
+    (runtime_root / "pyvenv.cfg").write_text(
+        f"home = {missing_base}\nversion = 3.10.11\n",
+        encoding="utf-8",
+    )
+
+    fallback_dir = tmp_path / "fallback"
+    fallback_dir.mkdir()
+    fallback_pythonw = fallback_dir / "pythonw.exe"
+    fallback_pythonw.write_text("", encoding="utf-8")
+
+    original_runtime_python_path = install_plugin.runtime_python_path
+    original_os_name = relayctl.os.name
+    original_sys_executable = relayctl.sys.executable
+    install_plugin.runtime_python_path = lambda root=None: runtime_python
+    relayctl.os.name = "nt"
+    relayctl.sys.executable = str(fallback_dir / "python.exe")
+    try:
+        result = relayctl._background_python_windowless_executable()
+    finally:
+        install_plugin.runtime_python_path = original_runtime_python_path
+        relayctl.os.name = original_os_name
+        relayctl.sys.executable = original_sys_executable
+
+    assert result == str(fallback_pythonw), (
+        f"expected fallback pythonw, got {result}"
+    )
+
+
+def test_background_python_executable_skips_stub_orphan_venv(tmp_path: Path) -> None:
+    """Same regression for the visible-window variant used on POSIX and as
+    the last-resort Windows fallback."""
+    runtime_root = tmp_path / "runtime"
+    runtime_scripts = runtime_root / "Scripts"
+    runtime_scripts.mkdir(parents=True)
+    runtime_python = runtime_scripts / "python.exe"
+    runtime_python.write_text("", encoding="utf-8")
+    missing_base = tmp_path / "missing-base-python"
+    (runtime_root / "pyvenv.cfg").write_text(
+        f"home = {missing_base}\nversion = 3.10.11\n",
+        encoding="utf-8",
+    )
+
+    fallback_python = tmp_path / "fallback-python.exe"
+    fallback_python.write_text("", encoding="utf-8")
+
+    original_runtime_python_path = install_plugin.runtime_python_path
+    original_sys_executable = relayctl.sys.executable
+    install_plugin.runtime_python_path = lambda root=None: runtime_python
+    relayctl.sys.executable = str(fallback_python)
+    try:
+        result = relayctl._background_python_executable()
+    finally:
+        install_plugin.runtime_python_path = original_runtime_python_path
+        relayctl.sys.executable = original_sys_executable
+
+    assert result == str(fallback_python), f"expected fallback python, got {result}"
+
+
+def test_background_python_executable_uses_runtime_when_venv_healthy(tmp_path: Path) -> None:
+    """Counterpart: when the base interpreter recorded in pyvenv.cfg DOES
+    exist, the resolver must still use the managed venv."""
+    runtime_root = tmp_path / "runtime"
+    runtime_scripts = runtime_root / "Scripts"
+    runtime_scripts.mkdir(parents=True)
+    runtime_python = runtime_scripts / "python.exe"
+    runtime_python.write_text("", encoding="utf-8")
+    base_dir = tmp_path / "base-python"
+    base_dir.mkdir()
+    (base_dir / "python.exe" if relayctl.os.name == "nt" else base_dir / "python").write_text(
+        "", encoding="utf-8"
+    )
+    (runtime_root / "pyvenv.cfg").write_text(
+        f"home = {base_dir}\nversion = 3.12.4\n",
+        encoding="utf-8",
+    )
+
+    original_runtime_python_path = install_plugin.runtime_python_path
+    install_plugin.runtime_python_path = lambda root=None: runtime_python
+    try:
+        result = relayctl._background_python_executable()
+    finally:
+        install_plugin.runtime_python_path = original_runtime_python_path
+
+    assert result == str(runtime_python)
+
+
 def test_profile_runtime_state_reads_app_server_pid_file(tmp_path: Path) -> None:
     env_path = tmp_path / "profile.env"
     env_path.write_text(

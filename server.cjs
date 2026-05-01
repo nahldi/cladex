@@ -374,6 +374,19 @@ function hasValidRemoteAccessToken(req) {
   return Boolean(provided) && provided === getRemoteAccessToken();
 }
 
+function isBaseInterpreterCandidateHealthy(candidate) {
+  // `candidate` is an absolute path to python.exe/pythonw.exe. If it lives
+  // inside a venv (pyvenv.cfg present at <root>), the base interpreter
+  // recorded in pyvenv.cfg's `home = ...` must still exist on disk —
+  // otherwise invoking it triggers the Python Launcher modal. For non-venv
+  // installs (no pyvenv.cfg), accept the candidate as-is.
+  const base = venvBaseInterpreterPath(candidate);
+  if (!base) {
+    return true;
+  }
+  return fsSync.existsSync(base);
+}
+
 function resolvePythonLaunchers() {
   const launchers = [];
   const managedPython = managedRuntimePythonPath();
@@ -388,7 +401,9 @@ function resolvePythonLaunchers() {
   ].filter(Boolean);
 
   for (const candidate of directCandidates) {
-    if (fsSync.existsSync(candidate) && !launchers.includes(candidate)) {
+    if (!fsSync.existsSync(candidate)) continue;
+    if (!isBaseInterpreterCandidateHealthy(candidate)) continue;
+    if (!launchers.includes(candidate)) {
       launchers.push(candidate);
     }
   }
@@ -418,9 +433,13 @@ function resolvePythonwLaunchers() {
     'pyw.exe',
   ].filter(Boolean);
   for (const candidate of directCandidates) {
-    if (!launchers.includes(candidate) && (candidate.toLowerCase().endsWith('.exe') ? fsSync.existsSync(candidate) : true)) {
-      launchers.push(candidate);
+    if (launchers.includes(candidate)) continue;
+    const isAbsoluteExe = candidate.toLowerCase().endsWith('.exe') && path.isAbsolute(candidate);
+    if (isAbsoluteExe) {
+      if (!fsSync.existsSync(candidate)) continue;
+      if (!isBaseInterpreterCandidateHealthy(candidate)) continue;
     }
+    launchers.push(candidate);
   }
   return launchers;
 }
@@ -488,8 +507,51 @@ function backendRuntimeManifestPath() {
   return root ? path.join(root, '.cladex-runtime-manifest.json') : '';
 }
 
+function venvBaseInterpreterPath(managedPython) {
+  // managedPython is .../runtime/Scripts/python.exe (Win) or .../runtime/bin/python (POSIX).
+  // pyvenv.cfg lives at the runtime root.
+  if (!managedPython) {
+    return '';
+  }
+  const root = path.dirname(path.dirname(managedPython));
+  const cfgPath = path.join(root, 'pyvenv.cfg');
+  let raw;
+  try {
+    raw = fsSync.readFileSync(cfgPath, 'utf8');
+  } catch {
+    return '';
+  }
+  for (const line of raw.split(/\r?\n/)) {
+    const idx = line.indexOf('=');
+    if (idx === -1) continue;
+    const key = line.slice(0, idx).trim().toLowerCase();
+    if (key !== 'home') continue;
+    const home = line.slice(idx + 1).trim();
+    if (!home) return '';
+    return process.platform === 'win32' ? path.join(home, 'python.exe') : path.join(home, 'python');
+  }
+  return '';
+}
+
+function isManagedRuntimeHealthy(managedPython) {
+  // A stub-orphan venv has the .exe stub on disk but its base interpreter
+  // (pyvenv.cfg `home = ...`) was uninstalled. Invoking the stub on Windows
+  // triggers the unblockable Python Launcher dialog, so refuse to use it.
+  if (!managedPython || !fsSync.existsSync(managedPython)) {
+    return false;
+  }
+  const base = venvBaseInterpreterPath(managedPython);
+  if (!base) {
+    return true; // not a venv (or pyvenv.cfg missing); nothing to validate
+  }
+  return fsSync.existsSync(base);
+}
+
 function backendRuntimeNeedsRefresh(managedPython) {
   if (!managedPython || !fsSync.existsSync(managedPython)) {
+    return true;
+  }
+  if (!isManagedRuntimeHealthy(managedPython)) {
     return true;
   }
   const manifestPath = backendRuntimeManifestPath();

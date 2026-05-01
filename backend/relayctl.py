@@ -1843,9 +1843,48 @@ def _sleep_until(seconds: float, stop_requested: list[bool]) -> bool:
     return not stop_requested[0]
 
 
+def _is_managed_venv_python_healthy(python: Path) -> bool:
+    """Reject a managed venv whose base interpreter has been uninstalled.
+
+    A venv is a tiny `python.exe`/`pythonw.exe` stub plus a `pyvenv.cfg`
+    that records the base interpreter via `home = ...`. If the base
+    interpreter is gone (operator uninstalled it), invoking the stub
+    triggers the unblockable Windows Python Launcher modal "No Python
+    at <home>\\pythonw.exe". Detect the orphan via pyvenv.cfg before
+    handing the path to subprocess so we never spawn the dialog.
+    """
+    try:
+        from bootstrap_runtime import _venv_is_healthy  # local import keeps cold-start cheap
+
+        return _venv_is_healthy(python)
+    except Exception:
+        # If bootstrap_runtime isn't importable for any reason, fall back to
+        # a direct check inside this module rather than failing closed (a
+        # false positive here just means we use the stub and might get a
+        # dialog; a false negative would mean we never use the runtime).
+        if not python.exists():
+            return False
+        cfg = python.parent.parent / "pyvenv.cfg"
+        if not cfg.exists():
+            return True
+        try:
+            for line in cfg.read_text(encoding="utf-8", errors="replace").splitlines():
+                if "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                if key.strip().lower() != "home":
+                    continue
+                home = Path(value.strip()).expanduser()
+                base = home / ("python.exe" if os.name == "nt" else "python")
+                return base.exists()
+        except OSError:
+            return False
+        return True
+
+
 def _background_python_executable() -> str:
     runtime_python = install_plugin.runtime_python_path()
-    if runtime_python.exists():
+    if runtime_python.exists() and _is_managed_venv_python_healthy(runtime_python):
         return str(runtime_python)
     return sys.executable
 
@@ -1853,8 +1892,14 @@ def _background_python_executable() -> str:
 def _background_python_windowless_executable() -> str:
     if os.name != "nt":
         return _background_python_executable()
-    runtime_pythonw = install_plugin.runtime_python_path().with_name("pythonw.exe")
-    if runtime_pythonw.exists():
+    runtime_python = install_plugin.runtime_python_path()
+    runtime_pythonw = runtime_python.with_name("pythonw.exe")
+    # Health check passes runtime_pythonw because pyvenv.cfg lives at
+    # runtime_pythonw.parent.parent — the venv root — and the file-exists
+    # check needs to validate the actual exe we're about to spawn, not its
+    # python.exe sibling (which may legitimately be absent in some packaged
+    # bundles that ship pythonw-only).
+    if runtime_pythonw.exists() and _is_managed_venv_python_healthy(runtime_pythonw):
         return str(runtime_pythonw)
     pythonw = Path(sys.executable).with_name("pythonw.exe")
     if pythonw.exists():

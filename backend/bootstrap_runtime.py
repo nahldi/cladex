@@ -13,11 +13,28 @@ place, so pip becomes a no-op.
 
 Operators can override the runtime root with CLADEX_RUNTIME_DATA_ROOT
 and the install source with CLADEX_INSTALL_SOURCE.
+
+# Stub-orphaned venv detection
+
+A Python venv is a tiny stub `python.exe` / `pythonw.exe` plus a
+`pyvenv.cfg` file that points at the base interpreter via `home = ...`.
+When a user uninstalls the base interpreter (e.g. removes Python 3.10
+because they installed 3.12), the venv stub still exists and passes a
+`Path.exists()` check, but invoking it triggers the Windows Python
+Launcher modal "No Python at <home>\\pythonw.exe". The dialog is
+unblockable and stacks per call.
+
+`_venv_is_healthy()` reads `pyvenv.cfg` and confirms the base
+interpreter still exists on disk. If not, the bootstrap deletes the
+broken venv (`shutil.rmtree`) and recreates it from the currently
+running Python — which by definition is healthy because it is
+executing this code.
 """
 
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 import venv
@@ -52,8 +69,64 @@ def _runtime_python(root: Path) -> Path:
     return root / "bin" / "python"
 
 
+def _venv_base_python(root: Path) -> Path | None:
+    """Return the venv's base-interpreter path, or None if root isn't a venv.
+
+    A non-venv Python install has no pyvenv.cfg; in that case the file
+    existing IS the interpreter and there is nothing further to validate.
+    """
+    cfg = root / "pyvenv.cfg"
+    if not cfg.exists():
+        return None
+    try:
+        text = cfg.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    for line in text.splitlines():
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        if key.strip().lower() != "home":
+            continue
+        home = Path(value.strip()).expanduser()
+        if os.name == "nt":
+            return home / "python.exe"
+        return home / "python"
+    return None
+
+
+def _venv_is_healthy(python: Path) -> bool:
+    """Return True if `python` is a usable interpreter, not a stub orphan.
+
+    The stub-orphan check is: if `python` lives inside a venv, its
+    pyvenv.cfg `home = ...` must point at a base interpreter that still
+    exists. If not, invoking this `python` would re-exec the missing
+    base — which on Windows triggers the unblockable Python Launcher
+    modal.
+    """
+    if not python.exists():
+        return False
+    # Walk up from Scripts/python.exe -> Scripts -> root, or bin/python -> bin -> root.
+    venv_root = python.parent.parent
+    base = _venv_base_python(venv_root)
+    if base is None:
+        return True
+    return base.exists()
+
+
 def _ensure_venv(root: Path) -> Path:
+    """Create the venv if missing OR rebuild it if the existing venv is orphaned."""
     python = _runtime_python(root)
+    if python.exists() and not _venv_is_healthy(python):
+        # Stub-orphan: base interpreter was uninstalled. The stub will fire
+        # the Python Launcher modal on every invocation. Wipe and rebuild.
+        try:
+            shutil.rmtree(root)
+        except OSError as exc:
+            raise RuntimeError(
+                f"Could not remove orphaned managed runtime at {root}: {exc}. "
+                "Delete it manually and retry."
+            ) from exc
     if not python.exists():
         venv.EnvBuilder(with_pip=True, clear=False, upgrade_deps=False).create(root)
     if not python.exists():

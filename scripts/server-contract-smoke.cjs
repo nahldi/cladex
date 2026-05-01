@@ -210,6 +210,38 @@ async function main() {
     'utf8',
   );
   assert.equal(backendRuntimeNeedsRefresh(managedPython), false);
+
+  // Regression for the post-v3 stacked Python Launcher modal bug. A managed
+  // venv whose base interpreter has been uninstalled still has the .exe stub
+  // on disk, so the file-exists check passes — but invoking the stub fires
+  // the unblockable Windows Python Launcher dialog. backendRuntimeNeedsRefresh
+  // must read pyvenv.cfg's `home = ...` and demand a rebuild when the base
+  // interpreter is missing.
+  const venvRootForOrphanCheck = path.dirname(path.dirname(managedPython));
+  const missingBaseDir = path.join(venvRootForOrphanCheck, 'missing-base-interpreter');
+  fs.writeFileSync(
+    path.join(venvRootForOrphanCheck, 'pyvenv.cfg'),
+    `home = ${missingBaseDir}\nversion = 3.10.11\n`,
+    'utf8',
+  );
+  assert.equal(
+    backendRuntimeNeedsRefresh(managedPython),
+    true,
+    'stub-orphan venv must force a runtime rebuild',
+  );
+  // After the base interpreter is restored, the manifest is honored again.
+  fs.mkdirSync(missingBaseDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(missingBaseDir, process.platform === 'win32' ? 'python.exe' : 'python'),
+    '',
+    'utf8',
+  );
+  assert.equal(
+    backendRuntimeNeedsRefresh(managedPython),
+    false,
+    'healthy venv with restored base must not force a rebuild',
+  );
+
   if (originalRuntimeDataRoot === undefined) {
     delete process.env.CLADEX_RUNTIME_DATA_ROOT;
   } else {
