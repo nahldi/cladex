@@ -4,6 +4,8 @@ import {
   Activity,
   AlertTriangle,
   Bot,
+  ChevronDown,
+  CornerDownLeft,
   FileText,
   FolderKanban,
   Hash,
@@ -14,19 +16,24 @@ import {
   Pencil,
   Play,
   Plus,
+  Radio,
   RefreshCw,
   RotateCcw,
   SearchCheck,
+  Send,
   Settings,
+  Sparkles,
   Square,
   Terminal,
   Trash2,
+  WifiOff,
   Wrench,
   X,
 } from 'lucide-react';
 import CladexBackground from './components/CladexBackground';
 
 type ViewName = 'relays' | 'workgroups' | 'review' | 'live';
+type ViewMode = 'simple' | 'advanced';
 type ProfileType = 'Claude' | 'Codex';
 type RelayType = 'claude' | 'codex';
 type ReviewProvider = 'codex' | 'claude';
@@ -702,6 +709,28 @@ export default function App() {
   // by ~6 dock-style helpers below to pick the right surface tones.
   const isDark = true;
 
+  // Simple ↔ Advanced view mode. Persists across launches via localStorage.
+  // Simple = essentials only (the default for new operators). Advanced =
+  // every surface exposes its full set of knobs and inspector rows.
+  const [viewMode, setViewMode] = useState<ViewMode>(() => {
+    if (typeof window === 'undefined') return 'simple';
+    try {
+      const saved = window.localStorage.getItem('cladex.viewMode');
+      return saved === 'advanced' ? 'advanced' : 'simple';
+    } catch {
+      return 'simple';
+    }
+  });
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    try {
+      window.localStorage.setItem('cladex.viewMode', viewMode);
+    } catch {
+      /* ignore quota / privacy-mode failures */
+    }
+  }, [viewMode]);
+
   // One-shot mount effect — adds `.dark` to <html> for Tailwind's dark
   // variants. Empty deps list because there is no toggle to track.
   useEffect(() => {
@@ -849,7 +878,7 @@ export default function App() {
       <CladexBackground isDark={isDark} />
       <div className={`pointer-events-none absolute inset-0 z-0 transition-opacity duration-500 ${isDark ? 'bg-[radial-gradient(circle_at_top,rgba(249,115,22,0.12),transparent_28%),radial-gradient(circle_at_bottom_right,rgba(16,185,129,0.12),transparent_32%)] opacity-100' : 'bg-[radial-gradient(circle_at_top,rgba(212,115,94,0.16),transparent_30%),radial-gradient(circle_at_bottom_right,rgba(125,181,165,0.18),transparent_34%)] opacity-80'}`} />
       <main className="relative z-10 flex min-h-screen flex-col overflow-y-auto pb-24 sm:pb-28">
-        <header className="mx-auto flex w-full max-w-7xl flex-col gap-4 px-4 pb-2 pt-5 sm:px-8 sm:pt-7 lg:flex-row lg:items-start lg:justify-between lg:gap-6">
+        <header className="mx-auto flex w-full max-w-[1640px] flex-col gap-4 px-4 pb-2 pt-5 sm:px-8 sm:pt-7 lg:flex-row lg:items-start lg:justify-between lg:gap-6">
           <div className="flex items-center gap-4">
             <div className={`relative h-12 w-12 overflow-hidden rounded-[18px] border shadow-[0_0_28px_rgba(99,102,241,0.16)] ${isDark ? 'border-white/10 bg-white/5' : 'border-black/10 bg-white/70 shadow-[0_0_30px_rgba(212,115,94,0.12)]'}`}>
               <img src={CLADEX_LOGO} alt="CLADEX" className="h-full w-full object-cover" />
@@ -859,13 +888,14 @@ export default function App() {
               <p className={`mt-1.5 font-mono text-[11px] uppercase tracking-[0.32em] ${isDark ? 'text-orange-300/85' : 'text-[#b15f4e]'}`}>Unified Relay Network</p>
             </div>
           </div>
-          <div className="flex gap-2 self-start lg:pt-4">
+          <div className="flex items-center gap-2 self-start lg:pt-4">
+            <ViewModeToggle value={viewMode} onChange={setViewMode} />
             <MiniIconButton label="Refresh" icon={<RefreshCw size={15} />} onClick={() => void loadAll()} />
             <MiniIconButton label="Stop All" icon={<PauseCircle size={15} />} tone="danger" onClick={() => void runAction('stop-all', api.stopAll)} />
           </div>
         </header>
 
-        {!bootPending && errorText ? <div className={`mx-auto mt-3 w-full max-w-7xl rounded-2xl border px-4 py-3 text-sm ${isDark ? 'border-amber-500/20 bg-amber-500/10 text-amber-100' : 'border-amber-300 bg-amber-50 text-amber-950'}`}>{errorText}</div> : null}
+        {!bootPending && errorText ? <div className={`mx-auto mt-3 w-full max-w-[1640px] rounded-2xl border px-4 py-3 text-sm ${isDark ? 'border-amber-500/20 bg-amber-500/10 text-amber-100' : 'border-amber-300 bg-amber-50 text-amber-950'}`}>{errorText}</div> : null}
 
         <AnimatePresence mode="wait">
           {view === 'relays' ? (
@@ -912,6 +942,7 @@ export default function App() {
                 backups={backups}
                 busyKey={busyKey}
                 allowCladexSelfReview={allowCladexSelfReview}
+                viewMode={viewMode}
                 onAnalyze={(body) => api.analyzeReview(body)}
                 onStart={(body) => void runAction('review-start', () => api.startReview(body))}
                 onFixPlan={(job) => void runAction(`review-fix-${job.id}`, () => api.createFixPlan(job.id))}
@@ -923,7 +954,7 @@ export default function App() {
             </motion.div>
           ) : (
             <motion.div key="live" initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -12 }}>
-              <LiveFeed profiles={profiles} selectedProfileId={selectedProfileId} onSelectProfile={setSelectedProfileId} />
+              <LiveFeed profiles={profiles} selectedProfileId={selectedProfileId} onSelectProfile={setSelectedProfileId} viewMode={viewMode} />
             </motion.div>
           )}
         </AnimatePresence>
@@ -957,8 +988,8 @@ export default function App() {
             }}
           />
         ) : null}
-        {activeModal === 'add' ? <AddProfileModal onClose={() => setActiveModal(null)} onSubmit={async (data) => { if (await runAction('create-profile', () => api.createProfile(data))) { setActiveModal(null); return; } throw new Error(lastActionErrorRef.current || 'Failed to save relay.'); }} /> : null}
-        {activeModal === 'edit' && selectedProfile ? <EditProfileModal profile={selectedProfile} onClose={() => setActiveModal(null)} onSubmit={async (data) => { if (await runAction(`update-${selectedProfile.id}`, () => api.updateProfile(selectedProfile.id, selectedProfile.relayType, data))) { setActiveModal(null); return; } throw new Error(lastActionErrorRef.current || 'Failed to save relay.'); }} /> : null}
+        {activeModal === 'add' ? <AddProfileModal viewMode={viewMode} onClose={() => setActiveModal(null)} onSubmit={async (data) => { if (await runAction('create-profile', () => api.createProfile(data))) { setActiveModal(null); return; } throw new Error(lastActionErrorRef.current || 'Failed to save relay.'); }} /> : null}
+        {activeModal === 'edit' && selectedProfile ? <EditProfileModal profile={selectedProfile} viewMode={viewMode} onClose={() => setActiveModal(null)} onSubmit={async (data) => { if (await runAction(`update-${selectedProfile.id}`, () => api.updateProfile(selectedProfile.id, selectedProfile.relayType, data))) { setActiveModal(null); return; } throw new Error(lastActionErrorRef.current || 'Failed to save relay.'); }} /> : null}
         {activeModal === 'logs' && selectedProfile ? <LogsModal profile={selectedProfile} onClose={() => setActiveModal(null)} /> : null}
         {activeModal === 'settings' ? (
           <SettingsModal
@@ -1005,7 +1036,7 @@ function RelayDashboard({
   onLogs: (profile: Profile) => void;
 }) {
   return (
-    <div className="mx-auto flex w-full max-w-7xl flex-1 flex-col px-4 pb-10 pt-4 sm:px-8">
+    <div className="mx-auto flex w-full max-w-[1640px] flex-1 flex-col px-4 pb-10 pt-4 sm:px-8">
       {loading ? (
         <EmptyState
           title={bootPending ? 'Starting the local CLADEX runtime...' : 'Loading relay state...'}
@@ -1183,7 +1214,7 @@ function WorkgroupsView({
   onRemove: (name: string) => void;
 }) {
   return (
-    <div className="mx-auto flex w-full max-w-7xl flex-1 flex-col px-4 pb-8 pt-6 sm:px-8 sm:pt-8">
+    <div className="mx-auto flex w-full max-w-[1640px] flex-1 flex-col px-4 pb-8 pt-6 sm:px-8 sm:pt-8">
       <div className="mb-6 flex flex-col gap-4 sm:mb-8 sm:flex-row sm:items-end sm:justify-between">
         <div>
           <div className="text-[10px] font-bold uppercase tracking-[0.24em] text-slate-500 dark:text-gray-500">Saved workgroups</div>
@@ -1242,6 +1273,7 @@ function ReviewProjectView({
   backups,
   busyKey,
   allowCladexSelfReview,
+  viewMode = 'simple',
   onAnalyze,
   onStart,
   onFixPlan,
@@ -1255,6 +1287,7 @@ function ReviewProjectView({
   backups: BackupRecord[];
   busyKey: string | null;
   allowCladexSelfReview: boolean;
+  viewMode?: ViewMode;
   onAnalyze: (body: { workspace: string; provider: ReviewProvider; allowSelfReview?: boolean }) => Promise<ReviewAnalysis>;
   onStart: (body: { workspace: string; provider: ReviewProvider; agents: number; title?: string; accountHome?: string; allowSelfReview?: boolean; backupBeforeReview?: boolean }) => void;
   onFixPlan: (job: ReviewJob) => void;
@@ -1263,6 +1296,8 @@ function ReviewProjectView({
   onCancelFixRun: (run: FixRun) => void;
   onCreateBackup: (workspace: string) => void;
 }) {
+  const isAdvanced = viewMode === 'advanced';
+  void isAdvanced; // currently consumed below in inline conditionals
   const [workspace, setWorkspace] = useState('');
   const [title, setTitle] = useState('');
   const [provider, setProvider] = useState<ReviewProvider>('codex');
@@ -1336,16 +1371,24 @@ function ReviewProjectView({
   }
 
   return (
-    <div className="review-swarm-page mx-auto flex w-full max-w-[1500px] flex-1 flex-col px-4 pb-8 pt-5 sm:px-8 sm:pt-7">
+    <div className="review-swarm-page mx-auto flex w-full max-w-[1640px] flex-1 flex-col px-4 pb-8 pt-5 sm:px-8 sm:pt-7">
       <div className="mb-5 grid gap-4 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-end">
         <div className="min-w-0">
           <div className="flex flex-wrap items-center gap-2">
             <div className="text-[10px] font-bold uppercase tracking-[0.24em] text-emerald-700 dark:text-emerald-300">Review Swarm</div>
-            <MetaPill label="read-only lanes" />
-            <MetaPill label="scratch-copy reviews" />
+            {isAdvanced ? (
+              <>
+                <MetaPill label="read-only lanes" />
+                <MetaPill label="scratch-copy reviews" />
+              </>
+            ) : null}
           </div>
-          <h2 className="mt-2 text-2xl font-black tracking-tight text-slate-950 dark:text-white sm:text-3xl">Swarm control room</h2>
-          <p className="mt-2 max-w-3xl select-none text-sm leading-relaxed text-slate-600 dark:text-gray-400">Pick a project folder, let Project Scout size the run, then dispatch Codex or Claude reviewers into isolated copies. Live work stays here; finished scans move behind History.</p>
+          <h2 className="mt-2 text-2xl font-black tracking-tight text-slate-950 dark:text-white sm:text-3xl">{isAdvanced ? 'Swarm control room' : 'Code review'}</h2>
+          <p className="mt-2 max-w-3xl select-none text-sm leading-relaxed text-slate-600 dark:text-gray-400">
+            {isAdvanced
+              ? 'Pick a project folder, let Project Scout size the run, then dispatch Codex or Claude reviewers into isolated copies. Live work stays here; finished scans move behind History.'
+              : 'Pick a project folder and run a review. The AI reads the project in a sandbox copy and reports findings. Nothing in your project is modified.'}
+          </p>
         </div>
         <div className="grid grid-cols-2 gap-2 sm:flex sm:flex-wrap sm:justify-end">
           <div className="select-none rounded-[14px] border border-slate-200/80 bg-white/70 px-3 py-2 text-right dark:border-white/10 dark:bg-white/[0.035]">
@@ -1408,64 +1451,89 @@ function ReviewProjectView({
               onAnalyze={() => void analyzeTarget()}
             />
 
-            <div className="border-t border-slate-200/80 pt-4 dark:border-white/10">
-              <FormInput label="Run title" value={title} onChange={setTitle} placeholder="Production readiness pass" />
-            </div>
-
-            <div className="rounded-[18px] border border-emerald-400/25 bg-emerald-500/[0.055] px-4 py-3">
-              <div className="flex flex-wrap items-start justify-between gap-2">
-                <div>
-                  <div className="text-[10px] font-bold uppercase tracking-[0.22em] text-emerald-700 dark:text-emerald-200">Swarm workspace</div>
-                  <div className="mt-1 text-sm text-slate-600 dark:text-gray-400">Reviewers work in CLADEX scratch copies. The selected project stays untouched during review.</div>
-                </div>
-                <MetaPill label="isolated" />
+            {isAdvanced ? (
+              <div className="border-t border-slate-200/80 pt-4 dark:border-white/10">
+                <FormInput
+                  label="Run title (optional)"
+                  value={title}
+                  onChange={setTitle}
+                  placeholder="Production readiness pass"
+                  helper="Shown in the History tab so you can find this run later. If you leave it blank, CLADEX uses '{project} deep scan'."
+                />
               </div>
-            </div>
+            ) : null}
+
+            {isAdvanced ? (
+              <div className="rounded-[18px] border border-emerald-400/25 bg-emerald-500/[0.055] px-4 py-3">
+                <div className="flex flex-wrap items-start justify-between gap-2">
+                  <div>
+                    <div className="text-[10px] font-bold uppercase tracking-[0.22em] text-emerald-700 dark:text-emerald-200">Sandbox copy</div>
+                    <div className="mt-1 text-sm text-slate-600 dark:text-gray-400">Reviewers work in CLADEX scratch copies. The selected project stays untouched during review.</div>
+                  </div>
+                  <MetaPill label="isolated" />
+                </div>
+              </div>
+            ) : null}
 
             <section className="border-t border-slate-200/80 pt-4 dark:border-white/10">
               <div className="mb-3 flex items-center justify-between gap-3">
                 <div>
-                  <div className="text-[10px] font-bold uppercase tracking-[0.22em] text-slate-500 dark:text-gray-500">Swarm lanes</div>
-                  <div className="mt-1 text-sm font-semibold text-slate-900 dark:text-white">Provider and lane count</div>
+                  <div className="text-[10px] font-bold uppercase tracking-[0.22em] text-slate-500 dark:text-gray-500">{isAdvanced ? 'Swarm lanes' : 'Reviewer'}</div>
+                  <div className="mt-1 text-sm font-semibold text-slate-900 dark:text-white">{isAdvanced ? 'Provider and lane count' : 'Which AI does the review?'}</div>
                 </div>
-                <div className="font-mono text-lg font-semibold text-slate-900 dark:text-white">{agents}</div>
+                {isAdvanced ? <div className="font-mono text-lg font-semibold text-slate-900 dark:text-white">{agents}</div> : null}
               </div>
               <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
                 <TypeButton active={provider === 'codex'} label="Codex" icon={<Terminal size={18} />} onClick={() => selectProvider('codex')} tone="emerald" />
                 <TypeButton active={provider === 'claude'} label="Claude Code" icon={<Bot size={18} />} onClick={() => selectProvider('claude')} tone="orange" />
               </div>
-              <label className="mt-4 block">
-                <div className="mb-2 flex items-center justify-between gap-3">
-                  <div className="text-[10px] font-bold uppercase tracking-[0.22em] text-slate-500 dark:text-gray-500">Reviewer count</div>
-                  <div className="font-mono text-sm text-slate-700 dark:text-gray-300">1-50 lanes</div>
-                </div>
-                <input
-                  type="range"
-                  min={1}
-                  max={50}
-                  value={agents}
-                  onChange={(event) => setAgents(Number(event.target.value))}
-                  className="w-full accent-emerald-500"
-                />
-              </label>
-              <details className="mt-4 rounded-[16px] border border-slate-200/80 bg-white/55 px-4 py-3 dark:border-white/10 dark:bg-black/25">
-                <summary className="cursor-pointer text-sm font-semibold text-slate-700 dark:text-gray-300">Provider account folder</summary>
-                <div className="mt-4 space-y-4">
-                  <BrowseField
-                    label={provider === 'codex' ? 'Codex login/config folder' : 'Claude login/config folder'}
-                    value={accountHome}
-                    onChange={setAccountHome}
-                    placeholder={provider === 'codex' ? 'Optional CODEX_HOME for a separate Codex account' : 'Optional CLAUDE_CONFIG_DIR for a separate Claude account'}
-                    buttonLabel="Choose account folder"
-                    stacked
+              {isAdvanced ? (
+                <label className="mt-4 block">
+                  <div className="mb-2 flex items-center justify-between gap-3">
+                    <div>
+                      <div className="text-[10px] font-bold uppercase tracking-[0.22em] text-slate-500 dark:text-gray-500">Parallel lanes</div>
+                      <div className="mt-1 text-[12px] text-slate-500 dark:text-gray-500">More lanes = faster, more parallel API calls. 8 is a safe default; 50 is the cap.</div>
+                    </div>
+                    <div className="font-mono text-sm text-slate-700 dark:text-gray-300">1-50</div>
+                  </div>
+                  <input
+                    type="range"
+                    min={1}
+                    max={50}
+                    value={agents}
+                    onChange={(event) => setAgents(Number(event.target.value))}
+                    className="w-full accent-emerald-500"
                   />
-                </div>
-              </details>
+                </label>
+              ) : null}
+              {isAdvanced ? (
+                <details className="mt-4 rounded-[16px] border border-slate-200/80 bg-white/55 px-4 py-3 dark:border-white/10 dark:bg-black/25">
+                  <summary className="cursor-pointer text-sm font-semibold text-slate-700 dark:text-gray-300">Use a different AI account for this scan</summary>
+                  <div className="mt-4 space-y-4">
+                    <BrowseField
+                      label={provider === 'codex' ? 'Codex login/config folder' : 'Claude login/config folder'}
+                      value={accountHome}
+                      onChange={setAccountHome}
+                      placeholder={provider === 'codex' ? 'Optional CODEX_HOME for a separate Codex account' : 'Optional CLAUDE_CONFIG_DIR for a separate Claude account'}
+                      helper="Folder containing the AI CLI login. Useful if you have a dedicated 'reviewer' account separate from your everyday account. Leave blank to share your default login."
+                      buttonLabel="Choose account folder"
+                      stacked
+                    />
+                  </div>
+                </details>
+              ) : null}
             </section>
 
-            <div className="border-t border-slate-200/80 pt-4 dark:border-white/10">
-              <ToggleRow checked={backupBeforeReview} onChange={setBackupBeforeReview} label="Create backup before scan" />
-            </div>
+            {isAdvanced ? (
+              <div className="border-t border-slate-200/80 pt-4 dark:border-white/10">
+                <ToggleRow
+                  checked={backupBeforeReview}
+                  onChange={setBackupBeforeReview}
+                  label="Save a snapshot of the project before scanning"
+                  helper="On by default. Snapshots let you roll back the project to its pre-scan state if a Fix Run later modifies files you didn't expect."
+                />
+              </div>
+            ) : null}
 
             <div className="sticky bottom-4 z-20 -mx-1 space-y-3 rounded-[18px] border border-slate-200/80 bg-white/88 p-3 shadow-[0_18px_45px_rgba(15,23,42,0.14)] backdrop-blur-xl dark:border-white/10 dark:bg-[#070908]/92 dark:shadow-[0_18px_55px_rgba(0,0,0,0.45)]">
               <button
@@ -2575,14 +2643,332 @@ function FindingsExplorer({ jobId, totalFindings, partial = false }: { jobId: st
   );
 }
 
+// ---------------------------------------------------------------------------
+// LiveFeed — operator console (flat Discord/Slack/ChatGPT-style chat feed)
+//
+// Native chat apps don't use floating bubbles. They use a flat message feed
+// with the avatar in the left margin, the sender name + timestamp on the
+// first message of a run, and subsequent messages stacked tightly under it.
+// Hover reveals secondary actions (a full timestamp, eventually copy/react).
+// We borrow that vocabulary directly because operators have years of muscle
+// memory for it.
+//
+// Key affordances:
+//   - flat message rows, NO bubbles. Just avatar + body on the surface.
+//   - sender grouping with 5-min gap (Discord/Slack convention).
+//   - sticky day separator (thin rule with centered date pill).
+//   - inline `code spans` and ```triple-backtick``` blocks.
+//   - URL linkify.
+//   - hover row reveals absolute timestamp on the right margin.
+//   - auto-scroll on new messages — but only when user is pinned to bottom.
+//     If they scrolled up, a floating "↓ N new" pill appears instead.
+//   - typing indicator inline at the bottom of the feed while sending.
+//   - Slack-style composer: textarea with send button in the corner,
+//     hint line below. Auto-grows to ~7 lines, then scrolls inside.
+//   - Enter sends, Shift+Enter newline (with hint shown so users discover it).
+//   - status pill on the conversation header (LIVE / STANDBY / OFFLINE).
+//   - sidebar channel list with `#` icon and live LED, Discord style.
+// ---------------------------------------------------------------------------
+
+const _CHAT_DAY_FORMATTER = typeof Intl !== 'undefined'
+  ? new Intl.DateTimeFormat(undefined, { weekday: 'long' })
+  : null;
+const _CHAT_LONG_DATE_FORMATTER = typeof Intl !== 'undefined'
+  ? new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric' })
+  : null;
+const _CHAT_TIME_FORMATTER = typeof Intl !== 'undefined'
+  ? new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit', hour12: false })
+  : null;
+
+function chatParseTimestamp(timestamp: string | undefined): Date | null {
+  if (!timestamp) return null;
+  const parsed = new Date(timestamp);
+  if (Number.isNaN(parsed.getTime())) return null;
+  return parsed;
+}
+
+function chatDayKey(timestamp: string | undefined): string {
+  const parsed = chatParseTimestamp(timestamp);
+  if (!parsed) return 'unknown';
+  return `${parsed.getFullYear()}-${parsed.getMonth() + 1}-${parsed.getDate()}`;
+}
+
+function chatDayLabel(timestamp: string | undefined): string {
+  const parsed = chatParseTimestamp(timestamp);
+  if (!parsed) return 'Earlier';
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const compare = new Date(parsed);
+  compare.setHours(0, 0, 0, 0);
+  const diffDays = Math.round((today.getTime() - compare.getTime()) / 86_400_000);
+  if (diffDays === 0) return 'Today';
+  if (diffDays === 1) return 'Yesterday';
+  if (diffDays > 1 && diffDays < 7 && _CHAT_DAY_FORMATTER) return _CHAT_DAY_FORMATTER.format(parsed);
+  if (_CHAT_LONG_DATE_FORMATTER) return _CHAT_LONG_DATE_FORMATTER.format(parsed);
+  return parsed.toDateString();
+}
+
+function chatTimeLabel(timestamp: string | undefined): string {
+  const parsed = chatParseTimestamp(timestamp);
+  if (!parsed) return '';
+  if (_CHAT_TIME_FORMATTER) return _CHAT_TIME_FORMATTER.format(parsed);
+  return `${String(parsed.getHours()).padStart(2, '0')}:${String(parsed.getMinutes()).padStart(2, '0')}`;
+}
+
+function chatSenderInitials(name: string | undefined, role: 'user' | 'assistant'): string {
+  if (role === 'user') return 'OP';
+  if (!name) return 'AI';
+  const parts = name.replace(/[#@]/g, '').split(/[\s\-_·]+/).filter(Boolean);
+  if (parts.length >= 2) return (parts[0][0] + parts[1][0]).toUpperCase();
+  return name.replace(/[^A-Za-z0-9]/g, '').slice(0, 2).toUpperCase() || 'AI';
+}
+
+function chatRenderInlineSpans(text: string, keyPrefix: string): React.ReactNode {
+  // Split on backtick code spans. Anything else is plain text. URLs are
+  // linkified in a second pass. Plain whitespace and newlines are preserved
+  // by the parent container's `whitespace-pre-wrap`.
+  const segments: React.ReactNode[] = [];
+  const codeRe = /`([^`\n]+)`/g;
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+  let i = 0;
+  while ((match = codeRe.exec(text)) !== null) {
+    if (match.index > lastIndex) {
+      segments.push(...chatLinkify(text.slice(lastIndex, match.index), `${keyPrefix}-t-${i++}`));
+    }
+    segments.push(
+      <code
+        key={`${keyPrefix}-c-${i++}`}
+        className="rounded-md border border-white/10 bg-black/35 px-1.5 py-0.5 font-mono text-[12px] text-amber-100/90 dark:text-amber-200/90"
+      >
+        {match[1]}
+      </code>,
+    );
+    lastIndex = match.index + match[0].length;
+  }
+  if (lastIndex < text.length) {
+    segments.push(...chatLinkify(text.slice(lastIndex), `${keyPrefix}-t-${i++}`));
+  }
+  return segments.length ? segments : text;
+}
+
+function chatLinkify(text: string, keyPrefix: string): React.ReactNode[] {
+  const out: React.ReactNode[] = [];
+  const urlRe = /\bhttps?:\/\/[^\s<>"')]+/g;
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+  let i = 0;
+  while ((match = urlRe.exec(text)) !== null) {
+    if (match.index > lastIndex) {
+      out.push(<React.Fragment key={`${keyPrefix}-p-${i++}`}>{text.slice(lastIndex, match.index)}</React.Fragment>);
+    }
+    const url = match[0];
+    out.push(
+      <a
+        key={`${keyPrefix}-a-${i++}`}
+        href={url}
+        target="_blank"
+        rel="noopener noreferrer"
+        className="break-all underline decoration-indigo-400/60 underline-offset-2 hover:text-indigo-300"
+      >
+        {url}
+      </a>,
+    );
+    lastIndex = match.index + url.length;
+  }
+  if (lastIndex < text.length) {
+    out.push(<React.Fragment key={`${keyPrefix}-p-${i++}`}>{text.slice(lastIndex)}</React.Fragment>);
+  }
+  return out.length ? out : [<React.Fragment key={`${keyPrefix}-p-only`}>{text}</React.Fragment>];
+}
+
+function chatRenderMessageBody(text: string): React.ReactNode {
+  // Triple-backtick code blocks have priority over inline backticks.
+  const segments: React.ReactNode[] = [];
+  const blockRe = /```([a-zA-Z0-9_+\-.]*)\n?([\s\S]*?)```/g;
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+  let i = 0;
+  while ((match = blockRe.exec(text)) !== null) {
+    if (match.index > lastIndex) {
+      segments.push(
+        <span key={`b-${i++}`} className="whitespace-pre-wrap break-words">
+          {chatRenderInlineSpans(text.slice(lastIndex, match.index), `b${i}`)}
+        </span>,
+      );
+    }
+    const lang = match[1] || '';
+    const body = match[2] || '';
+    segments.push(
+      <pre
+        key={`pre-${i++}`}
+        className="my-2 max-w-full overflow-x-auto rounded-xl border border-white/10 bg-black/55 px-3 py-2.5 font-mono text-[12px] leading-relaxed text-amber-100/90 dark:text-amber-200/95"
+      >
+        {lang ? (
+          <div className="mb-1 text-[9px] font-semibold uppercase tracking-[0.18em] text-amber-200/40">
+            {lang}
+          </div>
+        ) : null}
+        <code>{body}</code>
+      </pre>,
+    );
+    lastIndex = match.index + match[0].length;
+  }
+  if (lastIndex < text.length) {
+    segments.push(
+      <span key={`tail-${i++}`} className="whitespace-pre-wrap break-words">
+        {chatRenderInlineSpans(text.slice(lastIndex), `t${i}`)}
+      </span>,
+    );
+  }
+  return segments.length ? segments : <span className="whitespace-pre-wrap break-words">{text}</span>;
+}
+
+interface ChatGroup {
+  key: string;
+  role: 'user' | 'assistant';
+  senderName: string;
+  messages: ChatMessageRecord[];
+  firstTimestamp?: string;
+  lastTimestamp?: string;
+}
+
+interface ChatDayBlock {
+  key: string;
+  label: string;
+  groups: ChatGroup[];
+}
+
+function chatGroupMessages(messages: ChatMessageRecord[], assistantName: string): ChatDayBlock[] {
+  const days: ChatDayBlock[] = [];
+  const SENDER_GAP_MS = 5 * 60 * 1000;
+  for (const message of messages) {
+    const parsed = chatParseTimestamp(message.timestamp);
+    const dayKey = chatDayKey(message.timestamp);
+    let day = days[days.length - 1];
+    if (!day || day.key !== dayKey) {
+      day = { key: dayKey, label: chatDayLabel(message.timestamp), groups: [] };
+      days.push(day);
+    }
+    const sender = message.senderName || (message.role === 'user' ? 'Operator' : assistantName);
+    let group = day.groups[day.groups.length - 1];
+    const lastTimestampDate = group ? chatParseTimestamp(group.lastTimestamp) : null;
+    const sameSender = group && group.role === message.role && group.senderName === sender;
+    const recentEnough = sameSender && lastTimestampDate && parsed
+      ? parsed.getTime() - lastTimestampDate.getTime() <= SENDER_GAP_MS
+      : false;
+    if (sameSender && (recentEnough || !lastTimestampDate || !parsed)) {
+      group.messages.push(message);
+      group.lastTimestamp = message.timestamp || group.lastTimestamp;
+    } else {
+      day.groups.push({
+        key: `${dayKey}-${day.groups.length}-${message.id}`,
+        role: message.role,
+        senderName: sender,
+        messages: [message],
+        firstTimestamp: message.timestamp,
+        lastTimestamp: message.timestamp,
+      });
+    }
+  }
+  return days;
+}
+
+function chatRelativeTime(timestamp: string | undefined): string {
+  const parsed = chatParseTimestamp(timestamp);
+  if (!parsed) return '';
+  const diffSec = Math.round((Date.now() - parsed.getTime()) / 1000);
+  if (diffSec < 5) return 'now';
+  if (diffSec < 60) return `${diffSec}s`;
+  const diffMin = Math.round(diffSec / 60);
+  if (diffMin < 60) return `${diffMin}m`;
+  const diffHr = Math.round(diffMin / 60);
+  if (diffHr < 24) return `${diffHr}h`;
+  return chatDayLabel(timestamp).toLowerCase();
+}
+
+function ChatStatusPill({ status }: { status: 'live' | 'standby' | 'down' }) {
+  if (status === 'live') {
+    return (
+      <span className="inline-flex items-center gap-1.5 rounded-full border border-emerald-400/30 bg-emerald-500/12 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.18em] text-emerald-300">
+        <span className="relative flex h-1.5 w-1.5">
+          <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-75" />
+          <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-emerald-400" />
+        </span>
+        Online
+      </span>
+    );
+  }
+  if (status === 'standby') {
+    return (
+      <span className="inline-flex items-center gap-1.5 rounded-full border border-amber-400/30 bg-amber-500/10 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.18em] text-amber-300">
+        <span className="h-1.5 w-1.5 rounded-full bg-amber-400" />
+        Starting
+      </span>
+    );
+  }
+  return (
+    <span className="inline-flex items-center gap-1.5 rounded-full border border-slate-500/25 bg-slate-500/10 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.18em] text-slate-400">
+      <WifiOff size={10} />
+      Offline
+    </span>
+  );
+}
+
+function ChatAvatar({
+  initials,
+  role,
+  relayType,
+  pulse = false,
+  size = 'md',
+}: {
+  initials: string;
+  role: 'user' | 'assistant';
+  relayType?: RelayType;
+  pulse?: boolean;
+  size?: 'sm' | 'md';
+}) {
+  const palette = role === 'user'
+    ? 'bg-indigo-500/15 text-indigo-200 ring-indigo-400/30'
+    : relayType === 'codex'
+      ? 'bg-emerald-500/15 text-emerald-200 ring-emerald-400/30'
+      : 'bg-amber-500/15 text-amber-200 ring-amber-400/30';
+  const dimensions = size === 'sm' ? 'h-7 w-7 text-[10px]' : 'h-10 w-10 text-[12px]';
+  const dotOffset = size === 'sm' ? '-bottom-0 -right-0' : '-bottom-0.5 -right-0.5';
+  const dotSize = size === 'sm' ? 'h-2 w-2' : 'h-2.5 w-2.5';
+  return (
+    <div className={`relative flex shrink-0 select-none items-center justify-center rounded-full font-mono font-bold tracking-wider ring-1 ${dimensions} ${palette}`}>
+      {initials}
+      {pulse ? (
+        <span className={`absolute ${dotOffset} flex ${dotSize}`}>
+          <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-70" />
+          <span className={`relative inline-flex ${dotSize} rounded-full bg-emerald-400 ring-2 ring-[#0a0a0c]`} />
+        </span>
+      ) : null}
+    </div>
+  );
+}
+
+function ChatTypingDots({ accentClass }: { accentClass: string }) {
+  return (
+    <span className={`inline-flex items-end gap-0.5 ${accentClass}`} aria-label="typing">
+      <span className="block h-1.5 w-1.5 animate-bounce rounded-full bg-current [animation-delay:-0.3s]" />
+      <span className="block h-1.5 w-1.5 animate-bounce rounded-full bg-current [animation-delay:-0.15s]" />
+      <span className="block h-1.5 w-1.5 animate-bounce rounded-full bg-current" />
+    </span>
+  );
+}
+
 function LiveFeed({
   profiles,
   selectedProfileId,
   onSelectProfile,
+  viewMode = 'simple',
 }: {
   profiles: Profile[];
   selectedProfileId: string | null;
   onSelectProfile: (value: string) => void;
+  viewMode?: ViewMode;
 }) {
   const workspaces = Array.from(new Set(profiles.map((profile) => profile.workspace))).sort();
   const [activeWorkspace, setActiveWorkspace] = useState(workspaces[0] || '');
@@ -2591,10 +2977,32 @@ function LiveFeed({
   const [historyError, setHistoryError] = useState('');
   const [sending, setSending] = useState(false);
   const [draft, setDraft] = useState('');
+  const [unreadBelow, setUnreadBelow] = useState(0);
   const sendingRef = useRef(false);
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+  const composerRef = useRef<HTMLTextAreaElement | null>(null);
+  const wasNearBottomRef = useRef(true);
+  const previousMessageCountRef = useRef(0);
+  const previousProfileIdRef = useRef<string | null>(null);
+  const reduceMotion = useReducedMotion();
+  const isAdvanced = viewMode === 'advanced';
   const workspaceProfiles = profiles.filter((profile) => profile.workspace === activeWorkspace);
   const activeProfile = workspaceProfiles.find((profile) => profileKey(profile) === selectedProfileId) || workspaceProfiles[0] || null;
   const activeProfileCanChat = Boolean(activeProfile?.running && activeProfile?.ready);
+  const relayStatus: 'live' | 'standby' | 'down' = !activeProfile
+    ? 'down'
+    : activeProfile.running && activeProfile.ready
+      ? 'live'
+      : activeProfile.running
+        ? 'standby'
+        : 'down';
+  const assistantLabel = activeProfile ? labelFor(activeProfile) : 'Relay';
+  const channelLabel = activeProfile ? (activeProfile.activeChannel || activeProfile.discordChannel || (activeProfile.allowDms ? 'DM' : '')) : '';
+  const accentClass = activeProfile?.type === 'Codex'
+    ? 'text-emerald-300'
+    : activeProfile?.type === 'Claude'
+      ? 'text-amber-300'
+      : 'text-indigo-300';
 
   useEffect(() => {
     if (!workspaces.length) {
@@ -2649,6 +3057,67 @@ function LiveFeed({
     };
   }, [activeProfile]);
 
+  // Track whether the user is near the bottom of the scroll. Discord/Slack
+  // pattern: only auto-scroll on new message if the user is already pinned
+  // to bottom; otherwise show a "↓ N new" pill.
+  useEffect(() => {
+    const node = scrollRef.current;
+    if (!node) return;
+    const handleScroll = () => {
+      const distance = node.scrollHeight - node.scrollTop - node.clientHeight;
+      const nearBottom = distance < 96;
+      wasNearBottomRef.current = nearBottom;
+      if (nearBottom) setUnreadBelow(0);
+    };
+    node.addEventListener('scroll', handleScroll, { passive: true });
+    return () => node.removeEventListener('scroll', handleScroll);
+  }, []);
+
+  useEffect(() => {
+    const node = scrollRef.current;
+    if (!node) return;
+    const profileKeyValue = activeProfile ? profileKey(activeProfile) : null;
+    const profileChanged = previousProfileIdRef.current !== profileKeyValue;
+    const messageCountChanged = previousMessageCountRef.current !== messages.length;
+    if (profileChanged) {
+      node.scrollTop = node.scrollHeight;
+      wasNearBottomRef.current = true;
+      setUnreadBelow(0);
+    } else if (messageCountChanged) {
+      if (wasNearBottomRef.current) {
+        node.scrollTop = node.scrollHeight;
+      } else {
+        const delta = messages.length - previousMessageCountRef.current;
+        if (delta > 0) setUnreadBelow((current) => current + delta);
+      }
+    }
+    previousProfileIdRef.current = profileKeyValue;
+    previousMessageCountRef.current = messages.length;
+  }, [activeProfile, messages.length]);
+
+  // Auto-grow composer up to ~7 lines.
+  useEffect(() => {
+    const ta = composerRef.current;
+    if (!ta) return;
+    ta.style.height = 'auto';
+    const lineHeight = 22;
+    const maxHeight = lineHeight * 7 + 16;
+    const next = Math.min(Math.max(ta.scrollHeight, 44), maxHeight);
+    ta.style.height = `${next}px`;
+  }, [draft]);
+
+  function jumpToLatest() {
+    const node = scrollRef.current;
+    if (!node) return;
+    if (reduceMotion) {
+      node.scrollTop = node.scrollHeight;
+    } else {
+      node.scrollTo({ top: node.scrollHeight, behavior: 'smooth' });
+    }
+    wasNearBottomRef.current = true;
+    setUnreadBelow(0);
+  }
+
   async function sendMessage() {
     if (!activeProfile || !activeProfileCanChat || !draft.trim() || sending) {
       return;
@@ -2681,7 +3150,7 @@ function LiveFeed({
           role: 'assistant',
           content: payload.reply || 'No reply returned from the relay.',
           channelId: payload.channelId || activeProfile.activeChannel || activeProfile.discordChannel,
-          senderName: labelFor(activeProfile),
+          senderName: assistantLabel,
           timestamp: new Date().toISOString(),
         },
       ]);
@@ -2693,7 +3162,7 @@ function LiveFeed({
           role: 'assistant',
           content: error instanceof Error ? error.message : 'Failed to send local operator message.',
           channelId: activeProfile.activeChannel || activeProfile.discordChannel,
-          senderName: labelFor(activeProfile),
+          senderName: assistantLabel,
           timestamp: new Date().toISOString(),
         },
       ]);
@@ -2702,79 +3171,266 @@ function LiveFeed({
     }
   }
 
-  return (
-    <div className="mx-auto flex w-full max-w-6xl flex-1 flex-col px-4 pb-8 pt-6 sm:px-8 sm:pt-8">
-      <div className="overflow-hidden rounded-[32px] border border-slate-200/80 bg-[#fbfaf6] shadow-[0_22px_60px_rgba(15,23,42,0.12)] dark:border-white/10 dark:bg-[#0a0a0c] dark:shadow-2xl">
-        <div className="flex gap-2 overflow-x-auto border-b border-slate-200 bg-white/60 px-4 py-4 sm:flex-wrap sm:px-5 dark:border-white/5 dark:bg-white/[0.03]">
-          {workspaces.map((workspace) => (
-            <button key={workspace} onClick={() => setActiveWorkspace(workspace)} className={`rounded-2xl px-4 py-2 text-sm font-medium transition-colors ${activeWorkspace === workspace ? 'border border-indigo-500/30 bg-indigo-500/15 text-indigo-700 dark:text-indigo-200' : 'text-slate-500 hover:bg-black/5 hover:text-slate-900 dark:text-gray-500 dark:hover:bg-white/5 dark:hover:text-gray-200'}`}>
-              {workspace.split(/[\\/]/).filter(Boolean).pop() || workspace}
-            </button>
-          ))}
-        </div>
-        <div className="grid min-h-[640px] grid-cols-1 xl:grid-cols-[260px_minmax(0,1fr)_320px]">
-          <div className="border-b border-slate-200 bg-white/30 p-4 xl:border-b-0 xl:border-r xl:p-5 dark:border-white/5 dark:bg-black/20">
-            <div className="text-[10px] font-bold uppercase tracking-[0.22em] text-slate-500 dark:text-gray-500">Relays in this workspace</div>
-            <div className="mt-4 space-y-3">
-              {workspaceProfiles.map((profile) => (
-                <button key={profileKey(profile)} onClick={() => onSelectProfile(profileKey(profile))} className={`w-full rounded-2xl border px-4 py-3 text-left transition-colors ${activeProfile && profileKey(activeProfile) === profileKey(profile) ? 'border-indigo-500/30 bg-indigo-500/10' : 'border-slate-200 bg-white/70 hover:bg-slate-50 dark:border-white/5 dark:bg-white/[0.02] dark:hover:bg-white/[0.06]'}`}>
-                  <div className="flex items-center justify-between gap-3">
-                    <div>
-                      <div className="text-sm font-semibold text-slate-900 dark:text-white">{labelFor(profile)}</div>
-                      <div className="text-xs text-slate-500 dark:text-gray-500">{profile.type}</div>
-                    </div>
-                    <span className={`h-2.5 w-2.5 rounded-full ${profile.running ? (profile.type === 'Claude' ? 'bg-orange-400' : 'bg-emerald-400') : 'bg-slate-400 dark:bg-gray-600'}`} />
-                  </div>
-                </button>
-              ))}
-            </div>
-          </div>
+  const composerDisabled = !activeProfile || !activeProfileCanChat || sending;
+  const composerPlaceholder = activeProfile
+    ? activeProfileCanChat
+      ? `Message ${assistantLabel}${channelLabel ? ` — posts to ${channelLabel.startsWith('#') ? channelLabel : '#' + channelLabel}` : ''}`
+      : 'Start this relay before sending a local operator message.'
+    : 'Select a relay first.';
 
-          <div className="border-b border-slate-200 xl:border-b-0 xl:border-r dark:border-white/5">
-            <div className="border-b border-slate-200 bg-white/60 px-4 py-5 sm:px-6 dark:border-white/5 dark:bg-white/[0.03]">
+  const grouped = chatGroupMessages(messages, assistantLabel);
+
+  // Grid columns: in simple mode the inspector is hidden so the conversation
+  // gets the full remaining width.
+  const gridCols = isAdvanced
+    ? 'xl:grid-cols-[260px_minmax(0,1fr)_300px]'
+    : 'xl:grid-cols-[240px_minmax(0,1fr)]';
+
+  return (
+    <div className="mx-auto flex w-full max-w-[1640px] flex-1 flex-col px-3 pb-6 pt-4 sm:px-6 sm:pt-6">
+      <div className="flex min-h-0 flex-1 overflow-hidden rounded-[24px] border border-white/10 bg-[#0d0d10] shadow-[0_30px_80px_rgba(0,0,0,0.55)]">
+        <div className={`grid h-full min-h-0 w-full grid-cols-1 ${gridCols}`}>
+          {/* ── Channel sidebar (Discord-style) ───────────────────── */}
+          <aside className="flex min-h-0 flex-col border-b border-white/8 bg-[#0a0a0c] xl:border-b-0 xl:border-r">
+            <div className="flex items-center justify-between border-b border-white/8 px-4 py-3.5">
+              <div className="text-[10px] font-bold uppercase tracking-[0.22em] text-gray-500">Channels</div>
+              <span className="rounded-full bg-white/5 px-2 py-0.5 font-mono text-[10px] text-gray-400">{workspaceProfiles.length}</span>
+            </div>
+            {workspaces.length > 1 ? (
+              <div className="border-b border-white/5 px-3 py-2">
+                <select
+                  value={activeWorkspace}
+                  onChange={(event) => setActiveWorkspace(event.target.value)}
+                  className="w-full rounded-lg border border-white/8 bg-white/[0.03] px-2 py-1.5 text-xs text-gray-300 outline-none focus:border-indigo-400/60"
+                  aria-label="Workspace"
+                >
+                  {workspaces.map((workspace) => (
+                    <option key={workspace} value={workspace} className="bg-[#0a0a0c]">
+                      {workspace.split(/[\\/]/).filter(Boolean).pop() || workspace}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            ) : null}
+            <div className="flex-1 overflow-y-auto px-2 py-2" role="listbox" aria-label="Relays in this workspace">
+              {workspaceProfiles.length === 0 ? (
+                <div className="m-2 rounded-lg border border-dashed border-white/10 px-3 py-6 text-center text-xs text-gray-500">
+                  No relays in this workspace yet.
+                </div>
+              ) : workspaceProfiles.map((profile) => {
+                const isActive = activeProfile && profileKey(activeProfile) === profileKey(profile);
+                const live = profile.running && profile.ready;
+                const dotColor = live
+                  ? (profile.type === 'Claude' ? 'bg-amber-400' : 'bg-emerald-400')
+                  : profile.running
+                    ? 'bg-amber-400/60'
+                    : 'bg-slate-600';
+                return (
+                  <button
+                    key={profileKey(profile)}
+                    role="option"
+                    aria-selected={Boolean(isActive)}
+                    onClick={() => onSelectProfile(profileKey(profile))}
+                    className={`group flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left transition-colors ${isActive ? 'bg-white/8 text-white' : 'text-gray-400 hover:bg-white/[0.04] hover:text-gray-200'}`}
+                    title={labelFor(profile)}
+                  >
+                    <Hash size={15} className={isActive ? accentClass : 'text-gray-500 group-hover:text-gray-300'} />
+                    <span className="flex-1 truncate text-sm font-medium">{labelFor(profile).toLowerCase()}</span>
+                    <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${dotColor}`} aria-hidden />
+                  </button>
+                );
+              })}
+            </div>
+            {isAdvanced && activeProfile ? (
+              <div className="border-t border-white/8 px-4 py-3 text-[10px] font-mono text-gray-500">
+                <div className="mb-1 font-semibold uppercase tracking-[0.18em] text-gray-600">Workspace</div>
+                <div className="truncate text-gray-400" title={workspaceFor(activeProfile)}>{workspaceFor(activeProfile)}</div>
+              </div>
+            ) : null}
+          </aside>
+
+          {/* ── Conversation column ──────────────────────────────── */}
+          <section className="relative flex min-h-0 flex-col bg-[#0d0d10]">
+            {/* Header — Discord-style */}
+            <header className="flex items-center justify-between gap-4 border-b border-white/8 bg-[#0d0d10] px-4 py-3 sm:px-5">
               {activeProfile ? (
                 <>
-                  <div className="text-[10px] font-bold uppercase tracking-[0.22em] text-slate-500 dark:text-gray-500">Local operator chat</div>
-                  <div className="mt-2 text-2xl font-bold tracking-tight text-slate-900 dark:text-white">{labelFor(activeProfile)}</div>
-                  <div className="mt-2 text-sm text-slate-600 dark:text-gray-400">
-                    {activeProfileCanChat ? 'Chat with the same running relay session from inside CLADEX. Discord is still live; this is just the local operator surface.' : 'Start this relay before sending a local operator message.'}
+                  <div className="flex min-w-0 items-center gap-2.5">
+                    <Hash size={18} className={accentClass} />
+                    <h3 className="truncate text-[15px] font-semibold text-white" title={assistantLabel}>{assistantLabel.toLowerCase()}</h3>
+                    <ChatStatusPill status={relayStatus} />
+                    {channelLabel ? (
+                      <span className="hidden border-l border-white/10 pl-3 font-mono text-[11px] text-gray-500 sm:inline-flex sm:items-center sm:gap-1">
+                        <span className="text-gray-600">posts to</span>
+                        <span className="text-gray-400">#{channelLabel.replace(/^#/, '')}</span>
+                      </span>
+                    ) : null}
+                  </div>
+                  <div className="hidden items-center gap-2 text-xs text-gray-500 sm:flex">
+                    <span className="font-mono">{activeProfile.type === 'Claude' ? 'claude' : 'codex'}</span>
+                    {isAdvanced && activeProfile.model ? (
+                      <>
+                        <span className="text-gray-700">·</span>
+                        <span className="font-mono">{activeProfile.model}</span>
+                      </>
+                    ) : null}
                   </div>
                 </>
               ) : (
-                <div className="text-slate-500 dark:text-gray-500">Select a relay to inspect it.</div>
+                <div className="text-sm text-gray-500">Select a relay on the left to start chatting.</div>
               )}
-            </div>
-            <div className="flex h-[520px] sm:h-[560px] flex-col bg-[#f7f3ea]/70 dark:bg-black/30">
-              <div className="flex-1 overflow-y-auto p-4 sm:p-6">
+            </header>
+
+            {/* Message log */}
+            <div
+              ref={scrollRef}
+              role="log"
+              aria-live="polite"
+              aria-label={`Conversation with ${assistantLabel}`}
+              className="relative flex-1 overflow-y-auto bg-[#0d0d10]"
+              style={{ minHeight: '320px' }}
+            >
               {!activeProfile ? (
-                <EmptyState title="No relay selected." detail="Pick a relay on the left to inspect its feed." compact />
+                <div className="flex h-full items-center justify-center px-6 text-center text-sm text-gray-500">
+                  Pick a relay on the left to inspect its feed.
+                </div>
               ) : loading && !messages.length ? (
-                <div className="flex items-center gap-2 text-indigo-500 dark:text-indigo-300"><Loader2 size={16} className="animate-spin" /> Loading local chat history...</div>
+                <div className="flex h-full items-center justify-center gap-2 text-sm text-gray-500">
+                  <Loader2 size={14} className="animate-spin" />
+                  Loading conversation...
+                </div>
               ) : historyError ? (
-                <EmptyState title="Could not load local chat." detail={historyError} compact />
-              ) : messages.length ? (
-                <div className="space-y-4">
-                  {messages.map((message) => {
-                    const assistant = message.role === 'assistant';
-                    return (
-                      <div key={message.id} className={`flex ${assistant ? 'justify-start' : 'justify-end'}`}>
-                        <div className={`max-w-[85%] rounded-[22px] border px-4 py-3 text-sm leading-relaxed shadow-sm ${assistant ? 'border-slate-200 bg-white/85 text-slate-800 dark:border-white/5 dark:bg-white/[0.04] dark:text-gray-200' : 'border-indigo-500/25 bg-indigo-500/12 text-indigo-900 dark:text-indigo-100'}`}>
-                          <div className={`mb-1 text-[10px] font-bold uppercase tracking-[0.22em] ${assistant ? 'text-slate-400 dark:text-gray-500' : 'text-indigo-400'}`}>
-                            {assistant ? (message.senderName || labelFor(activeProfile)) : (message.senderName || 'Operator')}
-                          </div>
-                          <div className="whitespace-pre-wrap break-words">{message.content}</div>
-                        </div>
-                      </div>
-                    );
-                  })}
+                <div className="flex h-full items-center justify-center px-6 text-center">
+                  <div className="max-w-md">
+                    <div className="text-sm font-semibold text-red-300">Could not load chat history.</div>
+                    <div className="mt-1 text-xs text-gray-500">{historyError}</div>
+                  </div>
+                </div>
+              ) : grouped.length === 0 ? (
+                <div className="flex h-full flex-col items-center justify-center px-6 text-center">
+                  <div className="flex h-14 w-14 items-center justify-center rounded-2xl border border-white/8 bg-white/[0.03]">
+                    <Hash size={22} className={accentClass} />
+                  </div>
+                  <h4 className="mt-4 text-lg font-bold text-white">Welcome to #{assistantLabel.toLowerCase()}</h4>
+                  <p className="mt-2 max-w-md text-sm leading-relaxed text-gray-400">
+                    This is the start of your conversation with <span className="text-gray-200">{assistantLabel}</span>.
+                    Anything you send here goes through the same {activeProfile.type === 'Claude' ? 'Claude' : 'Codex'} relay your Discord users see — minus the round trip.
+                  </p>
+                  {!activeProfileCanChat ? (
+                    <div className="mt-4 inline-flex items-center gap-2 rounded-full border border-amber-400/30 bg-amber-500/10 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.18em] text-amber-200">
+                      <AlertTriangle size={11} />
+                      Relay offline — start it first
+                    </div>
+                  ) : null}
                 </div>
               ) : (
-                <EmptyState title="No local chat yet." detail="Send a message here to talk to the running relay without using Discord." compact />
+                <div className="flex flex-col py-3">
+                  {grouped.map((day) => (
+                    <div key={day.key} className="flex flex-col">
+                      {/* Day separator (full-bleed thin rule with date pill) */}
+                      <div className="sticky top-0 z-10 flex items-center gap-3 bg-gradient-to-b from-[#0d0d10] via-[#0d0d10]/95 to-transparent px-4 pb-2 pt-3 sm:px-6">
+                        <div className="h-px flex-1 bg-white/8" />
+                        <span className="font-mono text-[10px] font-semibold uppercase tracking-[0.2em] text-gray-500">{day.label}</span>
+                        <div className="h-px flex-1 bg-white/8" />
+                      </div>
+                      {day.groups.map((group) => {
+                        const initials = chatSenderInitials(group.senderName, group.role);
+                        const senderColor = group.role === 'user'
+                          ? 'text-indigo-300'
+                          : activeProfile.type === 'Codex'
+                            ? 'text-emerald-300'
+                            : 'text-amber-300';
+                        return (
+                          <div
+                            key={group.key}
+                            className="group/row flex items-start gap-3 px-4 py-1.5 transition-colors hover:bg-white/[0.025] sm:px-6"
+                          >
+                            <div className="w-10 shrink-0 pt-0.5">
+                              <ChatAvatar
+                                initials={initials}
+                                role={group.role}
+                                relayType={activeProfile.relayType}
+                              />
+                            </div>
+                            <div className="min-w-0 flex-1">
+                              <div className="flex items-baseline gap-2">
+                                <span className={`text-[14px] font-semibold ${senderColor}`}>{group.senderName}</span>
+                                <span className="font-mono text-[10px] text-gray-600" title={group.firstTimestamp}>{chatRelativeTime(group.firstTimestamp)}</span>
+                                <span className="ml-auto hidden font-mono text-[10px] text-gray-700 group-hover/row:inline" title={group.firstTimestamp}>{chatTimeLabel(group.firstTimestamp)}</span>
+                              </div>
+                              <div className="mt-0.5 flex flex-col gap-0.5">
+                                {group.messages.map((message) => {
+                                  const isErrorMessage = message.id.startsWith('error-');
+                                  return (
+                                    <motion.div
+                                      key={message.id}
+                                      initial={reduceMotion ? false : { opacity: 0, y: 4 }}
+                                      animate={{ opacity: 1, y: 0 }}
+                                      transition={{ duration: reduceMotion ? 0 : 0.16, ease: 'easeOut' }}
+                                      className={`text-[14px] leading-[1.55] ${isErrorMessage ? 'rounded-md border border-red-500/30 bg-red-500/8 px-3 py-2 text-red-200' : 'text-gray-200'}`}
+                                    >
+                                      {chatRenderMessageBody(message.content)}
+                                    </motion.div>
+                                  );
+                                })}
+                              </div>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  ))}
+                  {sending ? (
+                    <div className="flex items-start gap-3 px-4 py-2 sm:px-6">
+                      <div className="w-10 shrink-0">
+                        <ChatAvatar
+                          initials={chatSenderInitials(assistantLabel, 'assistant')}
+                          role="assistant"
+                          relayType={activeProfile.relayType}
+                        />
+                      </div>
+                      <div className="flex items-center gap-2 pt-2 text-[12px] text-gray-500">
+                        <ChatTypingDots accentClass={accentClass} />
+                        <span className="font-mono text-[10px] uppercase tracking-[0.18em]">{assistantLabel} is typing</span>
+                      </div>
+                    </div>
+                  ) : null}
+                  <div className="h-3" />
+                </div>
               )}
-              </div>
-              <div className="border-t border-slate-200 bg-white/70 p-4 dark:border-white/5 dark:bg-white/[0.03]">
-                <div className="flex flex-col gap-3 sm:flex-row">
+
+              {/* Floating jump-to-latest pill */}
+              <AnimatePresence>
+                {unreadBelow > 0 ? (
+                  <motion.button
+                    key="jump-to-latest"
+                    initial={{ opacity: 0, y: 8 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, y: 8 }}
+                    transition={{ duration: 0.18, ease: 'easeOut' }}
+                    onClick={jumpToLatest}
+                    className="absolute bottom-4 left-1/2 inline-flex -translate-x-1/2 items-center gap-1.5 rounded-full border border-indigo-400/40 bg-indigo-500/15 px-3 py-1.5 text-[11px] font-semibold uppercase tracking-[0.18em] text-indigo-200 shadow-[0_8px_24px_rgba(0,0,0,0.5)] backdrop-blur hover:bg-indigo-500/25"
+                    aria-label="Jump to latest message"
+                  >
+                    <ChevronDown size={13} />
+                    {unreadBelow} new
+                  </motion.button>
+                ) : null}
+              </AnimatePresence>
+            </div>
+
+            {/* Composer — Slack-style: contained pill with embedded send */}
+            <div className="border-t border-white/8 bg-[#0d0d10] px-3 py-3 sm:px-5">
+              <form
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  void sendMessage();
+                }}
+                className={`group relative rounded-xl border bg-white/[0.04] transition-colors ${composerDisabled ? 'border-white/8' : 'border-white/12 focus-within:border-indigo-400/50 focus-within:bg-white/[0.06]'}`}
+              >
+                <div className="flex items-end gap-2 px-3 py-2.5">
                   <textarea
+                    ref={composerRef}
                     value={draft}
                     onChange={(event) => setDraft(event.target.value)}
                     onKeyDown={(event) => {
@@ -2783,50 +3439,69 @@ function LiveFeed({
                         void sendMessage();
                       }
                     }}
-                    placeholder={activeProfile ? (activeProfileCanChat ? `Message ${labelFor(activeProfile)} here instead of Discord...` : 'Start this relay to enable local operator chat') : 'Select a relay first'}
-                    disabled={!activeProfile || !activeProfileCanChat || sending}
-                    className="min-h-[88px] flex-1 resize-none rounded-[22px] border border-slate-200 bg-white/85 px-4 py-3 text-sm text-slate-900 outline-none transition-colors focus:border-indigo-500 dark:border-white/10 dark:bg-black/40 dark:text-white"
+                    placeholder={composerPlaceholder}
+                    disabled={composerDisabled}
+                    rows={1}
+                    className="block max-h-[170px] flex-1 resize-none border-0 bg-transparent text-[14px] leading-[1.5] text-white outline-none placeholder:text-gray-600 disabled:cursor-not-allowed"
+                    aria-label="Message composer"
                   />
                   <button
-                    onClick={() => void sendMessage()}
-                    disabled={!activeProfile || !activeProfileCanChat || !draft.trim() || sending}
-                    className="inline-flex min-w-[120px] items-center justify-center gap-2 self-stretch rounded-[22px] bg-indigo-600 px-4 py-3 text-sm font-semibold text-white transition-colors hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-50 sm:self-end"
+                    type="submit"
+                    disabled={composerDisabled || !draft.trim()}
+                    className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-indigo-600 text-white shadow-[0_4px_14px_rgba(79,70,229,0.4)] transition-all hover:bg-indigo-500 active:translate-y-[1px] disabled:cursor-not-allowed disabled:bg-white/8 disabled:text-gray-600 disabled:shadow-none"
+                    aria-label="Send message"
+                    title="Send message (Enter)"
                   >
-                    {sending ? <Loader2 size={16} className="animate-spin" /> : <MessageSquare size={16} />}
-                    Send
+                    {sending ? <Loader2 size={14} className="animate-spin" /> : <Send size={14} />}
                   </button>
                 </div>
+              </form>
+              <div className="mt-1.5 flex items-center justify-between px-1 font-mono text-[10px] uppercase tracking-[0.18em] text-gray-600">
+                <span className="inline-flex items-center gap-1.5">
+                  <CornerDownLeft size={10} />
+                  Enter to send · Shift+Enter for newline
+                </span>
+                {draft.length > 280 ? (
+                  <span className={draft.length > 1800 ? 'text-amber-300' : 'text-gray-600'}>{draft.length} chars</span>
+                ) : null}
               </div>
             </div>
-          </div>
+          </section>
 
-          <div className="bg-white/40 p-4 sm:p-6 dark:bg-white/[0.03]">
-            <div className="text-[10px] font-bold uppercase tracking-[0.22em] text-slate-500 dark:text-gray-500">Relay details</div>
-            {activeProfile ? (
-              <div className="mt-4 space-y-4">
-                <InspectorRow label="Relay" value={labelFor(activeProfile)} />
-                <InspectorRow label="Workspace" value={workspaceFor(activeProfile)} />
-                <InspectorRow label="Worktree" value={activeProfile.activeWorktree || activeProfile.workspace} mono />
-                <InspectorRow label={activeProfile.type === 'Codex' ? 'Codex home' : 'Claude config'} value={accountHomeFor(activeProfile)} mono />
-                <InspectorRow label="Backend" value={activeProfile.provider || 'Runtime'} />
-                <InspectorRow label="Model" value={activeProfile.model || (activeProfile.type === 'Codex' ? 'Codex default' : 'Claude default')} mono />
-                <InspectorRow label="Effort" value={activeProfile.effort || (activeProfile.type === 'Claude' ? 'Adaptive prompt policy' : 'Adaptive relay policy')} />
-                <InspectorRow label="Trigger" value={activeProfile.triggerMode || 'Mention or direct message'} />
-                <InspectorRow label="Direct messages" value={activeProfile.allowDms ? 'Enabled' : 'Disabled'} />
-                <InspectorRow label="Channel" value={channelFor(activeProfile)} />
-                <InspectorRow label="Current detail" value={activeProfile.statusText || 'No detailed runtime note yet.'} />
+          {/* ── Inspector (advanced view only) ───────────────────── */}
+          {isAdvanced ? (
+            <aside className="flex min-h-0 flex-col border-l border-white/8 bg-[#0a0a0c]">
+              <div className="border-b border-white/8 px-4 py-3.5">
+                <div className="text-[10px] font-bold uppercase tracking-[0.22em] text-gray-500">Relay details</div>
               </div>
-            ) : (
-              <div className="mt-4 text-sm text-slate-500 dark:text-gray-500">No relay selected.</div>
-            )}
-          </div>
+              <div className="flex-1 overflow-y-auto px-4 py-4">
+                {activeProfile ? (
+                  <div className="space-y-4">
+                    <InspectorRow label="Relay" value={labelFor(activeProfile)} />
+                    <InspectorRow label="Workspace" value={workspaceFor(activeProfile)} />
+                    <InspectorRow label="Worktree" value={activeProfile.activeWorktree || activeProfile.workspace} mono />
+                    <InspectorRow label={activeProfile.type === 'Codex' ? 'Codex home' : 'Claude config'} value={accountHomeFor(activeProfile)} mono />
+                    <InspectorRow label="Backend" value={activeProfile.provider || 'Runtime'} />
+                    <InspectorRow label="Model" value={activeProfile.model || (activeProfile.type === 'Codex' ? 'Codex default' : 'Claude default')} mono />
+                    <InspectorRow label="Effort" value={activeProfile.effort || (activeProfile.type === 'Claude' ? 'Adaptive prompt policy' : 'Adaptive relay policy')} />
+                    <InspectorRow label="Trigger" value={activeProfile.triggerMode || 'Mention or direct message'} />
+                    <InspectorRow label="Direct messages" value={activeProfile.allowDms ? 'Enabled' : 'Disabled'} />
+                    <InspectorRow label="Channel" value={channelFor(activeProfile)} />
+                    <InspectorRow label="Current detail" value={activeProfile.statusText || 'No detailed runtime note yet.'} />
+                  </div>
+                ) : (
+                  <div className="text-sm text-gray-500">No relay selected.</div>
+                )}
+              </div>
+            </aside>
+          ) : null}
         </div>
       </div>
     </div>
   );
 }
 
-function AddProfileModal({ onClose, onSubmit }: { onClose: () => void; onSubmit: (data: ProfileFormData) => Promise<void> }) {
+function AddProfileModal({ onClose, onSubmit, viewMode = 'simple' }: { onClose: () => void; onSubmit: (data: ProfileFormData) => Promise<void>; viewMode?: ViewMode }) {
   const [type, setType] = useState<ProfileType>('Claude');
   const [name, setName] = useState('');
   const [workspace, setWorkspace] = useState('');
@@ -2846,8 +3521,15 @@ function AddProfileModal({ onClose, onSubmit }: { onClose: () => void; onSubmit:
   const [startupDmUserIds, setStartupDmUserIds] = useState('');
   const [startupDmText, setStartupDmText] = useState('Discord relay online. DM me here to chat with Codex.');
   const [startupChannelText, setStartupChannelText] = useState('');
+  const [showAdvanced, setShowAdvanced] = useState(viewMode === 'advanced');
   const [saving, setSaving] = useState(false);
   const [submitError, setSubmitError] = useState('');
+
+  // Simple mode default-collapses the access/startup advanced fields.
+  // Operators can still expand them with the toggle below.
+  useEffect(() => {
+    setShowAdvanced(viewMode === 'advanced');
+  }, [viewMode]);
 
   const codex = type === 'Codex';
   const accessError = profileCreateAccessError(type, channelId, allowDms, operatorIds, allowedUserIds);
@@ -2856,54 +3538,228 @@ function AddProfileModal({ onClose, onSubmit }: { onClose: () => void; onSubmit:
   return (
     <ModalShell title="Add Relay" onClose={onClose} wide>
       <div className="space-y-6">
-        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 sm:gap-4">
-          <TypeButton active={type === 'Claude'} label="Claude Code" icon={<Bot size={18} />} onClick={() => setType('Claude')} tone="orange" />
-          <TypeButton active={type === 'Codex'} label="Codex" icon={<Terminal size={18} />} onClick={() => setType('Codex')} tone="emerald" />
-        </div>
-
-        <FormSection title="Basics">
-          <FormInput label="Bot label" value={name} onChange={setName} placeholder="Tyson" />
-          <BrowseField label="Workspace folder" value={workspace} onChange={setWorkspace} placeholder="C:\\Projects\\my-repo" />
-          <FormInput label="Discord bot token" value={discordToken} onChange={setDiscordToken} placeholder="Paste token" type="password" />
-          <div className="grid gap-4 md:grid-cols-2">
-            <FormInput label="Allowed channel IDs" value={channelId} onChange={setChannelId} placeholder="123456789012345678, 234567890123456789" mono />
-            <FormInput label="Model override" value={model} onChange={setModel} placeholder={codex ? 'Codex default' : 'Claude default'} mono />
+        {/* Choose engine ------------------------------------------------ */}
+        <FormSection
+          title="1. Pick the AI engine"
+          description="Each relay is backed by either Claude Code (Anthropic) or Codex (OpenAI). Pick whichever you have a CLI logged into on this machine."
+        >
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 sm:gap-4">
+            <TypeButton active={type === 'Claude'} label="Claude Code" icon={<Bot size={18} />} onClick={() => setType('Claude')} tone="orange" />
+            <TypeButton active={type === 'Codex'} label="Codex" icon={<Terminal size={18} />} onClick={() => setType('Codex')} tone="emerald" />
           </div>
-          {codex ? (
-            <BrowseField label="Codex account home" value={codexHome} onChange={setCodexHome} placeholder="Optional CODEX_HOME for this relay account" />
-          ) : (
-            <BrowseField label="Claude config folder" value={claudeConfigDir} onChange={setClaudeConfigDir} placeholder="Optional CLAUDE_CONFIG_DIR for this relay account" />
-          )}
         </FormSection>
 
-        <FormSection title="Access">
-          <div className="grid gap-4 md:grid-cols-2">
-            <FormSelect label="Trigger mode" value={triggerMode} onChange={setTriggerMode} options={[{ value: 'mention_or_dm', label: 'Mention or direct message' }, { value: 'all', label: 'Every message in the channel' }, { value: 'dm_only', label: 'Direct messages only' }]} />
-            <FormInput label={codex ? 'Approved DM user IDs' : 'Approved user IDs'} value={allowedUserIds} onChange={setAllowedUserIds} placeholder="Comma-separated Discord user IDs" mono />
-          </div>
-          <div className="grid gap-4 md:grid-cols-2">
-            <FormInput label="Operator IDs" value={operatorIds} onChange={setOperatorIds} placeholder="Comma-separated Discord user IDs" mono />
-            <FormInput label="Allowed bot IDs" value={allowedBotIds} onChange={setAllowedBotIds} placeholder="Comma-separated Discord bot IDs for bot-to-bot chat" mono />
-          </div>
-          <div className="grid gap-4 md:grid-cols-2">
-            <FormInput label="Channel history limit" value={channelHistoryLimit} onChange={setChannelHistoryLimit} placeholder="20" mono />
-          </div>
-          {codex ? (
-            <div className="grid gap-4 md:grid-cols-2">
-              <FormInput label="Allowed channel author IDs" value={allowedChannelAuthorIds} onChange={setAllowedChannelAuthorIds} placeholder="Comma-separated Discord user IDs" mono />
-              <FormInput label="No-mention author IDs" value={channelNoMentionAuthorIds} onChange={setChannelNoMentionAuthorIds} placeholder="Comma-separated Discord user IDs" mono />
-            </div>
-          ) : null}
-          <ToggleRow checked={allowDms} onChange={setAllowDms} label="Allow direct messages for approved users" />
+        {/* Identity + Workspace ---------------------------------------- */}
+        <FormSection
+          title="2. Identity & workspace"
+          description="What this relay is called inside CLADEX, and which folder on this machine the AI gets full read/write access to."
+        >
+          <FormInput
+            label="Relay name"
+            value={name}
+            onChange={setName}
+            placeholder="ghostlink"
+            helper="Short label shown everywhere in CLADEX (sidebar, status bar, slash commands). Lowercase letters, numbers, and dashes work best."
+          />
+          <BrowseField
+            label="Workspace folder"
+            value={workspace}
+            onChange={setWorkspace}
+            placeholder="C:\\Projects\\my-repo"
+            helper="Local folder this relay can read and write. Treat it as the AI's 'project directory' — it'll run commands and edit files inside this folder."
+          />
         </FormSection>
 
-        {codex ? (
-          <FormSection title="Startup">
-            <FormInput label="Startup DM user IDs" value={startupDmUserIds} onChange={setStartupDmUserIds} placeholder="Comma-separated Discord user IDs" mono />
-            <FormInput label="Startup DM text" value={startupDmText} onChange={setStartupDmText} placeholder="Discord relay online. DM me here to chat with Codex." />
-            <FormInput label="Startup channel text" value={startupChannelText} onChange={setStartupChannelText} placeholder="Optional message posted in the main channel on startup" />
+        {/* Discord ----------------------------------------------------- */}
+        <FormSection
+          title="3. Discord connection"
+          description="The bot account this relay logs in as, and which channel it listens in."
+        >
+          <FormInput
+            label="Discord bot token"
+            value={discordToken}
+            onChange={setDiscordToken}
+            placeholder="MTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMg.ABCDEF.xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            type="password"
+            helper="From discord.com/developers → your application → Bot tab → Reset Token. Stored encrypted on this machine via Windows DPAPI — never written in plain text."
+          />
+          <FormInput
+            label="Discord channel ID"
+            value={channelId}
+            onChange={setChannelId}
+            placeholder="123456789012345678"
+            mono
+            helper="Right-click the Discord channel → Copy Channel ID (you must enable Developer Mode in Discord → Settings → Advanced first). Comma-separate to listen in multiple channels."
+          />
+          <FormInput
+            label={`Model (optional)`}
+            value={model}
+            onChange={setModel}
+            placeholder={codex ? 'Leave blank for Codex default (gpt-5-codex)' : 'Leave blank for Claude default (claude-sonnet-4-5)'}
+            mono
+            helper={codex
+              ? 'Override the Codex CLI model for this relay only. Examples: gpt-5-codex, o3-mini. Leave blank to use whatever your Codex CLI defaults to.'
+              : 'Override the Claude Code model for this relay only. Examples: claude-sonnet-4-5, claude-opus-4-1. Leave blank to use whatever your Claude CLI defaults to.'}
+          />
+        </FormSection>
+
+        {/* Optional account home (only show in advanced or when toggled) */}
+        {showAdvanced ? (
+          <FormSection
+            title={codex ? '4. Codex account (advanced)' : '4. Claude account (advanced)'}
+            description={codex
+              ? 'By default this relay uses your default Codex login. Point CODEX_HOME at a different folder if you want this relay to use a separate Codex account (e.g. a dedicated bot account).'
+              : 'By default this relay uses your default Claude login. Point CLAUDE_CONFIG_DIR at a different folder if you want this relay to use a separate Claude account.'}
+          >
+            {codex ? (
+              <BrowseField
+                label="Codex account folder"
+                value={codexHome}
+                onChange={setCodexHome}
+                placeholder="C:\\Users\\you\\.codex-bot-account"
+                helper="Folder containing a Codex CLI auth.json. Leave blank to share your default Codex login."
+              />
+            ) : (
+              <BrowseField
+                label="Claude config folder"
+                value={claudeConfigDir}
+                onChange={setClaudeConfigDir}
+                placeholder="C:\\Users\\you\\.claude-bot-account"
+                helper="Folder containing a Claude Code login. Leave blank to share your default Claude login."
+              />
+            )}
           </FormSection>
         ) : null}
+
+        {/* Who can talk to this bot ----------------------------------- */}
+        <FormSection
+          title={`${showAdvanced ? '5' : '4'}. Who can talk to this bot`}
+          description="Lock the bot down to specific Discord users, or open it up to your whole server. The defaults are sensible — you only need to fill these in if you want tighter control."
+        >
+          <FormSelect
+            label="When should the bot reply?"
+            value={triggerMode}
+            onChange={setTriggerMode}
+            options={[
+              { value: 'mention_or_dm', label: 'When @mentioned or DMed (recommended)' },
+              { value: 'all', label: 'On every message in the channel' },
+              { value: 'dm_only', label: 'Only in direct messages' },
+            ]}
+            helper="'When @mentioned or DMed' is the safest default. 'On every message' makes the bot reply to anything posted in the channel — useful for dedicated bot channels."
+          />
+
+          <ToggleRow
+            checked={allowDms}
+            onChange={setAllowDms}
+            label="Let approved users DM the bot privately"
+            helper="When on, users in the 'Discord users allowed to DM' list can chat with the bot in their Discord DMs (private 1-on-1 conversation, no channel needed)."
+          />
+
+          {allowDms ? (
+            <FormInput
+              label="Discord users allowed to DM"
+              value={allowedUserIds}
+              onChange={setAllowedUserIds}
+              placeholder="321521483237031946, 147643658866470402"
+              mono
+              helper="Comma-separated Discord user IDs. Right-click a user in Discord → Copy User ID. Anyone in this list can DM the bot one-on-one."
+            />
+          ) : null}
+
+          {showAdvanced ? (
+            <>
+              <FormInput
+                label="Bot operators (admin powers)"
+                value={operatorIds}
+                onChange={setOperatorIds}
+                placeholder="321521483237031946"
+                mono
+                helper="Comma-separated Discord user IDs. Operators can use admin slash commands like /reset, /interrupt, /steer. Leave blank if no one needs admin access."
+              />
+              <div className="grid gap-4 md:grid-cols-2">
+                <FormInput
+                  label="Channel context size"
+                  value={channelHistoryLimit}
+                  onChange={setChannelHistoryLimit}
+                  placeholder="20"
+                  mono
+                  helper="How many recent channel messages the bot reads as context before replying. Default 20. Set to 0 to disable channel context entirely (each reply is independent)."
+                />
+                <FormInput
+                  label="Other bots allowed to talk"
+                  value={allowedBotIds}
+                  onChange={setAllowedBotIds}
+                  placeholder="(usually empty)"
+                  mono
+                  helper="By default the bot ignores other bots so you can't accidentally create a reply loop. Add bot IDs here only if you want this bot to converse with another bot."
+                />
+              </div>
+
+              {codex ? (
+                <>
+                  <FormInput
+                    label="Restrict channel replies to specific people"
+                    value={allowedChannelAuthorIds}
+                    onChange={setAllowedChannelAuthorIds}
+                    placeholder="(blank = anyone in the channel)"
+                    mono
+                    helper="Comma-separated Discord user IDs. If blank, anyone in the channel can trigger the bot. Set this if you want only certain people to use the bot in a shared channel."
+                  />
+                  <FormInput
+                    label="People who can chat without @mentioning"
+                    value={channelNoMentionAuthorIds}
+                    onChange={setChannelNoMentionAuthorIds}
+                    placeholder="321521483237031946"
+                    mono
+                    helper="Comma-separated Discord user IDs. These users get a reply for every message they send in the channel — they don't have to type @bot first. Useful for the channel owner so chat feels natural."
+                  />
+                </>
+              ) : null}
+            </>
+          ) : null}
+        </FormSection>
+
+        {/* Optional startup messages ---------------------------------- */}
+        {showAdvanced && codex ? (
+          <FormSection
+            title="6. Startup messages (optional)"
+            description="What the bot sends when it comes online. Leave blank for silent startup."
+          >
+            <FormInput
+              label="Send a startup DM to these users"
+              value={startupDmUserIds}
+              onChange={setStartupDmUserIds}
+              placeholder="321521483237031946"
+              mono
+              helper="Comma-separated Discord user IDs. Each user gets a DM with the message below when the bot comes online. Useful for 'hey, I'm back online' notifications to the operator."
+            />
+            <FormInput
+              label="Startup DM message"
+              value={startupDmText}
+              onChange={setStartupDmText}
+              placeholder="Discord relay online. DM me here to chat with Codex."
+              helper="The body of the DM sent to the users above on startup."
+            />
+            <FormInput
+              label="Channel announcement on startup"
+              value={startupChannelText}
+              onChange={setStartupChannelText}
+              placeholder="(blank = silent startup)"
+              helper="Optional message posted in the main channel when the bot comes online. Leave blank if you don't want a notification posted publicly."
+            />
+          </FormSection>
+        ) : null}
+
+        {/* Show / hide advanced toggle */}
+        <div className="flex justify-center">
+          <button
+            type="button"
+            onClick={() => setShowAdvanced((v) => !v)}
+            className="inline-flex items-center gap-1.5 rounded-full border border-white/10 bg-white/[0.03] px-3 py-1.5 text-[11px] font-semibold uppercase tracking-[0.16em] text-gray-400 transition-colors hover:bg-white/[0.06] hover:text-gray-200"
+          >
+            {showAdvanced ? 'Hide advanced fields' : 'Show advanced fields (account override, operators, startup messages…)'}
+          </button>
+        </div>
 
         {accessError ? (
           <div className="rounded-2xl border border-amber-500/25 bg-amber-500/10 px-4 py-3 text-sm font-medium text-amber-800 dark:text-amber-100">
@@ -2918,7 +3774,7 @@ function AddProfileModal({ onClose, onSubmit }: { onClose: () => void; onSubmit:
 
         <div className="flex flex-col-reverse justify-end gap-3 pt-2 sm:flex-row">
           <SecondaryButton label="Cancel" onClick={onClose} />
-          <PrimaryButton label={saving ? 'Saving...' : 'Save relay'} icon={saving ? <Loader2 size={16} className="animate-spin" /> : <Plus size={16} />} onClick={async () => {
+          <PrimaryButton label={saving ? 'Saving...' : 'Create relay'} icon={saving ? <Loader2 size={16} className="animate-spin" /> : <Plus size={16} />} onClick={async () => {
             if (!canSave) return;
             setSaving(true);
             setSubmitError('');
@@ -2956,7 +3812,7 @@ function AddProfileModal({ onClose, onSubmit }: { onClose: () => void; onSubmit:
   );
 }
 
-function EditProfileModal({ profile, onClose, onSubmit }: { profile: Profile; onClose: () => void; onSubmit: (data: ProfileSettingsData) => Promise<void> }) {
+function EditProfileModal({ profile, onClose, onSubmit, viewMode = 'simple' }: { profile: Profile; onClose: () => void; onSubmit: (data: ProfileSettingsData) => Promise<void>; viewMode?: ViewMode }) {
   const [workspace, setWorkspace] = useState(profile.workspace);
   const [discordToken, setDiscordToken] = useState('');
   const [botName, setBotName] = useState(profile.botName || profile.displayName || '');
@@ -2975,58 +3831,224 @@ function EditProfileModal({ profile, onClose, onSubmit }: { profile: Profile; on
   const [startupDmUserIds, setStartupDmUserIds] = useState(profile.startupDmUserIds || '');
   const [startupDmText, setStartupDmText] = useState(profile.startupDmText || '');
   const [startupChannelText, setStartupChannelText] = useState(profile.startupChannelText || '');
+  const [showAdvanced, setShowAdvanced] = useState(viewMode === 'advanced');
   const [saving, setSaving] = useState(false);
   const [submitError, setSubmitError] = useState('');
+
+  useEffect(() => {
+    setShowAdvanced(viewMode === 'advanced');
+  }, [viewMode]);
 
   const codex = profile.type === 'Codex';
 
   return (
     <ModalShell title={`Edit ${labelFor(profile)}`} onClose={onClose} wide>
       <div className="space-y-6">
-        <FormSection title="Basics">
-          <InspectorRow label="Relay type" value={profile.type} />
-          <BrowseField label="Workspace folder" value={workspace} onChange={setWorkspace} placeholder="C:\\Projects\\my-repo" />
-          <FormInput label="Bot label" value={botName} onChange={setBotName} placeholder="Tyson" />
-          <FormInput label="Replace bot token" value={discordToken} onChange={setDiscordToken} placeholder="Leave blank to keep the current token" type="password" />
-          <div className="grid gap-4 md:grid-cols-2">
-            <FormInput label="Allowed channel IDs" value={channelId} onChange={setChannelId} placeholder="123456789012345678, 234567890123456789" mono />
-            <FormInput label="Model" value={model} onChange={setModel} placeholder={codex ? 'Codex default' : 'Claude default'} mono />
-          </div>
-          {codex ? (
-            <BrowseField label="Codex account home" value={codexHome} onChange={setCodexHome} placeholder="Optional CODEX_HOME for this relay account" />
-          ) : (
-            <BrowseField label="Claude config folder" value={claudeConfigDir} onChange={setClaudeConfigDir} placeholder="Optional CLAUDE_CONFIG_DIR for this relay account" />
-          )}
+        <FormSection
+          title="Identity & workspace"
+          description="What this relay is called inside CLADEX, and which folder on this machine the AI works in."
+        >
+          <InspectorRow label="AI engine" value={profile.type} />
+          <FormInput
+            label="Relay name"
+            value={botName}
+            onChange={setBotName}
+            placeholder="ghostlink"
+            helper="Short label shown everywhere in CLADEX (sidebar, status bar, slash commands)."
+          />
+          <BrowseField
+            label="Workspace folder"
+            value={workspace}
+            onChange={setWorkspace}
+            placeholder="C:\\Projects\\my-repo"
+            helper="Local folder this relay can read and write. Treat it as the AI's working directory."
+          />
         </FormSection>
 
-        <FormSection title="Access">
-          <div className="grid gap-4 md:grid-cols-2">
-            <FormSelect label="Trigger mode" value={triggerMode} onChange={setTriggerMode} options={[{ value: 'mention_or_dm', label: 'Mention or direct message' }, { value: 'all', label: 'Every message in the channel' }, { value: 'dm_only', label: 'Direct messages only' }]} />
-            <FormInput label={codex ? 'Approved DM user IDs' : 'Approved user IDs'} value={allowedUserIds} onChange={setAllowedUserIds} placeholder="Comma-separated Discord user IDs" mono />
-          </div>
-          <div className="grid gap-4 md:grid-cols-2">
-            <FormInput label="Operator IDs" value={operatorIds} onChange={setOperatorIds} placeholder="Comma-separated Discord user IDs" mono />
-            <FormInput label="Allowed bot IDs" value={allowedBotIds} onChange={setAllowedBotIds} placeholder="Comma-separated Discord bot IDs for bot-to-bot chat" mono />
-          </div>
-          <div className="grid gap-4 md:grid-cols-2">
-            <FormInput label="Channel history limit" value={channelHistoryLimit} onChange={setChannelHistoryLimit} placeholder="20" mono />
-          </div>
-          {codex ? (
-            <div className="grid gap-4 md:grid-cols-2">
-              <FormInput label="Allowed channel author IDs" value={allowedChannelAuthorIds} onChange={setAllowedChannelAuthorIds} placeholder="Comma-separated Discord user IDs" mono />
-              <FormInput label="No-mention author IDs" value={channelNoMentionAuthorIds} onChange={setChannelNoMentionAuthorIds} placeholder="Comma-separated Discord user IDs" mono />
-            </div>
-          ) : null}
-          <ToggleRow checked={allowDms} onChange={setAllowDms} label="Allow direct messages for approved users" />
+        <FormSection
+          title="Discord connection"
+          description="The bot account this relay logs in as, and which channel it listens in."
+        >
+          <FormInput
+            label="Replace Discord bot token"
+            value={discordToken}
+            onChange={setDiscordToken}
+            placeholder="Leave blank to keep the current token"
+            type="password"
+            helper="Only paste a new token if you regenerated it in the Discord Developer Portal. Stored encrypted via Windows DPAPI."
+          />
+          <FormInput
+            label="Discord channel ID"
+            value={channelId}
+            onChange={setChannelId}
+            placeholder="123456789012345678"
+            mono
+            helper="Right-click the channel → Copy Channel ID. Comma-separate to listen in multiple channels."
+          />
+          <FormInput
+            label="Model (optional)"
+            value={model}
+            onChange={setModel}
+            placeholder={codex ? 'Leave blank for Codex default (gpt-5-codex)' : 'Leave blank for Claude default (claude-sonnet-4-5)'}
+            mono
+            helper={codex
+              ? 'Override the Codex CLI model for this relay only. Leave blank to use whatever your Codex CLI defaults to.'
+              : 'Override the Claude Code model for this relay only. Leave blank to use whatever your Claude CLI defaults to.'}
+          />
         </FormSection>
 
-        {codex ? (
-          <FormSection title="Startup">
-            <FormInput label="Startup DM user IDs" value={startupDmUserIds} onChange={setStartupDmUserIds} placeholder="Comma-separated Discord user IDs" mono />
-            <FormInput label="Startup DM text" value={startupDmText} onChange={setStartupDmText} placeholder="Discord relay online. DM me here to chat with Codex." />
-            <FormInput label="Startup channel text" value={startupChannelText} onChange={setStartupChannelText} placeholder="Optional message posted in the main channel on startup" />
+        {showAdvanced ? (
+          <FormSection
+            title={codex ? 'Codex account (advanced)' : 'Claude account (advanced)'}
+            description={codex
+              ? 'Point CODEX_HOME at a different folder if you want this relay to use a separate Codex account.'
+              : 'Point CLAUDE_CONFIG_DIR at a different folder if you want this relay to use a separate Claude account.'}
+          >
+            {codex ? (
+              <BrowseField
+                label="Codex account folder"
+                value={codexHome}
+                onChange={setCodexHome}
+                placeholder="C:\\Users\\you\\.codex-bot-account"
+                helper="Folder containing a Codex CLI auth.json. Leave blank to share your default Codex login."
+              />
+            ) : (
+              <BrowseField
+                label="Claude config folder"
+                value={claudeConfigDir}
+                onChange={setClaudeConfigDir}
+                placeholder="C:\\Users\\you\\.claude-bot-account"
+                helper="Folder containing a Claude Code login. Leave blank to share your default Claude login."
+              />
+            )}
           </FormSection>
         ) : null}
+
+        <FormSection
+          title="Who can talk to this bot"
+          description="Lock the bot down to specific Discord users, or open it up to your whole server."
+        >
+          <FormSelect
+            label="When should the bot reply?"
+            value={triggerMode}
+            onChange={setTriggerMode}
+            options={[
+              { value: 'mention_or_dm', label: 'When @mentioned or DMed (recommended)' },
+              { value: 'all', label: 'On every message in the channel' },
+              { value: 'dm_only', label: 'Only in direct messages' },
+            ]}
+            helper="'When @mentioned or DMed' is the safest default. 'On every message' makes the bot reply to anything posted in the channel."
+          />
+
+          <ToggleRow
+            checked={allowDms}
+            onChange={setAllowDms}
+            label="Let approved users DM the bot privately"
+            helper="When on, users in the 'Discord users allowed to DM' list can chat with the bot in their Discord DMs (private 1-on-1)."
+          />
+
+          {allowDms ? (
+            <FormInput
+              label="Discord users allowed to DM"
+              value={allowedUserIds}
+              onChange={setAllowedUserIds}
+              placeholder="321521483237031946, 147643658866470402"
+              mono
+              helper="Comma-separated Discord user IDs. Right-click a user in Discord → Copy User ID."
+            />
+          ) : null}
+
+          {showAdvanced ? (
+            <>
+              <FormInput
+                label="Bot operators (admin powers)"
+                value={operatorIds}
+                onChange={setOperatorIds}
+                placeholder="321521483237031946"
+                mono
+                helper="Comma-separated Discord user IDs. Operators can use admin slash commands like /reset, /interrupt, /steer."
+              />
+              <div className="grid gap-4 md:grid-cols-2">
+                <FormInput
+                  label="Channel context size"
+                  value={channelHistoryLimit}
+                  onChange={setChannelHistoryLimit}
+                  placeholder="20"
+                  mono
+                  helper="How many recent channel messages the bot reads as context before replying. Default 20. Set to 0 to disable."
+                />
+                <FormInput
+                  label="Other bots allowed to talk"
+                  value={allowedBotIds}
+                  onChange={setAllowedBotIds}
+                  placeholder="(usually empty)"
+                  mono
+                  helper="By default the bot ignores other bots so you can't accidentally create a reply loop. Add bot IDs here only if you want bot-to-bot chat."
+                />
+              </div>
+              {codex ? (
+                <>
+                  <FormInput
+                    label="Restrict channel replies to specific people"
+                    value={allowedChannelAuthorIds}
+                    onChange={setAllowedChannelAuthorIds}
+                    placeholder="(blank = anyone in the channel)"
+                    mono
+                    helper="If blank, anyone in the channel can trigger the bot. Set this if you want only certain people to use the bot."
+                  />
+                  <FormInput
+                    label="People who can chat without @mentioning"
+                    value={channelNoMentionAuthorIds}
+                    onChange={setChannelNoMentionAuthorIds}
+                    placeholder="321521483237031946"
+                    mono
+                    helper="These users get a reply for every message they send in the channel — they don't have to type @bot first."
+                  />
+                </>
+              ) : null}
+            </>
+          ) : null}
+        </FormSection>
+
+        {showAdvanced && codex ? (
+          <FormSection
+            title="Startup messages (optional)"
+            description="What the bot sends when it comes online. Leave blank for silent startup."
+          >
+            <FormInput
+              label="Send a startup DM to these users"
+              value={startupDmUserIds}
+              onChange={setStartupDmUserIds}
+              placeholder="321521483237031946"
+              mono
+              helper="Comma-separated Discord user IDs. Each user gets a DM with the message below when the bot comes online."
+            />
+            <FormInput
+              label="Startup DM message"
+              value={startupDmText}
+              onChange={setStartupDmText}
+              placeholder="Discord relay online. DM me here to chat with Codex."
+              helper="The body of the DM sent to the users above on startup."
+            />
+            <FormInput
+              label="Channel announcement on startup"
+              value={startupChannelText}
+              onChange={setStartupChannelText}
+              placeholder="(blank = silent startup)"
+              helper="Optional message posted in the main channel when the bot comes online."
+            />
+          </FormSection>
+        ) : null}
+
+        <div className="flex justify-center">
+          <button
+            type="button"
+            onClick={() => setShowAdvanced((v) => !v)}
+            className="inline-flex items-center gap-1.5 rounded-full border border-white/10 bg-white/[0.03] px-3 py-1.5 text-[11px] font-semibold uppercase tracking-[0.16em] text-gray-400 transition-colors hover:bg-white/[0.06] hover:text-gray-200"
+          >
+            {showAdvanced ? 'Hide advanced fields' : 'Show advanced fields'}
+          </button>
+        </div>
         {submitError ? (
           <div className="rounded-2xl border border-red-500/25 bg-red-500/10 px-4 py-3 text-sm font-medium text-red-800 dark:text-red-100">
             {submitError}
@@ -3310,19 +4332,41 @@ function InspectorRow({ label, value, mono = false }: { label: string; value: st
   return <div className="grid grid-cols-[110px_minmax(0,1fr)] gap-3"><div className="pt-1 text-[10px] font-bold uppercase tracking-[0.22em] text-slate-500 dark:text-gray-500">{label}</div><div className={`rounded-2xl border border-slate-200/80 bg-white/80 px-3 py-2 text-sm text-slate-800 dark:border-white/5 dark:bg-black/30 dark:text-gray-200 ${mono ? 'break-all font-mono' : ''}`}>{value}</div></div>;
 }
 
-function FormInput({ label, value, onChange, placeholder, mono = false, type = 'text' }: { label: string; value: string; onChange: (value: string) => void; placeholder: string; mono?: boolean; type?: string }) {
-  return <label className="block"><div className="mb-2 text-[10px] font-bold uppercase tracking-[0.22em] text-slate-500 dark:text-gray-500">{label}</div><input type={type} value={value} onChange={(event) => onChange(event.target.value)} placeholder={placeholder} className={`w-full rounded-2xl border border-slate-200 bg-white/80 px-4 py-3 text-slate-900 outline-none focus:border-indigo-500 dark:border-white/10 dark:bg-black/40 dark:text-white ${mono ? 'font-mono text-sm' : 'text-sm'}`} /></label>;
+function FormFieldLabel({ label, helper }: { label: string; helper?: string }) {
+  return (
+    <div className="mb-2">
+      <div className="text-[11px] font-bold uppercase tracking-[0.18em] text-slate-500 dark:text-gray-400">{label}</div>
+      {helper ? (
+        <div className="mt-1 text-[12px] leading-relaxed text-slate-500 dark:text-gray-500">{helper}</div>
+      ) : null}
+    </div>
+  );
 }
 
-function BrowseField({ label, value, onChange, onPicked, placeholder, buttonLabel, stacked = false }: { label: string; value: string; onChange: (value: string) => void; onPicked?: (value: string) => void; placeholder: string; buttonLabel?: string; stacked?: boolean }) {
+function FormInput({ label, value, onChange, placeholder, mono = false, type = 'text', helper }: { label: string; value: string; onChange: (value: string) => void; placeholder: string; mono?: boolean; type?: string; helper?: string }) {
+  return (
+    <label className="block">
+      <FormFieldLabel label={label} helper={helper} />
+      <input
+        type={type}
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        placeholder={placeholder}
+        className={`w-full rounded-xl border border-slate-200 bg-white/80 px-3.5 py-2.5 text-slate-900 outline-none focus:border-indigo-500 dark:border-white/10 dark:bg-black/40 dark:text-white ${mono ? 'font-mono text-[13px]' : 'text-sm'}`}
+      />
+    </label>
+  );
+}
+
+function BrowseField({ label, value, onChange, onPicked, placeholder, buttonLabel, stacked = false, helper }: { label: string; value: string; onChange: (value: string) => void; onPicked?: (value: string) => void; placeholder: string; buttonLabel?: string; stacked?: boolean; helper?: string }) {
   const [browserOpen, setBrowserOpen] = useState(false);
   const desktopPickerAvailable = Boolean(window.cladexDesktop?.chooseDirectory);
   return (
     <>
     <label className="block">
-      <div className="mb-2 text-[10px] font-bold uppercase tracking-[0.22em] text-slate-500 dark:text-gray-500">{label}</div>
+      <FormFieldLabel label={label} helper={helper} />
       <div className={`flex flex-col gap-3 ${stacked ? '' : 'sm:flex-row'}`}>
-        <input value={value} onChange={(event) => onChange(event.target.value)} placeholder={placeholder} className="min-w-0 flex-1 rounded-2xl border border-slate-200 bg-white/80 px-4 py-3 text-sm text-slate-900 outline-none focus:border-indigo-500 dark:border-white/10 dark:bg-black/40 dark:text-white" />
+        <input value={value} onChange={(event) => onChange(event.target.value)} placeholder={placeholder} className="min-w-0 flex-1 rounded-xl border border-slate-200 bg-white/80 px-3.5 py-2.5 text-sm text-slate-900 outline-none focus:border-indigo-500 dark:border-white/10 dark:bg-black/40 dark:text-white" />
         <button
           type="button"
           onClick={async () => {
@@ -3336,7 +4380,7 @@ function BrowseField({ label, value, onChange, onPicked, placeholder, buttonLabe
             }
             setBrowserOpen(true);
           }}
-          className="rounded-2xl border border-slate-200 bg-white/80 px-4 py-3 text-sm font-semibold text-slate-700 transition-colors hover:bg-slate-100 dark:border-white/10 dark:bg-white/[0.03] dark:text-gray-200 dark:hover:bg-white/[0.08]"
+          className="rounded-xl border border-slate-200 bg-white/80 px-4 py-2.5 text-sm font-semibold text-slate-700 transition-colors hover:bg-slate-100 dark:border-white/10 dark:bg-white/[0.03] dark:text-gray-200 dark:hover:bg-white/[0.08]"
         >
           {buttonLabel || (desktopPickerAvailable ? 'Browse' : 'Browse server')}
         </button>
@@ -3347,23 +4391,41 @@ function BrowseField({ label, value, onChange, onPicked, placeholder, buttonLabe
   );
 }
 
-function FormSection({ title, children }: { title: string; children: React.ReactNode }) {
+function FormSection({ title, children, description }: { title: string; children: React.ReactNode; description?: string }) {
   return (
-    <section className="space-y-4">
-      <div className="text-[10px] font-bold uppercase tracking-[0.22em] text-slate-500 dark:text-gray-500">{title}</div>
-      <div className="space-y-4 rounded-[26px] border border-slate-200/80 bg-white/60 p-4 dark:border-white/10 dark:bg-black/20">
+    <section className="space-y-3">
+      <div>
+        <div className="text-[11px] font-bold uppercase tracking-[0.2em] text-slate-500 dark:text-gray-400">{title}</div>
+        {description ? <div className="mt-1 text-[12px] leading-relaxed text-slate-500 dark:text-gray-500">{description}</div> : null}
+      </div>
+      <div className="space-y-4 rounded-2xl border border-slate-200/80 bg-white/60 p-4 dark:border-white/10 dark:bg-black/25">
         {children}
       </div>
     </section>
   );
 }
 
-function FormSelect({ label, value, onChange, options }: { label: string; value: string; onChange: (value: string) => void; options: Array<{ value: string; label: string }> }) {
-  return <label className="block"><div className="mb-2 text-[10px] font-bold uppercase tracking-[0.22em] text-slate-500 dark:text-gray-500">{label}</div><select value={value} onChange={(event) => onChange(event.target.value)} className="w-full rounded-2xl border border-slate-200 bg-white/80 px-4 py-3 text-sm text-slate-900 outline-none focus:border-indigo-500 dark:border-white/10 dark:bg-black/40 dark:text-white">{options.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>;
+function FormSelect({ label, value, onChange, options, helper }: { label: string; value: string; onChange: (value: string) => void; options: Array<{ value: string; label: string }>; helper?: string }) {
+  return (
+    <label className="block">
+      <FormFieldLabel label={label} helper={helper} />
+      <select value={value} onChange={(event) => onChange(event.target.value)} className="w-full rounded-xl border border-slate-200 bg-white/80 px-3.5 py-2.5 text-sm text-slate-900 outline-none focus:border-indigo-500 dark:border-white/10 dark:bg-black/40 dark:text-white">
+        {options.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+      </select>
+    </label>
+  );
 }
 
-function ToggleRow({ checked, onChange, label }: { checked: boolean; onChange: (checked: boolean) => void; label: string }) {
-  return <label className="flex items-center gap-3 rounded-[16px] border border-slate-200/80 bg-white/80 px-4 py-3 text-sm text-slate-700 dark:border-white/10 dark:bg-black/30 dark:text-gray-300"><input type="checkbox" checked={checked} onChange={(event) => onChange(event.target.checked)} className="h-4 w-4 accent-emerald-500" />{label}</label>;
+function ToggleRow({ checked, onChange, label, helper }: { checked: boolean; onChange: (checked: boolean) => void; label: string; helper?: string }) {
+  return (
+    <label className="flex items-start gap-3 rounded-xl border border-slate-200/80 bg-white/80 px-4 py-3 text-sm text-slate-700 dark:border-white/10 dark:bg-black/30 dark:text-gray-300">
+      <input type="checkbox" checked={checked} onChange={(event) => onChange(event.target.checked)} className="mt-0.5 h-4 w-4 accent-emerald-500" />
+      <div className="min-w-0">
+        <div className="font-medium text-slate-700 dark:text-gray-200">{label}</div>
+        {helper ? <div className="mt-1 text-[12px] leading-relaxed text-slate-500 dark:text-gray-500">{helper}</div> : null}
+      </div>
+    </label>
+  );
 }
 
 function TypeButton({ active, label, icon, onClick, tone }: { active: boolean; label: string; icon: React.ReactNode; onClick: () => void; tone: 'orange' | 'emerald' }) {
@@ -3575,4 +4637,39 @@ function SecondaryButton({ label, onClick, busy = false }: { label: string; onCl
 
 function MiniIconButton({ label, icon, onClick, tone = 'default' }: { label: string; icon: React.ReactNode; onClick: () => void; tone?: 'default' | 'danger' }) {
   return <button type="button" title={label} onClick={onClick} className={`inline-flex h-9 w-9 items-center justify-center rounded-full border transition-colors ${tone === 'danger' ? 'border-red-500/20 bg-red-500/10 text-red-700 hover:bg-red-500/20 dark:text-red-200' : 'border-slate-200/80 bg-white/70 text-slate-500 hover:bg-slate-200 hover:text-slate-900 dark:border-white/5 dark:bg-white/5 dark:text-gray-400 dark:hover:bg-white/10 dark:hover:text-white'}`}>{icon}</button>;
+}
+
+function ViewModeToggle({ value, onChange }: { value: ViewMode; onChange: (next: ViewMode) => void }) {
+  // Two-state pill: Simple / Advanced. Persists across launches via the
+  // `cladex.viewMode` localStorage key (handled in App). Affects every
+  // screen — Relays cards, Workgroups, Review Swarm, Live Console, the
+  // Add/Edit Profile modal — by hiding seldom-touched fields in Simple
+  // and surfacing every knob in Advanced.
+  return (
+    <div
+      role="tablist"
+      aria-label="Interface density"
+      className="inline-flex h-9 items-center rounded-full border border-white/10 bg-white/[0.04] p-0.5 text-[11px] font-semibold uppercase tracking-[0.16em]"
+    >
+      {([
+        { id: 'simple' as const, label: 'Simple', hint: 'Just the essentials. Hides power-user knobs.' },
+        { id: 'advanced' as const, label: 'Advanced', hint: 'Surfaces every option on every screen.' },
+      ]).map((option) => {
+        const active = value === option.id;
+        return (
+          <button
+            key={option.id}
+            type="button"
+            role="tab"
+            aria-selected={active}
+            title={option.hint}
+            onClick={() => onChange(option.id)}
+            className={`inline-flex h-8 items-center rounded-full px-3 transition-colors ${active ? 'bg-indigo-500/85 text-white shadow-[0_2px_10px_rgba(79,70,229,0.35)]' : 'text-gray-400 hover:text-gray-200'}`}
+          >
+            {option.label}
+          </button>
+        );
+      })}
+    </div>
+  );
 }
