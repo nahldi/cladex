@@ -1913,8 +1913,8 @@ def _is_managed_venv_python_healthy(python: Path) -> bool:
                 key, _, value = line.partition("=")
                 if key.strip().lower() != "home":
                     continue
-                home = Path(value.strip()).expanduser()
-                base = home / ("python.exe" if os.name == "nt" else "python")
+                home = NATIVE_PATH_CLASS(value.strip()).expanduser()
+                base = home / ("python.exe" if IS_WINDOWS else "python")
                 return base.exists()
         except OSError:
             return False
@@ -1929,7 +1929,7 @@ def _background_python_executable() -> str:
 
 
 def _background_python_windowless_executable() -> str:
-    if os.name != "nt":
+    if not IS_WINDOWS:
         return _background_python_executable()
     runtime_python = install_plugin.runtime_python_path()
     runtime_pythonw = runtime_python.with_name("pythonw.exe")

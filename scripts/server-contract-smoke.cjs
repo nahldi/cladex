@@ -19,6 +19,13 @@ if (!RUN_BOOTSTRAP_SMOKE) {
 } else {
   delete process.env.CLADEX_SKIP_BACKEND_BOOTSTRAP;
 }
+if (
+  process.env.CLADEX_API_SMOKE_BACKEND_SUCCESS === '1'
+  && process.platform === 'win32'
+  && !process.env.CLADEX_PYTHONW
+) {
+  process.env.CLADEX_PYTHONW = process.env.CLADEX_PYTHON || 'python';
+}
 process.env.API_PORT = process.env.API_PORT || '34567';
 
 const {
@@ -189,6 +196,14 @@ function comparableFilesystemPath(value) {
 
 function assertSameFilesystemPath(actual, expected) {
   assert.equal(comparableFilesystemPath(actual), comparableFilesystemPath(expected));
+}
+
+function assertResponseStatus(response, expected, label) {
+  assert.equal(
+    response.status,
+    expected,
+    `${label}: expected ${expected}, got ${response.status}; body=${JSON.stringify(response.json)}`,
+  );
 }
 
 async function main() {
@@ -476,12 +491,12 @@ async function main() {
       fs.writeFileSync(path.join(smokeWorkspace, 'README.md'), '# smoke\n', 'utf8');
 
       const status = await request(port, { path: '/api/status' });
-      assert.equal(status.status, 200);
+      assertResponseStatus(status, 200, '/api/status');
       assert.ok(Array.isArray(status.json.running));
       assert.ok(Array.isArray(status.json.profiles));
 
       const reviews = await request(port, { path: '/api/reviews' });
-      assert.equal(reviews.status, 200);
+      assertResponseStatus(reviews, 200, '/api/reviews');
       assert.ok(Array.isArray(reviews.json));
 
       const scout = await request(port, {
@@ -490,7 +505,7 @@ async function main() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ workspace: smokeWorkspace, provider: 'codex' }),
       });
-      assert.equal(scout.status, 200);
+      assertResponseStatus(scout, 200, '/api/reviews/analyze');
       assertSameFilesystemPath(scout.json.workspace, smokeWorkspace);
       assert.ok(scout.json.recommendation);
 
@@ -500,7 +515,7 @@ async function main() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ workspace: smokeWorkspace, reason: 'api-smoke' }),
       });
-      assert.equal(backup.status, 200);
+      assertResponseStatus(backup, 200, '/api/backups');
       assert.match(backup.json.id || '', /^backup-/);
     }
 

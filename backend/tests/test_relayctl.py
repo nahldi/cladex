@@ -1178,15 +1178,15 @@ def test_background_python_executable_prefers_runtime(tmp_path: Path) -> None:
 
 def test_background_python_windowless_executable_prefers_runtime_pythonw(tmp_path: Path) -> None:
     original_runtime_python_path = install_plugin.runtime_python_path
-    original_os_name = relayctl.os.name
+    original_is_windows = relayctl.IS_WINDOWS
     install_plugin.runtime_python_path = lambda root=None: tmp_path / "python.exe"
     (tmp_path / "pythonw.exe").write_text("", encoding="utf-8")
-    relayctl.os.name = "nt"
+    relayctl.IS_WINDOWS = True
     try:
         assert relayctl._background_python_windowless_executable() == str(tmp_path / "pythonw.exe")
     finally:
         install_plugin.runtime_python_path = original_runtime_python_path
-        relayctl.os.name = original_os_name
+        relayctl.IS_WINDOWS = original_is_windows
 
 
 def test_background_python_windowless_executable_skips_stub_orphan_venv(tmp_path: Path) -> None:
@@ -1214,16 +1214,16 @@ def test_background_python_windowless_executable_skips_stub_orphan_venv(tmp_path
     fallback_pythonw.write_text("", encoding="utf-8")
 
     original_runtime_python_path = install_plugin.runtime_python_path
-    original_os_name = relayctl.os.name
+    original_is_windows = relayctl.IS_WINDOWS
     original_sys_executable = relayctl.sys.executable
     install_plugin.runtime_python_path = lambda root=None: runtime_python
-    relayctl.os.name = "nt"
+    relayctl.IS_WINDOWS = True
     relayctl.sys.executable = str(fallback_dir / "python.exe")
     try:
         result = relayctl._background_python_windowless_executable()
     finally:
         install_plugin.runtime_python_path = original_runtime_python_path
-        relayctl.os.name = original_os_name
+        relayctl.IS_WINDOWS = original_is_windows
         relayctl.sys.executable = original_sys_executable
 
     assert result == str(fallback_pythonw), (
