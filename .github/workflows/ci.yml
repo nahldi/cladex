@@ -74,7 +74,7 @@ jobs:
       - run: npm run api:smoke
         env:
           CLADEX_API_SMOKE_BOOTSTRAP: '1'
-      - run: python backend/cladex.py doctor --json | jq -e '.status=="ok"'
+      - run: python backend/cladex.py doctor --json | jq -e '.ok == true'
 
   package:
     runs-on: windows-latest

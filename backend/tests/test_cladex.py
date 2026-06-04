@@ -895,6 +895,14 @@ def test_cmd_doctor_json_reports_profile_port_collisions(monkeypatch, capsys) ->
     assert payload["profiles"]["duplicateCodexPorts"]["18000"] == ["one", "two"]
 
 
+def test_ci_doctor_gate_checks_ok_boolean() -> None:
+    workflow = Path(__file__).resolve().parents[2] / ".github" / "workflows" / "ci.yml"
+    text = workflow.read_text(encoding="utf-8")
+
+    assert "python backend/cladex.py doctor --json | jq -e '.ok == true'" in text
+    assert '.status=="ok"' not in text
+
+
 def test_doctor_profiles_reports_unsafe_workspaces_and_mixed_100_scale(tmp_path: Path, monkeypatch) -> None:
     profiles: list[dict] = []
     env_by_path: dict[str, dict[str, str]] = {}
