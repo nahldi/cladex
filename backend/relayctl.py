@@ -10,6 +10,7 @@ import install_plugin
 import json
 import os
 import re
+import secrets
 import shutil
 import socket
 import signal
@@ -352,7 +353,32 @@ def _write_env_file(path: Path, env: dict[str, str]) -> None:
     ordered_keys = [key for key in ENV_KEY_ORDER if key in safe_env]
     ordered_keys.extend(sorted(key for key in safe_env if key not in ordered_keys))
     lines = [f"{key}={safe_env[key]}" for key in ordered_keys]
-    atomic_write_text(path, "\n".join(lines) + "\n")
+    # D0003: identify secret refs that were freshly created by this call
+    # (i.e. did not exist in `existing_env`) so we can roll them back if the
+    # env-file write fails. Without rollback, a failed write leaves orphan
+    # encrypted blobs the operator never sees in `.env`.
+    fresh_refs: list[str] = []
+    for key in safe_env:
+        new_value = str(safe_env[key])
+        old_value = str(existing_env.get(key, ""))
+        if (
+            secret_store.is_secret_ref(new_value)
+            and new_value != old_value
+            and not secret_store.is_secret_ref(old_value)
+        ):
+            fresh_refs.append(new_value)
+    try:
+        atomic_write_text(path, "\n".join(lines) + "\n")
+    except OSError:
+        # Rollback: env-file write failed AFTER store_secret() persisted
+        # encrypted blobs. Delete them so the operator does not accumulate
+        # orphan secrets that no .env references.
+        for reference in fresh_refs:
+            try:
+                secret_store.delete_secret(reference)
+            except Exception:
+                pass
+        raise
     for reference in stale_secret_refs:
         secret_store.delete_secret(reference)
     try:
@@ -370,7 +396,8 @@ def _load_registry() -> dict:
     try:
         registry = json.loads(REGISTRY_PATH.read_text(encoding="utf-8"))
     except Exception as exc:
-        quarantine = REGISTRY_PATH.with_suffix(REGISTRY_PATH.suffix + f".corrupt-{int(time.time())}.bak")
+        quarantine_tag = f"{os.getpid()}-{secrets.token_hex(4)}-{time.time_ns()}"
+        quarantine = REGISTRY_PATH.with_suffix(REGISTRY_PATH.suffix + f".corrupt-{quarantine_tag}.bak")
         try:
             shutil.copy2(REGISTRY_PATH, quarantine)
         except OSError:
@@ -1147,7 +1174,7 @@ def _load_env_file_raw(path: Path) -> dict[str, str]:
     secret-ref ids and call `delete_secret` on them before deleting the
     env file."""
     env: dict[str, str] = {}
-    text = path.read_text(encoding="utf-8").lstrip("﻿")
+    text = path.read_text(encoding="utf-8").lstrip("\ufeff")
     for raw_line in text.splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:

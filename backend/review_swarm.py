@@ -19,6 +19,11 @@ from typing import Any, Callable
 
 from platformdirs import user_data_dir
 
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
+
 from agent_guardrails import assert_workspace_allowed, workspace_protection_violation
 
 
@@ -40,10 +45,66 @@ REVIEW_DATA_ROOT = Path(user_data_dir("cladex", False)) / "reviews"
 BACKUP_DATA_ROOT = Path(user_data_dir("cladex", False)) / "backups"
 _ACTIVE_GLOBAL_LANE_LOCKS: set[str] = set()
 _ACTIVE_GLOBAL_LANE_LOCKS_GUARD = threading.Lock()
-# F0011: serialize restore_backup so an operator double-click cannot stack
-# two restores against the same backup id (their pre-restore snapshots
-# would race the prune retention path).
-_RESTORE_BACKUP_LOCK = threading.Lock()
+# C0007/F0011: serialize restore_backup across BOTH threads and processes.
+# An in-process threading.Lock is not enough — two operator invocations from
+# separate processes (CLI re-run while the desktop app is restoring) would
+# both proceed and race the pre-restore snapshot prune. Per-workspace key so
+# different workspaces still restore in parallel.
+_RESTORE_TARGET_THREAD_LOCKS_GUARD = threading.Lock()
+_RESTORE_TARGET_THREAD_LOCKS: dict[str, threading.Lock] = {}
+
+
+def _restore_thread_lock_for(target_key: str) -> threading.Lock:
+    with _RESTORE_TARGET_THREAD_LOCKS_GUARD:
+        lock = _RESTORE_TARGET_THREAD_LOCKS.get(target_key)
+        if lock is None:
+            lock = threading.Lock()
+            _RESTORE_TARGET_THREAD_LOCKS[target_key] = lock
+        return lock
+
+
+@contextmanager
+def _serialize_restore_target(target: Path):
+    """Cross-process + cross-thread mutex keyed on the restore target path."""
+    target_key = str(target.resolve()) if target else str(target)
+    thread_lock = _restore_thread_lock_for(target_key)
+    thread_lock.acquire()
+    handle = None
+    try:
+        digest = hashlib.sha256(target_key.encode("utf-8")).hexdigest()[:24]
+        lock_dir = REVIEW_DATA_ROOT / "_restore-target-locks"
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        lock_path = lock_dir / f"{digest}.lock"
+        handle = open(lock_path, "a+b")
+        if os.name == "nt":
+            deadline = time.monotonic() + 60.0
+            while True:
+                try:
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError(f"timed out acquiring restore lock for {target}")
+                    time.sleep(0.05)
+        else:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        if handle is not None:
+            try:
+                if os.name == "nt":
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                handle.close()
+            except OSError:
+                pass
+        thread_lock.release()
 REVIEW_STRATEGY = "ai-review-swarm"
 REVIEW_ID_RE = re.compile(r"^review-\d{8}-\d{6}-[a-f0-9]{8}$")
 BACKUP_ID_RE = re.compile(r"^backup-\d{8}-\d{6}-[a-f0-9]{8}$")
@@ -738,10 +799,16 @@ def _workspace_start_lock(workspace: Path, *, preflight_only: bool):
             os.write(fd, json.dumps({"pid": os.getpid(), "workspace": str(workspace), "createdAt": utc_now()}).encode("utf-8"))
         finally:
             os.close(fd)
+        # C0001: mark active in the in-process tracker AS SOON AS the lock
+        # is written. Otherwise _global_lane_lock_stale sees pid==our_pid
+        # AND not active and returns True, so a sibling acquire in the same
+        # process would unlink our lock and steal it.
+        _mark_global_lane_slot_active(lock_path)
         break
     try:
         yield
     finally:
+        _mark_global_lane_slot_inactive(lock_path)
         try:
             lock_path.unlink()
         except OSError:
@@ -983,21 +1050,22 @@ def _skip_from_snapshot_or_restore(name: str) -> bool:
 def restore_backup(backup_id: str, *, confirm: str) -> dict[str, Any]:
     if confirm != backup_id:
         raise ValueError("restore requires --confirm with the exact backup id")
-    # F0011: serialize the restore path. Two concurrent restores (operator
-    # double-click, retried CLI invocation) would stack pre-restore
-    # snapshots whose env-var suppression races: the second's
-    # create_source_backup could see the first's finally-popped flag and
-    # call prune_backups, deleting the just-created pre-restore snapshot
-    # before _restore_snapshot_into_target reads it.
-    with _RESTORE_BACKUP_LOCK:
-        backup = load_backup(backup_id)
-        snapshot = Path(str(backup.get("snapshot", ""))).expanduser().resolve()
-        target = Path(str(backup.get("workspace", ""))).expanduser().resolve()
-        if not snapshot.exists() or not snapshot.is_dir():
-            raise ValueError(f"backup snapshot is missing: {snapshot}")
-        if not target.exists() or not target.is_dir():
-            raise ValueError(f"restore target is missing: {target}")
-
+    # C0007/F0011: serialize the restore path across processes AND threads.
+    # Two concurrent restores (operator double-click, retried CLI invocation
+    # from another process) would stack pre-restore snapshots whose env-var
+    # suppression races: the second's create_source_backup could see the
+    # first's finally-popped flag and call prune_backups, deleting the
+    # just-created pre-restore snapshot before _restore_snapshot_into_target
+    # reads it. Lock keyed on the restore target so unrelated workspaces
+    # still restore in parallel.
+    backup = load_backup(backup_id)
+    snapshot = Path(str(backup.get("snapshot", ""))).expanduser().resolve()
+    target = Path(str(backup.get("workspace", ""))).expanduser().resolve()
+    if not snapshot.exists() or not snapshot.is_dir():
+        raise ValueError(f"backup snapshot is missing: {snapshot}")
+    if not target.exists() or not target.is_dir():
+        raise ValueError(f"restore target is missing: {target}")
+    with _serialize_restore_target(target):
         # Use the explicit skip_prune kwarg (race-free) instead of the
         # process-global env var. The env var remains as a back-compat
         # shim for callers outside this function.
@@ -1134,6 +1202,19 @@ def launch_review_worker(job_id: str) -> None:
         "stderr": subprocess.DEVNULL,
     }
     kwargs.update(_hidden_subprocess_kwargs())
+    # C0003: detach from parent process group/session so the supervising
+    # server.cjs (which uses execFileAsync apiCommandTimeoutMs + taskkill /T
+    # on Windows) cannot reap us when the parent's request times out. The
+    # worker's job spans many minutes; the API call returns in seconds.
+    if os.name == "nt":
+        detach_flags = (
+            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            | getattr(subprocess, "DETACHED_PROCESS", 0)
+            | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        )
+        kwargs["creationflags"] = kwargs.get("creationflags", 0) | detach_flags
+    else:
+        kwargs["start_new_session"] = True
     subprocess.Popen(command, **kwargs)
 
 

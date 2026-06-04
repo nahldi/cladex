@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import json
 import os
+import re
 from pathlib import Path
 
 import pytest
@@ -34,6 +35,19 @@ def test_session_persists_initialized_state(tmp_path: Path) -> None:
     assert reloaded.session_id == first_id
     assert reloaded.initialized is True
     assert reloaded.last_success_at
+
+
+def test_claude_session_corrupt_quarantine_name_has_entropy(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    session_file = state_dir / "claude_session.json"
+    session_file.write_text("{not json", encoding="utf-8")
+
+    ClaudeSession(state_dir, tmp_path / "workspace")
+
+    quarantines = list(state_dir.glob("claude_session.json.corrupt-*.bak"))
+    assert quarantines
+    assert re.search(r"\.corrupt-\d+-[0-9a-f]{8}-\d+\.bak$", quarantines[0].name)
 
 
 def test_build_persistent_command_uses_stream_json(tmp_path: Path) -> None:

@@ -60,6 +60,7 @@ import logging
 import os
 import re
 import secrets as _stdlib_secrets
+import shutil
 import sys
 import time
 from ctypes import wintypes
@@ -110,7 +111,14 @@ def _secrets_root() -> Path:
         try:
             os.chmod(base, 0o700)
         except OSError as exc:
-            _LOG.warning("secret_store: chmod 0o700 failed for %s: %s", base, exc)
+            # F0002: refuse to proceed when we cannot tighten the secret
+            # root's permissions on POSIX. Continuing would persist the
+            # secret blob with the default umask (typically 0o644 / 0o755),
+            # leaving the encrypted token readable by any local user.
+            raise OSError(
+                f"secret_store: cannot tighten {base} to 0o700: {exc}; refusing to write secrets at "
+                f"world-readable permissions."
+            ) from exc
     return base
 
 
@@ -284,11 +292,34 @@ def resolve_secret(reference: str) -> str:
     try:
         blob = json.loads(raw)
     except Exception as exc:
-        quarantine = blob_path.with_suffix(blob_path.suffix + f".corrupt-{int(time.time())}.bak")
+        # D0004 + F0006: docstring promises a `.bak` COPY of the corrupt
+        # blob, not a destructive move. shutil.copy2 first, then unlink the
+        # original. Filename includes pid + token_hex(4) + nanosecond
+        # timestamp so two same-second quarantines don't collide.
+        quarantine_tag = f"{os.getpid()}-{_stdlib_secrets.token_hex(4)}-{time.time_ns()}"
+        quarantine = blob_path.with_suffix(blob_path.suffix + f".corrupt-{quarantine_tag}.bak")
+        copied = False
         try:
-            blob_path.replace(quarantine)
+            shutil.copy2(str(blob_path), str(quarantine))
+            copied = True
+            # F0001: lock the quarantine file down on POSIX so the leaked
+            # base64 ciphertext is no more readable than the original blob.
+            if os.name != "nt":
+                try:
+                    os.chmod(quarantine, 0o600)
+                except OSError as chmod_exc:
+                    _LOG.warning(
+                        "secret_store: chmod 0o600 failed for quarantine %s: %s",
+                        quarantine,
+                        chmod_exc,
+                    )
+            try:
+                blob_path.unlink()
+            except OSError:
+                pass
         except OSError:
-            quarantine = blob_path
+            if not copied:
+                quarantine = blob_path
         raise CorruptSecretBlobError(
             f"Secret blob {blob_path} is unreadable; quarantined copy: {quarantine}"
         ) from exc
@@ -350,11 +381,20 @@ def materialize_env_secrets(env: dict[str, str]) -> dict[str, str]:
     for key, value in env.items():
         try:
             resolved[key] = resolve_secret_value(value)
-        except (FileNotFoundError, ValueError, OSError):
-            # Leave the literal in place; the consumer (relay startup,
-            # discord.py login) will surface a clear auth failure rather
-            # than us silently producing an empty token.
-            resolved[key] = value
+        except (FileNotFoundError, ValueError, OSError) as exc:
+            # F0008: NEVER hand a `secret-ref:...` literal to the consumer
+            # (discord.py would log in with the literal as the bot token,
+            # producing an opaque rate-limit response). Set the value to
+            # the empty string so downstream auth fails fast and clearly,
+            # and warn loudly with the env key so the operator can re-enter
+            # the secret.
+            _LOG.warning(
+                "secret_store: failed to materialize secret for env key %s (%s); "
+                "passing empty string so downstream auth fails fast.",
+                key,
+                exc,
+            )
+            resolved[key] = ""
     return resolved
 
 

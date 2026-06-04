@@ -2,7 +2,9 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import sys
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -664,6 +666,19 @@ def test_claude_relay_run_rejects_existing_empty_allowlists(tmp_path: Path, monk
     assert excinfo.value.code
 
 
+def test_claude_registry_corrupt_quarantine_name_has_entropy(tmp_path: Path, monkeypatch) -> None:
+    registry_path = tmp_path / "workspaces.json"
+    registry_path.write_text("{not json", encoding="utf-8")
+    monkeypatch.setattr(claude_relay, "REGISTRY_PATH", registry_path)
+
+    with pytest.raises(claude_relay.CorruptClaudeRegistryError, match="registry is unreadable"):
+        claude_relay._load_registry()
+
+    quarantines = list(tmp_path.glob("workspaces.json.corrupt-*.bak"))
+    assert quarantines
+    assert re.search(r"\.corrupt-\d+-[0-9a-f]{8}-\d+\.bak$", quarantines[0].name)
+
+
 def test_claude_relay_run_returns_child_exit_code(tmp_path: Path, monkeypatch) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -777,7 +792,10 @@ def test_append_operator_history_redacts_secret_shaped_values(tmp_path: Path, mo
         sender_name="op",
     )
     persisted = history_path.read_text(encoding="utf-8")
+    payload = json.loads(persisted)
+    timestamp = payload["messages"][0]["timestamp"]
     assert github_token not in persisted, "GitHub token leaked unredacted"
     assert discord_token not in persisted, "Discord token leaked unredacted"
     assert api_key not in persisted, "api_key value leaked unredacted"
     assert "REDACTED" in persisted, "sanitize_text should have inserted a [REDACTED] marker"
+    assert datetime.fromisoformat(timestamp).tzinfo is not None

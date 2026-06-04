@@ -14,12 +14,13 @@ jobs:
       fail-fast: false
       matrix:
         os: [windows-latest, ubuntu-latest, macos-latest]
+        node-version: ['22', '24']
     steps:
       - uses: actions/checkout@v6
 
       - uses: actions/setup-node@v6
         with:
-          node-version: '22'
+          node-version: ${{ matrix.node-version }}
           cache: npm
 
       - run: npm ci
@@ -64,7 +65,7 @@ jobs:
           python-version: '3.12'
 
       - run: npm ci
-      - run: cmd /c npm install -g @openai/codex@0.125.0 @anthropic-ai/claude-code@2.1.117
+      - run: cmd /c npm install -g @openai/codex@0.137.0 @anthropic-ai/claude-code@2.1.162
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -e "backend[dev]" -c backend/constraints.txt
       - run: npm run api:smoke

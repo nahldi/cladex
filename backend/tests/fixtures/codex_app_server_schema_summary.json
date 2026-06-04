@@ -1,5 +1,5 @@
 {
-  "source": "codex-cli 0.125.0 stable JSON schema summary",
+  "source": "codex-cli 0.137.0 stable JSON schema summary",
   "methods": {
     "thread/start": {
       "schema": "v2/ThreadStartParams.json",
@@ -13,12 +13,12 @@
         "ephemeral",
         "model",
         "modelProvider",
-        "permissionProfile",
         "personality",
         "sandbox",
         "serviceName",
         "serviceTier",
-        "sessionStartSource"
+        "sessionStartSource",
+        "threadSource"
       ],
       "required": []
     },
@@ -34,7 +34,6 @@
         "excludeTurns",
         "model",
         "modelProvider",
-        "permissionProfile",
         "personality",
         "sandbox",
         "serviceTier",
@@ -63,12 +62,12 @@
       "allowedProperties": [
         "approvalPolicy",
         "approvalsReviewer",
+        "clientUserMessageId",
         "cwd",
         "effort",
         "input",
         "model",
         "outputSchema",
-        "permissionProfile",
         "personality",
         "sandboxPolicy",
         "serviceTier",
@@ -79,7 +78,7 @@
     },
     "turn/steer": {
       "schema": "v2/TurnSteerParams.json",
-      "allowedProperties": ["expectedTurnId", "input", "threadId"],
+      "allowedProperties": ["clientUserMessageId", "expectedTurnId", "input", "threadId"],
       "required": ["expectedTurnId", "input", "threadId"]
     },
     "turn/interrupt": {
@@ -88,8 +87,5 @@
       "required": ["threadId", "turnId"]
     }
   },
-  "exclusiveFields": [
-    ["permissionProfile", "sandbox"],
-    ["permissionProfile", "sandboxPolicy"]
-  ]
+  "exclusiveFields": []
 }

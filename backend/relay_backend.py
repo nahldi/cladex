@@ -93,18 +93,7 @@ def codex_text_input(text: str) -> list[dict[str, Any]]:
     return [{"type": "text", "text": text, "text_elements": []}]
 
 
-def _session_permission_profile(session) -> dict[str, Any] | None:
-    provider = getattr(session, "_permission_profile", None)
-    if provider is None:
-        return None
-    profile = provider()
-    return profile if isinstance(profile, dict) and profile else None
-
-
 def _thread_permission_fields(session) -> dict[str, Any]:
-    permission_profile = _session_permission_profile(session)
-    if permission_profile is not None:
-        return {"permissionProfile": permission_profile}
     return {
         "approvalPolicy": session._approval_policy(),
         "approvalsReviewer": None,
@@ -113,9 +102,6 @@ def _thread_permission_fields(session) -> dict[str, Any]:
 
 
 def _turn_permission_fields(session) -> dict[str, Any]:
-    permission_profile = _session_permission_profile(session)
-    if permission_profile is not None:
-        return {"permissionProfile": permission_profile}
     return {
         "approvalPolicy": None,
         "approvalsReviewer": None,
@@ -467,14 +453,13 @@ class CliResumeCodexBackend(CodexBackend):
             except (BrokenPipeError, ConnectionError):
                 pass
 
-        try:
-            await asyncio.wait_for(_write_prompt(), timeout=write_timeout)
-        except asyncio.TimeoutError:
-            await self._terminate_cli_process_tree(process)
-            raise BackendUnavailableError(
-                f"Degraded Codex CLI fallback timed out while sending prompt after {write_timeout:.0f}s."
-            )
+        # F0003: write + read MUST run concurrently. A large prompt (~64KB+)
+        # fills the OS pipe buffer; the writer blocks on drain() until the
+        # child reads. The child reads only after sending some output. If we
+        # awaited the writer to completion first, sequential pipes deadlock.
+        # Run write in a background task and start reading immediately.
         deadline = loop.time() + timeout_seconds
+        write_task = asyncio.create_task(_write_prompt())
         chunks: list[bytes] = []
         bytes_read = 0
         truncated = False
@@ -501,10 +486,24 @@ class CliResumeCodexBackend(CodexBackend):
                 chunks.append(chunk)
                 bytes_read += len(chunk)
         except asyncio.TimeoutError:
+            write_task.cancel()
             await self._terminate_cli_process_tree(process)
             raise BackendUnavailableError(
                 f"Degraded Codex CLI fallback timed out after {timeout_seconds}s."
             )
+        # Bound the writer so a stalled child cannot leave a dangling task.
+        # Writer should be done by now (child hit EOF); enforce write_timeout
+        # as a hard upper bound.
+        try:
+            await asyncio.wait_for(write_task, timeout=write_timeout)
+        except asyncio.TimeoutError:
+            write_task.cancel()
+            await self._terminate_cli_process_tree(process)
+            raise BackendUnavailableError(
+                f"Degraded Codex CLI fallback timed out while sending prompt after {write_timeout:.0f}s."
+            )
+        except asyncio.CancelledError:
+            pass
         if truncated:
             await self._terminate_cli_process_tree(process)
         try:

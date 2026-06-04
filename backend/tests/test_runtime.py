@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import subprocess
 import json
 import shutil
@@ -30,6 +31,51 @@ def test_state_namespace_rejects_path_traversal() -> None:
         relay_common.state_dir_for_namespace("nested/path")
     with pytest.raises(ValueError, match="Invalid state namespace"):
         relay_common.state_dir_for_namespace("Case-Alias")
+
+
+def test_windows_codex_resolution_prefers_current_npm_native_binary(tmp_path: Path) -> None:
+    shim_dir = tmp_path / "npm"
+    native = (
+        shim_dir
+        / "node_modules"
+        / "@openai"
+        / "codex"
+        / "node_modules"
+        / "@openai"
+        / "codex-win32-x64"
+        / "vendor"
+        / "x86_64-pc-windows-msvc"
+        / "bin"
+        / "codex.exe"
+    )
+    native.parent.mkdir(parents=True)
+    native.write_bytes(b"MZ")
+    cmd = shim_dir / "codex.cmd"
+    cmd.parent.mkdir(parents=True, exist_ok=True)
+    cmd.write_text("@echo off\n", encoding="utf-8")
+    app_alias = tmp_path / "WindowsApps" / "codex.exe"
+    app_alias.parent.mkdir()
+    app_alias.write_bytes(b"MZ")
+
+    def fake_which(name: str) -> str | None:
+        return {"codex.cmd": str(cmd), "codex.exe": str(app_alias)}.get(name)
+
+    assert relay_common._resolve_windows_codex_bin(fake_which) == str(native.resolve())
+
+
+def test_windows_codex_resolution_uses_cmd_before_windowsapps_alias(tmp_path: Path) -> None:
+    shim_dir = tmp_path / "npm"
+    cmd = shim_dir / "codex.cmd"
+    cmd.parent.mkdir(parents=True)
+    cmd.write_text("@echo off\n", encoding="utf-8")
+    app_alias = tmp_path / "WindowsApps" / "codex.exe"
+    app_alias.parent.mkdir()
+    app_alias.write_bytes(b"MZ")
+
+    def fake_which(name: str) -> str | None:
+        return {"codex.cmd": str(cmd), "codex.exe": str(app_alias)}.get(name)
+
+    assert relay_common._resolve_windows_codex_bin(fake_which) == str(cmd)
 
 
 def test_runtime_binding_creates_worktree_and_memory_contract(tmp_path: Path) -> None:
@@ -96,6 +142,26 @@ def test_worktree_manager_uses_fallback_branch_when_branch_checked_out_elsewhere
     assert first_path != second_path
     assert second_branch.startswith(f"{first_branch}-")
     assert (second_path / ".git").exists()
+
+
+def test_worktree_manager_locks_repo_before_channel_worktree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo = tmp_path / "repo"
+    state = tmp_path / "state"
+    _init_git_repo(repo)
+    manager = WorktreeManager(state / "worktrees")
+    entered: list[Path] = []
+
+    @contextlib.contextmanager
+    def fake_serialize_path(path: Path):
+        entered.append(path)
+        yield
+
+    monkeypatch.setattr(relay_runtime, "_serialize_path", fake_serialize_path)
+
+    worktree_path, _branch = manager.ensure(repo, project_id="project-one", channel_id="channel-one")
+
+    assert entered[:2] == [repo / ".git", worktree_path]
+    assert worktree_path.exists()
 
 
 def test_runtime_persists_primary_thread_mapping(tmp_path: Path) -> None:

@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -767,8 +768,9 @@ def _chat_with_profile(
                 raw_response = response_path.read_text(encoding="utf-8")
                 response = json.loads(raw_response)
             except Exception as exc:
+                quarantine_tag = f"{os.getpid()}-{secrets.token_hex(4)}-{time.time_ns()}"
                 quarantine = response_path.with_suffix(
-                    response_path.suffix + f".corrupt-{int(time.time())}.bak"
+                    response_path.suffix + f".corrupt-{quarantine_tag}.bak"
                 )
                 try:
                     response_path.replace(quarantine)

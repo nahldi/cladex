@@ -730,6 +730,24 @@ def test_load_json_file_quarantines_corrupt_state(tmp_path: Path) -> None:
     assert list(tmp_path.glob("workspaces.json.corrupt-*"))
 
 
+def test_chat_with_profile_corrupt_response_quarantine_name_has_entropy(tmp_path: Path, monkeypatch) -> None:
+    import pytest
+
+    monkeypatch.setattr(cladex.uuid, "uuid4", lambda: SimpleNamespace(hex="fixed-response"))
+    monkeypatch.setattr(cladex.relayctl, "state_dir_for_namespace", lambda _namespace: tmp_path / "state")
+    profile = {"name": "test", "_relay_type": "codex", "state_namespace": "test"}
+    responses_dir = cladex._operator_responses_dir(profile)
+    responses_dir.mkdir(parents=True)
+    (responses_dir / "fixed-response.json").write_text("{not json", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="Operator bridge response unreadable"):
+        cladex._chat_with_profile(profile, message="hello", timeout_seconds=1)
+
+    quarantines = list(responses_dir.glob("fixed-response.json.corrupt-*.bak"))
+    assert quarantines
+    assert re.search(r"\.corrupt-\d+-[0-9a-f]{8}-\d+\.bak$", quarantines[0].name)
+
+
 def test_list_json_contains_runtime_fields(monkeypatch, capsys) -> None:
     monkeypatch.setattr(
         cladex,

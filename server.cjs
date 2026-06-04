@@ -183,12 +183,14 @@ function isValidFixRunId(value) {
   return /^fix-\d{8}-\d{6}-[a-f0-9]{8}$/.test(String(value || '').trim());
 }
 
-// Mirror backend slugify(): lowercase alphanumerics + hyphens, length 1..64.
-// Without this, a path-shaped or option-shaped id (e.g. "--workspace=/etc")
-// is forwarded to argparse as a positional arg, surfacing as 500 + raw
-// stderr instead of a clean 400.
+// Mirror what backend `_filter_profiles(name=...)` accepts: alphanumerics,
+// hyphens, and underscores, case-insensitive, length 1..64. Backend matches
+// case-insensitively, so existing profiles like `MyRelay` or `Codex-Prod`
+// must pass this gate. Without this, a path-shaped or option-shaped id
+// (e.g. "--workspace=/etc") is forwarded to argparse as a positional arg,
+// surfacing as 500 + raw stderr instead of a clean 400.
 function isValidProfileId(value) {
-  return /^[a-z0-9-]{1,64}$/.test(String(value || '').trim());
+  return /^[A-Za-z0-9_-]{1,64}$/.test(String(value || '').trim());
 }
 
 function rejectInvalidReviewId(res, extra = {}) {
@@ -306,8 +308,36 @@ function getRemoteAccessToken() {
   remoteAccessTokenCache = generated;
   try {
     fsSync.mkdirSync(path.dirname(statePath), { recursive: true });
-    fsSync.writeFileSync(statePath, JSON.stringify({ token: generated }, null, 2) + '\n', { encoding: 'utf8', mode: 0o600 });
-    fsSync.chmodSync(statePath, 0o600);
+    // F0011: open with O_WRONLY|O_CREAT|O_EXCL ('wx') and explicit mode
+    // 0o600 so the file is created with restricted permissions atomically.
+    // The previous writeFileSync({mode}) plus follow-up chmodSync left a
+    // tiny window where the freshly-created token file was world-readable
+    // (umask + late chmod). 'wx' refuses to clobber an existing file —
+    // handle EEXIST by re-reading the existing token, since a concurrent
+    // server process may have just generated one.
+    let fd;
+    try {
+      fd = fsSync.openSync(statePath, 'wx', 0o600);
+    } catch (openErr) {
+      if (openErr && openErr.code === 'EEXIST') {
+        try {
+          const parsed = JSON.parse(fsSync.readFileSync(statePath, 'utf8'));
+          const saved = String(parsed.token || '').trim();
+          if (saved) {
+            remoteAccessTokenCache = saved;
+            try { fsSync.chmodSync(statePath, 0o600); } catch {}
+            return remoteAccessTokenCache;
+          }
+        } catch {}
+      }
+      throw openErr;
+    }
+    try {
+      fsSync.writeSync(fd, JSON.stringify({ token: generated }, null, 2) + '\n');
+    } finally {
+      try { fsSync.closeSync(fd); } catch {}
+    }
+    try { fsSync.chmodSync(statePath, 0o600); } catch {}
   } catch {}
   return remoteAccessTokenCache;
 }
@@ -805,9 +835,65 @@ async function sweepStaleApiRunnerOutputs() {
   } catch {}
 }
 
+// C0006: cap concurrent runPython execs so a flood of API requests cannot
+// fork-bomb the host. Default to min(8, os.cpus().length); override via
+// CLADEX_RUNPYTHON_CONCURRENCY. Inline Promise-based semaphore — no new
+// dependencies. Pending callers form a FIFO queue.
+function resolveRunPythonConcurrency() {
+  const raw = String(process.env.CLADEX_RUNPYTHON_CONCURRENCY || '').trim();
+  const override = Number(raw);
+  if (Number.isFinite(override) && override >= 1) {
+    return Math.floor(override);
+  }
+  let cpuCount = 1;
+  try {
+    cpuCount = Math.max(1, os.cpus().length || 1);
+  } catch {
+    cpuCount = 1;
+  }
+  return Math.min(8, cpuCount);
+}
+
+const RUN_PYTHON_CONCURRENCY = resolveRunPythonConcurrency();
+let runPythonInFlight = 0;
+const runPythonWaiters = [];
+
+function acquireRunPythonSlot() {
+  if (runPythonInFlight < RUN_PYTHON_CONCURRENCY) {
+    runPythonInFlight += 1;
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    // The waiter holds an implicit "owe one inflight slot" credit; the
+    // releaser hands it off without changing the inflight counter so the
+    // semaphore invariant (inflight <= limit) is preserved.
+    runPythonWaiters.push(resolve);
+  });
+}
+
+function releaseRunPythonSlot() {
+  if (runPythonWaiters.length > 0) {
+    const next = runPythonWaiters.shift();
+    // Hand off the slot directly: the awaiting caller becomes the new owner
+    // without bumping inflight (we never decremented for them).
+    next();
+    return;
+  }
+  runPythonInFlight = Math.max(0, runPythonInFlight - 1);
+}
+
 async function runPython(args, cwd = BACKEND_DIR, extraEnv = {}, options = {}) {
   await bootstrapBackendRuntime();
   await sweepStaleApiRunnerOutputs();
+  await acquireRunPythonSlot();
+  try {
+    return await runPythonInner(args, cwd, extraEnv, options);
+  } finally {
+    releaseRunPythonSlot();
+  }
+}
+
+async function runPythonInner(args, cwd, extraEnv, options) {
   const childEnv = { ...process.env, ...extraEnv };
   const platform = options.platform || process.platform;
   const execAsync = options.execFileAsync || execFileAsync;

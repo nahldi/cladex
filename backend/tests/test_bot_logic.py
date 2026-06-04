@@ -1169,7 +1169,7 @@ def test_codex_session_start_turn_uses_schema_builder_payload() -> None:
     assert "collaborationMode" not in payload
     assert payload["threadId"] == "thread-1"
     assert payload["input"][0] == {"type": "text", "text": "Ship it.", "text_elements": []}
-    assert set(payload).issubset({"threadId", "input", "cwd", "approvalPolicy", "approvalsReviewer", "sandboxPolicy", "model", "serviceTier", "effort", "summary", "personality", "outputSchema", "permissionProfile"})
+    assert set(payload).issubset({"threadId", "input", "cwd", "approvalPolicy", "approvalsReviewer", "sandboxPolicy", "model", "serviceTier", "effort", "summary", "personality", "outputSchema"})
 
 
 def test_developer_instructions_include_soul() -> None:

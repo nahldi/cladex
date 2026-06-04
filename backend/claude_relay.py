@@ -21,6 +21,7 @@ import getpass
 import json
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -138,7 +139,28 @@ def _write_env_file(path: Path, env: dict[str, str]) -> None:
     ordered_keys = [key for key in ENV_KEY_ORDER if key in safe_env]
     ordered_keys.extend(sorted(key for key in safe_env if key not in ordered_keys))
     lines = [f"{key}={safe_env[key]}" for key in ordered_keys]
-    atomic_write_text(path, "\n".join(lines) + "\n")
+    # D0003: identify secret refs created by this call so we can roll them
+    # back if the env-file write fails. Otherwise a failed write strands
+    # encrypted blobs the operator never sees referenced from `.env`.
+    fresh_refs: list[str] = []
+    for key in safe_env:
+        new_value = str(safe_env[key])
+        old_value = str(existing_env.get(key, ""))
+        if (
+            secret_store.is_secret_ref(new_value)
+            and new_value != old_value
+            and not secret_store.is_secret_ref(old_value)
+        ):
+            fresh_refs.append(new_value)
+    try:
+        atomic_write_text(path, "\n".join(lines) + "\n")
+    except OSError:
+        for reference in fresh_refs:
+            try:
+                secret_store.delete_secret(reference)
+            except Exception:
+                pass
+        raise
     for reference in stale_secret_refs:
         secret_store.delete_secret(reference)
     try:
@@ -161,7 +183,8 @@ def _load_registry() -> dict:
     try:
         registry = json.loads(REGISTRY_PATH.read_text(encoding="utf-8"))
     except Exception as exc:
-        quarantine = REGISTRY_PATH.with_suffix(REGISTRY_PATH.suffix + f".corrupt-{int(time.time())}.bak")
+        quarantine_tag = f"{os.getpid()}-{secrets.token_hex(4)}-{time.time_ns()}"
+        quarantine = REGISTRY_PATH.with_suffix(REGISTRY_PATH.suffix + f".corrupt-{quarantine_tag}.bak")
         try:
             shutil.copy2(REGISTRY_PATH, quarantine)
         except OSError:
@@ -744,6 +767,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     # can locate and reap the entire tree even when relay.pid is missing.
     supervisor_pid_file = state_dir / ".supervisor.pid"
     process: subprocess.Popen | None = None
+    interrupted = False
     try:
         with open(log_file, "a") as log:
             process = subprocess.Popen(
@@ -762,7 +786,14 @@ def cmd_run(args: argparse.Namespace) -> int:
             process.wait()
             return process.returncode or 0
     except KeyboardInterrupt:
+        interrupted = True
         print("\nStopping relay...")
+    except Exception as exc:
+        # F0002/R0006: surface the cause instead of silently returning 0.
+        # Without this branch a Popen failure (PATH, permissions, OOM, env
+        # corruption) was swallowed and the supervisor reported success.
+        print(f"Relay launch failed: {exc}", file=sys.stderr)
+        return 1
     finally:
         # Always reap the bot subtree — Popen pid plus every descendant
         # (claude CLI, node child processes) walked by psutil's
@@ -783,7 +814,12 @@ def cmd_run(args: argparse.Namespace) -> int:
         except OSError:
             pass
 
-    return 0
+    # R0006: return the child's actual exit code. KeyboardInterrupt is
+    # canonically signalled as 130 (SIGINT). If the child already terminated
+    # before our ctrl-c, prefer its returncode.
+    if process is not None and process.returncode not in (None,):
+        return process.returncode or 0
+    return 130 if interrupted else 0
 
 
 def cmd_version(args: argparse.Namespace) -> int:

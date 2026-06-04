@@ -146,8 +146,13 @@ def _acquire_run_lock(run_id: str) -> bool:
             existing_pid = int(existing.split(":", 1)[0]) if existing else 0
         except Exception:
             existing_pid = 0
+        # R0001: own-pid means we already hold this lock — treat as success
+        # (re-entrant skip), DO NOT unlink. Unlinking our own lock then
+        # re-acquiring lets a sibling thread wedge in between.
+        if existing_pid == os.getpid():
+            return True
         # Treat 0-byte / unparseable / dead-pid lockfiles as stale.
-        if not existing or not existing_pid or existing_pid == os.getpid() or not _pid_alive(existing_pid):
+        if not existing or not existing_pid or not _pid_alive(existing_pid):
             try:
                 lock_path.unlink()
             except OSError:
@@ -175,7 +180,10 @@ def _acquire_start_lock(review_id: str, *, wait_seconds: float = 8.0) -> bool:
                 existing_pid = int(existing.split(":", 1)[0]) if existing else 0
             except Exception:
                 existing_pid = 0
-            if not existing or not existing_pid or existing_pid == os.getpid() or not _pid_alive(existing_pid):
+            # R0001: own-pid means we already hold this lock — re-entrant skip.
+            if existing_pid == os.getpid():
+                return True
+            if not existing or not existing_pid or not _pid_alive(existing_pid):
                 try:
                     lock_path.unlink()
                 except OSError:
@@ -224,10 +232,13 @@ def _run_state_lock(run_id: str, *, wait_seconds: float = 8.0) -> Any:
     deadline = time.monotonic() + wait_seconds
     lock_path = _state_lock_path(run_id)
     with _thread_lock_for_run(run_id):
+        fd: int | None = None
+        own_lock = False
         while True:
             lock_path.parent.mkdir(parents=True, exist_ok=True)
             try:
                 fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                own_lock = True
                 break
             except FileExistsError:
                 existing = ""
@@ -236,7 +247,15 @@ def _run_state_lock(run_id: str, *, wait_seconds: float = 8.0) -> Any:
                     existing_pid = int(existing.split(":", 1)[0]) if existing else 0
                 except Exception:
                     existing_pid = 0
-                if not existing or not existing_pid or existing_pid == os.getpid() or not _pid_alive(existing_pid):
+                # R0001: own-pid means a leftover from this same process — but the
+                # _state_lock_stack thread-local already caught legit reentrancy
+                # (see top of function). An own-pid lockfile with empty stack
+                # indicates a prior crash inside this same process; treat it as
+                # already-held and yield without rewriting (do NOT unlink, which
+                # would race a sibling thread that is genuinely holding it).
+                if existing_pid == os.getpid():
+                    break
+                if not existing or not existing_pid or not _pid_alive(existing_pid):
                     try:
                         lock_path.unlink()
                         continue
@@ -245,19 +264,24 @@ def _run_state_lock(run_id: str, *, wait_seconds: float = 8.0) -> Any:
                 if time.monotonic() >= deadline:
                     raise RuntimeError("Fix Review state is busy; try again.")
                 time.sleep(0.05)
-        try:
-            os.write(fd, f"{os.getpid()}:{utc_now()}".encode("utf-8"))
-        finally:
-            os.close(fd)
+        if fd is not None:
+            try:
+                os.write(fd, f"{os.getpid()}:{utc_now()}".encode("utf-8"))
+            finally:
+                os.close(fd)
         stack.append(run_id)
         try:
             yield
         finally:
             stack.pop()
-            try:
-                lock_path.unlink()
-            except OSError:
-                pass
+            # Only unlink the lock file when we created it. If we adopted an
+            # own-pid leftover, leave it in place — a sibling thread/call may
+            # be the actual owner.
+            if own_lock:
+                try:
+                    lock_path.unlink()
+                except OSError:
+                    pass
 
 
 def _severity_phase(severity: str) -> int:
@@ -870,12 +894,11 @@ def _progress(tasks: list[dict[str, Any]]) -> dict[str, int]:
 def _safe_phase_parallelism(tasks: list[dict[str, Any]], requested: int) -> int:
     # Fix workers share one writable workspace. Keep phases serialized until
     # CLADEX has per-task worktree isolation and a merge step.
-    # TODO(per-task-worktree-isolation): once each fix task runs in its own
-    # git worktree with a deterministic merge step, honor `requested`
+    # Deferred(per-task-worktree-isolation): once each fix task runs in its
+    # own git worktree with a deterministic merge step, honor `requested`
     # (validated by validate_max_agents) instead of forcing 1. Operator UI
     # advertises maxAgents + planner produces recommendedAgentCount today,
-    # but this stub returns 1 unconditionally — that mismatch is intentional
-    # until the isolation work lands.
+    # but this stub returns 1 unconditionally until the isolation work lands.
     return 1
 
 
@@ -1067,6 +1090,19 @@ def launch_fix_worker(run_id: str) -> None:
         "stderr": subprocess.DEVNULL,
     }
     kwargs.update(review_swarm._hidden_subprocess_kwargs())
+    # C0003: detach from parent process group/session so the supervising
+    # server.cjs (which uses execFileAsync apiCommandTimeoutMs + taskkill /T
+    # on Windows) cannot reap us when the parent's request times out. The
+    # worker's job spans many minutes; the API call returns in seconds.
+    if os.name == "nt":
+        detach_flags = (
+            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            | getattr(subprocess, "DETACHED_PROCESS", 0)
+            | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        )
+        kwargs["creationflags"] = kwargs.get("creationflags", 0) | detach_flags
+    else:
+        kwargs["start_new_session"] = True
     subprocess.Popen(command, **kwargs)
 
 

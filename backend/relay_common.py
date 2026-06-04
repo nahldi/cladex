@@ -4,6 +4,7 @@ import json
 import hashlib
 import os
 import re
+import secrets as _stdlib_secrets
 import shutil
 import subprocess
 import sys
@@ -208,7 +209,10 @@ def _prune_stale_replace_directory_siblings(destination: Path) -> None:
         if not name.startswith(prefix):
             continue
         suffix = name[len(prefix) :]
-        pid_part = suffix.split(".", 1)[0]
+        # New format: "<pid>-<hex>-<ns>". Legacy format: "<pid>" (then maybe
+        # ".<extras>"). Handle both: pid is the first dash- or dot-delimited
+        # token.
+        pid_part = re.split(r"[-.]", suffix, maxsplit=1)[0]
         try:
             owning_pid = int(pid_part)
         except ValueError:
@@ -217,6 +221,9 @@ def _prune_stale_replace_directory_siblings(destination: Path) -> None:
             continue
         if pid_exists(owning_pid):
             continue
+        # F0006 sweeper: we deliberately skip the open-handle / fcntl probe
+        # here because the directory may still be actively written by a live
+        # PID; the pid_exists check above is the gate.
         try:
             shutil.rmtree(entry, ignore_errors=True)
         except OSError:
@@ -248,8 +255,12 @@ def _quarantine_stuck_backup(backup_destination: Path, error: BaseException) -> 
 def replace_directory(source: Path, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     _prune_stale_replace_directory_siblings(destination)
-    temp_destination = destination.parent / f".{destination.name}.tmp-{os.getpid()}"
-    backup_destination = destination.parent / f".{destination.name}.bak-{os.getpid()}"
+    # F0006: include token_hex(4) + nanosecond timestamp so two same-pid forks
+    # cannot collide. PID alone is recycled within seconds on Windows under
+    # supervisor restart.
+    _suffix_tag = f"{os.getpid()}-{_stdlib_secrets.token_hex(4)}-{time.time_ns()}"
+    temp_destination = destination.parent / f".{destination.name}.tmp-{_suffix_tag}"
+    backup_destination = destination.parent / f".{destination.name}.bak-{_suffix_tag}"
     if temp_destination.exists():
         shutil.rmtree(temp_destination)
     if backup_destination.exists():
@@ -605,28 +616,37 @@ def relay_codex_env(workspace: Path, base_env: dict[str, str] | None = None) -> 
     return env
 
 
-def resolve_codex_bin() -> str:
-    if os.name == "nt":
-        codex_cmd = shutil.which("codex.cmd")
-        if codex_cmd:
-            shim_dir = Path(codex_cmd).resolve().parent
-            candidates = sorted(
-                (shim_dir / "node_modules" / "@openai" / "codex" / "node_modules" / "@openai").glob(
-                    "codex-win32-*/vendor/*/codex/codex.exe"
-                )
-            )
+def _resolve_windows_codex_bin(which=shutil.which) -> str | None:
+    codex_cmd = which("codex.cmd")
+    if codex_cmd:
+        cmd_path = Path(codex_cmd).resolve()
+        native_root = cmd_path.parent / "node_modules" / "@openai" / "codex" / "node_modules" / "@openai"
+        for pattern in (
+            "codex-win32-*/vendor/*/bin/codex.exe",
+            "codex-win32-*/vendor/*/codex/codex.exe",
+        ):
+            candidates = sorted(native_root.glob(pattern))
             if candidates:
                 return str(candidates[0].resolve())
-        codex_exe = shutil.which("codex.exe")
-        if codex_exe:
-            return codex_exe
+        return str(cmd_path)
+    codex_exe = which("codex.exe")
+    if codex_exe:
+        return codex_exe
+    return None
+
+
+def resolve_codex_bin() -> str:
+    if os.name == "nt":
+        resolved = _resolve_windows_codex_bin()
+        if resolved:
+            return resolved
     return shutil.which("codex") or "codex"
 
 
 def codex_cli_version() -> str:
     codex_bin = resolve_codex_bin()
     if os.name == "nt" and not codex_bin.lower().endswith(".exe"):
-        command = ["cmd", "/c", "codex.CMD", "--version"]
+        command = ["cmd", "/c", codex_bin, "--version"]
     else:
         command = [codex_bin, "--version"]
     result = subprocess.run(

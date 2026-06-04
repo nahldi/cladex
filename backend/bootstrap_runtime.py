@@ -34,6 +34,7 @@ executing this code.
 from __future__ import annotations
 
 import os
+import secrets as _stdlib_secrets
 import shutil
 import stat
 import subprocess
@@ -165,7 +166,11 @@ def _ensure_venv(root: Path) -> Path:
         except OSError:
             pass
         if root.exists():
-            purge_target = root.with_name(f"{root.name}.purging-{int(time.time())}")
+            # R0008: include pid + token_hex(4) + nanosecond timestamp so two
+            # bootstrap invocations in the same second cannot pick the same
+            # purge target (one would clobber the other's pending purge).
+            purge_tag = f"{os.getpid()}-{_stdlib_secrets.token_hex(4)}-{time.time_ns()}"
+            purge_target = root.with_name(f"{root.name}.purging-{purge_tag}")
             try:
                 os.rename(root, purge_target)
             except OSError as exc:
@@ -260,7 +265,29 @@ def _pip_install(python: Path) -> int:
         timeout = max(int(str(timeout_raw or DEFAULT_TIMEOUT_SECONDS).strip()), 1)
     except ValueError:
         timeout = DEFAULT_TIMEOUT_SECONDS
-    proc = subprocess.run(cmd, env=env, timeout=timeout, check=False)
+    # R0006/F0002: capture pip output so we can surface the LAST 40 lines on
+    # failure. Without this, a packaged-user machine sees an opaque non-zero
+    # exit from cladex bootstrap with no hint of which install_target failed
+    # or why pip refused (network, hash mismatch, missing wheel, etc.).
+    proc = subprocess.run(cmd, env=env, timeout=timeout, check=False, capture_output=True, text=True)
+    if proc.returncode != 0:
+        try:
+            tail_lines: list[str] = []
+            for stream_name, stream_value in (("stderr", proc.stderr), ("stdout", proc.stdout)):
+                stream_text = stream_value or ""
+                if stream_text.strip():
+                    tail_lines.append(f"--- pip {stream_name} (last 40 lines) ---")
+                    tail_lines.extend(stream_text.splitlines()[-40:])
+            tail = "\n".join(tail_lines)
+            print(
+                f"cladex bootstrap: pip install for {install_target} exited with {proc.returncode}.\n{tail}",
+                file=sys.stderr,
+            )
+        except Exception:
+            print(
+                f"cladex bootstrap: pip install for {install_target} exited with {proc.returncode}.",
+                file=sys.stderr,
+            )
     return proc.returncode
 
 

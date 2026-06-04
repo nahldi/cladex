@@ -18,7 +18,7 @@ import sys
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import discord
@@ -357,7 +357,7 @@ class ClaudeRelayBot(commands.Bot):
             "session_id": self._backend.session_id if self._backend else None,
             "model": self._backend.configured_model if self._backend else None,
             "effort": self._backend.effort if self._backend else None,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         atomic_write_text(status_file, json.dumps(data, indent=2))
 
@@ -392,7 +392,7 @@ class ClaudeRelayBot(commands.Bot):
                 "content": safe_content,
                 "channelId": channel_id,
                 "senderName": sender_name,
-                "timestamp": datetime.utcnow().isoformat(),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
             }
         )
         atomic_write_text(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import os
 import re
 import shlex
@@ -23,6 +24,8 @@ else:
 
 from relay_common import atomic_write_json, atomic_write_text, slugify, workspace_root
 
+
+_LOG = logging.getLogger(__name__)
 
 _FILE_LOCK_REGISTRY_GUARD = threading.Lock()
 _FILE_LOCK_REGISTRY: dict[str, threading.Lock] = {}
@@ -364,8 +367,17 @@ def _summarize_commands(commands_run: list[str], *, limit: int = 8) -> list[str]
     return cleaned
 
 
-def _handoff_top_entry_matches(path: Path, *, task_id: str, fingerprint: str) -> bool:
-    """Return True if HANDOFF.md most-recent entry already encodes this task+fingerprint."""
+def _handoff_top_entry_matches(
+    path: Path, *, task_id: str, fingerprint: str, result_text: str = ""
+) -> bool:
+    """Return True if HANDOFF.md most-recent entry already encodes this task+fingerprint.
+
+    Modern entries embed ``<!-- fp:<fingerprint> -->`` and short-circuit on the
+    marker. Legacy entries written before the fingerprint marker existed are
+    matched by ``- task id:`` plus ``- result:`` line equality (case-insensitive,
+    whitespace-collapsed) so retries do not re-append duplicates of pre-existing
+    entries from older runs.
+    """
     try:
         text = _read_text(path)
     except Exception:
@@ -381,6 +393,19 @@ def _handoff_top_entry_matches(path: Path, *, task_id: str, fingerprint: str) ->
         return True
     # Older entries pre-fingerprint: fall back to task id + result-line equality.
     if f"- task id: {task_id}" not in top:
+        return False
+    if not result_text:
+        return False
+    expected_result = _normalize_compare_text(result_text)
+    if not expected_result:
+        return False
+    for raw_line in top.splitlines():
+        stripped = raw_line.strip().lstrip("-* ").strip()
+        if not stripped.lower().startswith("result:"):
+            continue
+        _, _, value = stripped.partition(":")
+        if _normalize_compare_text(value) == expected_result:
+            return True
         return False
     return False
 
@@ -501,20 +526,46 @@ _KNOWN_FACTS_SCHEMA_VERSION = 1
 _TASKS_SCHEMA_VERSION = 1
 
 
-def _refuse_future_schema(path: Path, payload: dict[str, Any], current: int) -> None:
-    """If JSON schema_version exceeds current, rename to .bak so caller can re-seed."""
+class FutureSchemaError(RuntimeError):
+    """Raised when a JSON file's schema_version exceeds what this runtime understands.
+
+    The caller MUST NOT proceed to overwrite the file: the on-disk payload may
+    contain newer-schema fields the current runtime would silently drop. We
+    quarantine the file (.bak) and raise so the caller can bail out cleanly.
+    """
+
+
+def _refuse_future_schema(path: Path, payload: dict[str, Any], current: int) -> bool:
+    """Quarantine a future-schema JSON file so caller can re-seed.
+
+    Returns ``True`` when the on-disk payload's ``schema_version`` is at or
+    below ``current`` (caller proceeds normally). Raises ``FutureSchemaError``
+    when a future-schema file was successfully quarantined to ``.bak`` (caller
+    bails — overwriting would destroy the future-schema data the operator
+    presumably wants to keep). Raises ``OSError`` when the quarantine itself
+    failed (caller bails — overwriting would also destroy data).
+
+    The caller MUST already hold ``_serialize_path(path)`` so the read-quarantine
+    pair is atomic across threads and processes. We use ``os.replace`` so the
+    rename itself is atomic on both POSIX and Windows.
+    """
     try:
         version = int(payload.get("schema_version", 0) or 0)
     except (TypeError, ValueError):
         version = 0
-    if version > current:
-        try:
-            backup = path.with_suffix(path.suffix + ".bak")
-            if backup.exists():
-                backup.unlink()
-            path.rename(backup)
-        except OSError:
-            pass
+    if version <= current:
+        return True
+    if not path.exists():
+        # Another holder already quarantined under their lock turn.
+        return True
+    backup = path.with_suffix(path.suffix + ".bak")
+    if backup.exists():
+        backup.unlink()
+    os.replace(path, backup)
+    raise FutureSchemaError(
+        f"{path} schema_version {version} > runtime-supported {current}; "
+        f"quarantined to {backup}. Refusing to overwrite future-schema data."
+    )
 
 
 def _prune_known_facts_payload(facts: dict[str, Any]) -> dict[str, Any]:
@@ -1157,6 +1208,12 @@ class RuntimeStore:
             try:
                 conn.execute("BEGIN IMMEDIATE")
                 try:
+                    # R0002: only claim when (a) never claimed, (b) the prior
+                    # claim is stale (older than cutoff), or (c) the prior
+                    # claimant is the legacy zero pid (rows persisted before
+                    # claimant_pid was tracked). Previously the clause
+                    # `claimant_pid != our_pid` silently stole live foreign
+                    # claims mid-flight.
                     cursor = conn.execute(
                         """
                         UPDATE turn_records
@@ -1166,10 +1223,10 @@ class RuntimeStore:
                           AND (
                               side_effects_claimed_at = ''
                               OR side_effects_claimed_at < ?
-                              OR side_effects_claimant_pid != ?
+                              OR side_effects_claimant_pid = 0
                           )
                         """,
-                        (_now_iso(), our_pid, turn_id, cutoff, our_pid),
+                        (_now_iso(), our_pid, turn_id, cutoff),
                     )
                     rowcount = cursor.rowcount
                     conn.execute("COMMIT")
@@ -1458,7 +1515,15 @@ class WorktreeManager:
         worktree_path = worktree_root / slugify(channel_id)
         branch_name = f"relay/{slugify(project_id)}-{slugify(channel_id)}"
         fallback_branch_name = f"{branch_name}-{hashlib.sha1(str(worktree_path).encode('utf-8')).hexdigest()[:8]}"
-        with _serialize_path(worktree_path):
+        # C0002: per-worktree lock guards this channel's clone, but two distinct
+        # channels on the same repo_root still race `git worktree prune/add`
+        # against the shared `.git/index.lock`. Acquire the per-repo lock FIRST
+        # (consistent ordering: repo before worktree) so cross-channel ensure()
+        # calls serialize on the shared git plumbing. We lock on `repo_root /
+        # ".git"` so the lock-file sentinel lives inside repo_root rather than
+        # polluting its parent directory.
+        repo_lock_target = repo_root / ".git"
+        with _serialize_path(repo_lock_target), _serialize_path(worktree_path):
             if worktree_path.exists():
                 if not self._valid_git_worktree(worktree_path):
                     if worktree_path.is_dir():
@@ -2060,10 +2125,17 @@ class DurableRuntime:
         sender_type = "other-ai" if author_is_bot else "user"
         content = text.strip()
         known_facts_path = binding.worktree_path / MEMORY_DIR_NAME / "KNOWN_FACTS.json"
-        raw_known_facts = _read_json(known_facts_path, {"schema_version": _KNOWN_FACTS_SCHEMA_VERSION, "preferences": [], "constraints": [], "facts": []})
-        _refuse_future_schema(known_facts_path, raw_known_facts, _KNOWN_FACTS_SCHEMA_VERSION)
-        facts = _prune_known_facts_payload(raw_known_facts)
-        atomic_write_json(known_facts_path, _prune_known_facts_payload(facts))
+        # Serialize the read-_refuse_future_schema-write triple across processes
+        # so two relay processes cannot trample each other's KNOWN_FACTS.json.
+        with _serialize_path(known_facts_path):
+            raw_known_facts = _read_json(known_facts_path, {"schema_version": _KNOWN_FACTS_SCHEMA_VERSION, "preferences": [], "constraints": [], "facts": []})
+            try:
+                _refuse_future_schema(known_facts_path, raw_known_facts, _KNOWN_FACTS_SCHEMA_VERSION)
+            except (FutureSchemaError, OSError) as exc:
+                _LOG.warning("KNOWN_FACTS quarantine: %s", exc)
+            else:
+                facts = _prune_known_facts_payload(raw_known_facts)
+                atomic_write_json(known_facts_path, _prune_known_facts_payload(facts))
         if sender_type == "user" and content:
             self._upsert_memory_fact(
                 binding,
@@ -2226,11 +2298,18 @@ class DurableRuntime:
         decisions = _read_text(memory_dir / "DECISIONS.md")
         handoff = _read_text(memory_dir / "HANDOFF.md")
         known_facts_path = memory_dir / "KNOWN_FACTS.json"
-        raw_facts = _read_json(known_facts_path, {"schema_version": _KNOWN_FACTS_SCHEMA_VERSION, "preferences": [], "constraints": [], "facts": []})
-        _refuse_future_schema(known_facts_path, raw_facts, _KNOWN_FACTS_SCHEMA_VERSION)
-        facts = _prune_known_facts_payload(raw_facts)
-        if facts != raw_facts:
-            atomic_write_json(known_facts_path, facts)
+        # Serialize the read-_refuse_future_schema-write triple across processes
+        # so two callers cannot trample each other's KNOWN_FACTS.json.
+        with _serialize_path(known_facts_path):
+            raw_facts = _read_json(known_facts_path, {"schema_version": _KNOWN_FACTS_SCHEMA_VERSION, "preferences": [], "constraints": [], "facts": []})
+            try:
+                _refuse_future_schema(known_facts_path, raw_facts, _KNOWN_FACTS_SCHEMA_VERSION)
+            except (FutureSchemaError, OSError) as exc:
+                _LOG.warning("KNOWN_FACTS quarantine in build_context_bundle: %s", exc)
+                raw_facts = {"schema_version": _KNOWN_FACTS_SCHEMA_VERSION, "preferences": [], "constraints": [], "facts": []}
+            facts = _prune_known_facts_payload(raw_facts)
+            if facts != raw_facts:
+                atomic_write_json(known_facts_path, facts)
         unresolved = self.store.unresolved_claims(binding.project_id)
         active = self.store.active_task(channel_key)
         lines = [
@@ -2617,7 +2696,9 @@ class DurableRuntime:
             f"|blocker:{_normalize_compare_text(blocker or 'none')}"
         )
         fingerprint = hashlib.sha1(fingerprint_source.encode("utf-8")).hexdigest()[:16]
-        if _handoff_top_entry_matches(handoff_path, task_id=task_id, fingerprint=fingerprint):
+        if _handoff_top_entry_matches(
+            handoff_path, task_id=task_id, fingerprint=fingerprint, result_text=result_text
+        ):
             _prune_markdown_history(handoff_path, "HANDOFF", keep_entries=20, max_chars=8000)
             return
         entry = "\n".join(
@@ -2655,9 +2736,16 @@ class DurableRuntime:
                 }
             )
         tasks_path = binding.worktree_path / MEMORY_DIR_NAME / "TASKS.json"
-        existing_tasks = _read_json(tasks_path, {"schema_version": _TASKS_SCHEMA_VERSION, "tasks": []})
-        _refuse_future_schema(tasks_path, existing_tasks, _TASKS_SCHEMA_VERSION)
-        atomic_write_json(tasks_path, {"schema_version": _TASKS_SCHEMA_VERSION, "tasks": tasks})
+        # Serialize the read-_refuse_future_schema-write triple across processes
+        # so two writers cannot trample each other's TASKS.json.
+        with _serialize_path(tasks_path):
+            existing_tasks = _read_json(tasks_path, {"schema_version": _TASKS_SCHEMA_VERSION, "tasks": []})
+            try:
+                _refuse_future_schema(tasks_path, existing_tasks, _TASKS_SCHEMA_VERSION)
+            except (FutureSchemaError, OSError) as exc:
+                _LOG.warning("TASKS.json quarantine: %s", exc)
+                return
+            atomic_write_json(tasks_path, {"schema_version": _TASKS_SCHEMA_VERSION, "tasks": tasks})
 
     def _sync_status(
         self,

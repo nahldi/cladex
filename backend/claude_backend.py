@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import subprocess
 import time
 import uuid
@@ -320,8 +321,9 @@ class ClaudeSession:
                 raw = self.session_file.read_text(encoding="utf-8")
                 data = json.loads(raw)
             except Exception as exc:
+                quarantine_tag = f"{os.getpid()}-{secrets.token_hex(4)}-{time.time_ns()}"
                 quarantine = self.session_file.with_suffix(
-                    self.session_file.suffix + f".corrupt-{int(time.time())}.bak"
+                    self.session_file.suffix + f".corrupt-{quarantine_tag}.bak"
                 )
                 try:
                     self.session_file.replace(quarantine)
@@ -335,8 +337,9 @@ class ClaudeSession:
             else:
                 version = data.get("schemaVersion") if isinstance(data, dict) else None
                 if version is not None and version != self.SESSION_SCHEMA_VERSION:
+                    quarantine_tag = f"{os.getpid()}-{secrets.token_hex(4)}-{time.time_ns()}"
                     quarantine = self.session_file.with_suffix(
-                        self.session_file.suffix + f".corrupt-{int(time.time())}.bak"
+                        self.session_file.suffix + f".corrupt-{quarantine_tag}.bak"
                     )
                     try:
                         self.session_file.replace(quarantine)

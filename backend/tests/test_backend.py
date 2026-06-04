@@ -110,7 +110,7 @@ def test_codex_app_server_payload_builders_match_schema_summary() -> None:
     assert payloads["turn/steer"]["input"][0]["type"] == "text"
 
 
-def test_codex_permission_profile_payloads_do_not_mix_legacy_sandbox_fields() -> None:
+def test_codex_payloads_ignore_stale_permission_profile_provider_for_current_schema() -> None:
     session = _FakeSession()
     session._permission_profile = lambda: {"profileName": "workspace-write"}  # type: ignore[attr-defined]
 
@@ -122,12 +122,12 @@ def test_codex_permission_profile_payloads_do_not_mix_legacy_sandbox_fields() ->
         injected_context="context",
     )
 
-    assert thread_payload["permissionProfile"] == {"profileName": "workspace-write"}
-    assert "sandbox" not in thread_payload
-    assert "approvalPolicy" not in thread_payload
-    assert turn_payload["permissionProfile"] == {"profileName": "workspace-write"}
-    assert "sandboxPolicy" not in turn_payload
-    assert "approvalPolicy" not in turn_payload
+    assert "permissionProfile" not in thread_payload
+    assert thread_payload["sandbox"] == "danger-full-access"
+    assert thread_payload["approvalPolicy"] == "never"
+    assert "permissionProfile" not in turn_payload
+    assert "sandboxPolicy" in turn_payload
+    assert "approvalPolicy" in turn_payload
 
 
 def test_app_server_backend_uses_current_protocol_shapes() -> None:

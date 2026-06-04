@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import os
+import re
 from pathlib import Path
 import json
 import threading
@@ -33,7 +34,9 @@ def test_load_registry_fails_closed_on_corrupt_json(tmp_path: Path, monkeypatch)
     with pytest.raises(RuntimeError, match="Profile registry is unreadable"):
         relayctl._load_registry()
 
-    assert list(tmp_path.glob("workspaces.json.corrupt-*.bak"))
+    quarantines = list(tmp_path.glob("workspaces.json.corrupt-*.bak"))
+    assert quarantines
+    assert re.search(r"\.corrupt-\d+-[0-9a-f]{8}-\d+\.bak$", quarantines[0].name)
 
 
 def test_default_profile_port_allocator_avoids_registered_collisions(tmp_path: Path, monkeypatch) -> None:

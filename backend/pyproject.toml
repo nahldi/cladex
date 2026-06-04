@@ -49,6 +49,11 @@ dev = [
   "wheel>=0.45,<1",
 ]
 
+[tool.pytest.ini_options]
+markers = [
+  "slow: tests that intentionally exercise timeout or long-running subprocess behavior",
+]
+
 [tool.setuptools]
 include-package-data = false
 py-modules = ["agent_guardrails", "api_runner", "bootstrap_runtime", "bot", "cladex", "claude_backend", "claude_bot", "claude_common", "claude_relay", "fix_orchestrator", "install_plugin", "relay_backend", "relay_common", "relay_runtime", "relayctl", "review_swarm", "secret_store"]
